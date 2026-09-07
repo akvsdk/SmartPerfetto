@@ -1161,6 +1161,11 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     let conclusionText = '';
     let sdkSessionId: string | undefined;
     let rounds = 0;
+    // Turns observed as they stream, kept at method scope so a cancelled run
+    // can still say what it did. `rounds` is otherwise read once from the SDK's
+    // terminal `num_turns`, and that message never arrives on a timeout — a
+    // 1200s compare that dispatched 45 turns reported `rounds: 0`.
+    let observedTurns = 0;
     let delegatedRetry = false;
     let outputLanguage = options.outputLanguage ?? this.config.outputLanguage;
     let sourceUse: ReturnType<typeof createClaudeMcpServer>['sourceUse'] | undefined;
@@ -1867,6 +1872,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           if (msg.type === 'assistant' && Array.isArray((msg as any).message?.content)) {
             finalizeTurnMetrics();
             turnCounter++;
+            observedTurns++;
             firstTokenReceived = false;
             const toolNames: string[] = [];
             for (const block of (msg as any).message.content) {
@@ -2722,7 +2728,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         hypotheses: (this.sessionHypotheses.get(sessionId) || []).map(h => this.toProtocolHypothesis(h)),
         conclusion: conclusionText,
         confidence: turnConfidence,
-        rounds,
+        rounds: rounds || observedTurns,
         totalDurationMs: Date.now() - startTime,
         partial: isRuntimePartialResult || undefined,
         terminationReason,

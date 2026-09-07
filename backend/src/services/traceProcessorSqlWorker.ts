@@ -125,6 +125,40 @@ function resolveWorkerThreadPath(): { filename: string; execArgv: string[] } {
   };
 }
 
+
+/**
+ * Turn trace_processor's SQL error into the sentence it is trying to say.
+ *
+ * It reports failures in a Python-shaped traceback whose only frame is
+ * `File "stdin"`, so the reader gets four lines of scaffolding around one line
+ * of meaning:
+ *
+ *   Traceback (most recent call last):
+ *     File "stdin" line 1 col 1
+ *       select bogus from nowhere
+ *       ^
+ *   no such table: nowhere
+ *
+ * The header promises a call stack that does not exist, and `smp query` was
+ * printing the whole thing verbatim. Keep the diagnosis and the position, drop
+ * the scaffolding; anything that does not match this shape is passed through
+ * untouched, because trace_processor also emits plain single-line errors.
+ */
+export function normalizeTraceProcessorSqlError(raw: string): string {
+  const text = raw?.trim();
+  if (!text || !text.startsWith('Traceback (most recent call last):')) return raw;
+
+  const lines = text.split('\n');
+  const diagnosis = lines[lines.length - 1]?.trim();
+  if (!diagnosis) return raw;
+
+  const position = lines
+    .map(line => /File\s+"[^"]*"\s+line\s+(\d+)\s+col\s+(\d+)/.exec(line))
+    .find((match): match is RegExpExecArray => match !== null);
+
+  return position ? `${diagnosis} (line ${position[1]}, col ${position[2]})` : diagnosis;
+}
+
 export class TraceProcessorSqlWorker {
   private readonly processorId: string;
   private readonly traceId: string;
@@ -190,7 +224,7 @@ export class TraceProcessorSqlWorker {
         columns: parsed.columnNames,
         rows: parsed.rows,
         durationMs: Date.now() - startTime,
-        ...(parsed.error ? { error: parsed.error } : {}),
+        ...(parsed.error ? { error: normalizeTraceProcessorSqlError(parsed.error) } : {}),
       };
     } catch (error: any) {
       if (isTraceProcessorQueryCancelledError(error)) {

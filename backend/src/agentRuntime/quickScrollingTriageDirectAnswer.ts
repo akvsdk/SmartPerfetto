@@ -203,6 +203,20 @@ function formatNumber(value: number | undefined, digits = 2): string {
   return value.toFixed(digits).replace(/\.?0+$/, '');
 }
 
+/**
+ * A measurement with its unit, or `N/A` when there is no measurement.
+ *
+ * `formatNumber` renders a missing value as `-`, which reads correctly on its
+ * own but becomes `-ms` the moment a template appends a unit — and that string
+ * was reaching `conclusion.md` and persisting into `claim-support.json` as a
+ * formal anchored claim. A unit belongs to a number; with no number there is no
+ * unit either.
+ */
+export function formatMeasure(value: number | undefined, unit: string, digits = 2): string {
+  if (value === undefined) return 'N/A';
+  return `${formatNumber(value, digits)}${unit}`;
+}
+
 function findEnvelope(envelopes: DataEnvelope[], stepId: string): DataEnvelope | undefined {
   return envelopes.find(envelope =>
     envelope.meta.stepId === stepId &&
@@ -365,8 +379,8 @@ function buildPerformanceClaims(input: {
 
   const performanceStatement = localize(
     input.outputLanguage,
-    `滑动性能概览：评级 ${rating}；共 ${totalFrames} 帧，感知掉帧 ${perceivedJankFrames} 帧（${formatNumber(jankRate)}%），FPS ${formatNumber(actualFps)}/${formatNumber(refreshRate)}Hz。`,
-    `Scrolling summary: rating ${rating}; ${totalFrames} frames, ${perceivedJankFrames} perceived janky frames (${formatNumber(jankRate)}%), FPS ${formatNumber(actualFps)}/${formatNumber(refreshRate)}Hz.`,
+    `滑动性能概览：评级 ${rating}；共 ${totalFrames} 帧，感知掉帧 ${perceivedJankFrames} 帧（${formatMeasure(jankRate, '%')}），FPS ${formatNumber(actualFps)}/${formatNumber(refreshRate)}Hz。`,
+    `Scrolling summary: rating ${rating}; ${totalFrames} frames, ${perceivedJankFrames} perceived janky frames (${formatMeasure(jankRate, '%')}), FPS ${formatNumber(actualFps)}/${formatNumber(refreshRate)}Hz.`,
   );
   const performanceRefs = referencesForColumns({
     envelope,
@@ -381,8 +395,8 @@ function buildPerformanceClaims(input: {
   const bufferStuffingRate = numericValue(rowValue(row, index, 'buffer_stuffing_rate'));
   const responsibilityStatement = localize(
     input.outputLanguage,
-    `责任分布：App 侧掉帧 ${formatNumber(appJankyFrames)} 帧，SF/消费侧 ${formatNumber(sfJankCount)} 帧，Buffer Stuffing ${formatNumber(bufferStuffingFrames)} 帧（${formatNumber(bufferStuffingRate)}%）。`,
-    `Responsibility split: ${formatNumber(appJankyFrames)} app-side janky frames, ${formatNumber(sfJankCount)} SF/consumer-side frames, and ${formatNumber(bufferStuffingFrames)} Buffer Stuffing frames (${formatNumber(bufferStuffingRate)}%).`,
+    `责任分布：App 侧掉帧 ${formatNumber(appJankyFrames)} 帧，SF/消费侧 ${formatNumber(sfJankCount)} 帧，Buffer Stuffing ${formatNumber(bufferStuffingFrames)} 帧（${formatMeasure(bufferStuffingRate, '%')}）。`,
+    `Responsibility split: ${formatNumber(appJankyFrames)} app-side janky frames, ${formatNumber(sfJankCount)} SF/consumer-side frames, and ${formatNumber(bufferStuffingFrames)} Buffer Stuffing frames (${formatMeasure(bufferStuffingRate, '%')}).`,
   );
   const responsibilityRefs = referencesForColumns({
     envelope,
@@ -434,8 +448,8 @@ function buildInputLatencyClaim(input: {
   const rating = cellText(rowValue(row, index, 'input_latency_rating'));
   const statement = localize(
     input.outputLanguage,
-    `Input 延迟概览：评级 ${rating}；输入事件 ${totalInputEvents} 个，MOVE ${formatNumber(moveEvents)} 个，P95 App 处理 ${formatNumber(p95HandlingMs)}ms，最慢 Input→Present ${formatNumber(maxE2eMs)}ms，慢处理 ${formatNumber(slowHandlingEvents)} 个，输入堆积帧 ${formatNumber(inputBacklogFrames)} 个。`,
-    `Input latency summary: rating ${rating}; ${totalInputEvents} input events, ${formatNumber(moveEvents)} MOVE events, P95 app handling ${formatNumber(p95HandlingMs)}ms, max Input-to-Present ${formatNumber(maxE2eMs)}ms, ${formatNumber(slowHandlingEvents)} slow handling events, ${formatNumber(inputBacklogFrames)} backlog frames.`,
+    `Input 延迟概览：评级 ${rating}；输入事件 ${totalInputEvents} 个，MOVE ${formatNumber(moveEvents)} 个，P95 App 处理 ${formatMeasure(p95HandlingMs, 'ms')}，最慢 Input→Present ${formatMeasure(maxE2eMs, 'ms')}，慢处理 ${formatNumber(slowHandlingEvents)} 个，输入堆积帧 ${formatNumber(inputBacklogFrames)} 个。`,
+    `Input latency summary: rating ${rating}; ${totalInputEvents} input events, ${formatNumber(moveEvents)} MOVE events, P95 app handling ${formatMeasure(p95HandlingMs, 'ms')}, max Input-to-Present ${formatMeasure(maxE2eMs, 'ms')}, ${formatNumber(slowHandlingEvents)} slow handling events, ${formatNumber(inputBacklogFrames)} backlog frames.`,
   );
   const references = referencesForColumns({
     envelope,
@@ -481,8 +495,8 @@ function buildRootCauseClaim(input: {
   const primaryCause = cellText(rowValue(row, index, 'primary_cause'));
   const statement = localize(
     input.outputLanguage,
-    `掉帧样本中耗时最长的是 frame_id=${frameId}，帧耗时 ${formatNumber(selectedDuration)}ms，跳帧 ${formatNumber(vsyncMissed)}，分类 ${reasonCode}，主要原因为 ${primaryCause}。`,
-    `The longest janky sample is frame_id=${frameId}, duration ${formatNumber(selectedDuration)}ms, missed vsync ${formatNumber(vsyncMissed)}, reason ${reasonCode}, primary cause ${primaryCause}.`,
+    `掉帧样本中耗时最长的是 frame_id=${frameId}，帧耗时 ${formatMeasure(selectedDuration, 'ms')}，跳帧 ${formatNumber(vsyncMissed)}，分类 ${reasonCode}，主要原因为 ${primaryCause}。`,
+    `The longest janky sample is frame_id=${frameId}, duration ${formatMeasure(selectedDuration, 'ms')}, missed vsync ${formatNumber(vsyncMissed)}, reason ${reasonCode}, primary cause ${primaryCause}.`,
   );
   const references = referencesForColumns({
     envelope,

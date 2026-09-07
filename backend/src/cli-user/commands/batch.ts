@@ -152,7 +152,7 @@ export async function runBatchSkillCommand(args: BatchSkillCommandArgs): Promise
     }
     const params = parseParams(args.params);
     const maxConcurrency = parseConcurrency(args.concurrency);
-    const run = await withConsoleLogToStderr(format !== 'text', async () => {
+    const run = await withConsoleLogToStderr(true, async () => {
       const cliService = new CliAnalyzeService();
       lifecycle.service = cliService;
       await cliService.prepareTraceProcessor();

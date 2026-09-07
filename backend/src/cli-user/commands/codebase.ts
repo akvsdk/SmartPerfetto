@@ -133,7 +133,7 @@ export async function runCodebaseListCommand(args: CodebaseCommandBaseArgs): Pro
   const {service, scope} = managementContext(args);
   try {
     const codebases = await withConsoleLogToStderr(
-      format === 'json',
+      true,
       async () => service.list(scope),
     );
     if (format === 'json') {

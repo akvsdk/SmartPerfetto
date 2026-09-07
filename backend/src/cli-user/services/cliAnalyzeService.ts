@@ -22,6 +22,7 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import {randomUUID} from 'crypto';
 import { AssistantApplicationService } from '../../assistant/application/assistantApplicationService';
 import {
@@ -48,7 +49,8 @@ import { sessionContextManager } from '../../agent/context/enhancedSessionContex
 import { backendLogPath } from '../../runtimePaths';
 import { RagStore } from '../../services/ragStore';
 import { SymbolResolver, type ResolvedSymbolCandidate } from '../../services/symbol/symbolResolver';
-import { getTraceProcessorPath } from '../../services/workingTraceProcessor';
+import { getTraceProcessorPath, TraceProcessorFactory } from '../../services/workingTraceProcessor';
+import { withConsoleLogToStderr } from '../io/stdio';
 import { installTraceProcessorPrebuilt } from './traceProcessorInstaller';
 import {
   resolveAgentRuntimeSelection,
@@ -306,6 +308,16 @@ export class CliAnalyzeService {
   private readonly persistence: SessionPersistenceService;
   private readonly analyzeService: AgentAnalyzeSessionService<AnalyzeManagedSession>;
   private readonly ownedSessionIds = new Set<string>();
+  /**
+   * Traces this service loaded, so teardown can destroy exactly those.
+   *
+   * `TraceProcessorFactory.cleanup()` would be simpler, but it destroys every
+   * processor in the process. That is indistinguishable in a real CLI run —
+   * one command owns the process — and wrong everywhere else: under Jest's
+   * `--runInBand` a single process hosts many suites, and a CLI teardown has no
+   * business reaching into a processor another one is using.
+   */
+  private readonly ownedTraceIds = new Set<string>();
 
   constructor() {
     this.persistence = SessionPersistenceService.getInstance();
@@ -324,7 +336,41 @@ export class CliAnalyzeService {
 
   async loadTrace(tracePath: string): Promise<string> {
     await this.ensureTraceProcessorAvailable();
-    return getTraceProcessorService().loadTraceFromFilePath(tracePath);
+    const service = getTraceProcessorService();
+    const traceId = await service.loadTraceFromFilePath(tracePath);
+    this.ownedTraceIds.add(traceId);
+    // `loadTraceFromFilePath` awaits processing, so the status is already
+    // terminal here. Fail now rather than letting an unreadable file reach the
+    // runtime: trace_processor exits on it, every `execute_sql` then fails, and
+    // the model spends a full turn budget discovering there is nothing to
+    // analyse — ending in a "completed" session and exit 0.
+    //
+    // The authority is trace_processor's own verdict, not our format detector:
+    // that detector names three formats, while trace_processor reads many more,
+    // so rejecting on its `unknown` would trade wasted turns for refusing
+    // traces the tool can actually parse.
+    const trace = service.getTrace(traceId);
+    if (trace?.status === 'error') {
+      // trace_processor decides *whether* to fail; the detector explains *why*
+      // when it can. Its raw message here is "Process exited unexpectedly with
+      // code 1", which tells the reader nothing about the file they passed.
+      const language = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+      const name = path.basename(tracePath);
+      throw new Error(
+        trace.traceFormat === 'unknown'
+          ? localize(
+              language,
+              `无法识别的 trace 格式：${name} 不是本工具能读取的 trace`,
+              `Unrecognized trace format: ${name} is not a trace this tool can read`,
+            )
+          : localize(
+              language,
+              `无法读取 trace：${trace.error ?? '未知错误'}`,
+              `Trace could not be read: ${trace.error ?? 'unknown error'}`,
+            ),
+      );
+    }
+    return traceId;
   }
 
   /**
@@ -882,6 +928,25 @@ export class CliAnalyzeService {
     } catch {
       /* ignore — already cleaned or never started */
     }
+    // The line above retires *traces*, and only those uploaded over two hours
+    // ago that have also been idle for thirty minutes — a trace this command
+    // loaded seconds ago can never match it. Destroying the processors is a
+    // separate call, and without it the shell outlives the CLI as an orphan
+    // (PPID 1) holding a port from the 9100-9900 pool and its resident trace.
+    // One invocation leaks one; the pool is what runs out first.
+    // Teardown runs from a `finally`, after the command has already restored
+    // console.log and printed its result, so the factory's own log line would
+    // land on stdout underneath the output — machine-readable formats included.
+    await withConsoleLogToStderr(true, () => {
+      for (const traceId of this.ownedTraceIds) {
+        try {
+          TraceProcessorFactory.remove(traceId);
+        } catch {
+          /* ignore — already gone */
+        }
+      }
+      this.ownedTraceIds.clear();
+    });
   }
 }
 

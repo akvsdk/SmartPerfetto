@@ -11,6 +11,7 @@ import {
 import { runClaimVerification } from '../../services/verifier/claimVerificationRunner';
 import type { DataEnvelope } from '../../types/dataContract';
 import {
+  formatMeasure,
   buildQuickScrollingTriageSkillParams,
   buildQuickScrollingTriageDirectAnswer,
   selectQuickScrollingTriageEvidenceEnvelopes,
@@ -210,5 +211,25 @@ describe('buildQuickScrollingTriageDirectAnswer', () => {
       passed: true,
       unsupportedClaimCount: 0,
     }));
+  });
+});
+
+describe('formatMeasure', () => {
+  /**
+   * `formatNumber(undefined)` renders `-`, which reads fine alone but became
+   * `-ms` once a template appended the unit — and that string reached
+   * conclusion.md and persisted into claim-support.json as an anchored claim.
+   * 7 of 9 fast-mode outputs in the vendor matrix contained one.
+   */
+  it('never emits a bare unit for a missing measurement', () => {
+    expect(formatMeasure(undefined, 'ms')).toBe('N/A');
+    expect(formatMeasure(undefined, '%')).toBe('N/A');
+    expect(formatMeasure(undefined, 'ms')).not.toContain('-ms');
+  });
+
+  it('renders a real measurement with its unit', () => {
+    expect(formatMeasure(10.85, 'ms')).toBe('10.85ms');
+    expect(formatMeasure(0, 'ms')).toBe('0ms');
+    expect(formatMeasure(62, '%')).toBe('62%');
   });
 });

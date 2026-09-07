@@ -15,6 +15,7 @@
  */
 
 import type { StreamingUpdate } from '../../agent/types';
+import {localize, parseOutputLanguage} from '../../agentv3/outputLanguage';
 
 export interface RendererOptions {
   verbose: boolean;
@@ -62,7 +63,7 @@ export interface Renderer {
   /** Called on fatal errors that abort the run. */
   printError(message: string): void;
   /** Called last to summarize report path + any diagnostics. */
-  printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean }): void;
+  printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean; partial?: boolean; terminationReason?: string }): void;
 }
 
 export function createRenderer(opts: RendererOptions): Renderer {
@@ -206,9 +207,21 @@ export function createRenderer(opts: RendererOptions): Renderer {
     console.error(red(`\n✗ ${message}`));
   }
 
-  function printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean }): void {
+  function printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean; partial?: boolean; terminationReason?: string }): void {
     closeAnswerStream();
-    console.log(`\n${green('✓')} session ${bold(meta.sessionId)}`);
+    // A truncated run reached this point with a plain green tick, which is the
+    // same thing a complete run prints. Say which one happened.
+    const mark = meta.partial ? yellow('!') : green('✓');
+    console.log(`\n${mark} session ${bold(meta.sessionId)}`);
+    if (meta.partial) {
+      const language = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+      const reason = meta.terminationReason ? ` (${meta.terminationReason})` : '';
+      console.log(dim(localize(
+        language,
+        `  分析未完整结束，结果为部分内容${reason}`,
+        `  analysis did not finish; this is a partial result${reason}`,
+      )));
+    }
     console.log(`  ${dim('dir:')}    ${meta.sessionDir}`);
     console.log(`  ${dim('report:')} ${meta.reportPath}`);
     if (meta.turnReportPath) {
@@ -268,10 +281,12 @@ function createMachineRenderer(format: 'json' | 'ndjson'): Renderer {
     }, process.stderr);
   }
 
-  function printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean }): void {
+  function printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean; partial?: boolean; terminationReason?: string }): void {
     if (format === 'ndjson') {
       emit({
         ok: meta.success !== false,
+        ...(meta.partial ? { partial: true } : {}),
+        ...(meta.terminationReason ? { terminationReason: meta.terminationReason } : {}),
         type: 'complete',
         sessionId: meta.sessionId,
         sessionDir: meta.sessionDir,
@@ -283,6 +298,8 @@ function createMachineRenderer(format: 'json' | 'ndjson'): Renderer {
 
     emit({
       ok: meta.success !== false,
+      ...(meta.partial ? { partial: true } : {}),
+      ...(meta.terminationReason ? { terminationReason: meta.terminationReason } : {}),
       sessionId: meta.sessionId,
       sessionDir: meta.sessionDir,
       reportPath: meta.reportPath,

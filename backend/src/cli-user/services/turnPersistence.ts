@@ -97,9 +97,16 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
   const turnMarkdown = sourceProvenance
     ? appendSourceProvenanceMarkdown(baseTurnMarkdown, sourceProvenance, outputLanguage)
     : baseTurnMarkdown;
+  // A run that stopped early is neither cleanly completed nor failed; filing it
+  // as `completed` made `smp list` show a truncated comparison exactly like a
+  // finished one.
+  const statusForIndex: CliSessionIndexEntry['status'] =
+    result.result.partial && input.indexEntry.status === 'completed'
+      ? 'partial'
+      : input.indexEntry.status;
   const indexEntry = result.privateKnowledge
-    ? {...input.indexEntry, firstQuery: durableQuery}
-    : input.indexEntry;
+    ? {...input.indexEntry, status: statusForIndex, firstQuery: durableQuery}
+    : {...input.indexEntry, status: statusForIndex};
 
   const conclusion = result.result.conclusion || '';
   const turnPrefix = path.join(sp.turnsDir, String(turn).padStart(3, '0'));
@@ -163,6 +170,8 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
     sessionDir: sp.dir,
     sessionId,
     success: result.result.success,
+    ...(result.result.partial ? { partial: true } : {}),
+    ...(result.result.terminationReason ? { terminationReason: result.result.terminationReason } : {}),
   });
 }
 

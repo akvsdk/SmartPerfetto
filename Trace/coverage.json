@@ -8671,7 +8671,7 @@
           },
           {
             "id": "performance_summary",
-            "sha256": "9a6596efc4da022db84b6e86414e020fd175137d3cc52972ff169dfeb8b52266",
+            "sha256": "0ae371bfb0971a38be22b67fcd2b2ef871dfb0e8e68a7fe82f25e1e7312f1ae3",
             "required_columns": [
               "total_frames",
               "perceived_jank_frames",
@@ -8689,7 +8689,7 @@
           },
           {
             "id": "buffer_tx_performance_fallback",
-            "sha256": "e8f61547c6044ed5306ddd8583e47452d4d2538b494c0d91bf6b16883c2fee1a",
+            "sha256": "e24a2f31bd95dbb85bd8c761c15bd8f58b03648b6e0b471fac40d7aa0f73fddf",
             "required_columns": [
               "total_frames",
               "actual_fps",
@@ -8765,7 +8765,7 @@
           },
           {
             "id": "expert_analysis_window",
-            "sha256": "b57b2c33b7940bef6aad48fba48b75fc6fd165c222e1335f06a59d00334c13af",
+            "sha256": "f43c488f5c4ce17739c46bfc39dab4e69547a68c42ad53acf26b0cc14ca593e3",
             "required_columns": [
               "window_start_ts",
               "window_end_ts",
@@ -8775,7 +8775,7 @@
           },
           {
             "id": "jank_type_stats",
-            "sha256": "311cd7e34156413394570e01fd6f2519fff0327c4fca5b9b0de0c7aeaf34b852",
+            "sha256": "ddc5fc0a5bb281c34f9344194732c8a5e2646dc02c33916b6e3cbb7b2a4591c5",
             "required_columns": [
               "jank_type",
               "count",
@@ -8791,7 +8791,7 @@
           },
           {
             "id": "scroll_sessions",
-            "sha256": "86253fc5d0497e0e1ab1d2da86f96f42468179ef020a798d2b95d7021c4e8026",
+            "sha256": "7f2f8b558d417456cf175ce9cad270f12113a135b32295612705fe0cb0e04437",
             "required_columns": [
               "session_id",
               "process_name",
@@ -8807,7 +8807,7 @@
           },
           {
             "id": "session_stats_batch",
-            "sha256": "981d05ee4ba30aeea084ea77e12bcf9baf0135fafe42efbaa194cbc90b4ea1c2",
+            "sha256": "c9ac5845bc45592588ad7b8e5a9968f2a74b16445205e9ef297a4349dddfa357",
             "required_columns": [
               "session_id",
               "process_name",
@@ -8819,7 +8819,7 @@
           },
           {
             "id": "session_jank",
-            "sha256": "74eb7501a7b95d83f4b799cc1d959347e233b542649f4933083e8ea7ce0aad1a",
+            "sha256": "b6f6be6077dd0996bb3a312550ef9d48b21243e607d8364089355c6ac7bc4789",
             "required_columns": [
               "session_id",
               "frame_count",
@@ -8833,7 +8833,7 @@
           },
           {
             "id": "get_app_jank_frames",
-            "sha256": "14bed695c34e1944870ed9f4ad12f10fe1198c203bf6181d12392b255c6c42a9",
+            "sha256": "037805fdda5102d4a878ecdc3d3c899c2b93c08e76e90a523f724355e48a997f",
             "required_columns": [
               "frame_id",
               "frame_identity_key",
@@ -8869,7 +8869,7 @@
           },
           {
             "id": "batch_frame_root_cause",
-            "sha256": "0cda2b5afa4d1307018836b53b002d0510c35ea5230dcac89ebd4aacd587e441",
+            "sha256": "fe2d8a4e9b6b3223160966f4050378a2ce346afd69e8078d735056b1b91cc41a",
             "required_columns": [
               "frame_id",
               "frame_identity_key",
@@ -8947,7 +8947,7 @@
           },
           {
             "id": "global_context_flags",
-            "sha256": "fdb537e31847ada0f0b0c2053acd2b7de03824ca49944c39d45d3fa9f8807ef6",
+            "sha256": "333085f0eb30b51243a0998268af3b558c55cbc4450ec43de08496fd9608912e",
             "required_columns": [
               "video_during_scroll",
               "video_slice_count",
@@ -8962,7 +8962,7 @@
           },
           {
             "id": "session_quadrant_summary",
-            "sha256": "eedb20ef44a7f07a082feecfe5e9ecc4807c421d493332b363dc5db8c43d211d",
+            "sha256": "f00f7314b17bccb64615dad79fbd9b0af936dcbe1111f3dd7bd1598d5e4ce415",
             "required_columns": [
               "thread",
               "q1_big_pct",
@@ -8986,7 +8986,7 @@
           },
           {
             "id": "session_thread_core_affinity",
-            "sha256": "2669592629689f01933d515b32cc1980373be17f63cd7240443b340e4949c5bc",
+            "sha256": "c4500b76b40e52cac83b3253eebd316182f643a1fd2f702a2e82d5f71df5c556",
             "required_columns": [
               "thread_name",
               "core_type",
@@ -8996,7 +8996,7 @@
           },
           {
             "id": "root_cause_classification",
-            "sha256": "6fbcc7a5e5461d68b5626f451a525e7304c8e9ac9b2356883394fa8e7f0abbc6",
+            "sha256": "0620cf5ed604b6b2c2879b1f85385a2e5b46aa5b98f88ebf015bae46208c9568",
             "required_columns": [
               "problem_category",
               "problem_component",

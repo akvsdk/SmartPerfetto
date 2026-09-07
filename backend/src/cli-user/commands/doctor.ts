@@ -16,7 +16,7 @@ export interface DoctorCommandArgs {
 export async function runDoctorCommand(args: DoctorCommandArgs): Promise<number> {
   const { paths } = bootstrap({ envFile: args.envFile, sessionDir: args.sessionDir, requireLlm: false });
   const format = args.format ?? 'text';
-  const report = await withConsoleLogToStderr(format !== 'text', async () => collectDoctorReport(paths.home));
+  const report = await withConsoleLogToStderr(true, async () => collectDoctorReport(paths.home));
 
   if (format === 'json' || format === 'ndjson') {
     console.log(JSON.stringify(report, null, format === 'json' ? 2 : 0));

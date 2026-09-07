@@ -10,7 +10,7 @@ import { getTraceProcessorService } from '../../services/traceProcessorService';
 import { createSkillExecutor } from '../../services/skillEngine/skillExecutor';
 import { ensureSkillRegistryInitialized, skillRegistry } from '../../services/skillEngine/skillLoader';
 import { withConsoleLogToStderr } from '../io/stdio';
-import {parseOutputLanguage} from '../../agentv3/outputLanguage';
+import {localize, parseOutputLanguage} from '../../agentv3/outputLanguage';
 import {
   localizeSkillDiagnostics,
   localizeSkillDisplayResults,
@@ -33,7 +33,7 @@ export async function runSkillCommand(args: SkillCommandArgs): Promise<number> {
 
   try {
     const params = parseParams(args.params);
-    const { traceId, result } = await withConsoleLogToStderr(format !== 'text', async () => {
+    const { traceId, result } = await withConsoleLogToStderr(true, async () => {
       bootstrap({ envFile: args.envFile, sessionDir: args.sessionDir, requireLlm: false });
       const service = new CliAnalyzeService();
       lifecycle.service = service;
@@ -132,8 +132,12 @@ function writeSkillOutput(format: OutputFormat, payload: Record<string, unknown>
 
 function writeError(format: OutputFormat, message: string): void {
   if (format === 'json' || format === 'ndjson') {
+    // The machine-readable shape keeps its stable English key and value; only
+    // the human-facing frame follows the configured output language, the way
+    // `batch` already does it.
     console.error(JSON.stringify({ ok: false, type: 'error', error: message }));
   } else {
-    console.error(`Error: ${message}`);
+    const language = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+    console.error(localize(language, `错误：${message}`, `Error: ${message}`));
   }
 }

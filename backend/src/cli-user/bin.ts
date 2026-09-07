@@ -62,6 +62,7 @@ import {beginCliUpdateNotice} from './updateNotice';
 import { DEFAULT_ANALYSIS_QUERY } from './constants';
 import type {CodeAwareMode} from '../services/codebase/codeAwareFeature';
 import type {CapturePresetId, CliAnalysisMode} from './types';
+import {localize, parseOutputLanguage} from '../agentv3/outputLanguage';
 
 interface GlobalOpts {
   file?: string;
@@ -929,7 +930,7 @@ function main(): void {
     if (err instanceof CommanderError) {
       process.exit(err.exitCode === 0 ? 0 : 2);
     }
-    console.error(`Fatal: ${err.message}`);
+    console.error(localize(parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE), `致命错误：${err.message}`, `Fatal: ${err.message}`));
     if (process.env.DEBUG) console.error(err.stack);
     process.exit(2);
   });
@@ -949,7 +950,7 @@ async function runReplCommand(args: {
     await runRepl({ paths, service, renderer }, args.resume);
     return 0;
   } catch (err) {
-    console.error(`Fatal: ${(err as Error).message}`);
+    console.error(localize(parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE), `致命错误：${(err as Error).message}`, `Fatal: ${(err as Error).message}`));
     return 1;
   } finally {
     await service.shutdown();

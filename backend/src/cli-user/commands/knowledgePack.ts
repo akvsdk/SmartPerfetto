@@ -5,6 +5,7 @@
 import {bootstrap} from '../bootstrap';
 import {getAndroidInternalsPackStatus} from '../../services/androidInternalsPack/knowledgePackStatus';
 import {updateAndroidInternalsPack} from '../../services/androidInternalsPack/knowledgePackUpdater';
+import {localize, parseOutputLanguage} from '../../agentv3/outputLanguage';
 
 export interface KnowledgePackCommandArgs {
   envFile?: string;
@@ -51,10 +52,30 @@ export async function runKnowledgePackUpdateCommand(
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // TUF metadata expiring is a publisher-side rotation, not something the
+    // reader can configure around. Saying so keeps people from re-running the
+    // command and editing local config in search of a fix that is not here.
+    const upstream = /expired|timestamp\.json|snapshot\.json|metadata/i.test(message);
     if (args.format === 'json') {
-      console.log(JSON.stringify({status: 'error', error: message}, null, 2));
+      console.log(JSON.stringify({
+        status: 'error',
+        error: message,
+        ...(upstream ? {cause: 'upstream_metadata'} : {}),
+      }, null, 2));
     } else {
-      console.error(`Knowledge Pack update failed: ${message}`);
+      const language = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+      console.error(localize(
+        language,
+        `Knowledge Pack 更新失败：${message}`,
+        `Knowledge Pack update failed: ${message}`,
+      ));
+      if (upstream) {
+        console.error(localize(
+          language,
+          '  这是上游签名元数据的问题，本地无法绕过；请等待发布方轮换后重试。',
+          '  This is an upstream signing-metadata problem that cannot be worked around locally; retry once the publisher rotates it.',
+        ));
+      }
     }
     return 1;
   }

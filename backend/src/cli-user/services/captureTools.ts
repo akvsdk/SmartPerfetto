@@ -205,14 +205,23 @@ interface BuildResolutionInput {
 
 function buildResolution(input: BuildResolutionInput): CaptureToolResolution {
   const exists = fs.existsSync(input.path);
+  const executable = exists && isExecutable(input.path);
   return {
     name: input.name,
-    source: input.source,
+    // Where the tool *is*, not where it was looked for. Reporting the intended
+    // source for a file that is not there made `doctor` contradict itself
+    // inside one payload: `source: "bundled"` beside `exists: false`, under a
+    // message reading "tracebox is not bundled". `path` still records where it
+    // was expected. `buildPathResolution` already resolved this the same way.
+    source: exists ? input.source : 'missing',
     path: input.path,
     exists,
-    executable: exists && isExecutable(input.path),
+    executable,
     platformKey: input.platformKey,
-    hint: input.hint,
+    // A hint is remediation advice, so it belongs to a failure. Attached
+    // unconditionally it told users "adb was not found" next to
+    // `exists: true, executable: true`.
+    ...(executable ? {} : {hint: input.hint}),
   };
 }
 
@@ -235,7 +244,7 @@ function buildPathResolution(input: {
     exists: usable,
     executable: usable,
     platformKey: input.platformKey,
-    hint: input.hint,
+    ...(usable ? {} : {hint: input.hint}),
   };
 }
 

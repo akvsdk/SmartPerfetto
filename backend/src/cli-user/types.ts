@@ -126,7 +126,13 @@ export interface CliSessionIndexEntry {
   traceFilename: string;
   firstQuery: string;
   turnCount: number;
-  status: 'pending' | 'completed' | 'failed';
+  /**
+   * `partial` is a run that produced output but did not finish — a timeout
+   * hard limit, an exhausted turn budget, a failed quality gate. It used to be
+   * filed as `completed`, so `smp list` showed a truncated 1200s comparison
+   * exactly like a clean one.
+   */
+  status: 'pending' | 'completed' | 'partial' | 'failed';
 }
 
 /** One row in `<sessionDir>/transcript.jsonl` — human-readable turn log. */

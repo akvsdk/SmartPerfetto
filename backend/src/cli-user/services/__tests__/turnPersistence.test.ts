@@ -542,3 +542,69 @@ function readTextFiles(root: string): string[] {
   }
   return output;
 }
+
+describe('commitTurnOutputs records a truncated run as truncated', () => {
+  /**
+   * A 1200s comparison that hit the hard limit was filed as `completed`, so
+   * `smp list` showed it exactly like a finished run, with no marker anywhere
+   * that the analysis had been cut off.
+   */
+  it('files a partial result as partial rather than completed', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-cli-partial-'));
+    const paths = computePaths(home);
+    ensureLayout(paths);
+    const sp = sessionPaths(paths, 'session-partial');
+    ensureSessionLayout(sp);
+
+    const result = {
+      sessionId: 'session-partial',
+      traceId: 'trace-partial',
+      codeAwareMode: 'off',
+      result: {
+        sessionId: 'session-partial',
+        success: true,
+        findings: [],
+        hypotheses: [],
+        conclusion: 'partial output',
+        confidence: 0.25,
+        rounds: 45,
+        totalDurationMs: 1206000,
+        partial: true,
+        terminationReason: 'timeout',
+      },
+    } as unknown as RunTurnOutput;
+
+    commitTurnOutputs({
+      paths,
+      sp,
+      renderer: rendererStub(),
+      sessionId: 'session-partial',
+      turn: 1,
+      query: 'compare',
+      result,
+      config: {
+        sessionId: 'session-partial',
+        backendSessionId: 'session-partial',
+        tracePath: '/tmp/trace.perfetto-trace',
+        traceId: 'trace-partial',
+        createdAt: 1,
+        lastTurnAt: 2,
+        turnCount: 1,
+      },
+      turnMarkdown: 'partial output',
+      indexEntry: {
+        sessionId: 'session-partial',
+        createdAt: 1,
+        lastTurnAt: 2,
+        tracePath: '/tmp/trace.perfetto-trace',
+        traceFilename: 'trace.perfetto-trace',
+        firstQuery: 'compare',
+        turnCount: 1,
+        status: 'completed',
+      },
+    });
+
+    const index = JSON.parse(fs.readFileSync(paths.indexFile, 'utf-8'));
+    expect(index.sessions['session-partial'].status).toBe('partial');
+  });
+});

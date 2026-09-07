@@ -22,6 +22,7 @@ import {
   withRunManifestLifecycle,
 } from '../selfEvolution/runManifestLifecycle';
 import type {RunManifestStore} from '../selfEvolution/runManifestStore';
+import {normalizeTraceProcessorSqlError} from '../traceProcessorSqlWorker';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -631,5 +632,32 @@ describe('TraceProcessorSqlWorker', () => {
     expect(worker.getStats()).toMatchObject({ running: false, queuedP0: 0, queuedP1: 0, queuedP2: 0 });
 
     await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+});
+
+describe('normalizeTraceProcessorSqlError', () => {
+  /**
+   * `smp query` printed this verbatim: a Python-shaped traceback whose only
+   * frame is `File "stdin"`, wrapping one line of actual diagnosis.
+   */
+  it('keeps the diagnosis and position, drops the fake traceback', () => {
+    const raw = [
+      'Traceback (most recent call last):',
+      '  File "stdin" line 1 col 1',
+      '    select bogus from nowhere',
+      '    ^',
+      'no such table: nowhere',
+    ].join('\n');
+    expect(normalizeTraceProcessorSqlError(raw)).toBe('no such table: nowhere (line 1, col 1)');
+  });
+
+  it('passes through errors that are not in that shape', () => {
+    expect(normalizeTraceProcessorSqlError('Query timeout')).toBe('Query timeout');
+    expect(normalizeTraceProcessorSqlError('')).toBe('');
+  });
+
+  it('still returns the diagnosis when no position is present', () => {
+    const raw = 'Traceback (most recent call last):\nsomething broke';
+    expect(normalizeTraceProcessorSqlError(raw)).toBe('something broke');
   });
 });

@@ -81,3 +81,37 @@ function makeExecutable(dir: string, name: string): string {
   fs.chmodSync(file, 0o755);
   return file;
 }
+
+describe('capture tool resolution reports only what is true', () => {
+  /**
+   * `doctor` contradicted itself inside one payload: `source: "bundled"` and
+   * `path` pointing at a file that does not exist, under a message reading
+   * "tracebox is not bundled".
+   */
+  it('does not claim a source for a tool that is not there', () => {
+    const resolved = resolveTraceboxTool(undefined, 'darwin-arm64', {
+      backendRoot: '/nonexistent-root-for-test',
+    });
+    expect(resolved.exists).toBe(false);
+    expect(resolved.source).toBe('missing');
+    // Where it was looked for is still recorded.
+    expect(typeof resolved.path).toBe('string');
+  });
+
+  /**
+   * A hint is remediation advice, so it belongs to a failure. Attached
+   * unconditionally it told users "adb was not found" beside
+   * `exists: true, executable: true`.
+   */
+  it('omits the remediation hint when the tool resolves', () => {
+    const missing = resolveTraceboxTool(undefined, 'darwin-arm64', {
+      backendRoot: '/nonexistent-root-for-test',
+    });
+    expect(missing.hint).toBeTruthy();
+
+    const resolved = resolveAdbTool();
+    if (resolved.exists && resolved.executable) {
+      expect(resolved.hint).toBeUndefined();
+    }
+  });
+});

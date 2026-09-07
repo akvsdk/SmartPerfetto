@@ -8,6 +8,7 @@ import type { OutputFormat } from '../repl/renderer';
 import { CliAnalyzeService } from '../services/cliAnalyzeService';
 import { getTraceProcessorService, type QueryResult } from '../../services/traceProcessorService';
 import { withConsoleLogToStderr } from '../io/stdio';
+import {localize, parseOutputLanguage} from '../../agentv3/outputLanguage';
 
 export interface QueryCommandArgs {
   trace: string;
@@ -23,7 +24,7 @@ export async function runQueryCommand(args: QueryCommandArgs): Promise<number> {
   const lifecycle: { service?: CliAnalyzeService } = {};
 
   try {
-    const { traceId, result } = await withConsoleLogToStderr(format !== 'text', async () => {
+    const { traceId, result } = await withConsoleLogToStderr(true, async () => {
       bootstrap({ envFile: args.envFile, sessionDir: args.sessionDir, requireLlm: false });
       const service = new CliAnalyzeService();
       lifecycle.service = service;
@@ -72,9 +73,13 @@ function writeQueryOutput(
 
 function writeError(format: OutputFormat, message: string): void {
   if (format === 'json' || format === 'ndjson') {
+    // The machine-readable shape keeps its stable English key and value; only
+    // the human-facing frame follows the configured output language, the way
+    // `batch` already does it.
     console.error(JSON.stringify({ ok: false, type: 'error', error: message }));
   } else {
-    console.error(`Error: ${message}`);
+    const language = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+    console.error(localize(language, `错误：${message}`, `Error: ${message}`));
   }
 }
 
