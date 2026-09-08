@@ -11,6 +11,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Commit prefixes follow [Conventional Commits](https://www.conventionalcommits.org/).
 Detailed commit-level history is available via `git log`.
 
+## [1.9.0] - 2026-09-08
+
+### Added
+- Explicit Auto, Fast, and Full analysis modes in the AI Assistant, with mode
+  intent preserved across follow-up turns and native runtimes.
+- Codebase management commands for source selection, consent, pending-index
+  decisions, and lifecycle audits, with trace-bound source-use provenance in
+  analysis reports.
+
+### Changed
+- Analysis runtimes share typed turn intent and evidence context. Plans and
+  report expansion follow the request instead of fixed scene templates.
+- Tool progress describes meaningful outcomes through a shared narration layer.
+- Portable Skill exports preserve explicit process scopes and parameter bindings.
+
+### Fixed
+- Preserve original claims and evidence through verification, streaming,
+  snapshots, reports, and CLI output; incomplete assessments remain visible.
+- Keep process identity, trace side, source permissions, and query provenance
+  attached across composite Skills and truncated tool results.
+- Distinguish runtime failure by execution state and authorship, and preserve
+  provider reasoning and literal analysis content.
+- Repair CLI command contracts, UTF-8 trace filenames, writable portable upload
+  paths, and missing test-suite registration.
+
 ## [1.8.4] - 2026-08-27
 
 ### Fixed
