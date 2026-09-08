@@ -3,6 +3,7 @@
 
 ---
 scene: network
+classification_description: "Network traffic, packet activity, connectivity and communication performance."
 priority: 6
 effort: medium
 required_capabilities: []
@@ -50,10 +51,9 @@ final_report_contract:
     - id: request_stage_evidence_boundary
       label: 请求阶段证据边界
       description: '当问题涉及 DNS/connect/TLS/TTFB/body/decode/HTTPDNS/OkHttp/Cronet/APM/接入层日志时，区分 packet trace、request telemetry、日志/APM、时间窗/request_id 对齐和缺失证据。'
-      trigger_patterns:
-        - '(网络|network).*(慢|延迟|latency|slow|请求慢|request.*slow)|(请求|request).*(慢|耗时|延迟|latency|slow)'
-        - 'DNS|TTFB|HTTPDNS|OkHttp|Cronet|HttpEngine|EventListener|request[- ]stage|首包|首字节|secureConnect|responseHeadersStart'
-        - 'TLS|handshake|\bconnect(?:Start|End)?\b|request body|response body|body transfer|decode|server log|access[- ]layer|APM'
+      condition:
+        kind: semantic
+        description: '当问题要求定位网络请求耗时、失败或具体阶段瓶颈，或把包级 trace 与请求事件、客户端或服务端日志、APM 对照时适用。'
       pattern_groups:
         - ['请求阶段证据边界', 'request[- ]stage evidence', 'DNS/TCP/TLS/TTFB', '阶段证据']
         - ['packet[- ]level', 'trace_direct:packet_activity', 'request[- ]level', 'request telemetry', 'OkHttp', 'Cronet', 'HttpEngine', 'EventListener', 'APM', '接入层', '日志']
@@ -62,9 +62,9 @@ final_report_contract:
     - id: network_stack_policy_boundary
       label: 网络栈/版本策略边界
       description: '当问题涉及 Cronet/HttpEngine/HTTP3/QUIC/ECH/CT/NetworkCallback/local-network permission/validated/metered/satellite/constrained network 时，区分网络栈、API/targetSdk/Extension、设备/服务端支持、配置/权限和 trace packet 证据。'
-      trigger_patterns:
-        - 'Cronet|HttpEngine|HTTP/3|HTTP3|QUIC|0[- ]RTT|ECH|Encrypted Client Hello|Certificate Transparency|\bCT\b'
-        - 'NetworkCallback|NetworkCapabilities|validated internet|metered|estimated bandwidth|bandwidth estimate|local network permission|ACCESS_LOCAL_NETWORK|satellite|constrained network'
+      condition:
+        kind: semantic
+        description: '当问题要求解释网络协议栈、连接状态、网络权限或平台策略的行为及版本差异时适用。'
       pattern_groups:
         - ['网络栈/版本策略边界', 'stack policy boundary', '版本策略', 'network stack']
         - ['Cronet', 'HttpEngine', 'HTTP/3', 'HTTP3', 'QUIC', 'NetworkCallback', 'NetworkCapabilities', 'ECH', 'Encrypted Client Hello', 'Certificate Transparency', 'local network permission', 'ACCESS_LOCAL_NETWORK']

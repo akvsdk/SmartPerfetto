@@ -3,6 +3,9 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import type { QueryResult } from './traceProcessorService';
+import type {RuntimeFinalizationContext} from '../agentRuntime/analysisFinalizationContext';
+import type {DataEnvelope} from '../types/dataContract';
+import {capturedIdentityReadRequests, collectCapturedIdentities} from './processIdentity/capturedIdentity';
 import type {
   ComparisonReportSection,
   ComparisonSourceKind,
@@ -104,6 +107,37 @@ export function comparisonIdentityFromReportSection(
   const referencePackageName = safeReportPackageName(metricRecord.referencePackage);
   if (!currentPackageName || !referencePackageName) return undefined;
   return {currentPackageName, referencePackageName};
+}
+
+/** Display envelopes locate captures; only the issued execution record supplies identity. */
+export async function resolveCapturedComparisonIdentity(input: {
+  currentTraceId: string;
+  referenceTraceId: string;
+  dataEnvelopes: readonly DataEnvelope[];
+  context?: Pick<RuntimeFinalizationContext, 'resolveReferences'>;
+  signal: AbortSignal;
+  reportSection?: ComparisonReportSection;
+}): Promise<FinalResultComparisonIdentity> {
+  input.signal.throwIfAborted();
+  const identity: FinalResultComparisonIdentity = {
+    ...comparisonIdentityFromReportSection(input.reportSection),
+    currentTraceId: input.currentTraceId,
+    referenceTraceId: input.referenceTraceId,
+  };
+  if (!input.context) return identity;
+  const requests = capturedIdentityReadRequests(input.dataEnvelopes);
+  if (!requests.length) return identity;
+  const pin = {currentTraceId: input.currentTraceId, referenceTraceId: input.referenceTraceId};
+  const resolved = await input.context.resolveReferences(requests, input.signal);
+  input.signal.throwIfAborted();
+  const captured = collectCapturedIdentities(requests, resolved, pin);
+  for (const side of ['current', 'reference'] as const) {
+    const candidates = captured.identities.filter(candidate => candidate.target.traceSide === side);
+    if (captured.unresolvedSides.includes(side) || candidates.length !== 1) continue;
+    if (side === 'current') identity.currentResolution = candidates[0];
+    else identity.referenceResolution = candidates[0];
+  }
+  return identity;
 }
 
 export async function buildComparisonAppendix(

@@ -2,42 +2,44 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import type { PlanPhase } from './types';
+import {phaseMatchesCall, type AnalysisPlanV3, type PlanPhase, type PlanSkipDisposition, type ToolCallRecord} from './types';
 
-type PlanPhaseIdentity = Pick<PlanPhase, 'id' | 'name' | 'goal'>;
-
-const CONCLUSION_LIKE_PHASE_PATTERN =
-  /(结构化结论|结构化报告|综合结论|最终结论|结论输出|输出结论|输出最终报告|最终报告|综合报告|优化建议|structured report|final conclusion|\bconclusion\b|final report|analysis report|final answer|write final answer|overall summary|final summary|recommendations?|optimization recommendations?|synthesis)/i;
-
-const COMPARISON_SYNTHESIS_PHASE_PATTERN =
-  /((差异|对比|比较|delta|comparison|compare).*(深钻|深入|根因|定位|归因|综合|复盘|synthesis|root cause|deep dive)|(深钻|深入|根因|定位|归因).*(差异|对比|比较|delta|comparison|compare))/i;
-
-const CHINESE_REPORT_DELIVERY_PHASE_PATTERN =
-  /(?:报告输出|输出[^，,；;。！？.!?\n]{0,12}分析报告)(?=$|[，,；;、及和与并])/;
-const CHINESE_REPORT_FOLLOWUP_EXECUTION_PATTERN =
-  /^[\s，,；;、及和与并]*[^，,；;。！？.!?\n]{0,24}(?:(?:补采|补证|取证)|(?:采集|查询|调用|运行|执行)[^，,；;。！？.!?\n]{0,8}(?:证据|数据|Trace|SQL|源码|工具|Skill)|(?:证据|数据|Trace|SQL|源码|工具|Skill)[^，,；;。！？.!?\n]{0,4}(?:采集|查询|调用|运行|执行)(?!结果|关系|限制|摘要|统计|明细|情况|口径|链路))/i;
-
-function classifyChineseReportDeliveryPhaseField(
-  value: string,
-): 'none' | 'delivery' | 'delivery_with_evidence_work' {
-  const match = CHINESE_REPORT_DELIVERY_PHASE_PATTERN.exec(value);
-  if (!match) return 'none';
-  const suffix = value.slice((match.index ?? 0) + match[0].length);
-  return CHINESE_REPORT_FOLLOWUP_EXECUTION_PATTERN.test(suffix)
-    ? 'delivery_with_evidence_work'
-    : 'delivery';
+export interface PlanPhaseCallResolution {
+  phase?: PlanPhase;
+  attribution: 'explicit' | 'unique' | 'unknown_phase' | 'unmatched' | 'ambiguous';
 }
 
-export function isConclusionLikePlanPhase(phase: PlanPhaseIdentity): boolean {
-  const reportDeliveryFields = [phase.id, phase.name, phase.goal]
-    .map(classifyChineseReportDeliveryPhaseField);
-  if (reportDeliveryFields.includes('delivery_with_evidence_work')) return false;
-  if (CONCLUSION_LIKE_PHASE_PATTERN.test(`${phase.id} ${phase.name} ${phase.goal}`)) {
-    return true;
+/** Dispatch ownership is structural; outcome and phase prose cannot select a phase. */
+export function resolvePlanPhaseForCall(
+  plan: AnalysisPlanV3,
+  call: ToolCallRecord,
+  explicitPhaseId?: string,
+): PlanPhaseCallResolution {
+  if (explicitPhaseId !== undefined) {
+    const matches = plan.phases.filter(phase => phase.id === explicitPhaseId);
+    if (matches.length !== 1) return {attribution: matches.length ? 'ambiguous' : 'unknown_phase'};
+    return phaseMatchesCall(matches[0], call)
+      ? {phase: matches[0], attribution: 'explicit'}
+      : {attribution: 'unmatched'};
   }
-  return reportDeliveryFields.includes('delivery');
+  const matches = plan.phases.filter(phase => phaseMatchesCall(phase, call));
+  return matches.length === 1
+    ? {phase: matches[0], attribution: 'unique'}
+    : {attribution: matches.length ? 'ambiguous' : 'unmatched'};
 }
 
-export function isComparisonSynthesisPlanPhase(phase: PlanPhaseIdentity): boolean {
-  return COMPARISON_SYNTHESIS_PHASE_PATTERN.test(`${phase.id} ${phase.name} ${phase.goal}`);
+export function isPlanSkipDisposition(value: unknown): value is PlanSkipDisposition {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const disposition = value as Record<string, unknown>;
+  return typeof disposition.kind === 'string' &&
+    ['not_applicable', 'evidence_unavailable', 'deferred'].includes(disposition.kind) &&
+    (disposition.failureToolCallIds === undefined ||
+      (Array.isArray(disposition.failureToolCallIds) && disposition.failureToolCallIds.every(id =>
+        typeof id === 'string' && id.trim().length > 0)));
+}
+
+export function hasValidPlanSkipDisposition(plan: AnalysisPlanV3, phase: PlanPhase): boolean {
+  if (!isPlanSkipDisposition(phase.skipDisposition)) return false;
+  return (phase.skipDisposition.failureToolCallIds ?? []).every(id =>
+    (plan.toolCallLog ?? []).some(call => call.toolCallId === id && call.success === false && call.matchedPhaseId === phase.id));
 }

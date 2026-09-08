@@ -39,6 +39,7 @@ import {
 } from '../services/selfEvolution/runManifestLifecycle';
 import type {AdaptiveRoutingReceiptV1} from '../types/adaptiveRouting';
 import {parseAdaptiveRoutingReceipt} from './adaptiveEvidenceRouter';
+import type {AnalysisTurnIntent} from './analysisTurnIntent';
 
 export interface RuntimeBudgetInputs {
   model?: string;
@@ -55,6 +56,8 @@ export interface RuntimeBudgetInputs {
 }
 
 export interface AnalysisRunSpec {
+  /** Resolved by this run, not accepted from client options or prior snapshots. */
+  turnIntent?: AnalysisTurnIntent;
   identity: {
     sessionId: string;
     traceId: string;
@@ -107,6 +110,7 @@ export interface AnalysisRunSpec {
 }
 
 export interface CreateAnalysisRunSpecInput {
+  turnIntent?: AnalysisTurnIntent;
   query: string;
   sessionId: string;
   traceId: string;
@@ -117,6 +121,8 @@ export interface CreateAnalysisRunSpecInput {
   outputLanguage: OutputLanguage;
   previousTurns?: ConversationTurn[];
   resolvedMode?: QueryComplexity;
+  /** Complete provider configuration selected for this run, independent of budget. */
+  resolvedModel?: string;
   budget?: RuntimeBudgetInputs;
   adaptiveRouting?: AdaptiveRoutingReceiptV1;
 }
@@ -140,7 +146,7 @@ function resolveEngineCapabilities(input: CreateAnalysisRunSpecInput): EngineCap
   return capabilities;
 }
 
-function canonicalRuntimeKind(value: string): AgentRuntimeKind {
+export function canonicalRuntimeKind(value: string): AgentRuntimeKind {
   if (isProductionAgentRuntimeKind(value)) return value;
   if (value === EXPERIMENTAL_PI_AGENT_CORE_RUNTIME_KIND) {
     return PI_AGENT_CORE_RUNTIME_KIND;
@@ -173,12 +179,13 @@ export function createAnalysisRunSpec(input: CreateAnalysisRunSpecInput): Analys
     selectionContext: options.selectionContext,
     hasReferenceTrace: !!options.referenceTraceId,
     previousTurns: input.previousTurns ?? [],
+    requestedMode: options.analysisMode ?? 'auto',
   });
   const traceContextPrompt = formatTraceContext(options.traceContext, input.outputLanguage);
   const runtimeKind = canonicalRuntimeKind(input.runtimeSelection.kind);
-  const actualModel = input.resolvedMode === 'quick'
+  const actualModel = input.resolvedModel ?? (input.resolvedMode === 'quick'
     ? input.budget?.lightModel ?? input.budget?.model
-    : input.budget?.model;
+    : input.budget?.model);
   const sink = resolveRunManifestAttributionSink(
     options.runManifestAttributionSink,
     currentRunManifestAttributionSink(),
@@ -216,6 +223,7 @@ export function createAnalysisRunSpec(input: CreateAnalysisRunSpecInput): Analys
   if (adaptiveRouting) sink?.recordAdaptiveRouting?.(adaptiveRouting);
 
   return {
+    ...(input.turnIntent ? {turnIntent: input.turnIntent} : {}),
     identity: {
       sessionId: input.sessionId,
       traceId: input.traceId,

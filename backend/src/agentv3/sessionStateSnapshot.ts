@@ -565,6 +565,8 @@ export interface SessionStateSnapshot {
   comparisonReportSection?: ComparisonReportSection;
   /** Final receipt, added explicitly after report/snapshot artifacts settle. */
   analysisReceipt?: import('../types/dataContract').AnalysisReceipt;
+  /** Exact current finalized body and metadata; absent for historical snapshots. */
+  finalResult?: import('../agent/core/orchestratorTypes').AnalysisResult;
   /** Path-free deterministic Trace Summary attribution for this trace/run. */
   traceSummary?: import('../types/traceSummaryAttribution').TraceSummaryAttributionV1;
 
@@ -581,6 +583,7 @@ export interface SessionStateSnapshot {
   dataEnvelopes: DataEnvelope[];
   claimSupport?: ClaimSupportV1[];
   claimVerificationResult?: ClaimVerificationResult;
+  sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;
   identityResolutions?: IdentityResolutionV1[];
   /**
    * Protocol-format hypotheses (from AnalysisResult) for report generation.
@@ -702,6 +705,7 @@ export interface SessionFieldsForSnapshot {
   /** Shared deterministic comparison report section, when available. */
   comparisonReportSection?: ComparisonReportSection;
   analysisReceipt?: SessionStateSnapshot['analysisReceipt'];
+  finalResult?: SessionStateSnapshot['finalResult'];
   traceSummary?: SessionStateSnapshot['traceSummary'];
   conversationSteps: ConversationStep[];
   queryHistory: QueryHistoryEntry[];
@@ -711,6 +715,7 @@ export interface SessionFieldsForSnapshot {
   dataEnvelopes: DataEnvelope[];
   claimSupport?: ClaimSupportV1[];
   claimVerificationResult?: ClaimVerificationResult;
+  sourceClaimVerificationResult?: SessionStateSnapshot['sourceClaimVerificationResult'];
   identityResolutions?: IdentityResolutionV1[];
   /** Protocol-format hypotheses from AnalysisResult. */
   hypotheses: any[];

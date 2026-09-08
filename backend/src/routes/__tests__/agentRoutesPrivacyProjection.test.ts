@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import {afterEach, describe, expect, it} from '@jest/globals';
+import {afterEach, describe, expect, it, jest} from '@jest/globals';
 import {EventEmitter} from 'events';
 import fs from 'fs';
 import os from 'os';
@@ -11,6 +11,7 @@ import ts from 'typescript';
 import {
   agentRoutesPrivacyProjectionTestSeam,
   agentRoutesReceiptTestSeam,
+  agentRoutesCancellationTestSeam,
 } from '../agentRoutes';
 import {
   clearCodeAwareOutputGuards,
@@ -22,6 +23,14 @@ import {ENTERPRISE_DB_PATH_ENV, openEnterpriseDb} from '../../services/enterpris
 import {resetAnalysisRunStoreForTests} from '../../services/analysisRunStore';
 import {resetAgentEventStoreForTests} from '../../services/agentEventStore';
 import {routeAdaptiveEvidencePreflight} from '../../agentRuntime/adaptiveEvidenceRouter';
+import {createDataEnvelope} from '../../types/dataContract';
+import * as claimPreparation from '../../services/evidence/analysisRelationPreparation';
+import * as qualityGate from '../../services/finalResultQualityGate';
+import * as finalizer from '../../services/finalizeAnalysisResult';
+import * as reportRoutes from '../reportRoutes';
+import * as snapshots from '../../services/analysisResultSnapshotPipeline';
+import * as eventStore from '../../services/agentEventStore';
+import {SessionPersistenceService} from '../../services/sessionPersistenceService';
 
 const sessionId = 'private-route-projection';
 
@@ -59,10 +68,84 @@ function completedSnapshotInputFromRoute(): ts.ObjectLiteralExpression | undefin
   return snapshotInput;
 }
 
-afterEach(() => clearCodeAwareOutputGuards(sessionId));
+afterEach(() => {clearCodeAwareOutputGuards(sessionId); jest.restoreAllMocks();});
 
 describe('agent route private projections', () => {
-  it('does not publish valid-looking source provenance without a current-run accessor', () => {
+  it.each(['live', 'snapshot'] as const)('rejects mismatched %s result run attribution during read recovery', location => {
+    const id = `http-read-run-${location}`;
+    const stored = {sessionId: id, success: true, conclusion: 'prior result', findings: [], hypotheses: [],
+      rounds: 1, confidence: 1, totalDurationMs: 1, completion: {runId: 'run-current'},
+      analysisReceipt: {runId: 'run-prior'}};
+    const session = {sessionId: id, activeRun: {runId: 'run-current'},
+      ...(location === 'live' ? {result: stored} : {})} as any;
+    const persistence = SessionPersistenceService.getInstance();
+    jest.spyOn(persistence, 'loadSessionStateSnapshot').mockReturnValue({sessionId: id,
+      lastRun: {runId: 'run-current'}, finalResult: stored} as any);
+    jest.spyOn(persistence, 'getSession').mockReturnValue(null);
+    const before = JSON.stringify(session);
+    expect(agentRoutesPrivacyProjectionTestSeam.recoverResultForSessionIfNeeded(id, session)).toBeNull();
+    expect(JSON.stringify(session)).toBe(before);
+  });
+
+  it.each(['completed', 'failed', 'cancelled', 'quota_exceeded', undefined])(
+    'preserves stored terminal status %s without inventing a legacy status', terminalRunStatus => {
+      const session = {sessionId, codeAwareMode: 'provider_send', codebaseIds: ['cb-private']} as any;
+      const eventData = JSON.stringify({data: {conclusion: '', terminalRunStatus}});
+      const projected = agentRoutesPrivacyProjectionTestSeam.sanitizePersistedAnalysisCompletedEvent(
+        session, {eventType: 'analysis_completed', eventData} as any,
+      );
+      expect(JSON.parse(projected.eventData).data.terminalRunStatus).toBe(terminalRunStatus);
+    },
+  );
+
+  it('keeps the original failed claim through completed HTTP payload reconstruction and replay', () => {
+    const claims = [{
+      id: 'http-wrong-ttid', text: 'TTID=9999ms', kind: 'numeric',
+      references: [{evidenceRefId: 'data:http-ttid', rowIndex: 0, column: 'ttid_ms', value: 9999}],
+    }];
+    const session = {
+      sessionId: 'http-claim-fidelity', traceId: 'trace-http', query: '核对 TTID',
+      runSequence: 2, providerId: null, scenes: [], hypotheses: [],
+      dataEnvelopes: [createDataEnvelope({columns: ['ttid_ms'], rows: [[1912]]}, {
+        type: 'skill_result', source: 'startup_analysis', title: '启动概览',
+        evidenceRefId: 'data:http-ttid', traceId: 'trace-http', traceSide: 'current',
+      })],
+      result: {
+        sessionId: 'http-claim-fidelity', success: true, findings: [], hypotheses: [],
+        conclusion: 'TTID=9999ms，事件计数1912次。', confidence: 0.9, rounds: 1, totalDurationMs: 1,
+        partial: true,
+        claimVerificationResult: {schemaVersion: 'claim_verifier@2', policy: 'record_only',
+          status: 'failed', passed: false, checkedClaimCount: 1, unsupportedClaimCount: 1,
+          claimResults: [{claimId: 'http-wrong-ttid', status: 'unsupported', issues: []}], issues: []},
+        conclusionContract: {
+          schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+          conclusions: [{rank: 1, statement: 'TTID=9999ms'}], claims,
+          clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+        },
+      },
+      // Final verification is stored by the write path, never recomputed by a read.
+      completedAnalysisFinalArtifacts: {receiptReference: {runManifestId: 'manifest-http-claim-fidelity'}},
+    } as any;
+
+    const before = JSON.stringify(session);
+    const verify = jest.spyOn(claimPreparation, 'runPreparedAnalysisClaimVerification');
+    const gate = jest.spyOn(qualityGate, 'applyFinalResultQualityGate');
+    const finalize = jest.spyOn(finalizer, 'finalizeAnalysisResult');
+    const report = jest.spyOn(reportRoutes, 'persistReport');
+    const snapshot = jest.spyOn(snapshots, 'persistCompletedAnalysisResultSnapshot');
+    const persistEvent = jest.spyOn(eventStore, 'persistSerializedAgentEvent');
+    const once = agentRoutesPrivacyProjectionTestSeam.ensureCompletedAnalysisResultPayload(session);
+    const replay = agentRoutesPrivacyProjectionTestSeam.ensureCompletedAnalysisResultPayload(session);
+    expect(JSON.stringify(session)).toBe(before);
+    for (const operation of [verify, gate, finalize, report, snapshot, persistEvent]) expect(operation).not.toHaveBeenCalled();
+    expect(once?.normalizedConclusionContract?.claims).toEqual(claims);
+    expect(replay?.normalizedConclusionContract?.claims).toEqual(claims);
+    expect(replay?.qualityArtifacts.claimVerificationResult).toMatchObject({status: 'failed', passed: false});
+    expect(replay?.result.partial).toBe(true);
+    expect(replay?.result.claimVerificationResult?.claimResults.map(claim => claim.claimId)).toEqual(['http-wrong-ttid']);
+  });
+
+  it('safely projects stored source metadata without borrowing a current-run accessor', () => {
     const fabricated = {
       schemaVersion: 'conclusion_contract_v1',
       mode: 'focused_answer',
@@ -116,9 +199,8 @@ describe('agent route private projections', () => {
     }, undefined);
 
     expect(projected.conclusion).toBe('trace-only conclusion');
-    expect(projected.conclusionContract).not.toHaveProperty('sourceUseDecision');
-    expect(projected.conclusionContract).not.toHaveProperty('sourceReferences');
-    expect(projected.conclusionContract).not.toHaveProperty('sourceClaimBindings');
+    expect(projected.conclusionContract.claims).toEqual(fabricated.claims);
+    expect(projected).not.toHaveProperty('deliveryAssurance');
     expect(JSON.stringify(projected)).not.toContain('SECRET_');
     expect(JSON.stringify(projected)).not.toContain('/Users/chris');
 
@@ -147,9 +229,8 @@ describe('agent route private projections', () => {
       } as any,
     );
     const persistedContract = JSON.parse(persisted.eventData).data.conclusionContract;
-    expect(persistedContract).not.toHaveProperty('sourceUseDecision');
-    expect(persistedContract).not.toHaveProperty('sourceReferences');
-    expect(persistedContract).not.toHaveProperty('sourceClaimBindings');
+    expect(persistedContract?.claims).toBeDefined();
+    expect(JSON.parse(persisted.eventData).data.deliveryAssurance).toBeUndefined();
     expect(persisted.eventData).not.toContain('SECRET_');
     expect(persisted.eventData).not.toContain('/Users/chris');
   });
@@ -437,7 +518,8 @@ describe('agent route private projections', () => {
     expect(summary.findingCount).toBe(1);
     expect(detail.findings).toHaveLength(1);
     expect(detail.result).toHaveProperty('claimSupport');
-    expect(detail.result).toHaveProperty('claimVerificationResult');
+    // An unknown status is not a verifier receipt to preserve or reinterpret.
+    expect(detail.result?.claimVerificationResult).toBeUndefined();
     expect(detail.result).toHaveProperty('identityResolutions');
     expect(JSON.stringify(detail)).not.toContain(canary);
   });

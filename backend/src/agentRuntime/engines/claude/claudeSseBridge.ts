@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import {readRuntimeToolEnvelope, readRuntimeToolReceipt, readRuntimeToolResultFacts} from '../../runtimeToolResult';
 import type { StreamingUpdate } from '../../../agent/types';
 import {
   isSdkMaxTurnsSubtype,
@@ -29,13 +30,19 @@ export function extractSdkToolResultBlocks(msg: any): SdkToolResultBlock[] {
   const content = msg?.message?.content;
   if (!Array.isArray(content)) return [];
 
-  return content
-    .filter((block: any) => block && typeof block === 'object' && block.type === 'tool_result')
-    .map((block: any) => ({
+  const results = content.filter((block: any) => block && typeof block === 'object' && block.type === 'tool_result');
+  const complete = readRuntimeToolEnvelope(msg.tool_use_result);
+  const hasReceipt = readRuntimeToolReceipt(complete) !== undefined;
+  return results.map((block: any) => {
+    const belongsToBlock = typeof complete?.tool_use_id === 'string'
+      ? complete.tool_use_id === block.tool_use_id : results.length === 1;
+    return {
       toolUseId: typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined,
-      result: block.content ?? msg.tool_use_result,
+      result: hasReceipt && belongsToBlock
+        ? complete : block.content ?? (belongsToBlock ? msg.tool_use_result : undefined),
       isError: typeof block.is_error === 'boolean' ? block.is_error : undefined,
-    }));
+    };
+  });
 }
 
 export function stringifySdkToolResult(result: unknown): string {
@@ -43,13 +50,7 @@ export function stringifySdkToolResult(result: unknown): string {
 }
 
 export function isSdkToolResultFailure(result: unknown, isError?: boolean): boolean {
-  if (isError === true) return true;
-  if (result && typeof result === 'object') {
-    const record = result as {success?: unknown; isError?: unknown};
-    if (record.success === false || record.isError === true) return true;
-  }
-  const text = stringifySdkToolResult(result);
-  return /(?:\\?")success(?:\\?")\s*:\s*false|(?:\\?")isError(?:\\?")\s*:\s*true/.test(text);
+  return isError === true || readRuntimeToolResultFacts(result).success === false;
 }
 
 /** Return type for createSseBridge — message handler + accumulated answer accessor. */
@@ -78,7 +79,7 @@ export function createSseBridge(
   narrationOptions: ToolNarrationOptions = {},
   textProjection?: CodeAwareStreamingTextProjection,
 ): SseBridge {
-  let lastToolUseId: string | undefined;
+  const completedToolUseIds = new Set<string>();
   const toolUseIdToName = new Map<string, string>();
   const toolUseIdToArgs = new Map<string, unknown>();
   /**
@@ -310,7 +311,8 @@ export function createSseBridge(
 
       for (const block of content) {
         if (block.type === 'tool_use') {
-          lastToolUseId = block.id;
+          if (typeof block.id === 'string' && block.id.trim() && block.id !== 'unknown' &&
+            (completedToolUseIds.has(block.id) || toolUseIdToName.has(block.id))) continue;
           if (typeof block.id === 'string' && typeof block.name === 'string') {
             setBoundedTaskName(toolUseIdToName, block.id, block.name);
             // Result narration needs the call target: most tool results do not
@@ -341,7 +343,7 @@ export function createSseBridge(
       return;
     }
 
-    if (msg.type === 'user' && msg.tool_use_result !== undefined) {
+    if (msg.type === 'user' && (msg.tool_use_result !== undefined || extractSdkToolResultBlocks(msg).length > 0)) {
       // After tool result, next assistant turn starts fresh
       cancelBufferTimer();
       textBuffer = '';
@@ -349,7 +351,10 @@ export function createSseBridge(
       currentTurnStreamedText = false;
       streamingAsAnswer = false;
       const emitToolResult = (taskId: string, rawResult: unknown, isError?: boolean): void => {
-        const toolName = toolUseIdToName.get(taskId) ?? 'unknown';
+        const toolName = toolUseIdToName.get(taskId);
+        // An unassociated result has no trustworthy disclosure policy.
+        if (!toolName || completedToolUseIds.has(taskId)) return;
+        completedToolUseIds.add(taskId);
         // Decide failure on the raw result: projection replaces a sensitive
         // tool's payload with a rejection envelope carrying no success field.
         const failed = isSdkToolResultFailure(rawResult, isError);
@@ -378,14 +383,18 @@ export function createSseBridge(
       const resultBlocks = extractSdkToolResultBlocks(msg);
       if (resultBlocks.length > 0) {
         for (const block of resultBlocks) {
-          const taskId = block.toolUseId || lastToolUseId || 'unknown';
-          emitToolResult(taskId, block.result, block.isError);
-          toolUseIdToName.delete(taskId);
+          const taskId = block.toolUseId || (toolUseIdToName.size === 1 ? toolUseIdToName.keys().next().value : undefined);
+          if (taskId) {
+            emitToolResult(taskId, block.result, block.isError);
+            toolUseIdToName.delete(taskId);
+          }
         }
       } else {
-        const taskId = lastToolUseId || 'unknown';
-        emitToolResult(taskId, msg.tool_use_result);
-        toolUseIdToName.delete(taskId);
+        const taskId = toolUseIdToName.size === 1 ? toolUseIdToName.keys().next().value : undefined;
+        if (taskId) {
+          emitToolResult(taskId, msg.tool_use_result);
+          toolUseIdToName.delete(taskId);
+        }
       }
       return;
     }
@@ -579,6 +588,7 @@ export function createSseBridge(
       cancelBufferTimer();
       textBuffer = '';
       toolUseIdToName.clear();
+      completedToolUseIds.clear();
       taskIdToAgentName.clear();
       textProjection?.flush();
     },

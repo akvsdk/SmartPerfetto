@@ -16,6 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import yaml from 'js-yaml';
+import { validateProcessScopeDeclarations } from './skillValidator';
 import { SkillDefinition, ModuleLayer, DialogueCapability } from './types';
 import { generateRenderingPipelineDetectionSkill } from '../renderingPipelineDetectionSkillGenerator';
 import logger from '../../utils/logger';
@@ -464,7 +465,10 @@ export class SkillRegistry {
       logger.warn('SkillLoader', `[${skill.name}.${w.stepId}] ${w.message}`);
     }
 
-    const fragWarnings = validateFragmentReferences(skill, this.getFragmentPaths());
+    const fragWarnings = [
+      ...validateFragmentReferences(skill, this.getFragmentPaths()),
+      ...validateProcessScopeDeclarations(skill, this.fragmentCache),
+    ];
     for (const w of fragWarnings) {
       logger.warn('SkillLoader', `[${skill.name}.${w.stepId}] ${w.message}`);
     }

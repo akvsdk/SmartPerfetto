@@ -5,20 +5,157 @@
 import {describe, it, expect} from '@jest/globals';
 import fs from 'fs';
 import path from 'path';
+import ts from 'typescript';
+import {
+  ANALYSIS_COMPLETED_PUBLIC_TYPE_PATHS,
+  analysisCompletedContractFragment,
+  analysisCompletedPublicTypeFragment,
+} from '../../../scripts/frontendContractFragments';
 import {
   buildColumnDefinitions,
   createDataEnvelope,
   displayResultToEnvelope,
+  envelopeToDisplayResult,
   inferColumnDefinition,
   validateDataEnvelope,
+  type AnalysisCompletedEvent,
 } from '../dataContract';
+import {copyScopeProvenance, identityForScopeEvidence, mergeScopeProvenance, scopeMetadata,
+  scopeProvenanceForFields, type EvidenceScopeProvenanceV1, type IdentityResolutionV1} from '../identityContract';
+
+describe('DataEnvelope process scope provenance', () => {
+  const provenance: EvidenceScopeProvenanceV1 = { version: 'process_scope_evidence@1', entries: [
+    { role: 'target', scope: { mode: 'exact_upid', traceId: 'trace', traceSide: 'current', upid: 42 }, fields: ['frames'] },
+    { role: 'global_context', scope: { mode: 'unscoped', traceId: 'trace', traceSide: 'current' }, fields: ['refresh_rate'] },
+  ] };
+  it('roundtrips mixed field roles without claiming that the entire table is exact target evidence', () => {
+    const envelope = displayResultToEnvelope({ stepId: 'mixed', title: 'Mixed', level: 'summary', layer: 'overview',
+      format: 'table', data: { columns: ['frames', 'refresh_rate'], rows: [[3, 60]] }, scopeProvenance: provenance }, 'skill');
+    expect(envelope.meta.evidenceRole).toBe('mixed');
+    expect(envelope.meta.appliedProcessScope).toBeUndefined();
+    expect(envelopeToDisplayResult(envelope).scopeProvenance).toEqual(provenance);
+    expect(validateDataEnvelope(envelope)).toEqual([]);
+    envelope.meta.traceId = 'other-trace';
+    expect(validateDataEnvelope(envelope)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'meta.scopeProvenance' }),
+    ]));
+  });
+
+  const invalidMarker: EvidenceScopeProvenanceV1 = {version: 'process_scope_evidence@1', entries: [], invalid: true};
+  const identity: IdentityResolutionV1 = {version: 'identity_contract@1', identityRefId: 'identity:42',
+    target: {traceId: 'trace', traceSide: 'current', upid: 42, source: 'skill_param'},
+    status: 'verified', processes: [], threads: [], warnings: []};
+  const scopedEntry = {...provenance.entries[0], scope: {...provenance.entries[0].scope, identityRefId: identity.identityRefId}};
+  const malformedEntries: Array<[string, unknown]> = [
+    ['fields string', {...scopedEntry, fields: 'frames'}],
+    ['mixed field values', {...scopedEntry, fields: ['frames', 7]}],
+    ['empty field name', {...scopedEntry, fields: ['frames', ' ']}],
+    ['bad availability', {...scopedEntry, availability: 'maybe'}],
+    ['bad relative scope', {...scopedEntry, relativeTo: {mode: 'exact_upid'}}],
+    ['cross-trace relative scope', {...scopedEntry, relativeTo: {...scopedEntry.scope, traceId: 'other'}}],
+    ['bad role', {...scopedEntry, role: 'other'}],
+    ['empty trace id', {...scopedEntry, scope: {...scopedEntry.scope, traceId: ''}}],
+    ['bad trace side', {...scopedEntry, scope: {...scopedEntry.scope, traceSide: 'other'}}],
+    ['bad upid', {...scopedEntry, scope: {...scopedEntry.scope, upid: 0}}],
+    ['named without name', {...scopedEntry, scope: {mode: 'named', traceId: 'trace', traceSide: 'current'}}],
+    ['unscoped with upid', {...scopedEntry, scope: {...scopedEntry.scope, mode: 'unscoped'}}],
+    ['null source step', {...scopedEntry, sourceStepId: null}],
+    ['empty identity ref', {...scopedEntry, scope: {...scopedEntry.scope, identityRefId: ''}}],
+    ['bad reason', {...scopedEntry, reason: 7}],
+    ['unknown property', {...scopedEntry, field: 'frames'}],
+  ];
+
+  it.each(malformedEntries)('retains invalid %s through raw validation, construction and projections', (_label, entry) => {
+    // A valid first entry must not survive by silently dropping a later bad one.
+    const malformed = {version: 'process_scope_evidence@1', entries: [scopedEntry, entry]} as EvidenceScopeProvenanceV1;
+    const raw = createDataEnvelope({columns: ['frames'], rows: [[3]]}, {type: 'skill_result', source: 'test', title: 'Scope'});
+    raw.meta.scopeProvenance = malformed;
+    expect(validateDataEnvelope(raw)).toEqual(expect.arrayContaining([expect.objectContaining({path: 'meta.scopeProvenance'})]));
+    const built = createDataEnvelope(raw.data, {type: 'skill_result', source: 'test', title: 'Scope',
+      scopeProvenance: malformed, identityResolution: identity});
+    expect(built.meta.scopeProvenance).toEqual(invalidMarker);
+    expect(built.meta.appliedProcessScope).toBeUndefined();
+    expect(built.meta.evidenceRole).toBeUndefined();
+    const restored = JSON.parse(JSON.stringify(built));
+    expect(envelopeToDisplayResult(restored).scopeProvenance).toEqual(invalidMarker);
+    expect(validateDataEnvelope(restored)).toEqual(expect.arrayContaining([expect.objectContaining({path: 'meta.scopeProvenance'})]));
+    expect(mergeScopeProvenance([provenance, malformed])).toEqual(invalidMarker);
+    expect(scopeProvenanceForFields(malformed, ['frames'])).toEqual(invalidMarker);
+    expect(identityForScopeEvidence(malformed, identity)).toBeUndefined();
+    expect(identityForScopeEvidence(restored.meta.scopeProvenance, identity)).toBeUndefined();
+    expect({...scopeMetadata({version: 'process_scope_evidence@1', entries: [scopedEntry]}),
+      ...scopeMetadata(malformed)}.appliedProcessScope).toBeUndefined();
+  });
+
+  it.each([null, {}, {version: 'other', entries: []}, {version: 'process_scope_evidence@1', entries: 'bad'},
+    {version: 'process_scope_evidence@1', entries: [], invalid: false}])('keeps present malformed metadata distinct from absence: %j', malformed => {
+    expect(copyScopeProvenance(malformed)).toEqual(invalidMarker);
+    expect(mergeScopeProvenance([undefined, malformed])).toEqual(invalidMarker);
+    expect(identityForScopeEvidence(malformed, identity)).toBeUndefined();
+  });
+
+  it('preserves valid field intersections and explicit empty scope without legacy fallback', () => {
+    const global = scopeProvenanceForFields(provenance, ['refresh_rate']);
+    expect(global?.entries).toEqual([provenance.entries[1]]);
+    expect(identityForScopeEvidence(global, identity)).toBeUndefined();
+    const empty = scopeProvenanceForFields(provenance, ['unknown']);
+    expect(empty).toEqual({version: 'process_scope_evidence@1', entries: []});
+    expect(mergeScopeProvenance([empty, undefined])).toEqual(empty);
+    expect(scopeMetadata(empty).evidenceRole).toBeUndefined();
+    expect(identityForScopeEvidence(empty, identity)).toBeUndefined();
+    expect(identityForScopeEvidence(undefined, identity)).toBe(identity);
+    expect(copyScopeProvenance(undefined)).toBeUndefined();
+    expect(scopeMetadata({version: 'process_scope_evidence@1', entries: [{...scopedEntry, fields: []}]}).appliedProcessScope).toBeUndefined();
+    expect(copyScopeProvenance({version: 'process_scope_evidence@1', entries: [{...scopedEntry, reason: undefined}]}))
+      .toEqual({version: 'process_scope_evidence@1', entries: [scopedEntry]});
+  });
+});
 
 describe('dataContract column inference', () => {
-  it('declares terminalRunStatus on analysis_completed payloads', () => {
-    const source = fs.readFileSync(path.resolve(__dirname, '../dataContract.ts'), 'utf8');
+  it('accepts historical omissions and the full finalized public event metadata', () => {
+    const candidate = {runId: 'run', attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: 'body-fingerprint'};
+    const historical: AnalysisCompletedEvent['data'] = {findings: []};
+    const current: AnalysisCompletedEvent['data'] = {
+      findings: [], success: false, terminalRunStatus: 'failed', conclusion: 'Original body',
+      turnIntent: {schemaVersion: 1, status: 'unavailable', source: 'fallback', registryFingerprint: 'registry',
+        taskKind: 'investigation', sceneId: 'general', scope: 'bounded_question', recommendedComplexity: 'quick',
+        deliverable: 'answer', evidenceAccess: 'existing_only'},
+      completion: {...candidate, schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'failed', reason: 'provider_error'},
+      outputOrigin: 'sdk_final',
+      runtimeAppendix: {schemaVersion: 1, origin: 'runtime_fallback', sourceCandidate: candidate, text: 'Runtime note'},
+      reportAssessment: {schemaVersion: 1, binding: {...candidate, conclusionContractFingerprint: 'contract',
+        evidenceFingerprint: 'evidence', requirementsFingerprint: 'requirements', registryFingerprint: 'registry',
+        intentFingerprint: 'intent'}, status: 'not_checked', requirements: []},
+      deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'failed', claims: 'not_checked',
+        source: 'not_applicable', identity: 'not_applicable', report: 'not_checked'},
+      sourceUseDecision: {schemaVersion: 'source_use_decision@1', codeAwareMode: 'metadata_only', status: 'pending',
+        selectedCodebaseIds: ['source'], queriedCodebaseIds: [], usedCodebaseIds: [], attemptedTools: [], references: []},
+      sourceClaimVerificationResult: {schemaVersion: 'source_claim_verifier@1', status: 'not_checked', bindings: [], issues: []},
+    };
+    expect(JSON.parse(JSON.stringify(historical))).toEqual({findings: []});
+    expect(JSON.parse(JSON.stringify(current))).toEqual(current);
+    const cancelled: AnalysisCompletedEvent['data'] = {findings: [], terminalRunStatus: 'cancelled'};
+    expect(cancelled.terminalRunStatus).toBe('cancelled');
+  });
 
-    expect(source).toContain("terminalRunStatus?: 'completed' | 'quota_exceeded'");
-    expect(source).toContain('sourceEnrichmentPending?: boolean');
+  it('generates only reachable public type declarations and resolves their constant type queries', () => {
+    const source = fs.readFileSync(path.resolve(__dirname, '../dataContract.ts'), 'utf8');
+    const fragment = analysisCompletedPublicTypeFragment(source, ANALYSIS_COMPLETED_PUBLIC_TYPE_PATHS.map(sourcePath =>
+      fs.readFileSync(path.resolve(__dirname, '../../', sourcePath), 'utf8')));
+    const parsed = ts.createSourceFile('public-types.ts', fragment, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    expect(parsed.statements.every(statement => ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement))).toBe(true);
+    const names = parsed.statements.map(statement => (statement as ts.InterfaceDeclaration).name.text);
+    expect(names).toEqual(expect.arrayContaining(['AnalysisTurnIntent', 'AnalysisCompletion', 'AgentRuntimeKind',
+      'AnalysisCandidateIdentity', 'AnalysisReportBinding', 'AnalysisReportRequirementAssessment',
+      'AnalysisDeliveryAssurance', 'SourceUseDecisionV1', 'SourceClaimVerificationResult', 'SourceClaimBindingV1']));
+    expect(names).not.toEqual(expect.arrayContaining(['CurrentAnalysisDeliveryContext']));
+    expect(fragment).not.toContain('typeof ');
+    expect(fragment).not.toContain('WeakMap');
+    expect(fragment).not.toContain('node:');
+    const event = analysisCompletedContractFragment(source);
+    expect(event).not.toContain('import(');
+    expect(event).toContain('completion?: AnalysisCompletion;');
+    expect(event).toContain('sourceClaimVerificationResult?: SourceClaimVerificationResult;');
   });
 
   it('infers start timestamp columns as range-navigable', () => {

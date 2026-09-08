@@ -5,7 +5,6 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
-import {classifyScene} from '../../src/agentv3/sceneClassifier';
 import {loadStrategies} from '../../src/agentv3/strategyLoader';
 import {createSkillEvaluator, type EvalStepResult, type SkillEvaluator} from '../skill-eval/runner';
 
@@ -70,6 +69,10 @@ export type CorpusRunResult = {
     isolated: string[];
     condition_skipped: string[];
     unavailable: string[];
+  };
+  strategy: {
+    declaration_checked: string[];
+    semantic_routing: 'not_evaluated';
   };
   correctness: {
     positive: string[];
@@ -426,19 +429,25 @@ async function runSkillExpectation(
   return evidence;
 }
 
+/** Checks declared registry identity only; a fixture query is not a model-routing verdict. */
+export function validateStrategyExpectationDeclaration(
+  expectation: Pick<CorpusExpectation, 'target' | 'expected_strategy' | 'query'>,
+): void {
+  const strategy = loadStrategies().get(expectation.target);
+  if (!strategy) throw new Error(`Strategy loader cannot resolve ${expectation.target}`);
+  const expected = expectation.expected_strategy ?? expectation.target;
+  if (strategy.scene !== expected) {
+    throw new Error(`Strategy declaration ${expected} does not match registered target ${strategy.scene}`);
+  }
+  if (!strategy.content.trim()) throw new Error(`Strategy declaration is empty: ${strategy.scene}`);
+}
+
 async function runStrategyExpectation(
   evaluator: SkillEvaluator,
   expectation: CorpusExpectation,
 ): Promise<void> {
   await assertMarker(evaluator, expectation.required_marker);
-  const strategy = loadStrategies().get(expectation.target);
-  if (!strategy) throw new Error(`Strategy loader cannot resolve ${expectation.target}`);
-  if (strategy.strategyKind !== 'contract_only') {
-    const actual = classifyScene(expectation.query ?? '');
-    if (actual !== (expectation.expected_strategy ?? expectation.target)) {
-      throw new Error(`classifier returned ${actual} for query ${JSON.stringify(expectation.query)}`);
-    }
-  }
+  validateStrategyExpectationDeclaration(expectation);
 }
 
 function corpusTracePath(repoRoot: string, entry: CorpusCase): string {
@@ -506,6 +515,7 @@ export async function runCorpusRegression(
     executed: [],
     sql: {normal: [], forced: [], isolated: [], condition_skipped: [], unavailable: []},
     correctness: {positive: [], execution_only: [], negative: [], deferred: []},
+    strategy: {declaration_checked: [], semantic_routing: 'not_evaluated'},
     failures: [],
   };
 
@@ -558,6 +568,7 @@ export async function runCorpusRegression(
             );
           } else {
             await runStrategyExpectation(evaluator, expectation);
+            result.strategy.declaration_checked.push(executionKey);
           }
           result.executed.push(executionKey);
         } catch (error: any) {
@@ -591,6 +602,10 @@ export async function runCorpusRegression(
             keys.filter((key) => key.startsWith(`${entry.id}:`)),
           ]),
         ),
+        strategy: {
+          declaration_checked: result.strategy.declaration_checked.filter(key => key.startsWith(`${entry.id}:`)),
+          semantic_routing: result.strategy.semantic_routing,
+        },
         correctness: Object.fromEntries(
           Object.entries(result.correctness).map(([status, keys]) => [
             status,

@@ -3,6 +3,7 @@
 
 ---
 scene: touch_tracking
+classification_description: "Continuous input-to-display tracking during a gesture, including how closely visual motion follows touch input."
 priority: 3
 effort: medium
 required_capabilities:

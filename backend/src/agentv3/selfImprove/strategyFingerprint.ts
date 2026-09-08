@@ -39,7 +39,7 @@ import {
 } from '../strategyLoader';
 import { computeHintFingerprint } from './hintFingerprint';
 import {canonicalContentHash} from '../../services/selfEvolution/canonicalJson';
-import {currentEffectiveRuntimeRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
+import {currentEffectiveRuntimeRegistrySnapshot, type ReadonlyStrategyRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
 
 const STRATEGIES_DIR = path.resolve(__dirname, '..', '..', '..', 'strategies');
 
@@ -67,6 +67,7 @@ export interface RunSnapshot {
   readonly sessionId: string;
   readonly sceneType: string;
   readonly overlayGeneration: string;
+  readonly registryFingerprint?: string;
   readonly strategyContent: string | undefined;
   readonly phaseHints: readonly PhaseHint[];
   readonly fingerprint: Readonly<StrategyVersionFingerprint>;
@@ -160,24 +161,26 @@ export function detectDrift(input: {
 export class RunSnapshotRegistry {
   private snapshots = new Map<string, RunSnapshot>();
 
-  capture(sessionId: string, sceneType: string): RunSnapshot {
+  capture(sessionId: string, sceneType: string, strategyRegistry?: ReadonlyStrategyRegistrySnapshot): RunSnapshot {
     // Re-capturing for the same session is allowed (multi-turn) and simply
     // refreshes the snapshot — the new values reflect any hot-reloads that
     // happened between turns, which is the desired behaviour: the freeze
     // boundary is the per-turn analyze() call.
     const registrySnapshot = currentEffectiveRuntimeRegistrySnapshot();
-    const overlayGeneration = registrySnapshot?.overlayGeneration ?? 'builtin';
+    const registry = strategyRegistry ?? registrySnapshot?.strategyRegistry;
+    const overlayGeneration = registry?.overlayGeneration ?? registrySnapshot?.overlayGeneration ?? 'builtin';
     const existing = this.snapshots.get(sessionId);
     if (
       existing
       && existing.sceneType === sceneType
       && existing.overlayGeneration === overlayGeneration
+      && existing.registryFingerprint === registry?.registryFingerprint
     ) {
       return existing;
     }
-    const strategyContent = getStrategyContent(sceneType);
-    const phaseHints = Object.freeze([...getPhaseHints(sceneType)]);
-    const strategyContentHash = registrySnapshot
+    const strategyContent = getStrategyContent(sceneType, registry);
+    const phaseHints = Object.freeze([...getPhaseHints(sceneType, registry)]);
+    const strategyContentHash = registry
       ? canonicalContentHash(strategyContent ?? '')
       : computeStrategyContentHash(sceneType);
     const fingerprint: StrategyVersionFingerprint = {
@@ -190,6 +193,7 @@ export class RunSnapshotRegistry {
       sessionId,
       sceneType,
       overlayGeneration,
+      ...(registry ? {registryFingerprint: registry.registryFingerprint} : {}),
       strategyContent,
       phaseHints,
       fingerprint: Object.freeze(fingerprint),

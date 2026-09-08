@@ -35,7 +35,7 @@ const SEMANTIC_DELTA_QUERIES = [
   {
     id: 'quantitative-only',
     kind: 'quantitative-only',
-    text: '这个 Trace 的启动区间持续多久？只回答 Trace 中的量化事实。',
+    text: 'Trace 中 StartupHooks.initializeOnMainThread#before-first-frame-sync-policy 这个标记区间持续多久？只回答 Trace 中的量化事实。',
   },
   {
     id: 'explicit-source-location',
@@ -53,8 +53,42 @@ const SEMANTIC_DELTA_RELATIVE_SOURCE_PATH =
 const SEMANTIC_DELTA_SOURCE_FILE = 'StartupHooks.kt';
 const SEMANTIC_DELTA_SOURCE_SYMBOL = 'StartupHooks.initializeOnMainThread';
 const SEMANTIC_DELTA_CALLER = 'Application.onCreate';
-const SEMANTIC_DELTA_ACTIONABLE_SEAM = 'avoid synchronous disk I/O before first frame';
 const PRIVATE_SOURCE_CANARY = 'SEMANTIC_DELTA_PRIVATE_SOURCE_CANARY_NEVER_EMIT';
+
+// Independent FrameTimeline population oracle for these E2E suites:
+// count one frame per (upid, frame_id), including separate process instances.
+const FRAME_FACT_SQL = `INCLUDE PERFETTO MODULE android.frames.timeline;
+WITH per_frame AS (
+  SELECT upid, COALESCE(NULLIF(name, ''), CAST(surface_frame_token AS TEXT),
+    CAST(display_frame_token AS TEXT), CAST(id AS TEXT)) AS frame_id,
+    MAX(CASE WHEN jank_type IS NOT NULL AND jank_type != 'None' THEN 1 ELSE 0 END) AS is_jank
+  FROM actual_frame_timeline_slice WHERE ts IS NOT NULL AND dur IS NOT NULL AND dur >= 0
+  GROUP BY upid, frame_id
+)
+SELECT COUNT(*) AS total_frames, COALESCE(SUM(is_jank), 0) AS jank_frames FROM per_frame`;
+
+function frameFactExpectation({taskKind = 'fact', deliverable = 'answer', scope = 'bounded_question', withJank = false} = {}) {
+  return {schemaVersion: 1, intent: {...(withJank ? {sceneId: 'scrolling'} : {}), taskKind, scope, deliverable},
+    facts: ['total_frames', ...(withJank ? ['jank_frames'] : [])].map(column => ({
+      id: column, kind: 'numeric', columns: [column], verification: 'proved', unit: 'frames',
+      oracle: {sql: FRAME_FACT_SQL, column, unit: 'frames'},
+    }))};
+}
+
+function sourceFactExpectation(query) {
+  const facts = JSON.parse(fs.readFileSync(path.resolve(backendRoot,
+    '../Trace/constructed/source-analysis-semantic/analysis/expected.json'), 'utf8')).source_trace_ground_truth.traceFacts;
+  const marker = facts.marker.replace(/'/g, "''");
+  return {schemaVersion: 1, intent: {sceneId: 'startup',
+    ...(query.kind === 'quantitative-only' ? {taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'} : {})},
+    facts: [{id: 'source_marker_duration', kind: 'numeric', columns: ['dur', 'dur_ns'], verification: 'proved',
+      value: facts.durationNs, unit: 'ns', oracle: {
+        sql: `SELECT s.dur AS duration_ns, s.ts AS start_ts, t.upid FROM slice s
+          JOIN thread_track tt ON s.track_id = tt.id JOIN thread t USING(utid) JOIN process p USING(upid)
+          WHERE s.name = '${marker}' AND t.name = '${facts.thread}' AND p.name = '${facts.process}'`,
+        column: 'duration_ns', unit: 'ns', anchorMatch: {startTs: 'start_ts', upid: 'upid'},
+      }}], uncoveredFacets: query.kind === 'quantitative-only' ? undefined : ['source recommendation action semantics']};
+}
 
 const suites = {
   startup: {
@@ -72,27 +106,16 @@ const suites = {
       '--output',
       'test-output/e2e-deepseek-startup-real.json',
       '--keep-session',
-      '--require-conclusion-evidence',
       '--require-claim-verifier-ok',
       '--require-non-partial',
-      '--require-final-report-heading',
-      '--forbid-process-narration',
+      '--expectation-json',
+      JSON.stringify({schemaVersion: 1, intent: {sceneId: 'startup', deliverable: 'report'}, facts: [{
+        id: 'startup_duration', kind: 'numeric', columns: ['dur_ms', 'duration_ms', 'ttid_ms'], verification: 'proved', unit: 'ms',
+        oracle: {sql: 'INCLUDE PERFETTO MODULE android.startup.startups; SELECT dur / 1e6 AS duration_ms, ts AS start_ts FROM android_startups',
+          column: 'duration_ms', unit: 'ms', anchorMatch: {startTs: 'start_ts'}},
+      }, {id: 'startup_type', kind: 'categorical', columns: ['startup_type'], verification: 'reference_only', value: 'cold'}]}),
       '--forbid-degraded-fallback',
       'completed_plan_summary_fallback',
-      '--require-text',
-      '冷启动',
-      '--require-text',
-      'ChaosTask',
-      '--forbid-text',
-      '完成综合结论输出',
-      '--forbid-text',
-      '分阶段证据摘要',
-      '--forbid-text',
-      '完整结构化报告已生成',
-      '--forbid-text',
-      '应维持温启动',
-      '--forbid-text',
-      'bindApplication 不存在',
     ],
   },
   scrolling: {
@@ -106,21 +129,13 @@ const suites = {
       '--trace',
       '../Trace/real/android-scroll-customer/trace.pftrace',
       '--query',
-      '分析滑动性能',
+      '分析滑动性能，并给出整个 Trace 的总帧数与 FrameTimeline 标记的掉帧数（按 upid 与 frame id 去重）。',
       '--output',
       'test-output/e2e-deepseek-scrolling-real.json',
       '--keep-session',
       '--require-non-partial',
-      '--require-tool',
-      'invoke_skill',
-      '--require-skill',
-      'scrolling_analysis',
-      '--require-skill',
-      'jank_frame_detail',
-      '--require-skill',
-      'frame_blocking_calls',
-      '--require-skill',
-      'blocking_chain_analysis',
+      '--expectation-json',
+      JSON.stringify(frameFactExpectation({taskKind: 'investigation', deliverable: 'report', scope: 'scene_wide', withJank: true})),
       '--forbid-degraded-fallback',
       'verification_failed',
     ],
@@ -302,7 +317,7 @@ function main() {
     }
   }
 
-  console.log(`\nDeepseek Agent SSE E2E passed: ${runtimeKinds.join(', ')} / ${suiteNames.join(', ')}`);
+  console.log(`\nDeepseek Agent SSE observed checks passed: ${runtimeKinds.join(', ')} / ${suiteNames.join(', ')}; semantic acceptance is recorded separately in each report.`);
 }
 
 function parseArgs(argv) {
@@ -542,6 +557,7 @@ function semanticConditionArgs(query, condition, outputPath, timeoutMs) {
     '--timeout-ms', String(timeoutMs),
     '--require-non-partial',
     '--require-claim-verifier-ok',
+    '--expectation-json', JSON.stringify(sourceFactExpectation(query)),
     '--require-text', SEMANTIC_DELTA_MARKER,
     '--forbid-text', PRIVATE_SOURCE_CANARY,
   ];
@@ -552,7 +568,6 @@ function semanticConditionArgs(query, condition, outputPath, timeoutMs) {
       '--forbid-text', SEMANTIC_DELTA_SOURCE_FILE,
       '--forbid-text', SEMANTIC_DELTA_SOURCE_SYMBOL,
       '--forbid-text', SEMANTIC_DELTA_CALLER,
-      '--forbid-text', SEMANTIC_DELTA_ACTIONABLE_SEAM,
       '--forbid-text', '[Code:',
     );
     return args;
@@ -568,7 +583,6 @@ function semanticConditionArgs(query, condition, outputPath, timeoutMs) {
       '--require-text', SEMANTIC_DELTA_SOURCE_FILE,
       '--require-text', SEMANTIC_DELTA_SOURCE_SYMBOL,
       '--require-text', SEMANTIC_DELTA_CALLER,
-      '--require-text', SEMANTIC_DELTA_ACTIONABLE_SEAM,
     );
   }
   return args;
@@ -617,13 +631,10 @@ function evaluateSemanticConditionReport(input) {
         setup?.activeIndexState === 'active' &&
         typeof setup?.activeGeneration === 'string' &&
         setup?.pendingGeneration === false;
-  const traceClaimPassed = summary?.claimVerifierStatus === 'passed' &&
-    summary?.claimVerifierPassed === true &&
-    (summary?.claimVerifierCheckedClaimCount || 0) > 0 &&
-    (summary?.claimVerifierUnsupportedClaimCount || 0) === 0;
-  const traceFactPassed =
-    summary?.requiredTextMatches?.[SEMANTIC_DELTA_MARKER] === true &&
-    traceClaimPassed;
+  const task = report?.taskVerification;
+  const traceFactPassed = task?.facts?.source_marker_duration?.proposition === 'proved' &&
+    task?.facts?.source_marker_duration?.matched === true &&
+    Object.keys(task?.checks || {}).length > 0 && Object.values(task.checks).every(value => value === true);
   const sourceToolCount = ['search_codebase', 'read_codebase_file', 'lookup_app_source']
     .reduce((count, tool) => count + (summary?.toolCallCounts?.[tool] || 0), 0);
   const forbiddenMatches = summary?.forbiddenTextMatches || {};
@@ -633,7 +644,6 @@ function evaluateSemanticConditionReport(input) {
       SEMANTIC_DELTA_SOURCE_FILE,
       SEMANTIC_DELTA_SOURCE_SYMBOL,
       SEMANTIC_DELTA_CALLER,
-      SEMANTIC_DELTA_ACTIONABLE_SEAM,
       '[Code:',
     ].every(text => forbiddenMatches[text] !== true) &&
     summary?.conclusionHasConcreteCodeRefs !== true &&
@@ -650,24 +660,17 @@ function evaluateSemanticConditionReport(input) {
     summary?.analysisCompletedSourceReferenceMembershipPassed === true &&
     mechanismStatuses.length > 0 &&
     mechanismStatuses.every(status => status === 'corroborated' || status === 'compatible');
+  const references = summary?.terminalAnalysis?.conclusionContract?.sourceUseDecision?.references || [];
+  const sourceIdentityPassed = references.some(reference =>
+    typeof reference.filePath === 'string' && path.posix.basename(reference.filePath) === SEMANTIC_DELTA_SOURCE_FILE &&
+    reference.symbol === SEMANTIC_DELTA_SOURCE_SYMBOL && Number.isInteger(reference.lineRange?.start) &&
+    reference.lineRange.start > 0 && reference.lineRange.end >= reference.lineRange.start);
+  const claims = summary?.terminalAnalysis?.conclusionContract?.claims || [];
+  const quantitativeOutputPassed = traceFactPassed && claims.length > 0 && claims.every(claim =>
+    ['numeric', 'time_range', 'comparison'].includes(claim.kind) && claim.semantics?.scope?.population !== 'codebase');
   const sourceSemanticPassed = query?.kind === 'quantitative-only'
-    ? sourceToolCount === 0 &&
-      (
-        condition === 'A0' ||
-        (
-          summary?.analysisCompletedSourceUseStatus === 'not_needed' &&
-          summary?.analysisCompletedSourceReferenceCount === 0
-        )
-      )
-    : summary?.requiredTextMatches?.[SEMANTIC_DELTA_SOURCE_FILE] === true &&
-      summary?.requiredTextMatches?.[SEMANTIC_DELTA_SOURCE_SYMBOL] === true &&
-      summary?.requiredTextMatches?.[SEMANTIC_DELTA_CALLER] === true &&
-      summary?.requiredTextMatches?.[SEMANTIC_DELTA_ACTIONABLE_SEAM] === true &&
-      (
-        summary?.conclusionHasConcreteCodeRefs === true ||
-        summary?.analysisCompletedHasConcreteCodeRefs === true
-      ) &&
-      summary?.analysisCompletedSourceUseStatus === 'corroborated' &&
+    ? quantitativeOutputPassed
+    : traceFactPassed && sourceIdentityPassed &&
       (summary?.analysisCompletedSourceReferenceCount || 0) > 0 &&
       (summary?.analysisCompletedSourceBindingCount || 0) > 0 &&
       sourceBindingPassed;
@@ -677,7 +680,10 @@ function evaluateSemanticConditionReport(input) {
     traceFactPassed,
     sourceLeakFree,
     sourceBindingPassed,
+    sourceIdentityPassed,
     sourceSemanticPassed,
+    uncoveredFacets: [...new Set([...(task?.uncoveredFacets || []),
+      ...(query?.kind === 'quantitative-only' ? [] : ['source recommendation action semantics'])])],
   };
 }
 
@@ -716,6 +722,7 @@ function runSemanticCondition(input) {
     },
     sourceBindingPassed: evaluation.sourceBindingPassed,
     sourceSemanticPassed: evaluation.sourceSemanticPassed,
+    uncoveredFacets: evaluation.uncoveredFacets,
     diagnostic: result.status === 0
       ? undefined
       : sanitizeDiagnostic(result.stderr || result.stdout || result.error?.message),
@@ -758,7 +765,7 @@ function runSemanticPairedAttempt(input) {
           a2?.sourceSemanticPassed &&
           a3?.sourceSemanticPassed;
       });
-    const quantitativeNotNeededPassed = queryRuns
+    const quantitativeOutputPassed = queryRuns
       .filter(run => run.query.kind === 'quantitative-only')
       .every(run => run.conditions.every(condition => condition.sourceSemanticPassed));
     return {
@@ -768,8 +775,9 @@ function runSemanticPairedAttempt(input) {
       queries: queryRuns,
       hardPassed,
       noTraceRegression,
-      quantitativeNotNeededPassed,
-      sourceUpliftPassed: sourceUpliftPassed && quantitativeNotNeededPassed && noTraceRegression,
+      quantitativeOutputPassed,
+      sourceUpliftPassed: sourceUpliftPassed && quantitativeOutputPassed && noTraceRegression,
+      uncoveredFacets: [...new Set(conditions.flatMap(condition => condition.uncoveredFacets))],
     };
   } finally {
     fs.rmSync(isolatedRoot, {recursive: true, force: true});
@@ -779,6 +787,20 @@ function runSemanticPairedAttempt(input) {
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), {recursive: true});
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function summarizeSemanticRuntimeRecords(records, attemptsRequired) {
+  const hardPassCount = records.filter(record => record.hardPassed).length;
+  const sourceUpliftPassCount = records.filter(record => record.sourceUpliftPassed).length;
+  const observedChecksPassed = hardPassCount === attemptsRequired &&
+    sourceUpliftPassCount >= Math.ceil(attemptsRequired * 0.8);
+  const uncoveredFacets = [...new Set(records.flatMap(record => record.uncoveredFacets || []))];
+  const completeAcceptance = observedChecksPassed && uncoveredFacets.length === 0;
+  return {status: !observedChecksPassed ? 'REAL PROVIDER FAILED' : completeAcceptance ? 'REAL PROVIDER PASSED' : 'REAL PROVIDER INCONCLUSIVE',
+    observedChecksPassed, completeAcceptance, uncoveredFacets, attemptsRequired, attemptsRun: records.length,
+    hardPassCount, sourceUpliftPassCount, hardAcceptance: `${hardPassCount}/${attemptsRequired}`,
+    sourceBindingAcceptance: `${sourceUpliftPassCount}/${attemptsRequired}`,
+    semanticAcceptance: !observedChecksPassed ? 'FAILED' : completeAcceptance ? 'PASSED' : 'INCONCLUSIVE'};
 }
 
 function runCodeAwareSemanticDeltaSuite(options) {
@@ -819,21 +841,12 @@ function runCodeAwareSemanticDeltaSuite(options) {
         record,
       );
     }
-    const hardPassCount = records.filter(record => record.hardPassed).length;
-    const sourceUpliftPassCount = records.filter(record => record.sourceUpliftPassed).length;
-    const passed = hardPassCount === options.repeat &&
-      sourceUpliftPassCount >= Math.ceil(options.repeat * 0.8);
-    if (!passed) attemptFailureCount += 1;
+    const acceptance = summarizeSemanticRuntimeRecords(records, options.repeat);
+    if (!acceptance.observedChecksPassed) attemptFailureCount += 1;
     runtimeResults.push({
       runtime: runtimeKind,
-      status: passed ? 'REAL PROVIDER PASSED' : 'REAL PROVIDER FAILED',
       credentialKind: availability.credentialKind,
-      attemptsRequired: options.repeat,
-      attemptsRun: records.length,
-      hardPassCount,
-      sourceUpliftPassCount,
-      hardAcceptance: `${hardPassCount}/${options.repeat}`,
-      semanticAcceptance: `${sourceUpliftPassCount}/${options.repeat}`,
+      ...acceptance,
     });
   }
   const aggregate = {
@@ -849,8 +862,11 @@ function runCodeAwareSemanticDeltaSuite(options) {
     semanticRequirement: `${Math.ceil(options.repeat * 0.8)}/${options.repeat}`,
     runtimeResults,
     attemptFailureCount,
+    uncoveredFacets: [...new Set(runtimeResults.flatMap(runtime => runtime.uncoveredFacets || []))],
+    semanticAcceptance: runtimeResults.some(runtime => runtime.status === 'REAL PROVIDER FAILED') ? 'FAILED'
+      : runtimeResults.length > 0 && runtimeResults.every(runtime => runtime.completeAcceptance) ? 'PASSED' : 'INCONCLUSIVE',
     completeAcceptance: runtimeResults.length > 0 &&
-      runtimeResults.every(runtime => runtime.status === 'REAL PROVIDER PASSED'),
+      runtimeResults.every(runtime => runtime.completeAcceptance === true),
   };
   writeJson(path.join(options.outputDir, 'aggregate.json'), aggregate);
   console.log(JSON.stringify(aggregate, null, 2));
@@ -1007,6 +1023,9 @@ function assertFile(filePath, label) {
 }
 
 module.exports = {
+  summarizeSemanticRuntimeRecords,
+  frameFactExpectation,
+  suites,
   buildChildEnv,
   evaluateSemanticConditionReport,
   parseArgs,

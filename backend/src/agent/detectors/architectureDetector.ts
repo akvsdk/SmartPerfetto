@@ -48,7 +48,7 @@ export function resolvePipelineArchitectureType(pipelineId: string): RenderingAr
 
 /**
  * Detect rendering architecture by executing the `rendering_pipeline_detection`
- * YAML skill.  Falls back to STANDARD with 0.5 confidence on any error.
+ * YAML skill. Failed or missing observations reject instead of inventing an architecture.
  */
 export async function detectArchitectureViaSkill(
   traceProcessorService: any,
@@ -71,18 +71,20 @@ export async function detectArchitectureViaSkill(
     const result = await executor.execute('rendering_pipeline_detection', traceId, {
       package: packageName || '',
     }, { signal });
+    throwIfTraceProcessorQueryCancelled(signal);
 
     if (!result.success) {
-      console.warn('[detectArchitectureViaSkill] Skill failed:', result.error);
-      return createDefaultResult();
+      throw new Error(result.error || 'Architecture detection skill execution failed');
     }
 
     // Extract step results via rawResults (keyed by step id)
     const pipelineRow = extractFirstRow(result.rawResults, 'determine_pipeline');
     const subvariantRow = extractFirstRow(result.rawResults, 'subvariants');
 
-    const pipelineId: string =
-      pipelineRow?.primary_pipeline_id || pipelineSkillLoader.getDefaultSelection().pipelineId;
+    const pipelineId = pipelineRow?.primary_pipeline_id;
+    if (typeof pipelineId !== 'string' || !pipelineId.trim()) {
+      throw new Error('Architecture detection did not produce a pipeline ID');
+    }
     const confidence: number = typeof pipelineRow?.primary_confidence === 'number'
       ? pipelineRow.primary_confidence
       : 0.5;
@@ -141,8 +143,8 @@ export async function detectArchitectureViaSkill(
     return info;
   } catch (err) {
     rethrowIfTraceProcessorQueryCancelled(err);
-    console.warn('[detectArchitectureViaSkill] Failed, returning default:', (err as Error).message);
-    return createDefaultResult();
+    console.warn('[detectArchitectureViaSkill] Failed:', (err as Error).message);
+    throw err;
   }
 }
 
@@ -168,21 +170,6 @@ function extractFirstRow(
     return data[0];
   }
   return undefined;
-}
-
-function createDefaultResult(): ArchitectureInfo {
-  return {
-    type: 'STANDARD',
-    confidence: 0.5,
-    evidence: [
-      {
-        type: 'slice',
-        value: 'Default assumption',
-        weight: 0.5,
-        source: 'No specific architecture detected, assuming standard Android',
-      },
-    ],
-  };
 }
 
 // =============================================================================

@@ -49,6 +49,8 @@ steps:
   # ========== 簇负载计算 ==========
   - id: cluster_load
     type: atomic
+    process_scope:
+      role: global_context
     name: "CPU 簇负载计算"
     optional: true
     display:

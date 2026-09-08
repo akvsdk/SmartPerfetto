@@ -7,30 +7,23 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
-import type { AnalysisResult } from '../../../agent/core/orchestratorTypes';
+import type { AnalysisResult, IOrchestrator } from '../../../agent/core/orchestratorTypes';
 import type { StreamingUpdate } from '../../../agent/types';
 import { createDataEnvelope } from '../../../types/dataContract';
 import { CliAnalyzeService } from '../cliAnalyzeService';
+import type {FinalizeAnalysisResultInput, FinalizedAnalysisResult} from '../../../services/finalizeAnalysisResult';
+import * as finalizationContexts from '../../../agentRuntime/analysisFinalizationContext';
+import type {RuntimeFinalizationContextInput} from '../../../agentRuntime/analysisFinalizationContext';
+import {buildStrategyRegistrySnapshotFromDefinitions} from '../../../agentv3/strategyLoader';
+import {analysisDeliveryFingerprint} from '../../../types/analysisDelivery';
 
-const mockAnalyze = jest.fn<() => Promise<AnalysisResult>>();
+const mockAnalyze = jest.fn<IOrchestrator['analyze']>();
 const mockPersistAgentTurn = jest.fn();
 const mockGenerateAgentDrivenHTML = jest.fn<(data: unknown) => string>(() => '<html></html>');
 const mockAnnotateLatestCompletedTurn = jest.fn();
-const mockRunClaimVerification = jest.fn((_input: unknown): any => ({
-  claimSupport: [],
-  claimVerificationResult: {
-    schemaVersion: 'claim_verifier@1',
-    status: 'not_checked',
-    policy: 'record_only',
-    notCheckedReason: 'test',
-    passed: false,
-    checkedClaimCount: 0,
-    unsupportedClaimCount: 0,
-    claimResults: [],
-    issues: [],
-  },
-  identityResolutions: [],
-}));
+const mockFinalizeAnalysisResult = jest.fn<(input: FinalizeAnalysisResultInput) => Promise<FinalizedAnalysisResult>>();
+const mockTraceSummary = jest.fn(async () => {throw new Error('summary unavailable');});
+const mockSecurityCleanups: Array<(sessionId: string) => void> = [];
 const mockCodebaseGet = jest.fn();
 const mockKnowledgeSourceGet = jest.fn();
 const mockPrepareSession = jest.fn();
@@ -51,9 +44,10 @@ const capabilityManifest = {
 let mockPreparedSession: any;
 
 jest.mock('../../../assistant/application/agentAnalyzeSessionService', () => ({
-  AgentAnalyzeSessionService: jest.fn().mockImplementation(() => ({
-    prepareSession: (...args: unknown[]) => mockPrepareSession(...args),
-  })),
+  AgentAnalyzeSessionService: jest.fn((options: {onSessionSecurityCleanup: (sessionId: string) => void}) => {
+    mockSecurityCleanups.push(options.onSessionSecurityCleanup);
+    return {prepareSession: (...args: unknown[]) => mockPrepareSession(...args)};
+  }),
   buildAgentQueryWithContinuityNotice: (query: string) => query,
 }));
 
@@ -88,8 +82,12 @@ jest.mock('../../../services/traceProcessorService', () => ({
   }),
 }));
 
-jest.mock('../../../services/verifier/claimVerificationRunner', () => ({
-  runClaimVerification: (input: unknown) => mockRunClaimVerification(input),
+jest.mock('../../../services/finalizeAnalysisResult', () => ({
+  finalizeAnalysisResult: (input: FinalizeAnalysisResultInput) => mockFinalizeAnalysisResult(input),
+}));
+
+jest.mock('../../../services/managedTraceSummary', () => ({
+  executeManagedTraceSummaryV1: () => mockTraceSummary(),
 }));
 
 jest.mock('../../../services/codebase/defaultCodebaseServices', () => ({
@@ -202,24 +200,38 @@ function makeSession(orchestrator: EventEmitter): any {
   };
 }
 
+const finalizationRegistry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'cli-finalization-test'});
+
+function attachCliContext(result: AnalysisResult, runId: string,
+  intent: Partial<RuntimeFinalizationContextInput['turnIntent']> = {}) {
+  const candidate = {runId, attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)};
+  finalizationContexts.attachFinalizationContext(result, {runId, sessionId: result.sessionId, deadlineMs: Date.now() + 10_000,
+    strategyRegistry: finalizationRegistry, traceIdentity: {currentTraceId: 'trace-cli'},
+    turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: finalizationRegistry.registryFingerprint,
+      taskKind: 'fact', sceneId: 'general', scope: 'bounded_question', recommendedComplexity: 'quick', deliverable: 'answer',
+      evidenceAccess: 'existing_only', ...intent},
+    deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
+      completion: {...candidate, schemaVersion: 1, status: 'completed', runtimeKind: 'openai-agents-sdk'}}});
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(settle => {resolve = settle;});
+  return {promise, resolve};
+}
+
 describe('CliAnalyzeService runTurn final quality gate', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockRunManifestLifecycles.length = 0;
-    mockRunClaimVerification.mockReturnValue({
-      claimSupport: [],
-      claimVerificationResult: {
-        schemaVersion: 'claim_verifier@1',
-        status: 'not_checked',
-        policy: 'record_only',
-        notCheckedReason: 'test',
-        passed: false,
-        checkedClaimCount: 0,
-        unsupportedClaimCount: 0,
-        claimResults: [],
-        issues: [],
-      },
-      identityResolutions: [],
+    mockSecurityCleanups.length = 0;
+    mockFinalizeAnalysisResult.mockReset();
+    mockFinalizeAnalysisResult.mockImplementation(async input => {
+      try {
+        input.owner.signal.throwIfAborted();
+        input.owner.assertAuthorized();
+        return {result: input.result};
+      } finally {input.context?.dispose();}
     });
     mockCodebaseGet.mockReset();
     mockKnowledgeSourceGet.mockReset();
@@ -231,6 +243,7 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     orchestrator.analyze = mockAnalyze;
     orchestrator.getSdkSessionId = () => 'sdk-cli-session-quality';
     mockPreparedSession = makeSession(orchestrator);
+    mockAnalyze.mockReset();
     mockAnalyze.mockResolvedValue({
       sessionId: 'cli-session-quality',
       success: true,
@@ -310,7 +323,7 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     ['source only', ['cb-cli'], undefined],
     ['RAG only', undefined, ['wiki-cli']],
     ['source and RAG', ['cb-cli'], ['wiki-cli']],
-  ] as const)('keeps ordinary %s source authorization dormant during session preparation', async (
+  ] as const)('preserves %s authorization across ordinary, explicit, and deep wording', async (
     _label,
     codebaseIds,
     knowledgeSourceIds,
@@ -336,23 +349,30 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
       consentedAt: Date.now(),
     });
 
-    await new CliAnalyzeService().runTurn({
-      ...cliTurnBinding,
-      traceId: 'trace-cli',
-      query: 'PRIVATE_PREPARE_QUERY_CANARY',
-      ...(codebaseIds ? {codebaseIds: [...codebaseIds]} : {}),
-      ...(knowledgeSourceIds ? {knowledgeSourceIds: [...knowledgeSourceIds]} : {}),
-      onEvent: jest.fn(),
-    });
-
-    expect(mockPrepareSession).toHaveBeenCalledWith(expect.objectContaining({
-      query: 'PRIVATE_PREPARE_QUERY_CANARY',
-      options: expect.objectContaining({
-        codeAwareMode: 'off',
-        ...(codebaseIds ? {codebaseIds: undefined} : {}),
+    const service = new CliAnalyzeService();
+    for (const query of ['为什么启动慢？', '定位源码 Foo::bar', '完整审查整个源码']) {
+      const output = await service.runTurn({
+        ...cliTurnBinding, traceId: 'trace-cli', query, analysisMode: 'full',
+        ...(codebaseIds ? {codebaseIds: [...codebaseIds]} : {}),
+        ...(knowledgeSourceIds ? {knowledgeSourceIds: [...knowledgeSourceIds]} : {}),
+        onEvent: jest.fn(),
+      });
+      const expectedOptions = {
+        codeAwareMode: codebaseIds ? 'metadata_only' : 'off',
+        ...(codebaseIds ? {codebaseIds: ['cb-cli']} : {}),
         ...(knowledgeSourceIds ? {knowledgeSourceIds: ['wiki-cli']} : {}),
-      }),
-    }));
+      };
+      expect(mockPrepareSession).toHaveBeenLastCalledWith(expect.objectContaining({
+        query, options: expect.objectContaining(expectedOptions),
+      }));
+      expect(mockAnalyze).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), 'trace-cli',
+        expect.objectContaining({...expectedOptions, analysisContextFingerprint: mockPreparedSession.analysisContextFingerprint}));
+      const runtimeOptions = mockAnalyze.mock.calls[mockAnalyze.mock.calls.length - 1][3];
+      expect(runtimeOptions?.sourceUsePolicy).toBeUndefined();
+      expect(output.privateKnowledge).toBe(true);
+      expect(output.sourceSupplementTask).toBeUndefined();
+    }
+    expect(mockAnalyze).toHaveBeenCalledTimes(3);
   });
 
   it('rejects codebase ids when code-aware mode is explicitly off', async () => {
@@ -436,7 +456,20 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     expect(mockAnalyze).not.toHaveBeenCalled();
   });
 
-  it('marks phase-summary runtime output partial across CLI result, session, report, and event stream', async () => {
+  it('preserves the shared finalizer partial verdict across CLI result, session, report, and events', async () => {
+    mockFinalizeAnalysisResult.mockImplementationOnce(async input => ({
+      result: {...input.result, partial: true, confidence: 0.55, terminationMessage: '最终结果质量闸门',
+        claimVerificationResult: {schemaVersion: 'claim_verifier@2', policy: 'record_only', status: 'failed', passed: false,
+          checkedClaimCount: 1, unsupportedClaimCount: 1,
+          claimResults: [{claimId: 'claim-cli-contradiction', status: 'unsupported',
+            referenceCells: [{evidenceRefId: 'data:cli', column: 'blocked_ms', status: 'value_mismatch'}],
+            deterministicProof: {kind: 'numeric_cell', status: 'rejected', reason: 'numeric_operator_rejected',
+              anchorIds: ['anchor-cli'], evidenceRefIds: ['data:cli']},
+            propositionCoverage: {status: 'none', covered: [], uncovered: ['numeric_cell'], reason: 'numeric_operator_rejected'}}],
+          issues: [{claimId: 'claim-cli-contradiction', severity: 'error', code: 'claim_reference_value_mismatch',
+            message: 'The claimed value contradicts the captured value.'}]}},
+      qualityIssue: {code: 'verifier_contradicted_claim', message: '最终结果质量闸门'},
+    }));
     const service = new CliAnalyzeService();
     const events: StreamingUpdate[] = [];
 
@@ -452,11 +485,6 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
       schemaVersion: 2,
       runManifestId: 'manifest-cli-test',
       capabilityManifest,
-      traceSummary: expect.objectContaining({
-        schemaVersion: 'trace_summary_attribution@1',
-        status: 'unavailable',
-        reason: 'trace_source_unavailable',
-      }),
       outputs: expect.objectContaining({
         cliTurnPath: '/tmp/turns/001.md',
       }),
@@ -464,9 +492,8 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     expect(output.result.confidence).toBe(0.55);
     expect(output.result.terminationMessage).toContain('最终结果质量闸门');
     expect(mockPreparedSession.result).toBe(output.result);
-    expect(mockPreparedSession.traceSummary).toEqual(expect.objectContaining({
-      status: 'unavailable', reason: 'trace_source_unavailable',
-    }));
+    expect(mockPreparedSession.traceSummary).toBeUndefined();
+    expect(mockTraceSummary).not.toHaveBeenCalled();
     expect(mockPersistAgentTurn).toHaveBeenCalledWith(expect.objectContaining({
       result: expect.objectContaining({
         conclusion: expect.stringContaining('分阶段证据摘要'),
@@ -488,7 +515,7 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
         type: 'degraded',
         content: expect.objectContaining({
           fallback: 'final_result_quality_gate',
-          code: 'plan_summary_fallback',
+          code: 'verifier_contradicted_claim',
           partial: true,
         }),
       }),
@@ -632,7 +659,7 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     }));
   });
 
-  it('derives verifier-ready contracts from CLI-collected DataEnvelopes before verification', async () => {
+  it('keeps CLI-collected observations separate when the model supplied no claims', async () => {
     const envelope = createDataEnvelope({
       columns: ['package', 'startup_type', 'ttid_ms'],
       rows: [['com.example.launch.aosp.heavy', 'cold', 1912]],
@@ -664,21 +691,6 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
         totalDurationMs: 1000,
       };
     });
-    mockRunClaimVerification.mockReturnValueOnce({
-      claimSupport: [],
-      claimVerificationResult: {
-        schemaVersion: 'claim_verifier@1',
-        status: 'passed',
-        policy: 'record_only',
-        notCheckedReason: undefined,
-        passed: true,
-        checkedClaimCount: 1,
-        unsupportedClaimCount: 0,
-        claimResults: [],
-        issues: [],
-      },
-      identityResolutions: [],
-    });
 
     const service = new CliAnalyzeService();
     const output = await service.runTurn({
@@ -687,12 +699,204 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
       query: '分析启动慢',
       onEvent: jest.fn(),
     });
-    const verifierInput = mockRunClaimVerification.mock.calls[0]?.[0] as any;
+    const finalizerInput = mockFinalizeAnalysisResult.mock.calls[0][0];
 
-    expect(output.result.conclusionContract?.metadata?.derivedFromNarrativeEvidenceMatch).toBe(true);
-    expect(verifierInput.conclusionContract?.claims?.some((claim: any) =>
-      claim.references?.some((ref: any) => ref.column === 'ttid_ms' && ref.value === 1912),
-    )).toBe(true);
-    expect(output.result.claimVerificationResult?.status).toBe('passed');
+    expect(output.result.conclusionContract?.metadata?.derivedFromNarrativeEvidenceMatch).not.toBe(true);
+    expect(finalizerInput.result.conclusionContract).toBeUndefined();
+    expect(finalizerInput.dataEnvelopes).toContain(envelope);
+    expect(output.result.conclusionContract).toBeUndefined();
   });
+
+  it('keeps the shared finalizer failed claim result through persistence and report rendering', async () => {
+    const claims = [{
+      id: 'cli-wrong-ttid', text: 'TTID=9999ms', kind: 'numeric' as const,
+      references: [{evidenceRefId: 'data:cli-ttid', rowIndex: 0, column: 'ttid_ms', value: 9999}],
+    }];
+    mockAnalyze.mockImplementationOnce(async () => {
+      mockPreparedSession.orchestrator.emit('update', {
+        type: 'data', timestamp: Date.now(),
+        content: [createDataEnvelope({columns: ['ttid_ms'], rows: [[1912]]}, {
+          type: 'skill_result', source: 'startup_analysis', title: '启动概览',
+          evidenceRefId: 'data:cli-ttid', traceId: 'trace-cli', traceSide: 'current',
+        })],
+      } satisfies StreamingUpdate);
+      return {
+        sessionId: 'cli-session-quality', success: true, findings: [], hypotheses: [],
+        conclusion: 'TTID=9999ms，事件计数1912次。', confidence: 0.9, rounds: 1, totalDurationMs: 1,
+        conclusionContract: {
+          schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+          conclusions: [{rank: 1, statement: 'TTID=9999ms'}], claims,
+          clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+        },
+      };
+    });
+    mockFinalizeAnalysisResult.mockImplementationOnce(async input => ({result: {...input.result, partial: true,
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2', policy: 'record_only', status: 'failed', passed: false,
+        checkedClaimCount: 1, unsupportedClaimCount: 1, claimResults: [{claimId: 'cli-wrong-ttid', status: 'unsupported'}], issues: []}}}));
+
+    const output = await new CliAnalyzeService().runTurn({
+      ...cliTurnBinding, traceId: 'trace-cli', query: '核对 TTID', onEvent: jest.fn(),
+    });
+    expect(output.result.conclusionContract?.claims).toEqual(claims);
+    expect(output.result.claimVerificationResult).toMatchObject({status: 'failed', passed: false});
+    expect(output.result.partial).toBe(true);
+    expect(mockPersistAgentTurn).toHaveBeenCalledWith(expect.objectContaining({
+      session: expect.objectContaining({
+        result: expect.objectContaining({
+          conclusionContract: expect.objectContaining({claims}),
+          claimVerificationResult: expect.objectContaining({status: 'failed'}),
+        }),
+      }),
+    }));
+    expect(mockGenerateAgentDrivenHTML).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({
+        conclusionContract: expect.objectContaining({claims}),
+        claimVerificationResult: expect.objectContaining({status: 'failed'}),
+      }),
+    }));
+  });
+  it('takes context from the exact runtime result and persists the complete final object without rewriting its body', async () => {
+    let runtimeResult!: AnalysisResult;
+    mockAnalyze.mockImplementationOnce(async (_query, sessionId, _traceId, options) => {
+      runtimeResult = {sessionId, success: true, findings: [], hypotheses: [], conclusion: 'original body', confidence: 0.8, rounds: 1, totalDurationMs: 1};
+      attachCliContext(runtimeResult, options!.runId!);
+      return runtimeResult;
+    });
+    const body = '  Final body.\r\n\r\n';
+    mockFinalizeAnalysisResult.mockImplementationOnce(async input => {
+      try {
+        expect(input.result).toBe(runtimeResult);
+        expect(input.context?.runId).toBe(input.owner.runId);
+        expect(finalizationContexts.takeFinalizationContext(runtimeResult)).toBeUndefined();
+        return {result: {...input.result, conclusion: body, partial: true,
+          claimVerificationResult: {schemaVersion: 'claim_verifier@2', policy: 'record_only', status: 'failed', passed: false,
+            checkedClaimCount: 0, unsupportedClaimCount: 0, claimResults: [], issues: []}}};
+      } finally {input.context?.dispose();}
+    });
+    const output = await new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli', query: 'question', onEvent: jest.fn()});
+    expect(mockFinalizeAnalysisResult).toHaveBeenCalledTimes(1);
+    expect(mockFinalizeAnalysisResult.mock.calls[0][0].comparisonIdentity).toBeUndefined();
+    expect(output.result.conclusion).toBe(body);
+    expect(mockPersistAgentTurn.mock.calls[0][0]).toMatchObject({result: {conclusion: body,
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2', status: 'failed'}}});
+    expect(mockPreparedSession.result).toBe(output.result);
+    expect(mockGenerateAgentDrivenHTML).toHaveBeenCalledWith(expect.objectContaining({result: expect.objectContaining({conclusion: body})}));
+  });
+
+  it('passes comparison identity only when a reference trace is actually attached', async () => {
+    await new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli', referenceTraceId: 'trace-reference',
+      query: 'Compare both traces', onEvent: jest.fn()});
+    expect(mockFinalizeAnalysisResult.mock.calls[0][0].comparisonIdentity).toEqual({
+      currentTraceId: 'trace-cli', referenceTraceId: 'trace-reference',
+    });
+    expect(mockAnalyze.mock.calls[0][3]?.referenceTraceId).toBe('trace-reference');
+  });
+
+  it.each(['existing_only', 'unavailable', 'bounded', 'allowed'] as const)('bounds post-run trace acquisition using the captured %s intent', async mode => {
+    mockAnalyze.mockImplementationOnce(async (_query, sessionId, _traceId, options) => {
+      const result: AnalysisResult = {sessionId, success: true, findings: [], hypotheses: [], conclusion: 'body', confidence: 0.8, rounds: 1, totalDurationMs: 1};
+      attachCliContext(result, options!.runId!, {status: mode === 'unavailable' ? 'unavailable' : 'resolved',
+        scope: mode === 'bounded' ? 'bounded_question' : 'scene_wide', evidenceAccess: mode === 'existing_only' ? 'existing_only' : 'read_new'});
+      return result;
+    });
+    await new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli', query: 'question', onEvent: jest.fn()});
+    expect(mockTraceSummary).toHaveBeenCalledTimes(mode === 'allowed' ? 1 : 0);
+  });
+
+  it('rejects a wrong-run context even while the product run token is current and disposes it', async () => {
+    const take = finalizationContexts.takeFinalizationContext;
+    let taken: ReturnType<typeof take>;
+    const spy = jest.spyOn(finalizationContexts, 'takeFinalizationContext').mockImplementation(result => (taken = take(result)));
+    try {
+      mockAnalyze.mockImplementationOnce(async (_query, sessionId) => {
+        const result: AnalysisResult = {sessionId, success: true, findings: [], hypotheses: [], conclusion: 'body', confidence: 0.8, rounds: 1, totalDurationMs: 1};
+        attachCliContext(result, 'wrong-runtime-run');
+        return result;
+      });
+      await expect(new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli', query: 'question', onEvent: jest.fn()}))
+        .rejects.toThrow('finalization_run_identity_mismatch');
+      expect(mockFinalizeAnalysisResult).not.toHaveBeenCalled();
+      expect(mockPersistAgentTurn).not.toHaveBeenCalled();
+      expect(() => taken!.runId).toThrow('finalization_context_disposed');
+    } finally {spy.mockRestore();}
+  });
+
+  it.each(['caller', 'shutdown', 'security_cleanup'] as const)('prevents late finalizer results from committing after %s', async cancellation => {
+    const started = deferred<FinalizeAnalysisResultInput>();
+    const finish = deferred<FinalizedAnalysisResult>();
+    mockFinalizeAnalysisResult.mockImplementationOnce(input => {
+      started.resolve(input);
+      return finish.promise.finally(() => input.context?.dispose());
+    });
+    const controller = new AbortController();
+    const service = new CliAnalyzeService();
+    const pending = service.runTurn({...cliTurnBinding, signal: controller.signal, traceId: 'trace-cli', query: 'question', onEvent: jest.fn()});
+    const input = await started.promise;
+    if (cancellation === 'caller') controller.abort(new DOMException('cancelled', 'AbortError'));
+    else if (cancellation === 'shutdown') await service.shutdown();
+    else mockSecurityCleanups[0]('cli-session-quality');
+    expect(input.owner.signal.aborted).toBe(true);
+    const before = mockPreparedSession.dataEnvelopes.length;
+    mockPreparedSession.orchestrator.emit('update', {type: 'data', content: createDataEnvelope({columns: ['value'], rows: [[1]]}, {type: 'sql_result', source: 'execute_sql', title: 'late'}), timestamp: Date.now()});
+    expect(mockPreparedSession.dataEnvelopes).toHaveLength(before);
+    finish.resolve({result: input.result});
+    await expect(pending).rejects.toThrow();
+    expect(mockPersistAgentTurn).not.toHaveBeenCalled();
+    expect(mockPreparedSession.result).toBeUndefined();
+  });
+
+  it('rechecks the actual authorization fingerprint after finalization before persistence', async () => {
+    const source = {codebaseId: 'cb-cli', lifecycleState: 'active', rootRealpath: fs.realpathSync(process.cwd()),
+      indexGeneration: 3, activeGeneration: 'codebase_3_test', contentFingerprint: 'a'.repeat(64), chunkCount: 1,
+      consent: {sendToProvider: false, consentHash: 'original'}};
+    mockCodebaseGet.mockReturnValue(source);
+    const started = deferred<FinalizeAnalysisResultInput>();
+    const finish = deferred<FinalizedAnalysisResult>();
+    mockFinalizeAnalysisResult.mockImplementationOnce(input => {started.resolve(input); return finish.promise;});
+    const pending = new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli', query: '分析源码', codebaseIds: ['cb-cli'], onEvent: jest.fn()});
+    const input = await started.promise;
+    source.consent.consentHash = 'revoked';
+    finish.resolve({result: input.result});
+    await expect(pending).rejects.toThrow('analysis_context_changed_restart_required');
+    expect(mockPersistAgentTurn).not.toHaveBeenCalled();
+  });
+
+  it('does not let a prior finalizer overwrite the next turn in the same session', async () => {
+    const started = deferred<FinalizeAnalysisResultInput>();
+    const finish = deferred<FinalizedAnalysisResult>();
+    mockFinalizeAnalysisResult.mockImplementationOnce(input => {started.resolve(input); return finish.promise;});
+    const service = new CliAnalyzeService();
+    const first = service.runTurn({...cliTurnBinding, traceId: 'trace-cli', query: 'first', onEvent: jest.fn()});
+    const prior = await started.promise;
+    await service.runTurn({...cliTurnBinding, turn: 2, traceId: 'trace-cli', query: 'second', onEvent: jest.fn()});
+    expect(prior.owner.signal.aborted).toBe(true);
+    finish.resolve({result: prior.result});
+    await expect(first).rejects.toThrow();
+    expect(mockPersistAgentTurn).toHaveBeenCalledTimes(1);
+    expect(mockPersistAgentTurn.mock.calls[0][0]).toMatchObject({query: 'second'});
+  });
+
+  it('disposes a taken context when cancellation interrupts summary preparation before the finalizer', async () => {
+    const summaryStarted = deferred<void>();
+    mockTraceSummary.mockImplementationOnce(() => {summaryStarted.resolve(undefined); return new Promise<never>(() => {});});
+    const take = finalizationContexts.takeFinalizationContext;
+    let context: ReturnType<typeof take>;
+    const spy = jest.spyOn(finalizationContexts, 'takeFinalizationContext').mockImplementation(result => (context = take(result)));
+    try {
+      mockAnalyze.mockImplementationOnce(async (_query, sessionId, _traceId, options) => {
+        const result: AnalysisResult = {sessionId, success: true, findings: [], hypotheses: [], conclusion: 'body', confidence: 0.8, rounds: 1, totalDurationMs: 1};
+        attachCliContext(result, options!.runId!, {scope: 'scene_wide', evidenceAccess: 'read_new'});
+        return result;
+      });
+      const controller = new AbortController();
+      const pending = new CliAnalyzeService().runTurn({...cliTurnBinding, signal: controller.signal, traceId: 'trace-cli', query: 'question', onEvent: jest.fn()});
+      await summaryStarted.promise;
+      controller.abort(new DOMException('cancelled', 'AbortError'));
+      await expect(pending).rejects.toThrow();
+      expect(mockFinalizeAnalysisResult).not.toHaveBeenCalled();
+      expect(mockPersistAgentTurn).not.toHaveBeenCalled();
+      expect(() => context!.runId).toThrow('finalization_context_disposed');
+    } finally {spy.mockRestore();}
+  });
+
 });

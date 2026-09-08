@@ -5,6 +5,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import {runInNewContext} from 'node:vm';
 
 import {afterEach, beforeEach, describe, expect, it} from '@jest/globals';
 
@@ -22,12 +23,19 @@ import {
 import * as toolResultProjection from '../rag/toolResultProjectionFilter';
 import {
   clearAllCodeAwareOutputGuards,
+  clearCodeAwareOutputGuards,
+  composeCodeAwareTextProjectionReceipts,
   createCodeAwareStreamingTextProjection,
+  isIssuedCodeAwareTextProjectionReceipt,
+  projectCodeAwareStructuredText,
   registerCodeAwareCanary,
   registerOnDemandSourceLookupForEcho,
   registerPrivateAnalysisQueryForEcho,
+  revokeCodeAwareOutputGuards,
   sanitizeCodeAwareStructuredText,
+  sanitizeCodeAwareStructuredTextWithReceipt,
   sanitizeCodeAwareText,
+  sanitizeCodeAwareTextWithReceipt,
 } from '../security/codeAwareOutputRegistry';
 import {projectCodeAwareStreamingUpdate} from '../security/codeAwareStreamingUpdateProjection';
 import {LLMEchoOutputStream, type CodeRef} from '../security/llmEchoOutputFilter';
@@ -39,6 +47,27 @@ const CODEBASE_SCOPE = {
   workspaceId: 'workspace-test',
   userId: 'tester',
 };
+
+describe('structured projection across execution realms', () => {
+  it('preserves ordinary foreign JSON data without inventing a privacy change', () => {
+    const value = runInNewContext('({claims: [{id: "claim", value: 49}], empty: null})');
+    const projected = projectCodeAwareStructuredText(undefined, value);
+    expect(projected.changed).toBe(false);
+    expect(projected.value).toEqual({claims: [{id: 'claim', value: 49}], empty: null});
+  });
+
+  it('still rejects foreign classes and never invokes their accessors', () => {
+    const input = runInNewContext(`(() => {
+      let called = 0;
+      class Value { get secret() { called++; return 'secret'; } }
+      return {value: new Value(), called: () => called};
+    })()`);
+    const projected = projectCodeAwareStructuredText(undefined, input.value);
+    expect(projected.changed).toBe(true);
+    expect(projected.value).toBeUndefined();
+    expect(input.called()).toBe(0);
+  });
+});
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-aware-safety-test-'));
@@ -1367,6 +1396,58 @@ describe('code-aware streaming application boundary', () => {
 
     expect(sanitizeCodeAwareText('session-large-query', 'ordinary provider output'))
       .toBe('[PRIVATE_OUTPUT_SUPPRESSED]');
+  });
+});
+
+describe('internal code-aware text projection receipts', () => {
+  it('distinguishes a literal placeholder from an actual replacement branch', () => {
+    const literal = sanitizeCodeAwareTextWithReceipt('ordinary-receipt', '[PRIVATE_OUTPUT_SUPPRESSED]');
+    expect(literal.disposition).toBe('preserved');
+    expect(literal.inputFingerprint).toBe(literal.outputFingerprint);
+    expect(Object.isFrozen(literal)).toBe(true);
+    expect(isIssuedCodeAwareTextProjectionReceipt(literal)).toBe(true);
+    expect(isIssuedCodeAwareTextProjectionReceipt({...literal})).toBe(false);
+    registerCodeAwareCanary('ordinary-receipt', 'PRIVATE_CANARY');
+    expect(sanitizeCodeAwareTextWithReceipt('ordinary-receipt', 'Before PRIVATE_CANARY after').disposition).toBe('redacted');
+  });
+
+  it('records both registration and derived-pattern overflow without inspecting output wording', () => {
+    for (let index = 0; index <= 200; index++) registerCodeAwareCanary('receipt-overflow', `canary-${index}`);
+    expect(sanitizeCodeAwareTextWithReceipt('receipt-overflow', 'ordinary output').disposition).toBe('replaced');
+    registerPrivateAnalysisQueryForEcho('receipt-derived-overflow', 'x'.repeat(512 * 1024 + 1));
+    expect(sanitizeCodeAwareTextWithReceipt('receipt-derived-overflow', 'ordinary output').disposition).toBe('replaced');
+  });
+
+  it('retains plain empty behavior and records actual revoked and detached streaming replacements', () => {
+    registerCodeAwareCanary('receipt-retired', 'PRIVATE_CANARY');
+    const detached = createCodeAwareStreamingTextProjection('receipt-retired', 'answer');
+    clearCodeAwareOutputGuards('receipt-retired');
+    expect(detached.projectCompleteWithReceipt('late output').disposition).toBe('replaced');
+    revokeCodeAwareOutputGuards('receipt-revoked');
+    const revoked = createCodeAwareStreamingTextProjection('receipt-revoked', 'answer');
+    expect(revoked.projectCompleteWithReceipt('').disposition).toBe('replaced');
+    expect(revoked.projectComplete('')).toBe('[PRIVATE_OUTPUT_SUPPRESSED]');
+    expect(sanitizeCodeAwareTextWithReceipt('receipt-revoked', '')).toMatchObject({text: '', disposition: 'preserved'});
+    expect(sanitizeCodeAwareStructuredTextWithReceipt('receipt-revoked', '')).toMatchObject({text: '', disposition: 'preserved'});
+  });
+
+  it('applies the existing structured byte limit without imposing it on the plain API', () => {
+    const oversized = 'x'.repeat(1024 * 1024 + 1);
+    expect(sanitizeCodeAwareTextWithReceipt(undefined, oversized)).toMatchObject({text: oversized, disposition: 'preserved'});
+    expect(sanitizeCodeAwareStructuredTextWithReceipt(undefined, oversized).disposition).toBe('replaced');
+    expect(sanitizeCodeAwareStructuredTextWithReceipt(undefined, '汉'.repeat(400_000)).disposition).toBe('replaced');
+  });
+
+  it('composes only issued contiguous receipts and keeps replacement absorbing', () => {
+    revokeCodeAwareOutputGuards('receipt-compose');
+    const replaced = createCodeAwareStreamingTextProjection('receipt-compose', 'answer').projectCompleteWithReceipt('private body');
+    const preserved = sanitizeCodeAwareTextWithReceipt(undefined, replaced.text);
+    const composed = composeCodeAwareTextProjectionReceipts(replaced, preserved);
+    expect(composed.disposition).toBe('replaced');
+    expect(composed.inputFingerprint).toBe(replaced.inputFingerprint);
+    expect(composeCodeAwareTextProjectionReceipts({...replaced}, preserved)).toBe(preserved);
+    const unrelated = sanitizeCodeAwareTextWithReceipt(undefined, 'different body');
+    expect(composeCodeAwareTextProjectionReceipts(replaced, unrelated)).toBe(unrelated);
   });
 });
 

@@ -45,6 +45,7 @@ export const DRILL_DOWN_SKILL_REGISTRY: Record<DrillDownEntityType, DrillDownSki
       render_start_ts: 'renderStartTs',
       render_end_ts: 'renderEndTs',
       pid: 'pid',
+      upid: 'upid',
       session_id: 'sessionId',
       layer_name: 'layerName',
       token_gap: 'tokenGap',
@@ -80,6 +81,8 @@ export const DRILL_DOWN_SKILL_REGISTRY: Record<DrillDownEntityType, DrillDownSki
         a.ts as start_ts,
         a.ts + a.dur as end_ts,
         a.dur,
+        a.upid,
+        COUNT(*) OVER () as match_count,
         p.name as process_name,
         a.jank_type,
         a.layer_name,
@@ -87,7 +90,8 @@ export const DRILL_DOWN_SKILL_REGISTRY: Record<DrillDownEntityType, DrillDownSki
       FROM actual_frame_timeline_slice a
       LEFT JOIN process p ON a.upid = p.upid
       WHERE COALESCE(a.display_frame_token, a.surface_frame_token) = $frame_id
-        AND ($process_name = '' OR p.name = $process_name OR p.name GLOB $process_name || ':*')
+        AND ($upid IS NULL OR a.upid = $upid)
+        AND ($upid IS NOT NULL OR $process_name = '' OR p.name = $process_name OR p.name GLOB $process_name || ':*')
       ORDER BY a.ts
       LIMIT 1
     `,
@@ -101,16 +105,19 @@ export const DRILL_DOWN_SKILL_REGISTRY: Record<DrillDownEntityType, DrillDownSki
       end_ts: 'endTs',
       package: 'processName',
       session_id: 'sessionId',
+      upid: 'upid',
     },
     enrichmentQuery: `
       SELECT
         session_id,
+        upid,
         MIN(ts) as start_ts,
         MAX(ts + dur) as end_ts,
         process_name
       FROM (
         SELECT
           af.frame_id,
+          af.upid,
           af.ts,
           af.dur,
           ej.scroll_id as session_id,
@@ -119,9 +126,10 @@ export const DRILL_DOWN_SKILL_REGISTRY: Record<DrillDownEntityType, DrillDownSki
         LEFT JOIN expected_frame_timeline_events ej ON af.frame_id = ej.frame_id
         LEFT JOIN process p ON af.upid = p.upid
         WHERE ej.scroll_id = $session_id
-          AND ($process_name = '' OR p.name = $process_name OR p.name GLOB $process_name || ':*')
+          AND ($upid IS NULL OR af.upid = $upid)
+          AND ($upid IS NOT NULL OR $process_name = '' OR p.name = $process_name OR p.name GLOB $process_name || ':*')
       )
-      GROUP BY session_id
+      GROUP BY session_id, upid
     `,
   },
   startup: {
@@ -151,7 +159,9 @@ export const DRILL_DOWN_SKILL_REGISTRY: Record<DrillDownEntityType, DrillDownSki
       FROM android_startups s
       LEFT JOIN android_startup_time_to_display ttd USING (startup_id)
       WHERE s.startup_id = $startup_id
-        AND ($process_name = '' OR s.package = $process_name OR s.package GLOB $process_name || ':*')
+        AND ($upid IS NULL OR EXISTS (SELECT 1 FROM android_startup_processes sp
+          WHERE sp.startup_id = s.startup_id AND sp.upid = $upid))
+        AND ($upid IS NOT NULL OR $process_name = '' OR s.package = $process_name OR s.package GLOB $process_name || ':*')
       LIMIT 1
     `,
   },

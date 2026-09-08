@@ -8,6 +8,23 @@ import yaml from 'js-yaml';
 import Database from 'better-sqlite3';
 import {describe, it, expect} from '@jest/globals';
 
+// Execute maintained SQL fragments in the legacy named fixtures as well.
+function createScopedSqlFixture(): Database.Database {
+  const db = new Database(':memory:');
+  const prepare = db.prepare.bind(db);
+  db.prepare = ((sql: string) => {
+    let rendered = sql.split('${__process_scope.upid}').join('NULL');
+    if (/\b(?:FROM|JOIN)\s+effective_target_processes\b/.test(rendered) &&
+        !/effective_target_processes\s+AS\s*\(/i.test(rendered)) {
+      const fragment = fs.readFileSync(path.join(process.cwd(), 'skills/fragments/effective_target_processes.sql'), 'utf8')
+        .split('${__process_scope.upid}').join('NULL');
+      rendered = rendered.replace(/\bWITH\s+/i, `WITH ${fragment}\n,\n`);
+    }
+    return prepare(rendered);
+  }) as typeof db.prepare;
+  return db;
+}
+
 describe('scrolling_analysis skill schema', () => {
   const skillPath = path.join(process.cwd(), 'skills', 'composite', 'scrolling_analysis.skill.yaml');
   const skill = yaml.load(fs.readFileSync(skillPath, 'utf-8')) as any;
@@ -72,7 +89,7 @@ describe('scrolling_analysis skill schema', () => {
   };
 
   const createConsumerJankFixture = () => {
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     db.function('android_is_app_jank_type', (value: unknown) =>
       /App Deadline Missed|App Resynced Jitter/.test(String(value)) ? 1 : 0);
     db.function('android_is_sf_jank_type', (value: unknown) =>
@@ -220,7 +237,7 @@ describe('scrolling_analysis skill schema', () => {
       path.join(process.cwd(), 'skills', 'fragments', 'root_cause_sample_cap.sql'),
       'utf-8',
     );
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       for (const [literal, expected] of [['NULL', 200], ['0', 200], ['-5', 200], ['1', 1], ['100000', 100000]] as const) {
         const row = db.prepare(
@@ -289,7 +306,7 @@ describe('scrolling_analysis skill schema', () => {
       '-- BATCH_ROOT_CAUSE_SCOPE_CTES_BEGIN',
       '-- BATCH_ROOT_CAUSE_SCOPE_CTES_END',
     )}`;
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       const run = (limit: number) => db.prepare(`
         WITH
@@ -385,25 +402,25 @@ describe('scrolling_analysis skill schema', () => {
       .replace(/,\s*$/, '')
       .split('${package}').join('com.example.app');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       const row = db.prepare(`
         WITH
-        jank_frame_list(frame_key, frame_start, frame_end) AS (
-          VALUES ('display:1', 1000000000, 2000000000)
+        jank_frame_list(frame_key, frame_start, frame_end, upid) AS (
+          VALUES ('display:1', 1000000000, 2000000000, 1)
         ),
         android_monitor_contention(
           ts, dur, process_name, is_blocked_thread_main,
-          short_blocking_method, blocking_thread_name
+          short_blocking_method, blocking_thread_name, upid
         ) AS (
           VALUES
-            (900000000, 300000000, 'com.example.app', 1, 'mainLock', 'owner-main'),
-            (1000000000, 900000000, 'com.example.app', 0, 'noise1', 'owner-1'),
-            (1010000000, 880000000, 'com.example.app', 0, 'noise2', 'owner-2'),
-            (1020000000, 860000000, 'com.example.app', 0, 'noise3', 'owner-3'),
-            (1030000000, 840000000, 'com.example.app', 0, 'noise4', 'owner-4'),
-            (1040000000, 820000000, 'com.example.app', 0, 'noise5', 'owner-5'),
-            (1050000000, 800000000, 'com.example.app', 0, 'noise6', 'owner-6')
+            (900000000, 300000000, 'com.example.app', 1, 'mainLock', 'owner-main', 1),
+            (1000000000, 900000000, 'com.example.app', 0, 'noise1', 'owner-1', 1),
+            (1010000000, 880000000, 'com.example.app', 0, 'noise2', 'owner-2', 1),
+            (1020000000, 860000000, 'com.example.app', 0, 'noise3', 'owner-3', 1),
+            (1030000000, 840000000, 'com.example.app', 0, 'noise4', 'owner-4', 1),
+            (1040000000, 820000000, 'com.example.app', 0, 'noise5', 'owner-5', 1),
+            (1050000000, 800000000, 'com.example.app', 0, 'noise6', 'owner-6', 1)
         ),
         ${productionCte}
         SELECT lock_contention_ms
@@ -441,21 +458,21 @@ describe('scrolling_analysis skill schema', () => {
       .split('${start_ts}').join('1000000000')
       .split('${end_ts}').join('2000000000');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       const batchRow = db.prepare(`
         WITH
-        jank_frame_list(frame_key, frame_start, frame_end) AS (
-          VALUES ('display:1', 1000000000, 2000000000)
+        jank_frame_list(frame_key, frame_start, frame_end, upid) AS (
+          VALUES ('display:1', 1000000000, 2000000000, 1)
         ),
         android_monitor_contention(
           ts, dur, process_name, is_blocked_thread_main,
-          short_blocking_method, blocking_thread_name
+          short_blocking_method, blocking_thread_name, upid
         ) AS (
           VALUES
-            (1000000000, 100000000, 'com.example.app', 1, 'exactLock', 'owner-exact'),
-            (1100000000, 200000000, 'com.example.app:renderer', 1, 'childLock', 'owner-child'),
-            (1200000000, 500000000, 'com.example.application', 1, 'wrongLock', 'owner-wrong')
+            (1000000000, 100000000, 'com.example.app', 1, 'exactLock', 'owner-exact', 1),
+            (1100000000, 200000000, 'com.example.app:renderer', 1, 'childLock', 'owner-child', 1),
+            (1200000000, 500000000, 'com.example.application', 1, 'wrongLock', 'owner-wrong', 1)
         ),
         ${batchCtes}
         SELECT lock_contention_ms
@@ -466,12 +483,12 @@ describe('scrolling_analysis skill schema', () => {
       const deepRow = db.prepare(`
         WITH
         android_monitor_contention(
-          ts, dur, process_name, is_blocked_thread_main
+          ts, dur, process_name, is_blocked_thread_main, upid
         ) AS (
           VALUES
-            (1000000000, 100000000, 'com.example.app', 1),
-            (1100000000, 200000000, 'com.example.app:renderer', 1),
-            (1200000000, 500000000, 'com.example.application', 1)
+            (1000000000, 100000000, 'com.example.app', 1, 1),
+            (1100000000, 200000000, 'com.example.app:renderer', 1, 2),
+            (1200000000, 500000000, 'com.example.application', 1, 3)
         ),
         ${deepCte}
         SELECT lock_contention_ms
@@ -535,7 +552,7 @@ describe('scrolling_analysis skill schema', () => {
       .split('${start_ts}').join('1000000000')
       .split('${end_ts}').join('1100000000');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE thread_track(id INTEGER PRIMARY KEY, utid INTEGER);
@@ -549,8 +566,8 @@ describe('scrolling_analysis skill schema', () => {
 
       const batchRow = db.prepare(`
         WITH
-        jank_frame_list(frame_key, frame_start, frame_end) AS (
-          VALUES ('display:1', 1000000000, 1100000000)
+        jank_frame_list(frame_key, frame_start, frame_end, upid) AS (
+          VALUES ('display:1', 1000000000, 1100000000, 42)
         ),
         per_frame_thread_roles(frame_key, role, utid) AS (
           VALUES ('display:1', 'main', 1)
@@ -614,7 +631,7 @@ describe('scrolling_analysis skill schema', () => {
       .split('${start_ts}').join('NULL')
       .split('${end_ts}').join('NULL');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE process(upid INTEGER PRIMARY KEY, name TEXT);
@@ -655,7 +672,7 @@ describe('scrolling_analysis skill schema', () => {
   });
 
   it('scopes input data to the exact app process and colon-delimited children', () => {
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE android_input_events(
@@ -674,6 +691,7 @@ describe('scrolling_analysis skill schema', () => {
           ('com.example.application',  500, 10, 510, 'MOVE', 5);
       `);
 
+      db.exec("ALTER TABLE android_input_events ADD COLUMN upid INTEGER; UPDATE android_input_events SET upid = CASE process_name WHEN 'com.example.app' THEN 1 WHEN 'com.example.app:remote' THEN 2 ELSE 3 END");
       const row = db.prepare(renderScrollingSql('input_data_check')).get() as {
         total_input_events: number;
         target_processes: number;
@@ -687,7 +705,7 @@ describe('scrolling_analysis skill schema', () => {
   });
 
   it('does not let a similar-prefix process win input latency target selection', () => {
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE counter_track(id INTEGER, name TEXT);
@@ -722,6 +740,7 @@ describe('scrolling_analysis skill schema', () => {
         }
       }
 
+      db.exec("ALTER TABLE android_input_events ADD COLUMN upid INTEGER; UPDATE android_input_events SET upid = CASE process_name WHEN 'com.example.app' THEN 1 WHEN 'com.example.app:remote' THEN 2 ELSE 3 END");
       const row = db.prepare(renderScrollingSql('input_latency_summary')).get() as {
         target_process: string;
         total_input_events: number;
@@ -742,7 +761,7 @@ describe('scrolling_analysis skill schema', () => {
       '-- 4. 非 App 大核 CPU 占用（后台干扰指标）',
       '\nSELECT',
     );
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE thread_state(utid INTEGER, state TEXT, dur INTEGER, cpu INTEGER, ts INTEGER);
@@ -784,7 +803,7 @@ describe('scrolling_analysis skill schema', () => {
       '-- Binder 调用统计',
       '-- 综合分析',
     );
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE android_binder_txns(client_process TEXT, client_dur INTEGER, client_ts INTEGER);
@@ -794,6 +813,7 @@ describe('scrolling_analysis skill schema', () => {
           ('com.example.application',  30000000, 300),
           ('com.other',                40000000, 400);
       `);
+      db.exec("ALTER TABLE android_binder_txns ADD COLUMN client_upid INTEGER; UPDATE android_binder_txns SET client_upid = CASE client_process WHEN 'com.example.app' THEN 1 WHEN 'com.example.app:remote' THEN 2 ELSE 3 END");
       const renderedCte = cte
         .split('${package}').join('com.example.app')
         .split('${start_ts}').join('NULL')
@@ -843,7 +863,7 @@ describe('scrolling_analysis skill schema', () => {
       .trim()
       .replace(/,\s*$/, '');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       const row = db.prepare(`
         WITH
@@ -899,7 +919,7 @@ describe('scrolling_analysis skill schema', () => {
       .trim()
       .replace(/,\s*$/, '');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       const row = db.prepare(`
         WITH
@@ -957,7 +977,7 @@ describe('scrolling_analysis skill schema', () => {
       .split('${start_ts}').join('NULL')
       .split('${end_ts}').join('NULL');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE counter_track(id INTEGER PRIMARY KEY, name TEXT);
@@ -1026,7 +1046,7 @@ describe('scrolling_analysis skill schema', () => {
       .split('${start_ts}').join('NULL')
       .split('${end_ts}').join('NULL');
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE process(upid INTEGER PRIMARY KEY, name TEXT);
@@ -1068,7 +1088,7 @@ describe('scrolling_analysis skill schema', () => {
       .split('${start_ts}').join('NULL')
       .split('${end_ts}').join('NULL');
     const runEnvironment = (processName: string) => {
-      const db = new Database(':memory:');
+      const db = createScopedSqlFixture();
       try {
         db.exec(`
           CREATE TABLE process(upid INTEGER PRIMARY KEY, name TEXT);
@@ -1123,7 +1143,7 @@ describe('scrolling_analysis skill schema', () => {
       bufferTxFrames: number | null,
       processName = 'com.example.app',
     ) => {
-      const db = new Database(':memory:');
+      const db = createScopedSqlFixture();
       try {
         db.exec(`
           CREATE TABLE process(upid INTEGER PRIMARY KEY, name TEXT);
@@ -1203,7 +1223,7 @@ describe('scrolling_analysis skill schema', () => {
     const renderSql = (targetProcessStatus: string) => String(getStep('fallback_no_frame_timeline').sql)
       .split('${package}').join('com.example.app')
       .split('${buffer_tx_coverage.data[0].target_process_status}').join(targetProcessStatus);
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec('CREATE TABLE actual_frame_timeline_slice(id INTEGER)');
       const targetMissingRows = db.prepare(renderSql('not_found')).all() as Array<Record<string, unknown>>;
@@ -1263,7 +1283,7 @@ describe('scrolling_analysis skill schema', () => {
       expect(end).toBeGreaterThan(start);
       return sql.slice(start + beginMarker.length, end).trim().replace(/,\s*$/, '');
     };
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.function('android_is_app_jank_type', (value: unknown) =>
         /App Deadline Missed|App Resynced Jitter/.test(String(value)) ? 1 : 0);
@@ -1365,7 +1385,7 @@ describe('scrolling_analysis skill schema', () => {
       '-- BATCH_FRAME_IDENTITY_FILE_IO_CTE_END',
     );
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.exec(`
         CREATE TABLE counter(track_id INTEGER, ts INTEGER, value REAL);
@@ -1382,10 +1402,10 @@ describe('scrolling_analysis skill schema', () => {
 
       const rows = db.prepare(`
         WITH
-        jank_frame_list(frame_key, frame_start, frame_end) AS (
+        jank_frame_list(frame_key, frame_start, frame_end, upid) AS (
           VALUES
-            ('surface:Layer A:7', 1000000, 1050000),
-            ('surface:Layer B:7', 1000000, 1200000)
+            ('surface:Layer A:7', 1000000, 1050000, 42),
+            ('surface:Layer B:7', 1000000, 1200000, 42)
         ),
         per_frame_thread_roles(frame_key, role, utid) AS (
           VALUES
@@ -1457,7 +1477,7 @@ describe('scrolling_analysis skill schema', () => {
     expect(end).toBeGreaterThan(start);
     const responsibilityCase = sql.slice(start + beginMarker.length, end).trim();
 
-    const db = new Database(':memory:');
+    const db = createScopedSqlFixture();
     try {
       db.function('android_is_app_jank_type', (value: unknown) =>
         /App Deadline Missed|App Resynced Jitter/.test(String(value)) ? 1 : 0);
@@ -1520,7 +1540,7 @@ describe('scrolling_analysis skill schema', () => {
       causeBegin + '-- JANK_CAUSE_CASE_BEGIN'.length,
       causeEnd,
     ).trim();
-    const causeDb = new Database(':memory:');
+    const causeDb = createScopedSqlFixture();
     try {
       const causes = causeDb.prepare(`
         WITH samples(
@@ -1727,5 +1747,240 @@ describe('scrolling_analysis skill schema', () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe('scrolling exact UPID SQL semantics', () => {
+  const source = yaml.load(fs.readFileSync(path.join(process.cwd(), 'skills/composite/scrolling_analysis.skill.yaml'), 'utf8')) as any;
+  const render = (stepId: string, upid: number) => String(source.steps.find((step: any) => step.id === stepId).sql)
+    .split('${__process_scope.upid}').join(String(upid))
+    .split('${package}').join('com.example.app')
+    .split('${start_ts}').join('NULL').split('${end_ts}').join('NULL');
+
+  it('does not count same-name restarts, children or similar prefixes as exact input events', () => {
+    const db = new Database(':memory:');
+    try {
+      db.exec(`CREATE TABLE android_input_events(upid INTEGER, process_name TEXT, receive_ts INTEGER,
+        receive_dur INTEGER, dispatch_ts INTEGER, event_action TEXT, frame_id INTEGER);
+        INSERT INTO android_input_events VALUES
+          (42,'com.example.app',100,10,90,'MOVE',1),
+          (43,'com.example.app',100,10,90,'MOVE',1),
+          (44,'com.example.app:child',100,10,90,'MOVE',1),
+          (45,'com.example.application',100,10,90,'MOVE',1);`);
+      expect(db.prepare(render('input_data_check', 42)).get()).toMatchObject({ total_input_events: 1, target_processes: 1 });
+    } finally { db.close(); }
+  });
+
+  it('binds Binder client UPID while retaining an external server', () => {
+    const sql = render('root_cause_classification', 42);
+    const begin = sql.indexOf('binder_stats AS (');
+    const end = sql.indexOf('-- 综合分析', begin);
+    const cte = sql.slice(begin, end).trim().replace(/,\s*$/, '');
+    const db = new Database(':memory:');
+    try {
+      db.exec(`CREATE TABLE android_binder_txns(client_upid INTEGER, client_process TEXT,
+        server_upid INTEGER, server_process TEXT, client_dur INTEGER, client_ts INTEGER);
+        INSERT INTO android_binder_txns VALUES
+          (42,'com.example.app',90,'surfaceflinger',10000000,100),
+          (43,'com.example.app',90,'surfaceflinger',50000000,100),
+          (44,'com.example.app:child',90,'surfaceflinger',70000000,100);`);
+      expect(db.prepare(`WITH ${cte} SELECT * FROM binder_stats`).get()).toMatchObject({ total_calls: 1, total_dur_ms: 10 });
+    } finally { db.close(); }
+  });
+
+  it('ignores lock events from another UPID even when the process name matches', () => {
+    const sql = render('batch_frame_root_cause', 42);
+    const begin = sql.indexOf('per_frame_lock_overlap AS (');
+    const end = sql.indexOf('-- 10g.5.', begin);
+    const ctes = sql.slice(begin, end).trim().replace(/,\s*$/, '');
+    const db = new Database(':memory:');
+    try {
+      const result = db.prepare(`WITH
+        jank_frame_list(frame_key,frame_start,frame_end,upid) AS (VALUES ('frame',0,100000000,42)),
+        android_monitor_contention(upid,ts,dur,process_name,is_blocked_thread_main,short_blocking_method,blocking_thread_name) AS (
+          VALUES (42,0,10000000,'com.example.app',1,'target','owner'),
+            (43,0,80000000,'com.example.app',1,'restarted','owner')),
+        ${ctes} SELECT lock_contention_ms FROM per_frame_lock_detail`).get();
+      expect(result).toMatchObject({ lock_contention_ms: 10 });
+    } finally { db.close(); }
+  });
+});
+
+describe('single-frame exact UPID SQL semantics', () => {
+  const source = yaml.load(fs.readFileSync(path.join(process.cwd(), 'skills/composite/jank_frame_detail.skill.yaml'), 'utf8')) as any;
+  const step = (id: string) => source.steps.find((value: any) => value.id === id);
+  const render = (sql: string, upid: number | null, packageName = 'com.example.app') => {
+    const values: Record<string, string> = {
+      '__process_scope.upid': upid === null ? 'NULL' : String(upid), package: packageName,
+      start_ts: '0', end_ts: '100000000', main_start_ts: 'NULL', main_end_ts: 'NULL',
+      render_start_ts: 'NULL', render_end_ts: 'NULL', dur_ms: '100',
+      jank_type: 'App Deadline Missed', jank_responsibility: 'APP',
+    };
+    return sql.replace(/\$\{([^}]+)\}/g, (_token, name: string) => {
+      if (!Object.prototype.hasOwnProperty.call(values, name)) throw new Error(`Unbound SQL fixture parameter: ${name}`);
+      return values[name];
+    });
+  };
+  const sqlFor = (id: string, upid: number | null, packageName = 'com.example.app') => {
+    const definition = step(id);
+    const fragments = (definition.sql_fragments || []).map((file: string) =>
+      fs.readFileSync(path.join(process.cwd(), 'skills', file), 'utf8').trim());
+    const sql = fragments.length ? String(definition.sql).replace(/\bWITH\b/i, `WITH\n${fragments.join(',\n')},`) : String(definition.sql);
+    return render(sql, upid, packageName);
+  };
+  const rootCtes = (first: string, next: string, upid: number | null) => {
+    const sql = String(step('root_cause_summary').sql);
+    const start = sql.indexOf(`${first} AS (`);
+    const end = sql.indexOf(`${next} AS (`, start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    return render(sql.slice(start, end).replace(/--[^\n]*/g, '').trim().replace(/,\s*$/, ''), upid);
+  };
+  const fixture = () => {
+    const db = new Database(':memory:');
+    // The maintained VSync fragment requests PERCENTILE(..., 50). SQLite's
+    // fixture aggregate supplies that median without replacing timing rows.
+    db.aggregate<number[]>('PERCENTILE', {varargs: true, start: () => [],
+      step: (values, value) => typeof value === 'number' ? [...values, value] : values,
+      result: values => {
+        const ordered = values.slice().sort((left, right) => left - right);
+        const middle = Math.floor(ordered.length / 2);
+        return ordered.length ? ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2 : null;
+      },
+    });
+    db.function('STR_SPLIT', (value: string, separator: string, index: number) => value.split(separator)[index] ?? null);
+    db.exec(`
+      CREATE TABLE process(upid INTEGER PRIMARY KEY, pid INTEGER, name TEXT);
+      INSERT INTO process VALUES (42,700,'com.example.app'),(43,700,'com.example.app'),
+        (44,701,'com.example.app:child'),(45,702,'com.example.application'),(90,900,'surfaceflinger');
+      CREATE TABLE thread(utid INTEGER PRIMARY KEY, tid INTEGER, upid INTEGER, name TEXT);
+      INSERT INTO thread VALUES (1,700,42,'main'),(2,710,42,'RenderThread'),(3,711,42,'1.ui'),(4,712,42,'1.raster'),
+        (5,713,42,'worker'),(8,800,42,'HeapTaskDaemon'),(11,700,43,'main'),(12,710,43,'RenderThread'),
+        (18,800,43,'HeapTaskDaemon'),(21,701,44,'main'),(31,702,45,'main'),(90,900,90,'surfaceflinger');
+      CREATE TABLE thread_track(id INTEGER PRIMARY KEY, utid INTEGER);
+      INSERT INTO thread_track SELECT utid,utid FROM thread;
+      CREATE TABLE slice(id INTEGER PRIMARY KEY, track_id INTEGER, ts INTEGER, dur INTEGER, name TEXT);
+      INSERT INTO slice VALUES (1,1,10000000,20000000,'target_main'),(2,2,10000000,4000000,'DrawFrame'),
+        (3,3,10000000,3000000,'target_flutter_ui'),(4,4,10000000,5000000,'target_flutter_raster'),
+        (5,5,10000000,99000000,'excluded_worker'),(11,11,10000000,80000000,'restarted_main'),
+        (12,12,10000000,80000000,'restarted_render'),(21,21,10000000,70000000,'child_main'),
+        (31,31,10000000,70000000,'similar_prefix_main'),
+        (41,1,10000000,1000000,'Choreographer#doFrame - resynced to 123 delayed 4'),
+        (42,11,10000000,8000000,'Choreographer#doFrame - resynced to 999 delayed 8');
+      CREATE TABLE android_binder_txns(client_upid INTEGER, client_utid INTEGER, client_tid INTEGER,
+        client_process TEXT, server_process TEXT, client_ts INTEGER, client_dur INTEGER, is_sync INTEGER);
+      INSERT INTO android_binder_txns VALUES (42,1,700,'com.example.app','surfaceflinger',10000000,10000000,1),
+        (43,11,700,'com.example.app','surfaceflinger',10000000,80000000,1),
+        (44,21,701,'com.example.app:child','external-child-server',10000000,70000000,1);
+      CREATE TABLE android_monitor_contention(upid INTEGER,ts INTEGER,dur INTEGER,process_name TEXT,
+        is_blocked_thread_main INTEGER,short_blocking_method TEXT,blocking_thread_name TEXT,
+        short_blocked_method TEXT,blocked_thread_name TEXT,waiter_count INTEGER);
+      INSERT INTO android_monitor_contention VALUES (42,10000000,10000000,'com.example.app',1,'externalLock','external-owner','targetWait','main',2),
+        (43,10000000,80000000,'com.example.app',1,'wrongLock','restarted-owner','wrongWait','main',9);
+      CREATE TABLE android_garbage_collection_events(tid INTEGER,utid INTEGER,upid INTEGER,gc_type TEXT,gc_ts INTEGER,gc_dur INTEGER);
+      INSERT INTO android_garbage_collection_events VALUES (800,8,42,'young',10000000,10000000),
+        (800,18,43,'young',10000000,80000000);
+      CREATE TABLE _cpu_topology(cpu_id INTEGER,core_type TEXT);
+      INSERT INTO _cpu_topology VALUES (0,'big'),(1,'little');
+      CREATE TABLE thread_state(utid INTEGER,ts INTEGER,dur INTEGER,state TEXT,cpu INTEGER,io_wait INTEGER,blocked_function TEXT);
+      INSERT INTO thread_state VALUES (1,0,10000000,'Running',0,0,NULL),(11,0,40000000,'Running',0,0,NULL),
+        (90,0,60000000,'Running',1,0,NULL),(1,20000000,2000000,'D',NULL,1,'filemap_fault'),
+        (11,20000000,8000000,'D',NULL,1,'filemap_fault'),(5,20000000,9000000,'D',NULL,1,'filemap_fault');
+      CREATE TABLE counter(track_id INTEGER,ts INTEGER,value REAL);
+      INSERT INTO counter VALUES (100,0,0),(100,16666667,1),(100,33333334,0),
+        (200,0,1000000),(200,50000000,2000000),(201,0,500000),(201,50000000,600000);
+      CREATE TABLE counter_track(id INTEGER,name TEXT);
+      INSERT INTO counter_track VALUES (100,'VSYNC-sf');
+      CREATE TABLE cpu_counter_track(id INTEGER,cpu INTEGER,name TEXT);
+      INSERT INTO cpu_counter_track VALUES (200,0,'cpufreq'),(201,1,'cpufreq');
+      CREATE TABLE expected_frame_timeline_slice(ts INTEGER,dur INTEGER);
+      INSERT INTO expected_frame_timeline_slice VALUES (0,16666667);
+    `);
+    return db;
+  };
+
+  it('preserves each target thread set, exact frame windows, and named/empty process selection', () => {
+    const db = fixture();
+    try {
+      expect(db.prepare(sqlFor('main_thread_slices', 42)).all()).toEqual([
+        expect.objectContaining({name: 'target_main', dur_ms: 20}),
+        expect.objectContaining({name: 'target_flutter_ui', dur_ms: 3}),
+      ]);
+      expect(db.prepare(sqlFor('render_thread_slices', 42)).all()).toEqual([
+        expect.objectContaining({name: 'target_flutter_raster', dur_ms: 5}),
+        expect.objectContaining({name: 'DrawFrame', dur_ms: 4}),
+      ]);
+      expect(db.prepare(sqlFor('choreographer_resync_markers', 42)).all()).toEqual([
+        expect.objectContaining({target_vsync: '123', resync_delay: '4', dur_ms: 1}),
+      ]);
+      expect(db.prepare(sqlFor('io_blocking', 42)).all()).toEqual([
+        expect.objectContaining({thread_name: 'main', blocked_count: 1, total_ms: 2, max_ms: 2}),
+      ]);
+      const named = db.prepare(sqlFor('main_thread_slices', null)).all() as {name: string}[];
+      expect(named.map(row => row.name).sort()).toEqual(['child_main', 'restarted_main', 'target_flutter_ui', 'target_main']);
+      const unscoped = db.prepare(sqlFor('main_thread_slices', null, '')).all() as {name: string}[];
+      expect(unscoped.map(row => row.name).sort()).toEqual([...named.map(row => row.name), 'similar_prefix_main'].sort());
+      db.exec("INSERT INTO slice VALUES (100,1,100000000,90000000,'outside_frame')");
+      expect(db.prepare(sqlFor('main_thread_slices', 42)).all()).toHaveLength(2);
+    } finally {db.close();}
+  });
+
+  it('binds Binder client UPID and root UTID while retaining the external server', () => {
+    const db = fixture();
+    try {
+      expect(db.prepare(sqlFor('binder_calls', 42)).all()).toEqual([
+        {interface: 'surfaceflinger', count: 1, dur_ms: 10, max_ms: 10, sync_count: 1},
+      ]);
+      const effective = render(fs.readFileSync(path.join(process.cwd(), 'skills/fragments/effective_target_processes.sql'), 'utf8'), 42);
+      const main = rootCtes('main_thread_utid', 'top_slice', 42);
+      const binder = rootCtes('binder_sync_main', 'binder_frame', 42);
+      expect(db.prepare(`WITH ${effective}, ${main}, ${binder} SELECT * FROM binder_sync_main`).all()).toEqual([
+        {client_ts: 10000000, client_dur: 10000000, server_process: 'surfaceflinger'},
+      ]);
+      expect(step('binder_calls').process_scope.context_fields.peer_context).toContain('interface');
+    } finally {db.close();}
+  });
+
+  it('uses lock and GC UPIDs despite reused process and thread IDs', () => {
+    const db = fixture();
+    try {
+      expect(db.prepare(sqlFor('lock_contention', 42)).all()).toEqual([
+        {blocking_method: 'externalLock', blocking_thread_name: 'external-owner', blocked_method: 'targetWait',
+          blocked_thread_name: 'main', main_blocked: 1, wait_ms: 10, waiter_count: 2},
+      ]);
+      const lock = rootCtes('monitor_lock_overlap', 'render_sync_intervals', 42);
+      expect(db.prepare(`WITH ${lock} SELECT lock_contention_ms FROM monitor_lock_overlap`).get()).toEqual({lock_contention_ms: 10});
+      expect(db.prepare(sqlFor('gc_in_frame', 42)).all()).toEqual([
+        {gc_type: 'young', gc_count: 1, total_dur_ms: 10, overlap_ms: 10, max_dur_ms: 10},
+      ]);
+      expect(db.prepare(sqlFor('gc_in_frame', null)).all()).toEqual([
+        {gc_type: 'young', gc_count: 2, total_dur_ms: 90, overlap_ms: 90, max_dur_ms: 80},
+      ]);
+      expect(step('lock_contention').process_scope.context_fields.peer_context).toEqual(['blocking_method', 'blocking_thread_name', 'waiter_count']);
+    } finally {db.close();}
+  });
+
+  it('keeps CPU resources and VSync global while root target metrics exclude restarts', () => {
+    const db = fixture();
+    try {
+      const frequencies = db.prepare(sqlFor('cpu_freq_analysis', 42)).all();
+      expect(frequencies).toEqual([
+        {core_type: 'little', avg_freq_mhz: 550, max_freq_mhz: 600, min_freq_mhz: 500},
+        {core_type: 'big', avg_freq_mhz: 1500, max_freq_mhz: 2000, min_freq_mhz: 1000},
+      ]);
+      expect(db.prepare(sqlFor('cpu_freq_analysis', 43)).all()).toEqual(frequencies);
+      const timeline = db.prepare(sqlFor('cpu_freq_timeline', 42)).all();
+      expect(timeline).toHaveLength(4);
+      expect(db.prepare(sqlFor('cpu_freq_timeline', 43)).all()).toEqual(timeline);
+      const cluster = rootCtes('cluster_core_counts', 'gc_frame_overlap', 42);
+      expect(db.prepare(`WITH ${cluster} SELECT * FROM cluster_load`).get()).toEqual({big_load_pct: 50, little_load_pct: 60});
+      const root = db.prepare(sqlFor('root_cause_summary', 42)).get() as Record<string, unknown>;
+      expect(root).toMatchObject({slice_name: 'target_main', slice_dur: 20, frame_budget_ms: 16.67,
+        frame_dur_ms: 100, main_io_block_ms: 2, reason_code: 'binder_sync_blocking'});
+      expect(root.deep_reason).toContain('surfaceflinger');
+      expect(step('root_cause_summary').process_scope.context_fields).toEqual({
+        global_context: ['frame_budget_ms', 'primary_cause', 'secondary_info'], peer_context: ['deep_reason'],
+      });
+    } finally {db.close();}
   });
 });

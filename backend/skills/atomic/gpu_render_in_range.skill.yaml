@@ -25,6 +25,11 @@ meta:
     GPU 工作来源不同：标准 RenderThread；Flutter raster；Game (Vulkan vs GLES)；
     Camera ISP；Video decoder。未来按 pipeline_id 切换 GPU 来源识别 SQL。
 
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package]
+
 inputs:
   - name: start_ts
     type: timestamp
@@ -63,6 +68,13 @@ display:
       type: duration
       format: duration_ms
 
+process_scope:
+  role: global_context
+  limitations:
+    - Operation aggregates combine application and SurfaceFlinger slices; they are not application-only measurements.
+sql_fragments:
+  - fragments/effective_target_processes.sql
+
 sql: |
   WITH gpu_slices AS (
     SELECT
@@ -85,7 +97,13 @@ sql: |
     JOIN thread t ON tt.utid = t.utid
     JOIN process p ON t.upid = p.upid
     WHERE (${start_ts} IS NULL OR s.ts >= ${start_ts}) AND (${end_ts} IS NULL OR s.ts < ${end_ts})
-      AND (('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '' OR p.name = 'surfaceflinger')
+      AND (
+        (
+          p.upid IN (SELECT upid FROM effective_target_processes)
+          AND (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        )
+        OR p.name = 'surfaceflinger'
+      )
       AND s.dur > 10000  -- > 10us
   )
   SELECT

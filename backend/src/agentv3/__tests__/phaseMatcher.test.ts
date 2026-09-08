@@ -60,7 +60,7 @@ describe('phaseMatchesCall', () => {
     })).toBe(false);
   });
 
-  it('allows attribution-only support skills without weakening same-tool narrowing', () => {
+  it('does not substitute support skills for an exact declared skill', () => {
     const phase: PlanPhase = {
       ...basePhase,
       expectedTools: ['invoke_skill'],
@@ -70,7 +70,7 @@ describe('phaseMatchesCall', () => {
       toolName: 'invoke_skill',
       timestamp: 0,
       skillId: 'process_identity_resolver',
-    })).toBe(true);
+    })).toBe(false);
     expect(phaseMatchesCall(phase, {
       toolName: 'invoke_skill',
       timestamp: 0,

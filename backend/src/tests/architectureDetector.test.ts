@@ -19,6 +19,7 @@ import {
 } from '../agent/detectors';
 import { resolvePipelineArchitectureType } from '../agent/detectors/architectureDetector';
 import { ensurePipelineSkillsInitialized, pipelineSkillLoader } from '../services/pipelineSkillLoader';
+import {createTraceProcessorQueryCancelledError} from '../services/traceProcessorCancellation';
 
 // Mock the skill engine dependencies
 jest.mock('../services/skillEngine/skillLoader', () => ({
@@ -329,7 +330,7 @@ describe('ArchitectureDetector (YAML skill-backed)', () => {
   });
 
   describe('Error handling', () => {
-    it('uses the catalog default when successful detection has no pipeline row', async () => {
+    it('rejects missing pipeline rows even when the catalog has a usable default', async () => {
       mockExecute.mockResolvedValue({
         success: true,
         displayResults: [],
@@ -345,40 +346,43 @@ describe('ArchitectureDetector (YAML skill-backed)', () => {
         });
 
       try {
-        const result = await detectArchitectureViaSkill(
+        await expect(detectArchitectureViaSkill(
           context.traceProcessorService,
           context.traceId,
-        );
-
-        expect(result.type).toBe('FLUTTER');
-        expect(result.additionalInfo?.pipelineId).toBe('FLUTTER_SURFACEVIEW_IMPELLER');
+        )).rejects.toThrow('did not produce a pipeline ID');
+        expect(defaultSpy).not.toHaveBeenCalled();
       } finally {
         defaultSpy.mockRestore();
       }
     });
 
-    it('should return STANDARD on skill execution failure', async () => {
+    it.each(['Skill not found', 'No processor for trace test-trace'])('rejects skill execution failure: %s', error => {
       mockExecute.mockResolvedValue({
         success: false,
-        error: 'Skill not found',
+        error,
         displayResults: [],
         diagnostics: [],
         executionTimeMs: 0,
       });
 
-      const result = await detectArchitectureViaSkill(context.traceProcessorService, context.traceId);
-
-      expect(result.type).toBe('STANDARD');
-      expect(result.confidence).toBe(0.5);
+      return expect(detectArchitectureViaSkill(context.traceProcessorService, context.traceId)).rejects.toThrow(error);
     });
 
-    it('should return STANDARD on thrown exception', async () => {
-      mockExecute.mockRejectedValue(new Error('Connection refused'));
+    it.each([new Error('Connection refused'), createTraceProcessorQueryCancelledError('cancelled by owner')])
+      ('preserves the original thrown exception: %s', async error => {
+        mockExecute.mockRejectedValue(error);
+        await expect(detectArchitectureViaSkill(context.traceProcessorService, context.traceId)).rejects.toBe(error);
+      });
 
-      const result = await detectArchitectureViaSkill(context.traceProcessorService, context.traceId);
-
-      expect(result.type).toBe('STANDARD');
-      expect(result.confidence).toBe(0.5);
+    it.each([undefined, '', '   '])('rejects an absent pipeline ID %s without changing actual STANDARD detection', async pipelineId => {
+      const result = buildSkillResult({pipelineId: 'ANDROID_VIEW_STANDARD_BLAST', confidence: 0.85});
+      result.rawResults.determine_pipeline.data[0].primary_pipeline_id = pipelineId;
+      mockExecute.mockResolvedValue(result);
+      await expect(detectArchitectureViaSkill(context.traceProcessorService, context.traceId)).rejects.toThrow('did not produce a pipeline ID');
+      mockExecute.mockResolvedValue(buildSkillResult({pipelineId: 'ANDROID_VIEW_STANDARD_BLAST', confidence: 0.85}));
+      await expect(detectArchitectureViaSkill(context.traceProcessorService, context.traceId)).resolves.toMatchObject({
+        type: 'STANDARD', confidence: 0.85,
+      });
     });
   });
 

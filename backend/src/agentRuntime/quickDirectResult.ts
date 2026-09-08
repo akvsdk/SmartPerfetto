@@ -5,7 +5,6 @@
 import type {
   AnalysisOptions,
   AnalysisResult,
-  QuickRunContextInjectedCounts,
   QuickRunTurnBudget,
 } from '../agent/core/orchestratorTypes';
 import type { ConversationTurn, StreamingUpdate } from '../agent/types';
@@ -17,13 +16,6 @@ import {
 import { applyFinalResultQualityGate } from '../services/finalResultQualityGate';
 import type { AnalysisRunSpec } from './analysisRunSpec';
 import { buildQuickAcknowledgementAnalysisResult } from './quickAcknowledgementDirectAnswer';
-import type {
-  RuntimeQuickEvidenceCounts,
-  RuntimeQuickEvidenceDirectAnswer,
-} from './quickEvidenceDirectAnswer';
-import {
-  buildQuickRunReceipt,
-} from './quickBudget';
 import {
   currentRunManifestAttributionSink,
   resolveRunManifestAttributionSink,
@@ -53,56 +45,6 @@ export function countCompletedQuickConversationTurns(
   turns: ReadonlyArray<Pick<ConversationTurn, 'completed'>>,
 ): number {
   return turns.filter(turn => turn.completed).slice(-3).length;
-}
-
-export function buildQuickDirectEvidenceAnalysisResult(input: {
-  query: string;
-  sessionId: string;
-  options: AnalysisOptions;
-  startedAt: number;
-  analysisRunSpec: AnalysisRunSpec;
-  budget: QuickRunTurnBudget;
-  directAnswer: RuntimeQuickEvidenceDirectAnswer;
-  evidenceCounts: RuntimeQuickEvidenceCounts;
-  previousTurns: ReadonlyArray<Pick<ConversationTurn, 'completed'>>;
-  hypotheses?: AnalysisResult['hypotheses'];
-  contextInjected?: Partial<Omit<QuickRunContextInjectedCounts, 'conversationTurns'>>;
-}): AnalysisResult {
-  recordDirectRuntimeModel({
-    options: input.options,
-    analysisRunSpec: input.analysisRunSpec,
-    model: 'runtime-pre-evidence',
-  });
-  const elapsedMs = Date.now() - input.startedAt;
-  return {
-    sessionId: input.sessionId,
-    success: true,
-    findings: [],
-    hypotheses: input.hypotheses ?? [],
-    conclusion: input.directAnswer.conclusion,
-    conclusionContract: input.directAnswer.conclusionContract,
-    confidence: input.directAnswer.confidence,
-    rounds: 0,
-    totalDurationMs: elapsedMs,
-    quickRun: buildQuickRunReceipt({
-      requestedMode: input.options.analysisMode ?? 'auto',
-      query: input.query,
-      budget: input.budget,
-      actualTurns: 0,
-      elapsedMs,
-      stopReason: 'answered',
-      evidence: {
-        frontendPrequeryInjected: input.analysisRunSpec.traceContext.datasetCount,
-        currentRunDataEnvelopes: input.evidenceCounts.currentRunDataEnvelopes,
-        citedEvidenceRefs: input.evidenceCounts.citedEvidenceRefs,
-      },
-      contextInjected: {
-        conversationTurns: countCompletedQuickConversationTurns(input.previousTurns),
-        ...(input.contextInjected ?? {}),
-      },
-      adaptiveRouting: input.analysisRunSpec.mode.adaptiveRouting,
-    }),
-  };
 }
 
 export function buildQuickDirectAcknowledgementAnalysisResult(input: {

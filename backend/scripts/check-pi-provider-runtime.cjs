@@ -43,6 +43,7 @@ import {
   fauxToolCall,
 } from '@earendil-works/pi-ai';
 import {createPiAgentCoreProviderRuntime} from './src/agentRuntime/engines/pi/piAgentCoreProvider.ts';
+import {takeFinalizationContext} from './src/agentRuntime/analysisFinalizationContext.ts';
 import {
   PI_AGENT_CORE_MODEL_JSON_ENV,
   PiAgentCoreRuntime,
@@ -184,15 +185,42 @@ function createSnapshotFields(overrides = {}) {
   };
 }
 
+function runtimeIntentResponse() {
+  return fauxAssistantMessage(JSON.stringify({
+    schemaVersion: 1,
+    taskKind: 'fact',
+    sceneId: 'general',
+    scope: 'bounded_question',
+    recommendedComplexity: 'quick',
+    deliverable: 'answer',
+    evidenceAccess: 'existing_only',
+  }));
+}
+
+function assertCompletedRuntime(result, conclusion) {
+  try {
+    assert.equal(result.success, true);
+    assert.equal(result.conclusion, conclusion);
+    assert.equal(result.turnIntent?.status, 'resolved');
+    assert.equal(result.completion?.status, 'completed');
+  } finally {
+    takeFinalizationContext(result)?.dispose();
+  }
+}
+
 const firstRuntimeProvider = createRuntimeProvider();
-firstRuntimeProvider.runtimeFaux.setResponses([fauxAssistantMessage('runtime-first')]);
+firstRuntimeProvider.runtimeFaux.setResponses([
+  runtimeIntentResponse(), fauxAssistantMessage('runtime-first'),
+]);
 const firstRuntime = createRuntime(firstRuntimeProvider.loader);
-await firstRuntime.analyze(
+const firstRuntimeResult = await firstRuntime.analyze(
   'Give a concise trace status.',
   'session-real-runtime',
   'trace-pi-real',
   {analysisMode: 'fast'},
 );
+assertCompletedRuntime(firstRuntimeResult, 'runtime-first');
+assert.equal(firstRuntimeProvider.runtimeFaux.state.callCount, 2);
 const runtimeSnapshot = firstRuntime.takeSnapshot(
   'session-real-runtime',
   'trace-pi-real',
@@ -202,19 +230,23 @@ assert.equal(runtimeSnapshot.engineState?.kind, 'pi-agent-core');
 assert.ok(runtimeSnapshot.engineState.pi.opaque?.messageCount > 0);
 
 const resumedRuntimeProvider = createRuntimeProvider();
-resumedRuntimeProvider.runtimeFaux.setResponses([fauxAssistantMessage('runtime-resumed')]);
+resumedRuntimeProvider.runtimeFaux.setResponses([
+  runtimeIntentResponse(), fauxAssistantMessage('runtime-resumed'),
+]);
 const resumedRuntime = createRuntime(resumedRuntimeProvider.loader);
 resumedRuntime.restoreFromSnapshot(
   'session-real-runtime',
   'trace-pi-real',
   runtimeSnapshot,
 );
-await resumedRuntime.analyze(
+const resumedRuntimeResult = await resumedRuntime.analyze(
   'Continue from the snapshot.',
   'session-real-runtime',
   'trace-pi-real',
   {analysisMode: 'fast'},
 );
+assertCompletedRuntime(resumedRuntimeResult, 'runtime-resumed');
+assert.equal(resumedRuntimeProvider.runtimeFaux.state.callCount, 2);
 const resumedSnapshot = resumedRuntime.takeSnapshot(
   'session-real-runtime',
   'trace-pi-real',
@@ -226,8 +258,10 @@ assert.ok(
     runtimeSnapshot.engineState.pi.opaque.messageCount,
 );
 
-resumedRuntimeProvider.runtimeFaux.setResponses([fauxAssistantMessage('private-runtime')]);
-await resumedRuntime.analyze(
+resumedRuntimeProvider.runtimeFaux.setResponses([
+  runtimeIntentResponse(), fauxAssistantMessage('private-runtime'),
+]);
+const privateRuntimeResult = await resumedRuntime.analyze(
   'Analyze with private source context.',
   'session-real-runtime',
   'trace-pi-real',
@@ -237,6 +271,8 @@ await resumedRuntime.analyze(
     codebaseIds: ['private-codebase'],
   },
 );
+assertCompletedRuntime(privateRuntimeResult, 'private-runtime');
+assert.equal(resumedRuntimeProvider.runtimeFaux.state.callCount, 4);
 const privateRuntimeSnapshot = resumedRuntime.takeSnapshot(
   'session-real-runtime',
   'trace-pi-real',
@@ -252,14 +288,37 @@ assert.equal(
   undefined,
 );
 
-async function assertRuntimeAbort(abortRuntime) {
-  const abortRuntimeProvider = createRuntimeProvider({
-    tokensPerSecond: 1,
-    tokenSize: {min: 1, max: 1},
-  });
-  abortRuntimeProvider.runtimeFaux.setResponses([
-    fauxAssistantMessage('this runtime response is deliberately slow'),
-  ]);
+async function withRuntimeDeadline(promise, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), 10_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function assertRuntimeAbort(abortRuntime, phase = 'main') {
+  const abortRuntimeProvider = createRuntimeProvider();
+  let resolveStarted;
+  const started = new Promise(resolve => { resolveStarted = resolve; });
+  let providerSignal;
+  const blockedResponse = async (_context, options) => {
+    providerSignal = options?.signal;
+    assert.ok(providerSignal instanceof AbortSignal);
+    resolveStarted();
+    await new Promise(resolve => {
+      if (providerSignal.aborted) resolve();
+      else providerSignal.addEventListener('abort', resolve, {once: true});
+    });
+    // The native faux transport constructs its own structured aborted message.
+    return fauxAssistantMessage('response interrupted before delivery');
+  };
+  abortRuntimeProvider.runtimeFaux.setResponses(phase === 'main'
+    ? [runtimeIntentResponse(), blockedResponse]
+    : [blockedResponse, fauxAssistantMessage('main must not run')]);
   const runtime = createRuntime(abortRuntimeProvider.loader);
   const analysis = runtime.analyze(
     'Start an abortable analysis.',
@@ -267,19 +326,33 @@ async function assertRuntimeAbort(abortRuntime) {
     'trace-pi-real',
     {analysisMode: 'fast'},
   );
-  for (let index = 0; index < 100 && abortRuntimeProvider.runtimeFaux.state.callCount === 0; index++) {
-    await new Promise(resolve => setTimeout(resolve, 10));
+  try {
+    await withRuntimeDeadline(Promise.race([
+      started,
+      analysis.then(() => { throw new Error('Analysis ended before the expected provider phase'); }),
+    ]), 'Expected provider phase did not start');
+    assert.equal(abortRuntimeProvider.runtimeFaux.state.callCount, phase === 'main' ? 2 : 1);
+    abortRuntime(runtime);
+    const result = await withRuntimeDeadline(analysis, 'Runtime did not settle after abort');
+    try {
+      assert.equal(providerSignal.aborted, true);
+      assert.equal(result.success, false);
+      assert.equal(result.partial, true);
+      assert.equal(result.completion?.status, 'cancelled');
+      assert.equal(result.completion?.reason, 'cancelled');
+      if (phase === 'main') assert.equal(result.turnIntent?.status, 'resolved');
+      assert.equal(abortRuntimeProvider.runtimeFaux.state.callCount, phase === 'main' ? 2 : 1);
+    } finally {
+      takeFinalizationContext(result)?.dispose();
+    }
+  } finally {
+    runtime.abortSession('session-real-abort');
   }
-  assert.equal(abortRuntimeProvider.runtimeFaux.state.callCount, 1);
-  abortRuntime(runtime);
-  const result = await analysis;
-  assert.equal(result.success, false);
-  assert.equal(result.terminationReason, 'timeout');
-  assert.match(result.conclusion, /aborted/i);
 }
 
 await assertRuntimeAbort(runtime => runtime.abortSession('session-real-abort'));
 await assertRuntimeAbort(runtime => runtime.abortActiveRun());
+await assertRuntimeAbort(runtime => runtime.abortSession('session-real-abort'), 'intent');
 const [first, second] = await Promise.all([
   createPiAgentCoreProviderRuntime({model, apiKeyEnv: 'PI_PRIVATE_KEY'}, {PI_PRIVATE_KEY: 'first-secret'}),
   createPiAgentCoreProviderRuntime({model, apiKeyEnv: 'PI_PRIVATE_KEY'}, {PI_PRIVATE_KEY: 'second-secret'}),

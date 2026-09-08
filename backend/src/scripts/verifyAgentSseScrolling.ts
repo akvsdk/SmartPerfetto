@@ -10,14 +10,15 @@ import cors from 'cors';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import {isDeepStrictEqual} from 'node:util';
 import agentRoutes from '../routes/agentRoutes';
 import ragAdminRoutes from '../routes/ragAdminRoutes';
 import skillRoutes from '../routes/skillRoutes';
 import traceProcessorRoutes from '../routes/traceProcessorRoutes';
-import { getTraceProcessorService } from '../services/traceProcessorService';
+import { getTraceProcessorService, type TraceInfo } from '../services/traceProcessorService';
 import { resolveAgentRuntimeSelection } from '../agentRuntime';
 import { getOpenAIRuntimeDiagnostics, hasOpenAICredentials } from '../agentOpenAI';
-import type {ConclusionContract} from '../agent/core/conclusionContract';
+import type {ClaimSemanticsV1, ConclusionContract} from '../agent/core/conclusionContract';
 import type { TraceDataset } from '../agent/core/orchestratorTypes';
 import type {
   SelectionContext,
@@ -33,12 +34,11 @@ import {
 import { writeTraceMetadata } from '../services/traceMetadataStore';
 import {CodeLookupLedger} from '../services/codebase/codeLookupLedger';
 import {hasConcreteCodeReference} from '../services/codebase/codeReferenceContract';
-import {verifySourceClaimBindings} from '../services/codebase/sourceClaimVerifier';
-import {
-  collectMatchedTraceEvidenceRefIdsByClaimId,
-  collectVerifiedTraceOccurrenceRefIdsByClaimId,
-} from '../services/verifier/claimVerificationRunner';
 import type {ClaimVerificationResult} from '../types/claimVerification';
+import type {ClaimSupportV1} from '../types/evidenceContract';
+import type {AnalysisDeliveryAssurance, AnalysisCompletion} from '../types/analysisDelivery';
+import {analysisDeliveryFingerprint} from '../types/analysisDelivery';
+import type {AnalysisTurnIntent} from '../agentRuntime/analysisTurnIntent';
 import {
   privateProjectedSourceEventType,
   successfulCodeLookupToolCounts,
@@ -48,6 +48,8 @@ type CodeAwareMode = 'off' | 'metadata_only' | 'provider_send';
 type SmartAction = 'preview' | 'analyze';
 
 export interface VerifyOptions {
+  /** Optional task facts; literal text checks are transport diagnostics only. */
+  expectation?: AgentSseExpectation;
   tracePath: string;
   referenceTracePath?: string;
   query: string;
@@ -104,7 +106,7 @@ export interface VerifyOptions {
   forbidProcessNarration: boolean;
   /** Optional upper bound for the final analysis_completed conclusion text length. */
   maxAnalysisCompletedConclusionChars?: number;
-  /** Literal text that must appear in a conclusion/analysis_completed event. */
+  /** Exact transport/canary assertion, never natural-language semantic evidence. */
   requiredText: string[];
   /** Literal text that must not appear in a conclusion/analysis_completed event. */
   forbiddenText: string[];
@@ -142,7 +144,8 @@ export interface VerifyOptions {
   tracePairMinimizedTraceSides: TraceSource[];
 }
 
-interface SseSummary {
+export interface SseSummary {
+  terminalAnalysis?: TerminalAnalysisEvidence;
   totalEvents: number;
   terminalEvent?: string;
   /** agentv3 event type counts */
@@ -238,6 +241,232 @@ interface SseSummary {
   skillCallCounts: Record<string, number>;
 }
 
+type FactScalar = string | number | boolean;
+export interface AgentSseExpectedFact {
+  id: string;
+  kind: 'numeric' | 'categorical' | 'identity';
+  columns: string[];
+  verification: 'proved' | 'reference_only';
+  population?: ClaimSemanticsV1['scope']['population'];
+  value?: FactScalar;
+  unit?: string;
+  /** Suite-owned read-only query. Results never enter the model context. */
+  oracle?: {sql: string; column: string; unit?: string;
+    anchorMatch?: {startTs?: string; upid?: string}};
+}
+
+export interface AgentSseExpectation {
+  schemaVersion: 1;
+  intent: Partial<Pick<AnalysisTurnIntent, 'sceneId' | 'taskKind' | 'scope' | 'deliverable' | 'evidenceAccess'>>;
+  facts: AgentSseExpectedFact[];
+  /** Explicitly unmeasured facets, such as source recommendation wording. */
+  uncoveredFacets?: string[];
+}
+
+export interface TerminalAnalysisEvidence {
+  success?: boolean;
+  conclusion?: string;
+  completion?: AnalysisCompletion;
+  turnIntent?: AnalysisTurnIntent;
+  deliveryAssurance?: AnalysisDeliveryAssurance;
+  conclusionContract?: ConclusionContract;
+  claimVerificationResult?: ClaimVerificationResult;
+  claimSupport?: ClaimSupportV1[];
+}
+
+export type AgentSseOracleRows = Record<string, Array<Record<string, unknown>>>;
+
+/** A returned trace ID is not a successful processor readiness probe. */
+export function assertVerificationTraceReady(traceId: string, trace: Pick<TraceInfo, 'status' | 'error'> | undefined): void {
+  if (trace?.status !== 'ready') {
+    throw new Error(`Trace ${traceId} is not ready (${trace?.status ?? 'missing'}): ${trace?.error ?? 'processor readiness was not established'}`);
+  }
+}
+
+/** Admit the entire pair before oracle queries, metadata publication or analysis. */
+export async function loadVerificationTracePair(input: {
+  service: Pick<ReturnType<typeof getTraceProcessorService>, 'loadTraceFromFilePath' | 'getTrace'>;
+  tracePath: string;
+  referenceTracePath?: string;
+  onLoaded?: (traceId: string, side: 'current' | 'reference') => void;
+}): Promise<{traceId: string; referenceTraceId?: string}> {
+  const load = async (filePath: string, side: 'current' | 'reference') => {
+    const id = await input.service.loadTraceFromFilePath(filePath);
+    // Ownership is reported before admission so a rejected pair is still cleaned up.
+    input.onLoaded?.(id, side);
+    assertVerificationTraceReady(id, input.service.getTrace(id));
+    return id;
+  };
+  const traceId = await load(input.tracePath, 'current');
+  const referenceTraceId = input.referenceTracePath ? await load(input.referenceTracePath, 'reference') : undefined;
+  return {traceId, ...(referenceTraceId ? {referenceTraceId} : {})};
+}
+
+export function taskAcceptanceStatus(observedChecksPassed: boolean, uncoveredFacets: readonly string[]): {
+  observedChecksPassed: boolean; semanticAcceptance: 'PASSED' | 'FAILED' | 'INCONCLUSIVE'; completeAcceptance: boolean;
+} {
+  return {observedChecksPassed,
+    semanticAcceptance: !observedChecksPassed ? 'FAILED' : uncoveredFacets.length ? 'INCONCLUSIVE' : 'PASSED',
+    completeAcceptance: observedChecksPassed && uncoveredFacets.length === 0};
+}
+
+/** Closed configuration schema: misspelled expectations must not silently disappear. */
+export function parseAgentSseExpectation(value: unknown): AgentSseExpectation {
+  const object = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+  const keys = (v: Record<string, unknown>, allowed: string[]) => Object.keys(v).every(key => allowed.includes(key));
+  const strings = (v: unknown): v is string[] => Array.isArray(v) && v.length > 0 && v.every(s => typeof s === 'string' && s.trim());
+  const scalar = (v: unknown) => typeof v === 'string' || typeof v === 'boolean' || typeof v === 'number' && Number.isFinite(v);
+  const fail = (): never => {throw new Error('Invalid --expectation-json: expected agent SSE expectation schemaVersion 1');};
+  if (!object(value) || !keys(value, ['schemaVersion', 'intent', 'facts', 'uncoveredFacets']) || value.schemaVersion !== 1 ||
+      !object(value.intent) || !keys(value.intent, ['sceneId', 'taskKind', 'scope', 'deliverable', 'evidenceAccess']) ||
+      !Object.keys(value.intent).length || !Array.isArray(value.facts) || !value.facts.length ||
+      (value.uncoveredFacets !== undefined && !strings(value.uncoveredFacets))) return fail();
+  const intentValues: Record<string, string[]> = {taskKind: ['acknowledgement', 'fact', 'investigation', 'comparison'],
+    scope: ['bounded_question', 'scene_wide'], deliverable: ['answer', 'report'], evidenceAccess: ['existing_only', 'read_new']};
+  for (const [key, item] of Object.entries(value.intent)) {
+    if (typeof item !== 'string' || !item.trim() || (intentValues[key] && !intentValues[key].includes(item))) return fail();
+  }
+  const ids = new Set<string>();
+  for (const fact of value.facts) {
+    if (!object(fact) || !keys(fact, ['id', 'kind', 'columns', 'verification', 'population', 'value', 'unit', 'oracle']) ||
+        typeof fact.id !== 'string' || !fact.id.trim() || ids.has(fact.id) || !strings(fact.columns) ||
+        !['numeric', 'categorical', 'identity'].includes(String(fact.kind)) ||
+        !['proved', 'reference_only'].includes(String(fact.verification)) ||
+        (fact.population !== undefined && !['cited_rows', 'selected_interval', 'process_instance', 'trace', 'codebase'].includes(String(fact.population))) ||
+        (fact.value !== undefined && !scalar(fact.value)) || (fact.unit !== undefined && (typeof fact.unit !== 'string' || !fact.unit.trim())) ||
+        (fact.value === undefined && fact.oracle === undefined)) return fail();
+    ids.add(fact.id);
+    if (fact.oracle !== undefined) {
+      const oracle = fact.oracle;
+      if (!object(oracle) || !keys(oracle, ['sql', 'column', 'unit', 'anchorMatch']) ||
+          typeof oracle.sql !== 'string' || !oracle.sql.trim() || typeof oracle.column !== 'string' || !oracle.column.trim() ||
+          (oracle.unit !== undefined && (typeof oracle.unit !== 'string' || !oracle.unit.trim())) ||
+          (oracle.anchorMatch !== undefined && (!object(oracle.anchorMatch) || !keys(oracle.anchorMatch, ['startTs', 'upid']) ||
+            !Object.values(oracle.anchorMatch).every(v => typeof v === 'string' && v.trim())))) return fail();
+      // The harness accepts SELECTs and module imports, never a mutation script.
+      const query = oracle.sql.replace(/^(?:\s*INCLUDE\s+PERFETTO\s+MODULE\s+[\w.]+\s*;)*/i, '').replace(/;\s*$/, '');
+      if (!/^\s*(SELECT|WITH)\b/i.test(query) || query.includes(';') ||
+          /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|REPLACE)\b/i.test(oracle.sql)) return fail();
+    }
+  }
+  return structuredClone(value) as unknown as AgentSseExpectation;
+}
+
+/** Only declared units are converted; column names never imply a unit. */
+function factValueEquals(actual: unknown, actualUnit: string | undefined, expected: unknown, expectedUnit: string | undefined): boolean {
+  const numeric = (value: unknown): number | undefined => {
+    const number = typeof value === 'number' ? value : typeof value === 'string' && /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(value)
+      ? Number(value) : undefined;
+    return number !== undefined && Number.isFinite(number) && Math.abs(number) <= Number.MAX_SAFE_INTEGER ? number : undefined;
+  };
+  if (actualUnit === expectedUnit && actual === expected) return true;
+  const left = numeric(actual), right = numeric(expected);
+  if (left === undefined || right === undefined || !actualUnit || !expectedUnit) return false;
+  if (actualUnit === expectedUnit) return left === right;
+  const timeScale: Record<string, number> = {ns: 1, us: 1_000, ms: 1_000_000, s: 1_000_000_000};
+  if (['frame', 'frames'].includes(actualUnit) && ['frame', 'frames'].includes(expectedUnit)) return left === right;
+  return Boolean(actualUnit && expectedUnit && timeScale[actualUnit] && timeScale[expectedUnit] &&
+    left * timeScale[actualUnit] === right * timeScale[expectedUnit]);
+}
+
+/** Transport projections do not reissue capture witnesses. v2 proves the retained raw cells. */
+export function evaluateAgentSseExpectation(input: {
+  terminal?: TerminalAnalysisEvidence; expectation: AgentSseExpectation; traceId: string; oracleRows?: AgentSseOracleRows;
+}): {checks: Record<string, boolean>; facts: Record<string, {matched: boolean; proposition: 'proved' | 'unknown'}>; uncoveredFacets: string[]} {
+  const {terminal, expectation, traceId} = input;
+  const claims = terminal?.conclusionContract?.claims ?? [];
+  const verifier = terminal?.claimVerificationResult;
+  const assurance = terminal?.deliveryAssurance;
+  const completion = terminal?.completion;
+  const checks: Record<string, boolean> = {
+    taskCompleted: terminal?.success === true && completion?.status === 'completed' &&
+      completion.conclusionFingerprint === analysisDeliveryFingerprint(terminal?.conclusion ?? '') &&
+      Boolean(completion.runId && completion.attemptId && completion.candidateRef),
+    deliveryCompletionPassed: assurance?.entry === 'new_finalization' && assurance.completion === 'passed',
+    deliveryClaimsPassed: assurance?.claims === 'passed',
+    deliveryIdentityPassed: assurance?.identity === 'passed' || assurance?.identity === 'not_applicable',
+    deliverySourcePassed: assurance?.source === 'passed' || assurance?.source === 'not_applicable',
+    deliveryReportPassed: expectation.intent.deliverable === 'report'
+      ? assurance?.report === 'passed' : assurance?.report === 'passed' || assurance?.report === 'not_applicable',
+    intentResolved: terminal?.turnIntent?.status === 'resolved',
+    originalClaimsVerified: verifier?.schemaVersion === 'claim_verifier@2' && verifier.passed === true &&
+      verifier.status === 'passed' && verifier.unsupportedClaimCount === 0 && claims.length > 0 &&
+      verifier.claimResults.length === claims.length && new Set(claims.map(claim => claim.id)).size === claims.length &&
+      claims.every(claim => Boolean(claim.id) && verifier.claimResults.filter(result => result.claimId === claim.id &&
+        (result.status === 'verified' || result.status === 'inference')).length === 1),
+  };
+  for (const [key, value] of Object.entries(expectation.intent)) checks[`intent:${key}`] = terminal?.turnIntent?.[key as keyof AnalysisTurnIntent] === value;
+  const facts: Record<string, {matched: boolean; proposition: 'proved' | 'unknown'}> = Object.create(null);
+  for (const fact of expectation.facts) {
+    const matches = claims.some(claim => {
+      const semantics = claim.semantics;
+      if (claim.kind !== fact.kind || !semantics || semantics.polarity !== 'affirmed' || semantics.discourse !== 'asserted' ||
+          semantics.modality !== 'certain' || (fact.population && semantics.scope.population !== fact.population)) return false;
+      const proof = verifier?.claimResults.find(result => result.claimId === claim.id);
+      const support = terminal?.claimSupport?.filter(item => item.claimId === claim.id);
+      if (support?.length !== 1 || support[0].text !== claim.text || support[0].kind !== claim.kind ||
+          !isDeepStrictEqual(support[0].semantics, semantics)) return false;
+      if (fact.verification === 'proved' && (proof?.status !== 'verified' || proof.deterministicProof?.status !== 'proved' ||
+          proof.deterministicProof.kind !== 'numeric_cell' ||
+          proof.propositionCoverage?.status !== 'complete' || proof.propositionCoverage.uncovered.length > 0)) return false;
+      return support[0].anchors.some(anchor => {
+        if (anchor.missing || anchor.context.traceId !== traceId || anchor.context.traceSide !== 'current') return false;
+        if (fact.verification === 'proved' && (!proof?.deterministicProof?.anchorIds.includes(anchor.anchorId) ||
+            !proof.deterministicProof.evidenceRefIds.includes(anchor.evidenceRefId))) return false;
+        return anchor.cells?.some(cell => {
+          if (!fact.columns.includes(cell.column) || cell.actualValue === undefined || cell.actualValue === null ||
+              (cell.value !== undefined && cell.value !== cell.actualValue)) return false;
+          const originalRefs = fact.kind === 'numeric' ? semantics.scope.subjectRefs ?? [] : claim.references;
+          if (!originalRefs.some(ref => {
+            const identifiers = [[ref.evidenceRefId, anchor.evidenceRefId], [ref.artifactId, anchor.context.artifactId],
+              [ref.sourceArtifactId, anchor.context.artifactId], [ref.sourceToolCallId, anchor.context.sourceToolCallId],
+              [ref.sourceRef, cell.sourceRef]].filter(([id]) => id !== undefined);
+            return ref.column === cell.column && identifiers.length > 0 && identifiers.every(([id, actual]) => id === actual) &&
+              (ref.rowIndex === undefined || ref.rowIndex === cell.rowIndex) &&
+              (ref.rowSelector === undefined || isDeepStrictEqual(ref.rowSelector, cell.rowSelector)) &&
+              (ref.value === undefined || ref.value === cell.actualValue);
+          })) return false;
+          if (!proof?.referenceCells?.some(ref => ref.anchorId === anchor.anchorId && ref.column === cell.column && ref.status === 'matched')) return false;
+          if (fact.kind === 'numeric' && (semantics.predicate !== 'numeric.cell' || semantics.numeric?.operator !== 'eq')) return false;
+          const values = fact.oracle ? input.oracleRows?.[fact.id] ?? [] : [{value: fact.value}];
+          return values.some(row => {
+            const expected = fact.oracle ? row[fact.oracle.column] : row.value;
+            const unit = fact.oracle?.unit ?? fact.unit;
+            if (fact.value !== undefined && !factValueEquals(expected, unit, fact.value, fact.unit)) return false;
+            if (fact.oracle?.anchorMatch?.startTs && String(anchor.timeRange?.startTs) !== String(row[fact.oracle.anchorMatch.startTs])) return false;
+            if (fact.oracle?.anchorMatch?.upid && anchor.identity?.upid !== row[fact.oracle.anchorMatch.upid]) return false;
+            return fact.kind === 'numeric'
+              ? factValueEquals(semantics.numeric?.value, semantics.numeric?.unit, expected, unit) &&
+                factValueEquals(cell.actualValue, cell.unit ?? fact.unit, expected, unit)
+              : cell.actualValue === expected;
+          });
+        });
+      });
+    });
+    facts[fact.id] = {matched: matches, proposition: matches && fact.verification === 'proved' ? 'proved' : 'unknown'};
+    checks[`fact:${fact.id}`] = matches;
+  }
+  return {checks, facts, uncoveredFacets: [...(expectation.uncoveredFacets ?? []),
+    ...expectation.facts.filter(fact => fact.verification === 'reference_only').map(fact => `${fact.id}: proposition proof unavailable`)]};
+}
+
+export async function collectAgentSseOracleRows(expectation: AgentSseExpectation, query: (sql: string) => Promise<{
+  columns: string[]; rows: unknown[][]; error?: string;
+}>): Promise<AgentSseOracleRows> {
+  const out: AgentSseOracleRows = Object.create(null);
+  const queried = new Map<string, Awaited<ReturnType<typeof query>>>();
+  for (const fact of expectation.facts) {
+    if (!fact.oracle) continue;
+    let result = queried.get(fact.oracle.sql);
+    if (!result) {result = await query(fact.oracle.sql); queried.set(fact.oracle.sql, result);}
+    if (result.error || !result.columns.includes(fact.oracle.column) || !result.rows.length || result.rows.length > 100_000) {
+      throw new Error(`Task fact oracle unavailable: ${fact.id}`);
+    }
+    out[fact.id] = result.rows.map(row => Object.fromEntries(result.columns.map((column, index) => [column, row[index]])));
+  }
+  return out;
+}
+
 export function buildFollowUpVerificationChecks(
   followUpSse: SseSummary,
   options: Pick<
@@ -313,6 +542,7 @@ function printUsage(): void {
   console.log('  --trace <path>                    Trace path (default: ../Trace/real/android-scroll-customer/trace.pftrace)');
   console.log('  --reference-trace <path>          Reference trace path for raw dual-trace comparison');
   console.log('  --query <text>                    Analyze query (default: 分析滑动性能)');
+  console.log('  --expectation-json <json|@file>   Closed v1 task intent/facts with independent trace oracles');
   console.log('  --timeout-ms <number>             SSE timeout in ms (default: 600000)');
   console.log('  --mode <fast|full|auto|smart>     Override analysisMode, or use smart as shorthand for --preset smart');
   console.log('  --preset <smart>                  Forward preset to the backend');
@@ -341,11 +571,11 @@ function printUsage(): void {
   console.log('  --forbid-process-narration         Fail if final text contains process narration like entering phases');
   console.log('  --max-analysis-completed-conclusion-chars <number>');
   console.log('                                      Fail if analysis_completed conclusion text exceeds this length');
-  console.log('  --require-text <text>              Require literal text in conclusion/analysis_completed; repeatable');
-  console.log('  --forbid-text <text>               Forbid literal text in conclusion/analysis_completed; repeatable');
+  console.log('  --require-text <text>              Exact transport/canary diagnostic only; not semantic correctness');
+  console.log('  --forbid-text <text>               Exact transport/canary diagnostic only; not semantic correctness');
   console.log('  --follow-up-query <text>           Run a second turn against the same session');
   console.log('  --follow-up-mode <fast|full|auto>  Follow-up mode (default: auto)');
-  console.log('  --follow-up-require-text <text>    Require literal text in follow-up conclusion; repeatable');
+  console.log('  --follow-up-require-text <text>    Exact follow-up transport diagnostic only; repeatable');
   console.log('  --follow-up-forbid-tool <name>     Fail if follow-up dispatches this tool; repeatable');
   console.log('  --forbid-degraded-fallback <name>  Fail if a degraded event with this fallback is emitted; repeatable');
   console.log('  --require-tool <name>              Require an agent_task_dispatched tool call; repeatable');
@@ -450,6 +680,14 @@ export function parseArgs(argv: string[]): VerifyOptions {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = argv[i + 1];
+
+    if (arg === '--expectation-json') {
+      if (!next) throw new Error('--expectation-json requires a value');
+      options.expectation = parseAgentSseExpectation(JSON.parse(next.startsWith('@')
+        ? fs.readFileSync(path.resolve(process.cwd(), next.slice(1)), 'utf8') : next));
+      i += 1;
+      continue;
+    }
 
     if (arg === '--help') {
       printUsage();
@@ -1578,13 +1816,25 @@ async function collectSseSummary(
           }
 
           if (event === 'analysis_completed') {
+            if (payload) {
+              summary.terminalAnalysis = {
+                success: payload.success as boolean | undefined,
+                conclusion: payload.conclusion as string | undefined,
+                completion: payload.completion as TerminalAnalysisEvidence['completion'],
+                turnIntent: payload.turnIntent as TerminalAnalysisEvidence['turnIntent'],
+                deliveryAssurance: payload.deliveryAssurance as TerminalAnalysisEvidence['deliveryAssurance'],
+                conclusionContract: payload.conclusionContract as TerminalAnalysisEvidence['conclusionContract'],
+                claimVerificationResult: payload.claimVerificationResult as TerminalAnalysisEvidence['claimVerificationResult'],
+                claimSupport: payload.claimSupport as TerminalAnalysisEvidence['claimSupport'],
+              };
+            }
             if (typeof payload?.conclusion === 'string') {
               recordTextChecks(summary, payload.conclusion, textChecks);
               recordConclusionEvidence(summary, payload.conclusion, 'analysis_completed');
             }
             recordClaimVerifierSummary(summary, payload);
             const conclusionContract = asRecord(payload?.conclusionContract);
-            const sourceUseDecision = asRecord(conclusionContract?.sourceUseDecision);
+            const sourceUseDecision = asRecord(payload?.sourceUseDecision) ?? asRecord(conclusionContract?.sourceUseDecision);
             if (typeof sourceUseDecision?.status === 'string') {
               summary.analysisCompletedSourceUseStatus = sourceUseDecision.status;
             }
@@ -1594,32 +1844,21 @@ async function collectSseSummary(
             if (Array.isArray(conclusionContract?.sourceClaimBindings)) {
               summary.analysisCompletedSourceBindingCount = conclusionContract.sourceClaimBindings.length;
             }
-            const claimVerificationResult = asRecord(payload?.claimVerificationResult);
-            if (
-              conclusionContract?.schemaVersion === 'conclusion_contract_v1' &&
-              sourceUseDecision?.schemaVersion === 'source_use_decision@1' &&
-              claimVerificationResult?.schemaVersion === 'claim_verifier@1'
-            ) {
-              const typedContract = conclusionContract as unknown as ConclusionContract;
-              const typedClaimVerification = claimVerificationResult as unknown as ClaimVerificationResult;
-              const sourceClaimVerification = verifySourceClaimBindings({
-                conclusionContract: typedContract,
-                actualSourceUseDecision: typedContract.sourceUseDecision,
-                matchedTraceEvidenceRefIdsByClaimId:
-                  collectMatchedTraceEvidenceRefIdsByClaimId(typedClaimVerification),
-                verifiedTraceOccurrenceRefIdsByClaimId:
-                  collectVerifiedTraceOccurrenceRefIdsByClaimId(typedClaimVerification),
-              });
+            const sourceClaimVerification = asRecord(payload?.sourceClaimVerificationResult);
+            if (sourceClaimVerification?.schemaVersion === 'source_claim_verifier@1' &&
+                Array.isArray(sourceClaimVerification.bindings) && Array.isArray(sourceUseDecision?.references)) {
               const returnedReferenceIds = new Set(
-                typedContract.sourceUseDecision?.references.map(reference => reference.id) ?? [],
+                sourceUseDecision.references.map(reference => asRecord(reference)?.id),
               );
-              summary.analysisCompletedSourceClaimVerifierStatus = sourceClaimVerification.status;
+              summary.analysisCompletedSourceClaimVerifierStatus = String(sourceClaimVerification.status);
               summary.analysisCompletedSourceMechanismStatuses = sourceClaimVerification.bindings
-                .map(binding => binding.mechanismStatus);
+                .map(binding => String(asRecord(binding)?.mechanismStatus));
               summary.analysisCompletedSourceReferenceMembershipPassed =
                 sourceClaimVerification.bindings.length > 0 &&
-                sourceClaimVerification.bindings.every(binding =>
-                  binding.sourceReferenceIds.every(referenceId => returnedReferenceIds.has(referenceId)));
+                sourceClaimVerification.bindings.every(binding => {
+                  const refs = asRecord(binding)?.sourceReferenceIds;
+                  return Array.isArray(refs) && refs.length > 0 && refs.every(ref => returnedReferenceIds.has(ref));
+                });
             }
             if (typeof payload?.reportUrl === 'string') {
               summary.analysisCompletedReportUrl = payload.reportUrl;
@@ -1963,7 +2202,13 @@ async function main(): Promise<void> {
 
   try {
     const setup = await setupAnalysisContext(baseUrl, options);
-    traceId = await traceProcessorService.loadTraceFromFilePath(options.tracePath);
+    await loadVerificationTracePair({service: traceProcessorService, tracePath: options.tracePath,
+      referenceTracePath: options.referenceTracePath, onLoaded: (id, side) => {
+        if (side === 'current') traceId = id;
+        else referenceTraceId = id;
+      }});
+    const oracleRows = options.expectation ? await collectAgentSseOracleRows(options.expectation,
+      sql => traceProcessorService.query(traceId, sql)) : undefined;
     await writeTraceMetadata({
       id: traceId,
       filename: path.basename(options.tracePath),
@@ -1978,7 +2223,6 @@ async function main(): Promise<void> {
 
     let tracePairContext: TracePairContext | undefined;
     if (options.referenceTracePath) {
-      referenceTraceId = await traceProcessorService.loadTraceFromFilePath(options.referenceTracePath);
       await writeTraceMetadata({
         id: referenceTraceId,
         filename: path.basename(options.referenceTracePath),
@@ -2033,6 +2277,9 @@ async function main(): Promise<void> {
       requiredText: options.requiredText,
       forbiddenText: options.forbiddenText,
     });
+    const taskVerification = options.expectation ? evaluateAgentSseExpectation({
+      terminal: sse.terminalAnalysis, expectation: options.expectation, traceId, oracleRows,
+    }) : undefined;
     const auditedLookupCounts = successfulCodeLookupToolCounts(
       CodeLookupLedger.restore(sessionId, 12_000, 2).getEntries(),
     );
@@ -2051,13 +2298,13 @@ async function main(): Promise<void> {
     const capabilityLimitedRuntime = options.allowCapabilityLimitedRuntime;
     const requiredChecks = {
       hasProgressEvents: sse.progressCount > 0,
-      ...(smartMode || capabilityLimitedRuntime || isQuickMode ? {} : { hasAgentResponses: sse.agentResponseCount > 0 }),
+      ...(smartMode || capabilityLimitedRuntime || isQuickMode || options.expectation ? {} : { hasAgentResponses: sse.agentResponseCount > 0 }),
       hasTerminalConclusionPayload: sse.conclusionCount > 0 || sse.analysisCompletedConclusionChars > 0,
       hasAnalysisCompletedEvent: sse.terminalEvent === 'analysis_completed' || sse.terminalEvent === 'end',
       hasNoSseErrors: sse.errorEvents.length === 0,
     };
 
-    const fullModeChecks = smartMode || capabilityLimitedRuntime
+    const fullModeChecks = smartMode || capabilityLimitedRuntime || options.expectation
       ? {}
       : {
         ...(options.allowNoDataEnvelopes ? {} : { hasDataEnvelopes: sse.dataEnvelopeCount > 0 }),
@@ -2075,8 +2322,8 @@ async function main(): Promise<void> {
     // Catches regressions where a fast CLI flag silently falls back to the full pipeline (or vice versa).
     const modeExpectationChecks: Record<string, boolean> = {};
     if (!capabilityLimitedRuntime && options.analysisMode === 'fast') {
-      modeExpectationChecks.fastModeHonored = isQuickMode;
-    } else if (!capabilityLimitedRuntime && options.analysisMode === 'full') {
+      modeExpectationChecks.fastModeHonored = options.expectation ? sse.quickRun?.resolvedMode === 'quick' : isQuickMode;
+    } else if (!capabilityLimitedRuntime && options.analysisMode === 'full' && !options.expectation) {
       modeExpectationChecks.fullModeHonored = !isQuickMode;
     }
     const conclusionEvidenceChecks = options.requireConclusionEvidence
@@ -2165,6 +2412,7 @@ async function main(): Promise<void> {
       : undefined;
     const externalIssueChecks = externalIssueVerification?.checks ?? {};
     const checks = {
+      ...taskVerification?.checks,
       ...requiredChecks,
       ...fullModeChecks,
       ...dualTraceChecks,
@@ -2186,7 +2434,8 @@ async function main(): Promise<void> {
       ...quickRunChecks,
       ...externalIssueChecks,
     };
-    let passed = Object.values(requiredChecks).every(Boolean)
+    let passed = Object.values(taskVerification?.checks ?? {}).every(Boolean)
+      && Object.values(requiredChecks).every(Boolean)
       && Object.values(modeExpectationChecks).every(Boolean)
       && Object.values(dualTraceChecks).every(Boolean)
       && Object.values(conclusionEvidenceChecks).every(Boolean)
@@ -2281,6 +2530,10 @@ async function main(): Promise<void> {
       sessionId,
       checks,
       passed,
+      taskVerification,
+      passedMeaning: 'observed_transport_and_task_checks_only',
+      ...taskAcceptanceStatus(passed, taskVerification?.uncoveredFacets ?? ['task semantics not evaluated']),
+      exactTextChecksPurpose: 'transport_or_canary_only_not_semantic_correctness',
       summary: sse,
       externalIssue: externalIssueVerification?.summary,
       followUp: followUpOutput,

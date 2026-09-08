@@ -20,6 +20,8 @@ import {
   type ConversationSourceEnrichmentState,
 } from './conversationSourceEnrichmentCoordinator';
 import type {PrimaryConversationSourceUse} from '../runtime/conversationSourcePolicy';
+import {buildAnalysisContextAuthorizationFingerprint, assertCurrentAnalysisContextAuthorization} from '../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../services/scopedKnowledgeStore';
 
 export type {
   ConversationEvidenceRef,
@@ -202,6 +204,8 @@ export class ConversationSessionService {
   private readonly listeners = new Map<string, Set<(event: ConversationSessionEvent) => void>>();
   private readonly sourceEnrichmentCoordinator: ConversationSourceEnrichmentCoordinator;
   private nextEventSeqId = 0;
+  private readonly cancellationRequested = new WeakSet<ConversationRun>();
+  private readonly runAuthorizationChecks = new WeakMap<ConversationRun, () => void>();
 
   constructor(deps: ConversationSessionServiceDeps) {
     this.createRuntime = deps.createRuntime;
@@ -354,12 +358,12 @@ export class ConversationSessionService {
       history: session.history.map((message) => ({...message})),
       traceContext: session.traceContext,
       selectionContext: input.runtimeOptions?.selectionContext,
-      onUpdate: (update) => this.publish(session!.sessionId, {
-        type: 'runtime_update',
-        sessionId: session!.sessionId,
-        runId,
-        update,
-      }),
+      onUpdate: (update) => {
+        if (!this.isCurrentRun(session!, run) || this.cancellationRequested.has(run)) return;
+        this.runAuthorizationChecks.get(run)?.();
+        if (!this.isCurrentRun(session!, run) || this.cancellationRequested.has(run)) return;
+        this.publish(session!.sessionId, {type: 'runtime_update', sessionId: session!.sessionId, runId, update});
+      },
     };
     const run: ConversationRun = {
       runId,
@@ -370,6 +374,14 @@ export class ConversationSessionService {
       events: [],
       sourceUseMode,
     };
+    const authorizationSelection = {codeAwareMode: session.codeAwareMode,
+      codebaseIds: session.codebaseIds ? [...session.codebaseIds] : undefined,
+      knowledgeSourceIds: session.knowledgeSourceIds ? [...session.knowledgeSourceIds] : undefined};
+    const authorizationScope = resolveKnowledgeScope(session);
+    const authorizationFingerprint = input.analysisContextFingerprint ?? input.runtimeOptions?.analysisContextFingerprint ??
+      session.analysisContextFingerprint ?? buildAnalysisContextAuthorizationFingerprint(authorizationSelection, authorizationScope);
+    this.runAuthorizationChecks.set(run, () => assertCurrentAnalysisContextAuthorization(
+      authorizationSelection, authorizationScope, authorizationFingerprint));
     session.activeRun = run;
     session.runs.push(run);
     try {
@@ -388,59 +400,53 @@ export class ConversationSessionService {
       }
       throw error;
     }
-    this.publish(session.sessionId, {
-      type: 'run_started',
-      sessionId: session.sessionId,
-      runId,
-    });
-    session.history.push({
-      role: 'user',
-      content: query,
-      ...(sourceUseMode === 'explicit' ? {sourceDerived: true} : {}),
-    });
+    if (this.isCurrentRun(session, run) && !this.cancellationRequested.has(run)) {
+      this.publish(session.sessionId, {type: 'run_started', sessionId: session.sessionId, runId});
+    }
+    if (this.isCurrentRun(session, run) && !this.cancellationRequested.has(run)) {
+      session.history.push({role: 'user', content: query, ...(sourceUseMode === 'explicit' ? {sourceDerived: true} : {})});
+    }
 
     let runtimeCompletion: Promise<ConversationRuntimeOutcome>;
     try {
-      runtimeCompletion = session.runtime.run(runtimeInput);
+      if (this.isCurrentRun(session, run) && !this.cancellationRequested.has(run)) this.runAuthorizationChecks.get(run)?.();
+      runtimeCompletion = this.isCurrentRun(session, run) && !this.cancellationRequested.has(run)
+        ? session.runtime.run(runtimeInput) : Promise.resolve({kind: 'cancelled', message: ''});
     } catch (error) {
       runtimeCompletion = Promise.reject(error);
     }
     const completion = runtimeCompletion
       .then((outcome) => {
-        this.completeRun(session!, run, outcome);
-        const enrichmentPending = Boolean(
-          session!.runtime.runSourceEnrichment &&
-          session!.runtime.shouldStartSourceEnrichment?.(runtimeInput, outcome),
-        );
-        run.sourceEnrichmentPending = enrichmentPending;
+        const enrichmentPending = outcome.kind !== 'cancelled' && this.isCurrentRun(session!, run) &&
+          !this.cancellationRequested.has(run) && Boolean(session!.runtime.runSourceEnrichment &&
+            session!.runtime.shouldStartSourceEnrichment?.(runtimeInput, outcome));
+        const accepted = this.completeRun(session!, run, outcome);
+        if (!accepted) return {kind: 'cancelled' as const, message: ''};
+        run.sourceEnrichmentPending = accepted.kind !== 'cancelled' && enrichmentPending;
         this.settleRun(session!, run);
-        this.publish(session!.sessionId, {
-          type: 'run_completed',
-          sessionId: session!.sessionId,
-          runId,
-          outcome,
-          enrichmentPending,
-        });
-        if (enrichmentPending) {
+        if (!this.isLatestRun(session!, run)) return accepted;
+        this.publish(session!.sessionId, {type: 'run_completed', sessionId: session!.sessionId, runId,
+          outcome: accepted, enrichmentPending: Boolean(run.sourceEnrichmentPending)});
+        if (run.sourceEnrichmentPending && this.isLatestRun(session!, run)) {
           queueMicrotask(() => {
-            if (!run.sourceEnrichmentPending || !session!.runtime.runSourceEnrichment) return;
+            if (!this.isLatestRun(session!, run) || !run.sourceEnrichmentPending || !session!.runtime.runSourceEnrichment) return;
             run.sourceEnrichment = this.sourceEnrichmentCoordinator.start({
               sessionId: session!.sessionId,
               runId,
-              execute: () => session!.runtime.runSourceEnrichment!({
-                ...runtimeInput,
-                primaryOutcome: outcome,
-              }),
-              cancel: () => session!.runtime.cancelSourceEnrichment?.(
-                session!.sessionId,
-                runId,
-              ) ?? Promise.resolve(),
+              execute: () => {
+                if (!this.isLatestRun(session!, run) || !run.sourceEnrichmentPending) throw new DOMException('Conversation run changed', 'AbortError');
+                this.runAuthorizationChecks.get(run)?.();
+                return session!.runtime.runSourceEnrichment!({...runtimeInput, primaryOutcome: accepted});
+              },
+              cancel: () => session!.runtime.cancelSourceEnrichment?.(session!.sessionId, runId) ?? Promise.resolve(),
             });
           });
         }
-        return outcome;
+        return accepted;
       })
       .catch((error: unknown) => {
+        if (!this.isCurrentRun(session!, run)) return {kind: 'cancelled' as const, message: ''};
+        if (this.cancellationRequested.has(run)) return this.settleCancelledRun(session!, run);
         const message = error instanceof Error ? error.message : String(error);
         run.status = 'failed';
         run.error = message;
@@ -448,15 +454,10 @@ export class ConversationSessionService {
         session!.status = 'failed';
         session!.error = message;
         session!.lastActivityAt = run.completedAt;
-        if (session!.activeRun?.runId === run.runId) {
-          session!.activeRun = undefined;
-        }
+        session!.activeRun = undefined;
         this.settleRun(session!, run);
-        this.publish(session!.sessionId, {
-          type: 'run_failed',
-          sessionId: session!.sessionId,
-          runId,
-          error: message,
+        if (this.isLatestRun(session!, run)) this.publish(session!.sessionId, {
+          type: 'run_failed', sessionId: session!.sessionId, runId, error: message,
         });
         throw error;
       });
@@ -491,17 +492,18 @@ export class ConversationSessionService {
         completedRun?.sourceEnrichmentPending ||
         completedRun?.sourceEnrichment?.status === 'running'
       ) {
-        await this.sourceEnrichmentCoordinator.cancel(runId);
         completedRun.sourceEnrichmentPending = false;
+        await this.sourceEnrichmentCoordinator.cancel(runId);
         return completedRun.outcome ?? {kind: 'cancelled', message: ''};
       }
       throw new Error(`Active conversation run not found: ${runId}`);
     }
-    await session.runtime.cancel(sessionId, runId);
+    this.cancellationRequested.add(run);
+    const cancellation = Promise.resolve().then(() => session.runtime.cancel(sessionId, runId));
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        run.completion,
+        cancellation.then(() => run.completion),
         new Promise<never>((_, reject) => {
           timeout = setTimeout(
             () => reject(new Error(`Conversation cancellation did not settle within ${this.cancelSettleTimeoutMs}ms`)),
@@ -512,6 +514,7 @@ export class ConversationSessionService {
       ]);
     } finally {
       if (timeout) clearTimeout(timeout);
+      if (this.isCurrentRun(session, run)) this.settleCancelledRun(session, run);
     }
   }
 
@@ -553,6 +556,7 @@ export class ConversationSessionService {
         }
         const activeRun = session.activeRun;
         if (activeRun && !activeRun.lifecycleSettled) {
+          this.cancellationRequested.add(activeRun);
           activeRun.status = 'cancelled';
           activeRun.completedAt = options.now ?? this.now();
           session.status = 'cancelled';
@@ -578,11 +582,41 @@ export class ConversationSessionService {
     });
   }
 
+  private isCurrentRun(session: ConversationSession, run: ConversationRun): boolean {
+    return this.sessions.getSession(session.sessionId) === session && session.activeRun === run &&
+      run.status === 'running' && !run.lifecycleSettled;
+  }
+
+  private isLatestRun(session: ConversationSession, run: ConversationRun): boolean {
+    return this.sessions.getSession(session.sessionId) === session && session.runs[session.runs.length - 1] === run;
+  }
+
+  private settleCancelledRun(session: ConversationSession, run: ConversationRun): ConversationRuntimeOutcome {
+    const outcome: ConversationRuntimeOutcome = {kind: 'cancelled', message: ''};
+    const accepted = this.completeRun(session, run, outcome);
+    if (accepted) {
+      run.sourceEnrichmentPending = false;
+      this.settleRun(session, run);
+      if (this.isLatestRun(session, run)) this.publish(session.sessionId, {type: 'run_completed',
+        sessionId: session.sessionId, runId: run.runId, outcome: accepted, enrichmentPending: false});
+    }
+    return accepted ?? outcome;
+  }
+
   private completeRun(
     session: ConversationSession,
     run: ConversationRun,
     outcome: ConversationRuntimeOutcome,
-  ): void {
+  ): ConversationRuntimeOutcome | undefined {
+    if (!this.isCurrentRun(session, run)) return undefined;
+    if (this.cancellationRequested.has(run) && outcome.kind !== 'cancelled') outcome = {kind: 'cancelled', message: ''};
+    try {this.runAuthorizationChecks.get(run)?.();}
+    catch (error) {
+      if (outcome.kind !== 'cancelled') throw error;
+      // Local cancellation can settle after revocation, but cannot retain private runtime facts.
+      outcome = {kind: 'cancelled', message: ''};
+    }
+    if (!this.isCurrentRun(session, run)) return undefined;
     const completedAt = this.now();
     run.outcome = outcome;
     run.completedAt = completedAt;
@@ -610,9 +644,8 @@ export class ConversationSessionService {
       status = 'cancelled';
     }
     session.status = status;
-    if (session.activeRun?.runId === run.runId) {
-      session.activeRun = undefined;
-    }
+    if (session.activeRun === run) session.activeRun = undefined;
+    return outcome;
   }
 
   private settleRun(session: ConversationSession, run: ConversationRun): void {

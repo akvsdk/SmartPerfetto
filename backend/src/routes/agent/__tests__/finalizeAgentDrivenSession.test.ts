@@ -102,7 +102,6 @@ function createFinalizeDeps(
   ensureCompletedAnalysisSseEvents = createEnsureCompletedAnalysisSseEventsMock(),
 ): FinalizeAgentDrivenSessionDeps<TestSession> {
   return {
-    applyFinalResultQualityGate: () => null,
     isRunCurrent: () => true,
     broadcast: () => undefined,
     buildConversationStepUpdate: () => null,
@@ -188,96 +187,64 @@ describe('finalizeAgentDrivenSession completed-cache invalidation', () => {
     expect(ensureCompletedAnalysisSseEvents).toHaveBeenCalledWith(session, 'run-current');
   });
 
-  it('records conclusion history after final quality gate mutations', () => {
+  it('commits supplied quality state and the complete final result without another gate', () => {
     const session = createSession();
-    const result = createResult();
+    const result = {...createResult(), conclusion: 'original\r\nbody', confidence: 0.55,
+      partial: true, terminationMessage: 'verified quality issue'};
     const deps = createFinalizeDeps();
-    deps.applyFinalResultQualityGate = jest.fn((input: {
-      result: AgentRuntimeAnalysisResult;
-      query: string;
-    }) => {
-      const targetResult = input.result;
-      targetResult.confidence = 0.55;
-      targetResult.partial = true;
-      targetResult.terminationMessage = 'quality gate downgraded the result';
-      return { code: 'sparse_unverified_conclusion', message: 'quality gate' };
-    });
-
-    finalizeAgentDrivenSession({
-      sessionId: 'session-a',
-      query: '分析一下',
-      traceId: 'trace-a',
-      session,
-      result,
-      runId: 'run-current',
-      logComponent: 'test',
+    deps.broadcast = jest.fn();
+    deps.persistAgentTurn = jest.fn();
+    deps.refreshPersistedAgentSnapshot = jest.fn();
+    finalizeAgentDrivenSession({sessionId: 'session-a', query: 'analysis', traceId: 'trace-a',
+      session, result, runId: 'run-current', logComponent: 'test',
+      qualityIssue: {code: 'sparse_unverified_conclusion', message: 'quality issue'},
     }, deps);
-
-    expect(session.result?.confidence).toBe(0.55);
-    expect(session.conclusionHistory[0]).toMatchObject({
-      conclusion: '收到。',
-      confidence: 0.55,
-    });
+    expect(session.result).toBe(result);
+    expect(session.conclusionHistory[0]).toMatchObject({conclusion: 'original\r\nbody', confidence: 0.55});
+    expect(deps.broadcast).toHaveBeenCalledTimes(1);
+    expect(deps.persistAgentTurn).toHaveBeenCalledWith(expect.objectContaining({result}));
+    expect(deps.refreshPersistedAgentSnapshot).toHaveBeenCalledWith(expect.objectContaining({result}));
   });
 
-  it('passes the resolved scene through the final quality gate', () => {
+  it('preserves finalized comparison prose without adding package names', () => {
     const session = createSession();
-    const result = createResult();
-    const deps = createFinalizeDeps();
-    deps.applyFinalResultQualityGate = jest.fn(() => null);
-
-    finalizeAgentDrivenSession({
-      sessionId: 'session-a',
-      query: '检查是否存在 ANR',
-      traceId: 'trace-a',
-      sceneType: 'anr',
-      session,
-      result,
-      runId: 'run-current',
-      logComponent: 'test',
-    }, deps);
-
-    expect(deps.applyFinalResultQualityGate).toHaveBeenCalledWith({
-      result,
-      query: '检查是否存在 ANR',
-      sceneType: 'anr',
-    });
-  });
-
-  it('completes deterministic comparison identity before final quality gating', () => {
-    const session = createSession();
-    const result = createResult();
-    result.conclusion = '# 双 Trace 对比分析报告\n\n## 综合结论\n\n左侧明显慢于右侧。';
-    const deps = createFinalizeDeps();
-    deps.applyFinalResultQualityGate = jest.fn(() => null);
-
-    finalizeAgentDrivenSession({
-      sessionId: 'session-a',
-      query: '对比两个 trace',
-      traceId: 'trace-a',
-      session,
-      result,
-      runId: 'run-current',
-      logComponent: 'test',
-      outputLanguage: 'zh-CN',
-      comparisonIdentity: {
-        currentPackageName: 'com.example.heavy',
-        referencePackageName: 'com.example.demo',
-      },
-    }, deps);
-
-    expect(result.conclusion).toContain('`com.example.heavy`');
-    expect(result.conclusion).toContain('`com.example.demo`');
-    expect(deps.applyFinalResultQualityGate).toHaveBeenCalledWith({
-      result,
-      query: '对比两个 trace',
-      sceneType: undefined,
-      comparisonIdentity: {
-        currentPackageName: 'com.example.heavy',
-        referencePackageName: 'com.example.demo',
-      },
-    });
+    const result = {...createResult(), conclusion: 'Left trace is slower.\r\n'};
+    finalizeAgentDrivenSession({sessionId: 'session-a', query: 'compare com.a and com.b', traceId: 'trace-a',
+      session, result, runId: 'run-current', logComponent: 'test'}, createFinalizeDeps());
+    expect(result.conclusion).toBe('Left trace is slower.\r\n');
     expect(session.conclusionHistory[0]?.conclusion).toBe(result.conclusion);
+  });
+
+  it('rechecks ownership after a callback and stops before history, persistence or delivery', () => {
+    const session = createSession();
+    const result = createResult();
+    const deps = createFinalizeDeps();
+    let current = true;
+    deps.isRunCurrent = () => current;
+    deps.broadcast = () => {current = false;};
+    deps.annotateLatestCompletedTurn = jest.fn();
+    deps.persistAgentTurn = jest.fn();
+    deps.sendAgentDrivenResult = jest.fn();
+    expect(() => finalizeAgentDrivenSession({sessionId: 'session-a', query: 'analysis', traceId: 'trace-a',
+      session, result, runId: 'run-current', logComponent: 'test',
+      qualityIssue: {code: 'sparse_unverified_conclusion', message: 'quality issue'},
+    }, deps)).toThrow('analysis_run_superseded');
+    expect(session.conclusionHistory).toEqual([]);
+    expect(deps.annotateLatestCompletedTurn).not.toHaveBeenCalled();
+    expect(deps.persistAgentTurn).not.toHaveBeenCalled();
+    expect(deps.sendAgentDrivenResult).not.toHaveBeenCalled();
+  });
+
+  it('rejects revoked authorization before assigning the final result', () => {
+    const session = createSession();
+    const deps = createFinalizeDeps();
+    deps.persistAgentTurn = jest.fn();
+    expect(() => finalizeAgentDrivenSession({sessionId: 'session-a', query: 'analysis', traceId: 'trace-a',
+      session, result: createResult(), runId: 'run-current', logComponent: 'test',
+      assertCurrent: () => {throw new Error('authorization_revoked');},
+    }, deps)).toThrow('authorization_revoked');
+    expect(session.result).toBeUndefined();
+    expect(deps.persistAgentTurn).not.toHaveBeenCalled();
   });
 
   it('finalizes and sends a timeout-partial result through the terminal SSE path', () => {

@@ -3,6 +3,7 @@
 
 ---
 scene: interaction
+classification_description: "Discrete input or tap response, from input dispatch through application handling to presentation."
 priority: 4
 effort: medium
 required_capabilities:

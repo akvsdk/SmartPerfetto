@@ -52,6 +52,9 @@ display:
       label: "值"
       type: string
 
+process_scope:
+  role: global_context
+
 sql: |
   WITH vsync_ticks AS (
     SELECT c.ts, c.value,

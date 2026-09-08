@@ -6,6 +6,11 @@ import { afterEach, describe, expect, it, jest } from '@jest/globals';
 import {createHash} from 'crypto';
 import {performance as nodePerformance} from 'perf_hooks';
 import http from 'http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+import {spawn} from 'node:child_process';
 import {
   decodeQueryArgsSql,
   encodeQueryResult,
@@ -592,6 +597,85 @@ describe('TraceProcessorSqlWorker', () => {
 
     gates.get('SELECT slow')!.resolve(encodedSqlResult('SELECT slow'));
   });
+
+  it('starts the source worker when the main Node starts with an ESM preload, queries, and tears down', async () => {
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'sql-worker-preload-'));
+    const preloadPath = path.join(fixtureRoot, 'preload.mjs');
+    const markerPath = path.join(fixtureRoot, 'main-preload.json');
+    const childPath = path.join(fixtureRoot, 'probe.cjs');
+    fs.writeFileSync(preloadPath, [
+      'import {isMainThread, threadId} from "node:worker_threads";',
+      'import {writeFileSync} from "node:fs";',
+      `if (isMainThread) writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({isMainThread, threadId}));`,
+    ].join('\n'));
+    fs.writeFileSync(childPath, [
+      'require(process.argv[2]);',
+      'const {Worker} = require("node:worker_threads");',
+      'const {once} = require("node:events");',
+      'const {TraceProcessorSqlWorker} = require(process.argv[3]);',
+      'const worker = new TraceProcessorSqlWorker({processorId: "source-worker-preload", traceId: "trace-preload", port: Number(process.argv[4]), forceInline: false});',
+      '(async () => {',
+      '  try {',
+      '    const result = await worker.query("SELECT 1 AS test", {timeoutMs: 5000});',
+      '    if (result.error) throw new Error(result.error);',
+      '    const usesWorkerThread = worker.getStats().usesWorkerThread;',
+      // Test-only probe of the actual runtime object; do not add a product API
+      // or mistake usesWorkerThread's configuration flag for execution evidence.
+      '    const thread = worker.worker;',
+      '    if (!(thread instanceof Worker) || thread.threadId <= 0) throw new Error("SQL worker thread did not start");',
+      '    const workerThreadId = thread.threadId;',
+      '    const exited = once(thread, "exit");',
+      '    worker.destroy();',
+      '    await exited;',
+      '    let destroyedRejected = false;',
+      '    try { await worker.enqueueRaw(Buffer.from([1]), {timeoutMs: 1000}); }',
+      '    catch (error) { destroyedRejected = /destroyed/.test(error.message); }',
+      '    console.log("WORKER_PROBE=" + JSON.stringify({result, usesWorkerThread, workerThreadId, threadExited: true, destroyedRejected}));',
+      '  } finally { worker.destroy(); }',
+      '})().catch(error => { console.error(error.message); process.exitCode = 1; });',
+    ].join('\n'));
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      req.on('end', () => {
+        res.writeHead(200, {'Content-Type': 'application/x-protobuf'});
+        res.end(encodedSqlResult(decodeQueryArgsSql(Buffer.concat(chunks))));
+      });
+    });
+    try {
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('test server did not bind');
+      // Node parses NODE_OPTIONS preloads at process startup, not when a running
+      // Jest process mutates process.env. Exercise that exact startup boundary.
+      const probe = await new Promise<{code: number | null; stdout: string; stderr: string}>((resolve, reject) => {
+        const child = spawn(process.execPath, [childPath, require.resolve('tsx/cjs'),
+          path.resolve(__dirname, '../traceProcessorSqlWorker.ts'), String(address.port)], {
+          env: {...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(preloadPath).href}`.trim()},
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '', stderr = '';
+        child.stdout.on('data', chunk => {stdout += chunk.toString();});
+        child.stderr.on('data', chunk => {stderr += chunk.toString();});
+        const timeout = setTimeout(() => child.kill('SIGTERM'), 10_000);
+        child.once('error', error => {clearTimeout(timeout); reject(error);});
+        child.once('close', code => {clearTimeout(timeout); resolve({code, stdout, stderr});});
+      });
+      expect(probe).toMatchObject({code: 0, stderr: ''});
+      const payload = probe.stdout.split('\n').find(line => line.startsWith('WORKER_PROBE='));
+      expect(payload).toBeDefined();
+      const result = JSON.parse(payload!.slice('WORKER_PROBE='.length));
+      expect(result).toMatchObject({result: {rows: [['SELECT 1 AS test']]}, usesWorkerThread: true,
+        threadExited: true, destroyedRejected: true});
+      expect(result.workerThreadId).toBeGreaterThan(0);
+      const preload = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+      expect(preload).toEqual({isMainThread: true, threadId: 0});
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      fs.rmSync(fixtureRoot, {recursive: true, force: true});
+    }
+  }, 15_000);
 
   it('cancels pending worker-thread HTTP requests and ignores late responses', async () => {
     const requestStarted = deferred<void>();

@@ -3,6 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {createHash} from 'crypto';
+import {decodeRuntimeToolResult, readRuntimeToolResultFacts, runtimeToolReceiptMetadata} from '../../agentRuntime/runtimeToolResult';
 
 import type {
   BackgroundKnowledgeReference,
@@ -77,7 +78,7 @@ const CODE_GRAPH_TOOL_NAMES = new Set([
 ]);
 
 export function isSensitiveRagToolName(toolName: string): boolean {
-  return SENSITIVE_RAG_TOOL_NAMES.has(toolName);
+  return SENSITIVE_RAG_TOOL_NAMES.has(toolName.replace(/^mcp__smartperfetto__/, ''));
 }
 
 function rejectedProjection(toolName: string): ProjectedPayload {
@@ -205,46 +206,8 @@ export function projectRagResultForSseAndLog(toolName: string, result: Sanitized
   };
 }
 
-function parseJson(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return undefined;
-  }
-}
-
-function parseTextPayload(value: unknown): unknown {
-  if (!value || typeof value !== 'object') return undefined;
-  const block = value as {type?: unknown; text?: unknown};
-  if (
-    (block.type === 'text' || block.type === 'input_text') &&
-    typeof block.text === 'string'
-  ) {
-    return parseJson(block.text);
-  }
-  return undefined;
-}
-
 function unwrapMcpPayload(raw: unknown): unknown {
-  const direct = parseJson(raw);
-  if (Array.isArray(direct)) {
-    for (const block of direct) {
-      const parsed = parseTextPayload(block);
-      if (parsed !== undefined) return parsed;
-    }
-    return direct;
-  }
-  if (!direct || typeof direct !== 'object') return direct;
-  const content = (direct as {content?: unknown}).content;
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      const parsed = parseTextPayload(block);
-      if (parsed !== undefined) return parsed;
-    }
-  }
-  const parsedDirect = parseTextPayload(direct);
-  return parsedDirect === undefined ? direct : parsedDirect;
+  return decodeRuntimeToolResult(raw).body;
 }
 
 function projectRawRetrievalResult(toolName: string, candidate: Record<string, unknown>): ProjectedPayload | undefined {
@@ -336,19 +299,25 @@ export function projectSensitiveRagToolResult(
 
 /** Fail closed for sensitive tool results copied to logs, SSE, or replay. */
 export function projectToolResultForExternalSurface(toolName: string, raw: unknown): unknown {
+  toolName = toolName.replace(/^mcp__smartperfetto__/, '');
+  // Projection describes disclosure, not tool execution. Carry only the
+  // producer's whitelisted facts, including an authoritative unknown receipt.
+  const publish = (payload: ProjectedPayload) => ({
+    ...payload, _meta: runtimeToolReceiptMetadata(readRuntimeToolResultFacts(raw)),
+  });
   const onDemandProjection = projectOnDemandSourceResult(toolName, raw);
-  if (onDemandProjection) return onDemandProjection;
+  if (onDemandProjection) return publish(onDemandProjection);
   const projected = projectSensitiveRagToolResult(toolName, raw);
-  if (projected) return projected;
+  if (projected) return publish(projected);
   const payload = unwrapMcpPayload(raw);
   const candidate = payload && typeof payload === 'object'
     ? ((payload as {result?: unknown}).result ?? payload)
     : undefined;
   if (toolName === 'lookup_blog_knowledge' && candidate && typeof candidate === 'object') {
     const publicProjection = projectRawRetrievalResult(toolName, candidate as Record<string, unknown>);
-    if (publicProjection) return publicProjection;
+    if (publicProjection) return publish(publicProjection);
   }
-  return isSensitiveRagToolName(toolName) ? rejectedProjection(toolName) : raw;
+  return isSensitiveRagToolName(toolName) ? publish(rejectedProjection(toolName)) : raw;
 }
 
 /** @deprecated Use projectSensitiveRagToolResult. */

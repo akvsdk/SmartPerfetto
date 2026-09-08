@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+
+import type {ConclusionContractClaimReference} from '../../agent/core/conclusionContract';
+import type {DataEnvelope} from '../../types/dataContract';
+import {bindCapturedAnchorFacts, capturedEvidenceTable, freezeEvidenceValue,
+  type CapturedFieldSemantics, type EvidenceScalar, type EvidenceTableWitness} from './evidenceCapture';
+
+export interface EvidenceReadRequest {
+  readonly key: string;
+  readonly reference: ConclusionContractClaimReference;
+  readonly requiredColumns: readonly string[];
+  /** Internal identity lookup: never returns or binds a cell/row witness. */
+  readonly metadataOnly?: true;
+}
+export interface CapturedEvidenceRecord {
+  readonly captureId: string;
+  readonly storeId: string;
+  readonly generation: number;
+  readonly columns: readonly string[];
+  readonly totalRowCount: number;
+  readonly meta: DataEnvelope['meta'];
+  readonly display: DataEnvelope['display'];
+  readonly sourceRefs?: readonly string[];
+  readonly fields: Readonly<Record<string, CapturedFieldSemantics>>;
+}
+export type EvidenceReadResolution = {
+  readonly key: string;
+  readonly status: 'resolved';
+  readonly record: CapturedEvidenceRecord;
+  readonly originalRowIndex?: number;
+  readonly row?: Readonly<Record<string, EvidenceScalar>>;
+} | {
+  readonly key: string;
+  readonly status: 'missing' | 'ambiguous' | 'incomplete' | 'denied';
+  readonly reason: string;
+};
+export interface EvidenceReadView {
+  resolveReferences(requests: readonly EvidenceReadRequest[], signal?: AbortSignal): Promise<readonly EvidenceReadResolution[]>;
+}
+export interface EvidenceReadBudget {maxReferences: number; maxScannedRows: number; maxCells: number; maxElapsedMs: number; maxBytes: number}
+export interface EvidenceReadViewOptions {
+  allowedTraces: readonly {traceId: string; traceSide: 'current' | 'reference'}[];
+  ownerKey: string;
+  budget?: Partial<EvidenceReadBudget>;
+}
+export interface EvidenceReadRecord {record: CapturedEvidenceRecord; witness: EvidenceTableWitness}
+const resolutions = new WeakMap<object, {witness: EvidenceTableWitness; rowIndex?: number; fields: readonly string[]}>();
+
+export function bindReadResolutionToAnchor(anchor: object, resolution: EvidenceReadResolution): void {
+  const captured = resolutions.get(resolution);
+  if (captured?.rowIndex !== undefined) bindCapturedAnchorFacts(anchor, captured.witness, captured.rowIndex, captured.fields, resolution.key);
+}
+export function isIssuedEvidenceReadResolution(resolution: EvidenceReadResolution): boolean {
+  return resolution.status !== 'resolved' || resolutions.has(resolution);
+}
+
+const normalized = (value: string) => value.trim().toLowerCase();
+function recordIdentifiers(record: CapturedEvidenceRecord, ref: ConclusionContractClaimReference): boolean[] {
+  const meta = record.meta;
+  const checks: boolean[] = [];
+  if (ref.evidenceRefId) checks.push(ref.evidenceRefId === meta.evidenceRefId ||
+    (Boolean(meta.artifactId) && [meta.artifactId, `data:${meta.artifactId}`, `ev_${meta.artifactId}`].includes(ref.evidenceRefId)));
+  if (ref.artifactId) checks.push(ref.artifactId === meta.artifactId);
+  if (ref.sourceArtifactId) checks.push(ref.sourceArtifactId === meta.artifactId);
+  if (ref.sourceToolCallId) checks.push(ref.sourceToolCallId === meta.sourceToolCallId);
+  if (ref.sourceRef) checks.push([...(record.sourceRefs || []), record.display.title, meta.source, meta.skillId, meta.stepId]
+    .some(alias => typeof alias === 'string' && normalized(alias) === normalized(ref.sourceRef!)));
+  return checks;
+}
+
+/** Runtime Store closure; no model-visible paging or Trace Processor fallback. */
+export function createEvidenceReadView(records: () => readonly EvidenceReadRecord[], options: EvidenceReadViewOptions): EvidenceReadView {
+  if (!options.ownerKey.trim()) throw new Error('Evidence read view requires a runtime owner');
+  const allowed = new Set(options.allowedTraces.map(trace => `${trace.traceSide}:${trace.traceId}`));
+  const budget: EvidenceReadBudget = {maxReferences: 256, maxScannedRows: 100_000, maxCells: 16_384,
+    maxElapsedMs: 1500, maxBytes: 1_048_576, ...options.budget};
+  if (Object.values(budget).some(value => !Number.isSafeInteger(value) || value < 0)) throw new Error('Invalid evidence read budget');
+  return Object.freeze({async resolveReferences(requests: readonly EvidenceReadRequest[], signal?: AbortSignal) {
+    const deadline = Date.now() + budget.maxElapsedMs;
+    let scanned = 0;
+    let cells = 0;
+    let bytes = 0;
+    const available = records();
+    const expired = () => Boolean(signal?.aborted) || Date.now() >= deadline;
+    const out: EvidenceReadResolution[] = [];
+    for (const request of requests) {
+      const fail = (status: 'missing' | 'ambiguous' | 'incomplete' | 'denied', reason: string) =>
+        out.push(Object.freeze({key: request.key, status, reason}));
+      if (out.length >= budget.maxReferences || expired()) {fail('incomplete', signal?.aborted ? 'read_cancelled' : 'read_budget_exhausted'); continue;}
+      const candidates = available.filter(({record}) => {
+        const checks = recordIdentifiers(record, request.reference);
+        return checks.length > 0 && checks.every(Boolean);
+      });
+      if (candidates.length !== 1) {
+        fail(candidates.length > 1 ? 'ambiguous' : 'missing', candidates.length > 1 ? 'multiple_evidence_records' :
+          available.some(({record}) => recordIdentifiers(record, request.reference).some(Boolean)) ? 'identifier_conflict' : 'evidence_not_retained');
+        continue;
+      }
+      const {record, witness} = candidates[0];
+      if (!allowed.has(`${record.meta.traceSide}:${record.meta.traceId}`)) {fail('denied', 'trace_outside_read_scope'); continue;}
+      const table = capturedEvidenceTable(witness);
+      if (!table || table.unavailableReason) {fail('missing', table?.unavailableReason || 'execution_witness_unavailable'); continue;}
+      if (record.meta.executionStatus === 'unavailable' || record.meta.executionStatus === 'optional_error') {fail('missing', 'execution_unavailable'); continue;}
+      if (new Set(table.columns).size !== table.columns.length) {fail('ambiguous', 'duplicate_evidence_columns'); continue;}
+      const ref = request.reference;
+      if (request.metadataOnly) {
+        if (request.requiredColumns.length || ['rowIndex', 'rowSelector', 'column', 'value']
+          .some(field => Object.prototype.hasOwnProperty.call(ref, field))) {
+          fail('missing', 'invalid_metadata_locator'); continue;
+        }
+        const readBytes = JSON.stringify(record).length * 2;
+        if (bytes + readBytes > budget.maxBytes || expired()) {fail('incomplete', 'evidence_read_size_or_deadline_exhausted'); continue;}
+        bytes += readBytes;
+        const resolution: EvidenceReadResolution = freezeEvidenceValue({key: request.key, status: 'resolved', record});
+        resolutions.set(resolution, {witness, fields: []});
+        out.push(resolution);
+        continue;
+      }
+      if (ref.rowIndex !== undefined && (!Number.isSafeInteger(ref.rowIndex) || ref.rowIndex < 0)) {fail('missing', 'invalid_row_index'); continue;}
+      let rowIndex = ref.rowIndex;
+      let failed = false;
+      if (ref.rowSelector !== undefined) {
+        const selectors = Object.entries(ref.rowSelector);
+        if (!selectors.length || selectors.some(([column]) => !table.columns.includes(column))) {fail('missing', 'invalid_row_selector'); continue;}
+        const matches: number[] = [];
+        for (let index = 0; index < table.rows.length; index++) {
+          if (++scanned > budget.maxScannedRows || expired()) {fail('incomplete', 'selector_scan_incomplete'); failed = true; break;}
+          if (selectors.every(([column, value]) => table.rows[index][table.columns.indexOf(column)] === value)) matches.push(index);
+          if (matches.length > 1) {fail('ambiguous', 'row_selector_not_unique'); failed = true; break;}
+        }
+        if (failed) continue;
+        if (matches.length === 0) {fail('missing', 'row_selector_not_found'); continue;}
+        if (rowIndex !== undefined && rowIndex !== matches[0]) {fail('missing', 'row_index_selector_conflict'); continue;}
+        rowIndex = matches[0];
+      }
+      if (rowIndex === undefined && table.rows.length === 1) rowIndex = 0;
+      if (rowIndex === undefined && ref.column) {fail('ambiguous', 'row_locator_required'); continue;}
+      if (rowIndex !== undefined && !table.rows[rowIndex]) {fail('missing', 'row_index_out_of_range'); continue;}
+      const requested = new Set([...request.requiredColumns, ...(ref.column ? [ref.column] : []), ...Object.keys(ref.rowSelector || {})]);
+      if ([...requested].some(column => !table.columns.includes(column))) {fail('missing', 'required_column_missing'); continue;}
+      const needed = new Set([...requested, ...Object.keys(table.fields),
+        ...['upid', 'pid', 'utid', 'tid', 'process_name', 'thread_name'].filter(column => table.columns.includes(column))]);
+      const wholeRow = !ref.column && request.requiredColumns.length === 0;
+      if (rowIndex !== undefined && wholeRow) table.columns.forEach(column => needed.add(column));
+      if (rowIndex !== undefined && cells + needed.size > budget.maxCells) {fail('incomplete', 'cell_read_budget_exhausted'); continue;}
+      const row: Record<string, EvidenceScalar> = Object.create(null);
+      if (rowIndex !== undefined) {
+        cells += needed.size;
+        for (const column of needed) {
+          const value = table.rows[rowIndex][table.columns.indexOf(column)];
+          if (value === undefined && (requested.has(column) || wholeRow)) {failed = true; break;}
+          if (value !== undefined) row[column] = value;
+        }
+      }
+      if (failed) {fail('missing', 'unsupported_raw_cell'); continue;}
+      const readBytes = JSON.stringify(record).length * 2 + Object.entries(row).reduce((total, [column, value]) =>
+        total + column.length * 6 + (typeof value === 'string' ? value.length * 6 : 32), 0);
+      if (bytes + readBytes > budget.maxBytes || expired()) {fail('incomplete', 'evidence_read_size_or_deadline_exhausted'); continue;}
+      bytes += readBytes;
+      const resolution: EvidenceReadResolution = freezeEvidenceValue({key: request.key, status: 'resolved', record,
+        ...(rowIndex !== undefined ? {originalRowIndex: rowIndex, row} : {})});
+      resolutions.set(resolution, {witness, rowIndex, fields: [...needed]});
+      out.push(resolution);
+    }
+    return Object.freeze(out);
+  }});
+}

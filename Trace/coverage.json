@@ -1124,7 +1124,7 @@
         "steps": [
           {
             "id": "app_production_stats",
-            "sha256": "181c09f7e163036af9375f1048e33c69fdf8bf534e843b506e0fc9ee51b53a82",
+            "sha256": "0f398c8fc7ec8d5c2909d5683f7c2bd2ec8a2c07f7c6257e79c3de27d8b4ff4b",
             "required_columns": [
               "total_produced_frames",
               "duration_ms",
@@ -1273,7 +1273,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "afaa0a4a72e3de097bea5c774c7dc3eb57bae84cd4760377f2c7d58a31d6baf8",
+            "sha256": "0567bfc6b04df4e61369efa8fb6b27f2e33c7bcb8cbc81960f632cff348f0cf7",
             "required_columns": [
               "server_process",
               "interface",
@@ -1298,7 +1298,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "7ff02cf0e944e53ce7f94fea7690a4d8d0ab54dfed15264c8922468091a21543",
+            "sha256": "85aff7c2b5c943281450508e808748e73fca1947c72ddbd0ff23d441a76b7c3d",
             "required_columns": [
               "client_process",
               "server_process",
@@ -2317,7 +2317,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "a382c79e03d08ffd69ea78406018352658e7d9a89f662484c20f1f37aea3f9df",
+            "sha256": "b7b8c2b7a3ea816c755f904b1453824240ab2e85d1ee3147d1841b54b3d0f024",
             "required_columns": [
               "total_frames",
               "avg_frame_ms",
@@ -2706,7 +2706,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "b7bb5f5a82bf538aaf8184319c92e02261ce72f8fcd96a6d696c2548ec1f6175",
+            "sha256": "242f4e60aea891d76b392841d819454fedae0f00d3920d0fbab7b8cae641a65e",
             "required_columns": [
               "operation",
               "count",
@@ -3156,7 +3156,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "7ef2a4debe82bf561c5a364e350a61da73acf6cf0edfee1332a924daa1092711",
+            "sha256": "d445216941bfab815af38560fdb3de7ebe26088677c852f4ce69feb1dd8c03c4",
             "required_columns": [
               "thread_name",
               "runnable_count",
@@ -3176,7 +3176,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "1cad9db1a5fcdb7eabbd65b924509170488810632f8ba9db6c0ae1ed1a194ea9",
+            "sha256": "5d224a6fdfccd85e5528464184a0f323f9f793ce6a82ce6c3e0f4801079702fe",
             "required_columns": [
               "slice_name",
               "count",
@@ -3197,7 +3197,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "7bd9aff535004fb28cb4706002d0def92a25bd5f11d94544f7810cf85a41d69e",
+            "sha256": "7fb5be6be0e3ffce1ae80b4eff6ca663d60e332773b28ac8ed9f73cfc4f9747f",
             "required_columns": [
               "state",
               "state_desc",
@@ -3435,7 +3435,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "f39e723af5c2030f0b4cb643c256b60e3fd5eac48f6068c01c6efb357a198918",
+            "sha256": "efcc84066f524c81629a2b79575f440cb73ca82476ccedb05595d554ab0226d2",
             "required_columns": [
               "thread_name",
               "fault_type",
@@ -3596,7 +3596,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "260e7821903a66fe02a27f1e7f298a64ebc8d03bc467d5c46da8f65b41198825",
+            "sha256": "ade14af1b1d3a7b40970e033745a0131fbd8b4f5237430ea6ff6f8e5085c2aca",
             "required_columns": [
               "rank",
               "confidence_score",
@@ -3635,7 +3635,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "d3288d8e3f8776f32083d96f61d1a226a811b1fa4dda35810cda722349bbc4c2",
+            "sha256": "40185a5534e9d7bf273d55c124aec7a07903cc6cfa28fd64ace91a9dfd5d72cc",
             "required_columns": [
               "process_name",
               "slice_name",
@@ -3878,7 +3878,7 @@
         "steps": [
           {
             "id": "root",
-            "sha256": "1dc7fb15bd957caedbc02335c1ed1a862e4523e479138244ce098c59126b2d63",
+            "sha256": "e540f3459db99ba1cf4e80b3de1510fe6e0a0377e2914f9933a647cae9dda4db",
             "required_columns": [
               "thread_name",
               "runnable_count",
@@ -4559,7 +4559,7 @@
         "steps": [
           {
             "id": "migration_analysis",
-            "sha256": "fccdcb637017da16cb63e72eb5bf975874a326d72204904c246a070159bff8bd",
+            "sha256": "67964f5ceeb958364918d09494e86b048f7a69fd9862654f7788c51e93dc9301",
             "required_columns": [
               "thread_name",
               "migration_count",
@@ -5400,7 +5400,7 @@
         "steps": [
           {
             "id": "anr_info",
-            "sha256": "7fa905d5a7550e3e7ce10205b2712a44cc80a0ae2fab8d62c3f3848971a2efe2",
+            "sha256": "a8ed97b01dc96fb3689307c4c4ecc803ffd9b9c69b60526778dbb09242c8012e",
             "required_columns": [
               "process_name",
               "pid",
@@ -5417,7 +5417,7 @@
           },
           {
             "id": "main_thread_quadrant",
-            "sha256": "b6087d790c6b9570ef4a79b4525aec60bff6621e6b1b51564b513d6767fff8d2",
+            "sha256": "9f0a677e7e505ed83ba76823c01326eb6599dd94e4b6ab3c260bd2998fbd618a",
             "required_columns": [
               "q1_big_running_ms",
               "q2_little_running_ms",
@@ -5432,7 +5432,7 @@
           },
           {
             "id": "render_thread_analysis",
-            "sha256": "fccad27784ec917e17743cf14a093de1068427e8334cdb3c986bef0fb24f8da9",
+            "sha256": "0d730ecd9a22540ad5a8e60de7b728fa4bfd7a11a8b1c25289100c53fbd3af45",
             "required_columns": [
               "type",
               "name",
@@ -5442,7 +5442,7 @@
           },
           {
             "id": "lock_contention",
-            "sha256": "10559e44c4b91912e40a096a8f52f78a46cf7d43c7afae62fd55e8a3547f9b00",
+            "sha256": "7a310ef365d659ed7dc5c814ad235d8c962fe494d4c0c2f5186e25c04ac01ee3",
             "required_columns": [
               "blocking_method",
               "blocking_thread_name",
@@ -5457,7 +5457,7 @@
           },
           {
             "id": "app_freeze_check",
-            "sha256": "27cb45ffa55c06ed198ca81f52682ce99ca6516c9b69af982caeef008012fd21",
+            "sha256": "9adacbb5df3c96a9fdd9daeac7719750533735dd4f622de9b8198294461e405e",
             "required_columns": [
               "thread_type",
               "running_ms",
@@ -5468,7 +5468,7 @@
           },
           {
             "id": "wakeup_chain",
-            "sha256": "b9f654fc7643de02da8d412dde4672fef5545608e3a553cf9b9226ccc7e7869a",
+            "sha256": "1520a838595771340f251cf9ba51196e2c9e96e2388c149cb903051b9f386f90",
             "required_columns": [
               "waker_thread",
               "waker_process",
@@ -5503,7 +5503,7 @@
           },
           {
             "id": "direct_blocker_classification",
-            "sha256": "a372204696006b93c068507ef98e47b2150d7550c8ed2316e3ae57b5d46f3070",
+            "sha256": "2d9b60739998601723e2b9d75cc16e121204cd72c839c0ed92526dc18aaa0ecd",
             "required_columns": [
               "direct_blocker_type",
               "evidence_ms",
@@ -5529,7 +5529,7 @@
           },
           {
             "id": "direct_blocker_slice_classification",
-            "sha256": "d48e1c1c639039b588d5f10644952df06589d9dade8e3a8432e8e877d5ff71ac",
+            "sha256": "6d755aed546790ca67147179a8caf24f9c6c1b84c58feb15a9bf8c51915d1671",
             "required_columns": [
               "direct_blocker_type",
               "evidence_ms",
@@ -7409,7 +7409,7 @@
           },
           {
             "id": "binder_calls",
-            "sha256": "0955045d129600787ae4efffe7a2c9d43bb4cf52db7f79ba55396f8fa701a5e9",
+            "sha256": "41ccb267eb0dc91df60635838d02bd87133fa0d0d1c81b76f78676218dd076bd",
             "required_columns": [
               "interface",
               "count",
@@ -7430,7 +7430,7 @@
           },
           {
             "id": "main_thread_slices",
-            "sha256": "1b233f9839e46017a54b1480979324a8f45a50e372858e9b6ca02d5aed842ff9",
+            "sha256": "f892bbb3c2740486d4892e4454bd3dcc829f54ab7b1f5affc276f1ef66f578a3",
             "required_columns": [
               "name",
               "dur_ms",
@@ -7441,7 +7441,7 @@
           },
           {
             "id": "choreographer_resync_markers",
-            "sha256": "3e3499e22cf83d84564bae8b85ece37ff27d8cb633810c21a128ac4301ebe90e",
+            "sha256": "8d8bdb8631a245675da2ceb025c7eb187d01c44368f95ae772573cef72eb4e48",
             "required_columns": [
               "name",
               "target_vsync",
@@ -7452,7 +7452,7 @@
           },
           {
             "id": "render_thread_slices",
-            "sha256": "d077a943dddc30d5f12f2513b23394d64371d2742ece970e3bf64df0c3e56346",
+            "sha256": "17b0119995d51033aa0bf15c8f1d29778f32761f60facde01c59fa22963893e1",
             "required_columns": [
               "name",
               "dur_ms",
@@ -7476,7 +7476,7 @@
           },
           {
             "id": "lock_contention",
-            "sha256": "7e76849a9211dd131b66ca09f99323326d5c51c01ece2f3160381fec0561464f",
+            "sha256": "8af702aa91228d19eac70459fadef8cd56f2ebd1e4697d8befc863cf50ea9440",
             "required_columns": [
               "blocking_method",
               "blocking_thread_name",
@@ -7489,7 +7489,7 @@
           },
           {
             "id": "gc_in_frame",
-            "sha256": "3c7822e221b851d517b77b3c402f3ba4c3521efc9067e28c7a3a2ddbfbba127f",
+            "sha256": "ed0d4ade1ea124e8e2fc69ef6581b913612e4640fd22c9ac92d91c8cee83cce1",
             "required_columns": [
               "gc_type",
               "gc_count",
@@ -7500,7 +7500,7 @@
           },
           {
             "id": "io_blocking",
-            "sha256": "b03559a5922ea85c9e3bb6c69987296c8a937837930a4a36d0e34f80a28a6299",
+            "sha256": "d369d0adf9529279a214b2d2946b2bc7b206e4e8f6796ed5959454aff2b2c2d8",
             "required_columns": [
               "thread_name",
               "blocked_count",
@@ -7513,7 +7513,7 @@
           },
           {
             "id": "root_cause_summary",
-            "sha256": "b6605b290a7e90bebbc59900f22f7f68ccf37160a96047057555e0773dc19b93",
+            "sha256": "23930404a492a36244beb28e066070d17b43082a262cf2e3ea9ed6b907cf879c",
             "required_columns": [
               "primary_cause",
               "deep_reason",
@@ -8645,7 +8645,7 @@
           },
           {
             "id": "vsync_config",
-            "sha256": "3361fdcc06134b8f0412eca781dcc192dd09f9b5dc2043061f94725434f9da67",
+            "sha256": "21bde88271404ffaaad38ace4d78c5c9ef2a880f43fdbd9a87d409eb2bd9585b",
             "required_columns": [
               "refresh_rate_hz",
               "vsync_period_ms",
@@ -8671,7 +8671,7 @@
           },
           {
             "id": "performance_summary",
-            "sha256": "0ae371bfb0971a38be22b67fcd2b2ef871dfb0e8e68a7fe82f25e1e7312f1ae3",
+            "sha256": "c310e4a748708a99c42271ceaa086ecfa105f7b1c425c91783de6c5b49f171be",
             "required_columns": [
               "total_frames",
               "perceived_jank_frames",
@@ -8737,7 +8737,7 @@
           },
           {
             "id": "input_data_check",
-            "sha256": "517eb885345a4a175510738a18e882c3f039387d5dbe66a135d19e99e80ae9a1",
+            "sha256": "86d62b8232c46cc48bffe94096e8641e0d5f45111b8523fb715e0eb8cac30096",
             "required_columns": [
               "input_data_status",
               "total_input_events",
@@ -8748,7 +8748,7 @@
           },
           {
             "id": "input_latency_summary",
-            "sha256": "19381861c53ca3d3b95eef0010d52e9c1ca65db161c2aac32d4eaedaf4985fa3",
+            "sha256": "1c43ee7fff9f66f90efa5e00357c2a0c282735a508ed6d6283a61a163a039be9",
             "required_columns": [
               "target_process",
               "total_input_events",
@@ -8765,7 +8765,7 @@
           },
           {
             "id": "expert_analysis_window",
-            "sha256": "f43c488f5c4ce17739c46bfc39dab4e69547a68c42ad53acf26b0cc14ca593e3",
+            "sha256": "9dd8bd4d8bc353a53405482f93b7ee1a8bd379f628b3f57848df17493a99ff88",
             "required_columns": [
               "window_start_ts",
               "window_end_ts",
@@ -8775,7 +8775,7 @@
           },
           {
             "id": "jank_type_stats",
-            "sha256": "ddc5fc0a5bb281c34f9344194732c8a5e2646dc02c33916b6e3cbb7b2a4591c5",
+            "sha256": "18e999a2238ab2d6d0c35eca3f94ab21962971c269f1bc71c342b1a4d27c0f9e",
             "required_columns": [
               "jank_type",
               "count",
@@ -8791,7 +8791,7 @@
           },
           {
             "id": "scroll_sessions",
-            "sha256": "7f2f8b558d417456cf175ce9cad270f12113a135b32295612705fe0cb0e04437",
+            "sha256": "6dbde53f7368e55a5889e2fdd3c145bc369fd383c51ef4d6e097b513abefc628",
             "required_columns": [
               "session_id",
               "process_name",
@@ -8807,7 +8807,7 @@
           },
           {
             "id": "session_stats_batch",
-            "sha256": "c9ac5845bc45592588ad7b8e5a9968f2a74b16445205e9ef297a4349dddfa357",
+            "sha256": "6fdf456750ebccf4b93ad603c098a1e19472b8d43f0aa4f048f5139024beb821",
             "required_columns": [
               "session_id",
               "process_name",
@@ -8819,7 +8819,7 @@
           },
           {
             "id": "session_jank",
-            "sha256": "b6f6be6077dd0996bb3a312550ef9d48b21243e607d8364089355c6ac7bc4789",
+            "sha256": "f75ebe85f10d77d34ed787cdab98acf33edb3c8515cfc45e727876fc4e10da60",
             "required_columns": [
               "session_id",
               "frame_count",
@@ -8833,7 +8833,7 @@
           },
           {
             "id": "get_app_jank_frames",
-            "sha256": "037805fdda5102d4a878ecdc3d3c899c2b93c08e76e90a523f724355e48a997f",
+            "sha256": "f4e707e433b6e9da2f995ad4ef68e90ca88455447d983e0eb8229a8c67d55ab4",
             "required_columns": [
               "frame_id",
               "frame_identity_key",
@@ -8869,7 +8869,7 @@
           },
           {
             "id": "batch_frame_root_cause",
-            "sha256": "fe2d8a4e9b6b3223160966f4050378a2ce346afd69e8078d735056b1b91cc41a",
+            "sha256": "c6af36df28050cbdff9a320219422c5a438434799918dfa465ee3e559664faed",
             "required_columns": [
               "frame_id",
               "frame_identity_key",
@@ -8947,7 +8947,7 @@
           },
           {
             "id": "global_context_flags",
-            "sha256": "333085f0eb30b51243a0998268af3b558c55cbc4450ec43de08496fd9608912e",
+            "sha256": "96a0077fd935636d83ee3d8ea353fd43c0a7bc0c66924d69bd5139926c8cbfa2",
             "required_columns": [
               "video_during_scroll",
               "video_slice_count",
@@ -8962,7 +8962,7 @@
           },
           {
             "id": "session_quadrant_summary",
-            "sha256": "f00f7314b17bccb64615dad79fbd9b0af936dcbe1111f3dd7bd1598d5e4ce415",
+            "sha256": "dce9e8a70fa489884aca2044e8f5d2c596ee858c8a4c5a2f52976c91693456cb",
             "required_columns": [
               "thread",
               "q1_big_pct",
@@ -8986,7 +8986,7 @@
           },
           {
             "id": "session_thread_core_affinity",
-            "sha256": "c4500b76b40e52cac83b3253eebd316182f643a1fd2f702a2e82d5f71df5c556",
+            "sha256": "6f34deac5c79551940fbbc9b906295de8e4aed5cd9ca1fae3f39bf4c542c58f4",
             "required_columns": [
               "thread_name",
               "core_type",
@@ -8996,7 +8996,7 @@
           },
           {
             "id": "root_cause_classification",
-            "sha256": "0620cf5ed604b6b2c2879b1f85385a2e5b46aa5b98f88ebf015bae46208c9568",
+            "sha256": "b7b9f3cfd24b605d96804369b0711e0d3649a73252cfb36ba7798ee47bdd8412",
             "required_columns": [
               "problem_category",
               "problem_component",
@@ -9007,7 +9007,7 @@
           },
           {
             "id": "fallback_no_frame_timeline",
-            "sha256": "3c058484b5003911959a58d26e2e677596134c71f6037a02698abfbdd5465963",
+            "sha256": "01780e4a0433f0a63bfc485a4a68a2e35895e5305893e18df4d125ff9d1102a9",
             "required_columns": [
               "status",
               "missing_table",

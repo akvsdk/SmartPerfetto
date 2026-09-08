@@ -120,7 +120,7 @@ describe('Smart preview selection binding', () => {
       codebaseIds: ['app-source'],
     }],
     ['RAG only', {knowledgeSourceIds: ['wiki']}, {
-      analysisMode: 'full',
+      analysisMode: 'fast',
       knowledgeSourceIds: ['wiki'],
     }],
     ['source and RAG', {
@@ -128,7 +128,7 @@ describe('Smart preview selection binding', () => {
       codebaseIds: ['app-source'],
       knowledgeSourceIds: ['wiki'],
     }, {
-      analysisMode: 'full',
+      analysisMode: 'fast',
       codeAwareMode: 'provider_send',
       codebaseIds: ['app-source'],
       knowledgeSourceIds: ['wiki'],

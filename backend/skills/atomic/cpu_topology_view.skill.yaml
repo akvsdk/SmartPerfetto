@@ -58,6 +58,8 @@ steps:
     name: "检查旧 CPU 拓扑对象"
     display:
       level: hidden
+    process_scope:
+      role: global_context
     sql: |
       SELECT type
       FROM sqlite_master
@@ -71,6 +73,8 @@ steps:
     display:
       level: hidden
     condition: "existing_topology_object.data?.[0]?.type === 'view'"
+    process_scope:
+      role: global_context
     sql: |
       DROP VIEW IF EXISTS _cpu_topology
 
@@ -80,6 +84,8 @@ steps:
     display:
       level: hidden
     condition: "existing_topology_object.data?.[0]?.type === 'table'"
+    process_scope:
+      role: global_context
     sql: |
       DROP TABLE IF EXISTS _cpu_topology
 
@@ -90,6 +96,8 @@ steps:
     optional: true
     display:
       level: hidden
+    process_scope:
+      role: global_context
     sql: |
       CREATE PERFETTO TABLE _cpu_topology AS
       WITH
@@ -274,6 +282,8 @@ steps:
         - name: cluster_count
           label: "簇数量"
           type: number
+    process_scope:
+      role: global_context
     sql: |
       SELECT
         cpu_id,

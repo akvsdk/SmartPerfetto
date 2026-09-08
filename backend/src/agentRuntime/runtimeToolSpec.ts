@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { McpToolExposure } from '../types/sparkContracts';
 import type {RunManifestAttributionSink} from '../types/selfEvolution';
 import {runtimeOutcomeFromError} from './runtimePerformance';
+import {normalizeRuntimeToolResult, readRuntimeToolReceipt, runtimeToolReceiptMetadata} from './runtimeToolResult';
 import {
   currentRunManifestAttributionSink,
   resolveRunManifestAttributionSink,
@@ -50,6 +51,9 @@ export type RuntimeToolHandler = (
   extra: RuntimeToolExtra,
 ) => Promise<RuntimeToolResult>;
 
+/** Evidence access is declared by the canonical registration, not inferred from a tool name. */
+export type RuntimeToolEvidenceEffect = 'none' | 'read_existing' | 'acquire';
+
 export interface SharedToolSpec {
   name: string;
   description: string;
@@ -60,6 +64,7 @@ export interface SharedToolSpec {
   requires?: string[];
   annotations?: RuntimeToolAnnotations;
   concurrency?: RuntimeToolConcurrencyPolicy;
+  evidenceEffect?: RuntimeToolEvidenceEffect;
 }
 
 const TIMED_SHARED_TOOL_HANDLER = Symbol('TIMED_SHARED_TOOL_HANDLER');
@@ -285,7 +290,7 @@ export function withRuntimeToolTiming(spec: SharedToolSpec): SharedToolSpec {
       timing = undefined;
     }
     try {
-      const result = await handler(args, normalizedExtra);
+      const result = normalizeRuntimeToolResult(await handler(args, normalizedExtra));
       const outcome = normalizedExtra.signal?.aborted
         ? 'cancelled'
         : (result as {isError?: unknown} | undefined)?.isError === true
@@ -345,6 +350,21 @@ export function withRuntimeToolConcurrency(
   return {...timedSpec, handler: coordinatedHandler};
 }
 
+/** Both admission branches own one timing receipt, including already-timed SDK handlers. */
+export function withRuntimeToolGuard(
+  spec: SharedToolSpec,
+  isAllowed: () => boolean,
+  deniedHandler: RuntimeToolHandler,
+): SharedToolSpec {
+  const allowed = withRuntimeToolTiming(spec).handler;
+  const denied = withRuntimeToolTiming({...spec, handler: deniedHandler}).handler;
+  const handler: TimedRuntimeToolHandler = (args, extra) =>
+    (isAllowed() ? allowed : denied)(args, extra);
+  // Every branch above is timed; outer SDK/concurrency wrappers must not time it again.
+  handler[TIMED_SHARED_TOOL_HANDLER] = true;
+  return {...spec, handler};
+}
+
 export function isClaudeSdkToolLike(value: unknown): value is ClaudeSdkToolLike {
   const toolLike = value as Partial<ClaudeSdkToolLike>;
   return !!toolLike
@@ -359,7 +379,7 @@ export function sharedToolSpecFromClaudeSdkTool(
   name: string,
   sdkTool: unknown,
   exposure: McpToolExposure,
-  extras: Pick<SharedToolSpec, 'summary' | 'requires' | 'concurrency'> = {},
+  extras: Pick<SharedToolSpec, 'summary' | 'requires' | 'concurrency' | 'evidenceEffect'> = {},
 ): SharedToolSpec {
   if (!isClaudeSdkToolLike(sdkTool)) {
     throw new Error(`Cannot build shared tool spec for ${name}: unsupported SDK descriptor shape`);
@@ -379,17 +399,17 @@ export function createClaudeSdkToolFromSharedSpec(
   spec: SharedToolSpec,
 ): SdkMcpToolDefinition {
   const timedSpec = withRuntimeToolTiming(spec);
+  const handler: ClaudeSdkToolHandler & TimedRuntimeToolHandler = async (args, extra) => timedSpec.handler(
+    args as Record<string, unknown>,
+    normalizeRuntimeToolExtra(extra),
+  );
+  // SDK -> shared conversion may wrap this descriptor again; this bridge already delegates timing.
+  handler[TIMED_SHARED_TOOL_HANDLER] = true;
   const sdkTool = createClaudeSdkTool(
     timedSpec.name,
     timedSpec.description,
     timedSpec.inputSchema,
-    async (args, extra) => {
-      const normalizedExtra = normalizeRuntimeToolExtra(extra);
-      return timedSpec.handler(
-        args as Record<string, unknown>,
-        normalizedExtra,
-      );
-    },
+    handler,
     timedSpec.annotations ? { annotations: timedSpec.annotations } : undefined,
   );
   return Object.assign(sdkTool, {
@@ -484,6 +504,15 @@ export function normalizeRuntimeToolArgs(value: unknown): unknown {
 }
 
 export function stringifyRuntimeToolResult(result: unknown): string {
+  const receipt = readRuntimeToolReceipt(result);
+  if (receipt !== undefined) {
+    const envelope = result as {content?: unknown; isError?: boolean};
+    return JSON.stringify({
+      _meta: runtimeToolReceiptMetadata(receipt),
+      content: envelope.content,
+      ...(envelope.isError === true ? {isError: true} : {}),
+    });
+  }
   const maybeResult = result as { content?: Array<Record<string, unknown>> };
   if (Array.isArray(maybeResult?.content)) {
     return maybeResult.content.map((block) => {

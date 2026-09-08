@@ -37,6 +37,7 @@ import {
 } from '../skillExecutor';
 import { validateDataEnvelope } from '../../../types/dataContract';
 import { isTraceProcessorQueryCancelledError } from '../../traceProcessorCancellation';
+import {capturedEvidenceTable, evidenceTableFor} from '../../evidence/evidenceCapture';
 
 // =============================================================================
 // Mock Setup
@@ -4322,6 +4323,82 @@ describe('SkillExecutor - Pipeline Step', () => {
     expect(bundle.pinInstructions.length).toBeGreaterThan(0);
     expect(Array.isArray(bundle.activeRenderingProcesses)).toBe(true);
     expect(bundle.activeRenderingProcesses[0]?.processName).toBe('com.demo.app');
+  });
+});
+
+describe('SkillExecutor synthesize capture provenance', () => {
+  it.each(['execute-composite', 'execute-deep', 'layered-composite'] as const)(
+    'carries the same raw atomic witness through hidden and visible synthesize entries: %s', async mode => {
+      const processor = createMockTraceProcessorService();
+      const longText = 'original raw text '.repeat(200);
+      const rows = Array.from({length: 60}, (_, index) => [index, index + 0.25, true, null, longText]);
+      processor.query.mockResolvedValue({columns: ['row_id', 'metric', 'flag', 'empty', 'text'], rows});
+      const executor = createSkillExecutor(processor);
+      const skill: SkillDefinition = {name: 'synthesize_capture', type: mode === 'execute-deep' ? 'deep' : 'composite',
+        version: '1', meta: createMeta('Synthesize capture'), steps: [
+          {id: 'hidden', type: 'atomic', sql: 'SELECT original_values', display: false, synthesize: true,
+            process_scope: {role: 'global_context'}},
+          {id: 'shown', type: 'atomic', sql: 'SELECT original_values', synthesize: true,
+            process_scope: {role: 'global_context'}, display: {layer: 'list', columns: [
+              {name: 'row_id', type: 'number'}, {name: 'metric', type: 'duration', unit: 'ms'},
+              {name: 'flag', type: 'boolean'}, {name: 'empty', type: 'string'}, {name: 'text', type: 'string'},
+            ]}},
+        ]};
+      executor.registerSkill(skill);
+      const result = mode === 'layered-composite' ? await executor.executeCompositeSkill(skill, {}, {traceId: 'trace'})
+        : await executor.execute(skill.name, 'trace');
+      const rawResults = mode === 'layered-composite' ? (result as LayeredResult).stepResults!
+        : Object.values((result as SkillExecutionResult).rawResults!);
+      expect(result.synthesizeData).toHaveLength(2);
+      for (const entry of result.synthesizeData!) {
+        const raw = rawResults.find(item => item.stepId === entry.stepId)!;
+        const witness = evidenceTableFor(entry)!;
+        expect(witness).toBe(evidenceTableFor(raw));
+        expect(capturedEvidenceTable(witness)?.rows[59]).toEqual([59, 59.25, true, null, longText]);
+        expect(evidenceTableFor(structuredClone(entry))).toBeUndefined();
+        entry.data[59].metric = 999;
+        expect(capturedEvidenceTable(witness)?.rows[59][1]).toBe(59.25);
+      }
+      expect(processor.query).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('does not lend an atomic witness to nested wrappers, iterator flattening or derived summaries', async () => {
+    const processor = createMockTraceProcessorService();
+    processor.query.mockResolvedValue({columns: ['metric'], rows: [[2]]});
+    const executor = createSkillExecutor(processor);
+    executor.registerSkills([
+      {name: 'raw_child', type: 'atomic', version: '1', meta: createMeta('Raw child'), sql: 'SELECT 2 AS metric',
+        process_scope: {role: 'global_context'}},
+      {name: 'synthesize_wrappers', type: 'composite', version: '1', meta: createMeta('Synthesize wrappers'), steps: [
+        {id: 'seed', type: 'atomic', sql: 'SELECT 2 AS metric', display: false, save_as: 'items',
+          process_scope: {role: 'global_context'}, synthesize: {role: 'overview', fields: [{key: 'metric', label: 'Metric'}]}},
+        {id: 'nested', skill: 'raw_child', display: false, synthesize: true},
+        {id: 'iterated', type: 'iterator', source: 'items', item_skill: 'raw_child', max_items: 1, display: false, synthesize: true},
+      ]},
+    ]);
+    const result = await executor.execute('synthesize_wrappers', 'trace');
+    expect(evidenceTableFor(result.synthesizeData!.find(entry => entry.stepId === 'seed')!)).toBeDefined();
+    for (const stepId of ['nested', 'iterated']) {
+      const entry = result.synthesizeData!.find(item => item.stepId === stepId)!;
+      expect(entry.success).toBe(true);
+      expect(evidenceTableFor(entry)).toBeUndefined();
+    }
+    const summary = result.displayResults.find(item => item.stepId === '__synthesize_summary__')!;
+    expect(summary).toBeDefined();
+    expect(evidenceTableFor(summary)).toBeUndefined();
+  });
+
+  it('does not capture an optional query failure as a successful empty table', async () => {
+    const processor = createMockTraceProcessorService();
+    processor.query.mockResolvedValue({error: 'optional query unavailable'});
+    const executor = createSkillExecutor(processor);
+    executor.registerSkill({name: 'synthesize_optional_error', type: 'composite', version: '1', meta: createMeta('Optional error'),
+      steps: [{id: 'optional', type: 'atomic', sql: 'SELECT unavailable', optional: true, display: false, synthesize: true,
+        process_scope: {role: 'global_context'}}]});
+    const result = await executor.execute('synthesize_optional_error', 'trace');
+    expect(result.synthesizeData).toHaveLength(1);
+    expect(evidenceTableFor(result.synthesizeData![0])).toBeUndefined();
   });
 });
 

@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import { assertEffectiveProcessScope, type EffectiveProcessScope } from '../../services/processIdentity/effectiveProcessScope';
 import {
   findDrillDownSkillConfig,
   getDrillDownSkillConfig,
@@ -167,12 +168,14 @@ function renderRegistryQuery(
   entityType: DrillDownEntityType,
   entityId: string,
   processName?: string,
+  processScope?: EffectiveProcessScope,
 ): string {
   const template = getDrillDownSkillConfig(entityType).enrichmentQuery;
   if (!template) return '';
   return template
     .split(`$${entityType}_id`).join(entityId)
-    .split('$process_name').join(quoteSqlString(processName?.trim() ?? ''));
+    .split('$process_name').join(quoteSqlString(processName?.trim() ?? ''))
+    .split('$upid').join(processScope?.mode === 'exact_upid' ? String(processScope.upid) : 'NULL');
 }
 
 function processFilterSql(processName?: string, alias = 'p.name'): string {
@@ -182,7 +185,7 @@ function processFilterSql(processName?: string, alias = 'p.name'): string {
   return `AND (${alias} = ${quoted} OR ${alias} GLOB ${quoted} || ':*')`;
 }
 
-function buildLegacyFrameQuery(frameId: string, processName?: string): string {
+function buildLegacyFrameQuery(frameId: string, processName?: string, processScope?: EffectiveProcessScope): string {
   return `
     SELECT
       af.frame_id,
@@ -197,12 +200,12 @@ function buildLegacyFrameQuery(frameId: string, processName?: string): string {
     LEFT JOIN expected_frame_timeline_events ej ON af.frame_id = ej.frame_id
     LEFT JOIN process p ON af.upid = p.upid
     WHERE af.frame_id = ${frameId}
-      ${processFilterSql(processName)}
+      ${processScope?.mode === 'exact_upid' ? `AND p.upid = ${processScope.upid}` : processFilterSql(processName)}
     LIMIT 1
   `;
 }
 
-function buildFrameTimestampQuery(frameTs: string, processName?: string): string {
+function buildFrameTimestampQuery(frameTs: string, processName?: string, processScope?: EffectiveProcessScope): string {
   return `
     WITH candidates AS (
       SELECT
@@ -219,7 +222,7 @@ function buildFrameTimestampQuery(frameTs: string, processName?: string): string
       LEFT JOIN process p ON a.upid = p.upid
       WHERE a.ts = ${frameTs}
         AND COALESCE(a.display_frame_token, a.surface_frame_token) IS NOT NULL
-        ${processFilterSql(processName)}
+        ${processScope?.mode === 'exact_upid' ? `AND p.upid = ${processScope.upid}` : processFilterSql(processName)}
     )
     SELECT *
     FROM candidates
@@ -228,7 +231,7 @@ function buildFrameTimestampQuery(frameTs: string, processName?: string): string
   `;
 }
 
-function buildDoFrameAliasQuery(frameId: string, processName?: string): string {
+function buildDoFrameAliasQuery(frameId: string, processName?: string, processScope?: EffectiveProcessScope): string {
   return `
     WITH target_slice AS (
       SELECT
@@ -245,7 +248,7 @@ function buildDoFrameAliasQuery(frameId: string, processName?: string): string {
         OR s.name = 'doFrame ${frameId}'
         OR s.name GLOB '*doFrame ${frameId}*'
       )
-        ${processFilterSql(processName, 'target_process.name')}
+        ${processScope?.mode === 'exact_upid' ? `AND t.upid = ${processScope.upid}` : processFilterSql(processName, 'target_process.name')}
       ORDER BY s.dur DESC
       LIMIT 1
     )
@@ -304,8 +307,10 @@ export async function resolveDrillDownEntity(input: {
   traceId: string;
   traceProcessorService: TraceQueryService;
   processName?: string;
+  processScope?: EffectiveProcessScope;
   signal?: AbortSignal;
 }): Promise<DrillDownEntityResolution | null> {
+  if (input.processScope) assertEffectiveProcessScope(input.processScope, input.traceId, input.processScope.traceSide);
   const requestedEntityId = normalizeDrillDownEntityId(input.entityId);
   if (requestedEntityId === null) return null;
 
@@ -313,6 +318,7 @@ export async function resolveDrillDownEntity(input: {
     input.entityType,
     requestedEntityId,
     input.processName,
+    input.processScope,
   );
   if (!registrySql) return null;
 
@@ -330,6 +336,9 @@ export async function resolveDrillDownEntity(input: {
         input.signal,
       );
   if (registryRow) {
+    if (input.processScope?.mode === 'exact_upid' && Number(registryRow.match_count || 1) !== 1) {
+      throw new DrillDownEntityResolutionError('Multiple frame rows match the exact process; provide a frame timestamp or full interval');
+    }
     return {
       entityType: input.entityType,
       requestedEntityId,
@@ -342,7 +351,7 @@ export async function resolveDrillDownEntity(input: {
 
   if (input.entityType !== 'frame') return null;
 
-  const legacySql = buildLegacyFrameQuery(requestedEntityId, input.processName);
+  const legacySql = buildLegacyFrameQuery(requestedEntityId, input.processName, input.processScope);
   const legacyRow = await queryOptionalSchemaRow(
     input.traceProcessorService,
     input.traceId,
@@ -360,7 +369,7 @@ export async function resolveDrillDownEntity(input: {
     };
   }
 
-  const aliasSql = buildDoFrameAliasQuery(requestedEntityId, input.processName);
+  const aliasSql = buildDoFrameAliasQuery(requestedEntityId, input.processName, input.processScope);
   const aliasRow = await queryFirstRow(
     input.traceProcessorService,
     input.traceId,
@@ -382,11 +391,13 @@ async function resolveFrameByTimestamp(input: {
   traceId: string;
   traceProcessorService: TraceQueryService;
   processName?: string;
+  processScope?: EffectiveProcessScope;
   signal?: AbortSignal;
 }): Promise<DrillDownEntityResolution | null> {
+  if (input.processScope) assertEffectiveProcessScope(input.processScope, input.traceId, input.processScope.traceSide);
   const requestedTimestamp = normalizeTimestamp(input.frameTs);
   if (requestedTimestamp === null) return null;
-  const sql = buildFrameTimestampQuery(requestedTimestamp, input.processName);
+  const sql = buildFrameTimestampQuery(requestedTimestamp, input.processName, input.processScope);
   const row = await queryFirstRow(
     input.traceProcessorService,
     input.traceId,
@@ -471,7 +482,9 @@ export async function resolveRegisteredDrillDownSkillParams(input: {
   traceId: string;
   traceProcessorService: TraceQueryService;
   signal?: AbortSignal;
+  processScope?: EffectiveProcessScope;
 }): Promise<DrillDownSkillParamResolution> {
+  if (input.processScope) assertEffectiveProcessScope(input.processScope, input.traceId, input.processScope.traceSide);
   const registered = findDrillDownSkillConfig(input.skillId);
   if (!registered) return {params: {...input.params}, enriched: false};
   const params = canonicalizeCommonDrillDownAliases(input.params);
@@ -497,6 +510,7 @@ export async function resolveRegisteredDrillDownSkillParams(input: {
         traceId: input.traceId,
         traceProcessorService: input.traceProcessorService,
         processName,
+        processScope: input.processScope,
         signal: input.signal,
       })
     : entityId == null
@@ -507,6 +521,7 @@ export async function resolveRegisteredDrillDownSkillParams(input: {
           traceId: input.traceId,
           traceProcessorService: input.traceProcessorService,
           processName,
+          processScope: input.processScope,
           signal: input.signal,
         });
   if (entityId == null && params.frame_ts == null) {
@@ -527,8 +542,15 @@ export async function resolveRegisteredDrillDownSkillParams(input: {
   }
 
   const enriched = {...params};
+  if (input.processScope?.mode === 'exact_upid' && resolution.row.upid != null &&
+      Number(resolution.row.upid) !== input.processScope.upid) {
+    throw new DrillDownEntityResolutionError('Resolved entity is outside the exact process scope');
+  }
   enriched[entityParam] = resolution.resolvedEntityId;
   for (const [paramName, source] of Object.entries(registered.paramMapping)) {
+    // Named analysis remains named unless the caller requested an exact selector.
+    // The row's UPID remains in resolution evidence without promoting authority.
+    if (paramName === 'upid' && input.processScope?.mode !== 'exact_upid' && params.upid == null) continue;
     const value = rowValueForSource(resolution.row, source);
     if (
       (paramName === 'start_ts' || paramName === 'end_ts')

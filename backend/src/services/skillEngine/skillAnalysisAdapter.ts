@@ -9,7 +9,10 @@
  * Provides intent detection, skill execution, and result conversion.
  */
 
+import { scopeMetadata, type EvidenceScopeProvenanceV1 } from '../../types/identityContract';
+import { resultScopeProvenance } from './scopeEvidence';
 import { TraceProcessorService } from '../traceProcessorService';
+import { DEFAULT_PROCESS_IDENTITY_ALIASES } from '../processIdentity/types';
 import { SkillExecutor, createSkillExecutor, LayeredResult } from './skillExecutor';
 import { skillRegistry, ensureSkillRegistryInitialized, type SkillRegistry } from './skillLoader';
 import { SkillDefinition, SkillEvent, DisplayLevel, DisplayLayer, StepResult } from './types';
@@ -48,6 +51,9 @@ export interface SkillAnalysisResponse {
   skillId: string;
   skillName: string;
   success: boolean;
+  partial?: boolean;
+  scopeProvenance?: EvidenceScopeProvenanceV1;
+  scopeLimitations?: string[];
   sections: Record<string, any>;
   diagnostics: Array<{
     id: string;
@@ -326,7 +332,7 @@ export class SkillAnalysisAdapter {
   }
 
   private collectLayeredFailures(layeredResult: LayeredResult): StepResult[] {
-    return this.collectLayeredSteps(layeredResult).filter(step => !step.success);
+    return this.collectLayeredSteps(layeredResult).filter(step => !step.success && step.code !== 'exact_scope_unavailable');
   }
 
   /**
@@ -421,8 +427,10 @@ export class SkillAnalysisAdapter {
     const params: Record<string, any> = {
       ...request.params,  // 先展开用户提供的参数
     };
-    if (packageName) {
-      params.package = packageName;  // packageName 会覆盖 params.package (如果有)
+    const hasExplicitSelector = [...DEFAULT_PROCESS_IDENTITY_ALIASES, 'upid', 'pid', 'thread_name', 'threadName']
+      .some(key => params[key] !== undefined && params[key] !== null && String(params[key]).trim() !== '');
+    if (packageName && !hasExplicitSelector) {
+      params.package = packageName;
     }
 
     // 创建事件收集器
@@ -473,6 +481,9 @@ export class SkillAnalysisAdapter {
 
         result = {
           success: failedSteps.length === 0,
+          partial: layeredResult?.partial,
+          scopeLimitations: layeredResult?.scopeLimitations,
+          scopeProvenance: layeredResult?.scopeProvenance,
           displayResults,
           diagnostics: failedSteps.map(step => ({
             id: `step_failed_${step.stepId}`,
@@ -603,6 +614,9 @@ export class SkillAnalysisAdapter {
       skillId: targetSkillId,
       skillName: localizedSkill.meta.display_name,
       success: result.success,
+      partial: result.partial,
+      scopeProvenance: result.scopeProvenance,
+      scopeLimitations: result.scopeLimitations,
       sections,
       diagnostics,
       summary,
@@ -638,6 +652,10 @@ export class SkillAnalysisAdapter {
     data: any;
     columnDefinitions?: Array<Record<string, any>>;
     sql?: string;
+    scopeProvenance?: EvidenceScopeProvenanceV1;
+    executionStatus?: import('../../types/dataContract').DataEnvelopeMeta['executionStatus'];
+    executionMessage?: string;
+    executionError?: string;
   }> {
     console.log('[convertLayeredResultToDisplayResults] Starting conversion. Input:', JSON.stringify({
       hasOverview: !!layeredResult?.layers?.overview,
@@ -654,6 +672,10 @@ export class SkillAnalysisAdapter {
       data: any;
       columnDefinitions?: Array<Record<string, any>>;
       sql?: string;
+    scopeProvenance?: EvidenceScopeProvenanceV1;
+    executionStatus?: import('../../types/dataContract').DataEnvelopeMeta['executionStatus'];
+    executionMessage?: string;
+    executionError?: string;
     }> = [];
 
     // 处理 overview 和 list 层（直接是 stepId -> StepResult 的映射）
@@ -675,10 +697,15 @@ export class SkillAnalysisAdapter {
           continue;
         }
 
-        const normalizedData = this.extractLayerStepData(stepResult as any);
+        const normalizedData = stepResult.code === 'exact_scope_unavailable'
+          ? { text: stepResult.error } : this.extractLayerStepData(stepResult as any);
         const columnDefinitions = this.extractColumnDefinitions(stepResult as any);
         const dr = {
           stepId,
+          ...scopeMetadata(resultScopeProvenance(stepResult)),
+          executionStatus: stepResult.code === 'exact_scope_unavailable' ? 'unavailable' as const : undefined,
+          executionMessage: stepResult.code === 'exact_scope_unavailable' ? stepResult.error : undefined,
+          sql: stepResult.sql,
           title: stepResult.display?.title || stepId,
           level: stepResult.display?.level || 'detail',
           format: stepResult.display?.format || 'table',
@@ -706,10 +733,13 @@ export class SkillAnalysisAdapter {
           if (!stepResult.display?.show && stepResult.display?.show !== undefined) continue;
           if (stepResult.display?.level === 'none') continue;
 
-          const normalizedData = this.extractLayerStepData(stepResult as any);
+          const normalizedData = stepResult.code === 'exact_scope_unavailable'
+          ? { text: stepResult.error } : this.extractLayerStepData(stepResult as any);
           const columnDefinitions = this.extractColumnDefinitions(stepResult as any);
           displayResults.push({
             stepId: `${sessionId}_${stepId}`,
+            ...scopeMetadata(resultScopeProvenance(stepResult)),
+            sql: stepResult.sql,
             title: stepResult.display?.title || `[${sessionId}] ${stepId}`,
             level: stepResult.display?.level || 'detail',
             format: stepResult.display?.format || 'table',
@@ -730,10 +760,13 @@ export class SkillAnalysisAdapter {
           if (!stepResult.display?.show && stepResult.display?.show !== undefined) continue;
           if (stepResult.display?.level === 'none') continue;
 
-          const normalizedData = this.extractLayerStepData(stepResult as any);
+          const normalizedData = stepResult.code === 'exact_scope_unavailable'
+          ? { text: stepResult.error } : this.extractLayerStepData(stepResult as any);
           const columnDefinitions = this.extractColumnDefinitions(stepResult as any);
           const dr = {
             stepId: `${sessionId}_${frameId}`,
+            ...scopeMetadata(resultScopeProvenance(stepResult)),
+            sql: stepResult.sql,
             title: stepResult.display?.title || `[${sessionId}] ${frameId}`,
             level: stepResult.display?.level || 'detail',
             format: stepResult.display?.format || 'table',
@@ -768,7 +801,11 @@ export class SkillAnalysisAdapter {
       format: string;
       data: any;
       columnDefinitions?: Array<Record<string, any>>;
-      sql?: string;  // 新增：原始 SQL
+      sql?: string;
+    scopeProvenance?: EvidenceScopeProvenanceV1;
+    executionStatus?: import('../../types/dataContract').DataEnvelopeMeta['executionStatus'];
+    executionMessage?: string;
+    executionError?: string;  // 新增：原始 SQL
     }>
   ): Record<string, any> {
     const sections: Record<string, any> = {};
@@ -886,7 +923,11 @@ export class SkillAnalysisAdapter {
         rowCount,
         columns,
         columnDefinitions,
-        sql: result.sql,  // 保存 SQL
+        sql: result.sql,
+        ...scopeMetadata(result.scopeProvenance),
+        executionStatus: result.executionStatus,
+        executionMessage: result.executionMessage,
+        executionError: result.executionError,
       };
 
       console.log(`[convertDisplayResultsToSections] ${result.stepId}: Final sectionData:`, JSON.stringify({

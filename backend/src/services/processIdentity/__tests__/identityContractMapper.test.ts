@@ -38,6 +38,17 @@ function resolution(overrides: Partial<ProcessIdentityResolution> = {}): Process
 }
 
 describe('identityContractMapper', () => {
+  it('keeps unselected candidates out of verified process and thread sidecars', () => {
+    const selected = resolution();
+    const sidecar = buildIdentityResolutionFromProcessGate({
+      traceId: 'trace-a', target: { upid: 42 },
+      resolution: { ...selected, candidates: [...selected.candidates,
+        { ...selected.candidates[0], upid: 43, threadUtid: 8 }] },
+    });
+    expect(sidecar?.processes.map(process => process.upid)).toEqual([42]);
+    expect(sidecar?.threads.map(thread => thread.owningUpid)).toEqual([42]);
+  });
+
   it('maps resolver weak and error statuses into v1 status vocabulary', () => {
     expect(mapProcessIdentityStatus(resolution())).toBe('verified');
     expect(mapProcessIdentityStatus(resolution({

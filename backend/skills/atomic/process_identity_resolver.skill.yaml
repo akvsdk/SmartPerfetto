@@ -169,6 +169,9 @@ display:
       type: string
       format: truncate
 
+process_scope:
+  role: identity_metadata
+
 sql: |
   INCLUDE PERFETTO MODULE android.process_metadata;
   INCLUDE PERFETTO MODULE android.frames.timeline;
@@ -558,7 +561,8 @@ sql: |
       ) AS rank,
       *
     FROM scored
-    WHERE is_kernel_task IS NULL OR is_kernel_task = 0
+    WHERE (is_kernel_task IS NULL OR is_kernel_task = 0)
+      AND (target_upid IS NULL OR upid = target_upid)
   )
   SELECT
     rank,

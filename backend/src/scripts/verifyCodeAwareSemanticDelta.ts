@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import express from 'express';
 
-import type {ConclusionContract} from '../agent/core/conclusionContract';
+import {parseConclusionContractDeclaration, type ConclusionContract} from '../agent/core/conclusionContract';
 import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import {createClaudeMcpServer} from '../agentv3/claudeMcpServer';
 import {ArtifactStore} from '../agentv3/artifactStore';
@@ -37,6 +37,9 @@ import {RagStore} from '../services/ragStore';
 import {clearCodeAwareOutputGuards} from '../services/security/codeAwareOutputRegistry';
 import {projectCodeAwareStreamingUpdate} from '../services/security/codeAwareStreamingUpdateProjection';
 import {runClaimVerification} from '../services/verifier/claimVerificationRunner';
+import {prepareClaimEvidence} from '../services/evidence/claimEvidencePreparation';
+import {captureEvidenceTable} from '../services/evidence/evidenceCapture';
+import {buildTraceProcessorQueryProvenance} from '../services/traceProcessorConnectionModel';
 import {getTraceProcessorPath} from '../services/workingTraceProcessor';
 import {DeterministicFixtureSourceAccessService} from '../testSupport/deterministicFixtureSourceAccess';
 import {createDataEnvelope} from '../types/dataContract';
@@ -115,6 +118,8 @@ export interface DeterministicVerificationSummary {
   schemaVersion: 'code_aware_semantic_delta_summary@2';
   evidenceKind: typeof DETERMINISTIC_EVIDENCE_KIND;
   realProviderAcceptance: false;
+  semanticCoverage: {status: 'INCONCLUSIVE'; uncoveredFacets: string[]};
+  passedMeaning: 'deterministic_assertions_only';
   passed: boolean;
   queryCount: number;
   conditionCount: number;
@@ -147,7 +152,7 @@ const QUERIES: readonly SemanticQuery[] = [
   {
     id: 'quantitative-only',
     kind: 'quantitative-only',
-    text: '这个 Trace 的启动区间持续多久？只回答 Trace 中的量化事实。',
+    text: 'Trace 中 StartupHooks.initializeOnMainThread#before-first-frame-sync-policy 这个标记区间持续多久？只回答 Trace 中的量化事实。',
   },
   {
     id: 'explicit-source-location',
@@ -504,7 +509,7 @@ async function collectSourceEvidence(input: {
   return {decision, sourceFacts, exactReference, rawSourceText, indexedReference};
 }
 
-function verifyTraceSourceBinding(input: {
+async function verifyTraceSourceBinding(input: {
   sourceUse: SourceUseDecisionV1;
   sourceReference: SourceReferenceV1;
   traceFacts: ActualTraceFacts;
@@ -513,35 +518,39 @@ function verifyTraceSourceBinding(input: {
   const evidenceRefId = 'data:source-analysis:marker';
   const claimId = 'claim-source-analysis-marker';
   const boundReference = input.wrongReference ?? input.sourceReference;
-  const contract: ConclusionContract = {
+  const reference = {evidenceRefId, rowIndex: 0, column: 'duration_ns', value: input.traceFacts.durationNs};
+  const declaration: ConclusionContract = {
     schemaVersion: 'conclusion_contract_v1',
     mode: 'focused_answer',
-    conclusions: [{rank: 1, statement: 'The source mechanism is bound to the verified trace marker.'}],
+    conclusions: [{rank: 1, statement: 'The source reference is compatible with the captured trace marker.'}],
     clusters: [],
     evidenceChain: [{conclusionId: claimId, text: 'Verified trace marker occurrence.'}],
     claims: [{
       id: claimId,
-      kind: 'categorical',
-      text: 'The constructed startup marker occurred once in the trace.',
-      references: [{
-        evidenceRefId,
-        rowIndex: 0,
-        column: 'marker',
-        value: input.traceFacts.marker,
-      }],
+      kind: 'numeric',
+      text: `The constructed startup marker lasted ${input.traceFacts.durationNs} ns.`,
+      references: [reference],
+      semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed',
+        discourse: 'asserted', quantifier: 'one', modality: 'certain',
+        scope: {population: 'cited_rows', subjectRefs: [reference]},
+        numeric: {operator: 'eq', value: input.traceFacts.durationNs, unit: 'ns'}},
     }],
     sourceUseDecision: input.sourceUse,
     sourceReferences: [boundReference],
     sourceClaimBindings: [{
       claimId,
-      mechanismStatus: 'corroborated',
+      mechanismStatus: 'compatible',
       sourceReferenceIds: [boundReference.id],
       traceEvidenceRefIds: [evidenceRefId],
     }],
     uncertainties: [],
     nextSteps: [],
   };
-  const envelope = createDataEnvelope({
+  const contract = parseConclusionContractDeclaration(declaration).contract;
+  if (!contract || contract.bindingEligibility !== 'eligible') throw new Error('Invalid source trace fixture declaration');
+  // These primitives were read by queryMaterializedTrace, not copied from the
+  // expected fixture. Capture precedes every presentation/verification projection.
+  const rawTable = {
     columns: ['occurrence_count', 'marker', 'duration_ns', 'thread_name', 'process_name'],
     rows: [[
       input.traceFacts.occurrenceCount,
@@ -550,7 +559,20 @@ function verifyTraceSourceBinding(input: {
       input.traceFacts.thread,
       input.traceFacts.process,
     ]],
-  }, {
+  };
+  const witness = captureEvidenceTable(rawTable, {duration_ns: {unit: 'ns',
+    origin: {kind: 'native_producer', definitionFingerprint: sha256File(__filename)}}});
+  const store = new ArtifactStore();
+  const artifactId = store.store({skillId: 'semantic-delta-fixture', title: 'Constructed source marker occurrence',
+    data: rawTable, sourceToolCallId: 'trace_processor:source-analysis-marker',
+    traceProvenance: buildTraceProcessorQueryProvenance({traceId: 'source-analysis-semantic', traceSide: 'current'}),
+    scopeProvenance: {version: 'process_scope_evidence@1', entries: [{role: 'target',
+      scope: {mode: 'unscoped', traceId: 'source-analysis-semantic', traceSide: 'current'},
+      fields: rawTable.columns, availability: 'available'}]}});
+  if (!store.registerEvidenceCapture(artifactId, witness, {evidenceRefId})) throw new Error('Source fixture capture registration failed');
+  const readView = store.createEvidenceReadView({ownerKey: 'deterministic-source-fixture',
+    allowedTraces: [{traceId: 'source-analysis-semantic', traceSide: 'current'}]});
+  const envelope = createDataEnvelope(rawTable, {
     type: 'sql_result',
     source: 'trace_processor',
     title: 'Constructed source marker occurrence',
@@ -559,25 +581,41 @@ function verifyTraceSourceBinding(input: {
     traceId: 'source-analysis-semantic',
     traceSide: 'current',
   });
+  const preparedEvidence = await prepareClaimEvidence({conclusionContract: contract, evidenceReadView: readView});
   const claimVerification = runClaimVerification({
     conclusionContract: contract,
     dataEnvelopes: [envelope],
+    preparedEvidence,
     policy: 'block',
   });
   const sourceClaimVerification = verifySourceClaimBindings({
     conclusionContract: contract,
     actualSourceUseDecision: input.sourceUse,
+    semanticsPolicy: 'declared',
     matchedTraceEvidenceRefIdsByClaimId: claimVerification.matchedTraceEvidenceRefIdsByClaimId,
     verifiedTraceOccurrenceRefIdsByClaimId:
       claimVerification.verifiedTraceOccurrenceRefIdsByClaimId,
   });
   const codeRefOnlyOccurrence = verifySourceClaimBindings({
-    conclusionContract: contract,
+    conclusionContract: {...contract, sourceClaimBindings: contract.sourceClaimBindings?.map(binding =>
+      ({...binding, mechanismStatus: 'corroborated'}))},
     actualSourceUseDecision: input.sourceUse,
+    semanticsPolicy: 'declared',
     matchedTraceEvidenceRefIdsByClaimId: claimVerification.matchedTraceEvidenceRefIdsByClaimId,
     verifiedTraceOccurrenceRefIdsByClaimId: {},
   });
-  return {claimVerification, sourceClaimVerification, codeRefOnlyOccurrence};
+  const wrongDeclaration = structuredClone(declaration);
+  wrongDeclaration.claims![0].semantics!.numeric!.value = input.traceFacts.durationNs + 1;
+  wrongDeclaration.claims![0].text = `The constructed startup marker lasted ${input.traceFacts.durationNs + 1} ns.`;
+  const wrongContract = parseConclusionContractDeclaration(wrongDeclaration).contract!;
+  const wrongPrepared = await prepareClaimEvidence({conclusionContract: wrongContract, evidenceReadView: readView});
+  const wrongNumericVerification = runClaimVerification({conclusionContract: wrongContract, preparedEvidence: wrongPrepared});
+  return {claimVerification, sourceClaimVerification, codeRefOnlyOccurrence, wrongNumericVerification,
+    originalWrongClaim: wrongContract.claims![0],
+    finiteProofPassed: claimVerification.claimVerificationResult.claimResults.length === 1 &&
+      claimVerification.claimVerificationResult.claimResults[0].deterministicProof?.status === 'proved' &&
+      claimVerification.claimVerificationResult.claimResults[0].propositionCoverage?.status === 'complete',
+    semanticCoverage: 'INCONCLUSIVE' as const};
 }
 
 function createSseEvidence(input: {
@@ -679,7 +717,7 @@ export async function runDeterministicSemanticDeltaVerification(input: {
     });
     sessions.push(a2Harness.sessionId);
     const a2 = await collectSourceEvidence({harness: a2Harness, groundTruth, indexed: false});
-    const a2Verification = verifyTraceSourceBinding({
+    const a2Verification = await verifyTraceSourceBinding({
       sourceUse: a2.decision,
       sourceReference: a2.exactReference,
       traceFacts,
@@ -695,17 +733,10 @@ export async function runDeterministicSemanticDeltaVerification(input: {
       stateRoot,
     });
     sessions.push(quantitativeHarness.sessionId);
-    const quantitativeResult = await quantitativeHarness.invoke('record_source_use_decision', {
-      status: 'not_needed',
-      reason: 'The quantitative question is fully answered by the trace and needs no source lookup.',
-    });
-    if (!isRecord(quantitativeResult) || quantitativeResult.success !== true) {
-      throw new Error('Actual source decision handler rejected quantitative not_needed');
-    }
+    // This fixture deliberately leaves optional source auditing untouched. A
+    // trace-only answer does not need a record_source_use_decision ceremony.
     const quantitativeDecision = quantitativeHarness.sourceUse.getSourceUseDecision();
-    if (!quantitativeDecision || quantitativeDecision.status !== 'not_needed') {
-      throw new Error('Actual source decision handler did not retain quantitative not_needed');
-    }
+    if (!quantitativeDecision) throw new Error('Source harness audit state is unavailable');
 
     const a3Setup = await setupCodebase(ragHarness, sourceRoot, 'register-and-index', 'provider_send');
     const a3Harness = createSourceHarness({
@@ -719,7 +750,7 @@ export async function runDeterministicSemanticDeltaVerification(input: {
     });
     sessions.push(a3Harness.sessionId);
     const a3 = await collectSourceEvidence({harness: a3Harness, groundTruth, indexed: true});
-    const a3Verification = verifyTraceSourceBinding({
+    const a3Verification = await verifyTraceSourceBinding({
       sourceUse: a3.decision,
       sourceReference: a3.exactReference,
       traceFacts,
@@ -745,7 +776,7 @@ export async function runDeterministicSemanticDeltaVerification(input: {
     }
     const a4Decision = a4Harness.sourceUse.getSourceUseDecision();
     if (!a4Decision) throw new Error('Actual A4 source search did not produce a decision');
-    const a4Verification = verifyTraceSourceBinding({
+    const a4Verification = await verifyTraceSourceBinding({
       sourceUse: a4Decision,
       sourceReference: a2.exactReference,
       wrongReference: a2.exactReference,
@@ -777,7 +808,8 @@ export async function runDeterministicSemanticDeltaVerification(input: {
       },
     };
     const passed = [a2Verification, a3Verification].every(verification =>
-      verification.claimVerification.claimVerificationResult.status === 'passed' &&
+      verification.finiteProofPassed && verification.claimVerification.claimVerificationResult.status === 'partial' &&
+      verification.wrongNumericVerification.claimVerificationResult.status === 'failed' &&
       verification.sourceClaimVerification.status === 'passed' &&
       verification.codeRefOnlyOccurrence.status !== 'passed') &&
       a4Verification.sourceClaimVerification.status === 'failed' &&
@@ -789,6 +821,8 @@ export async function runDeterministicSemanticDeltaVerification(input: {
       schemaVersion: 'code_aware_semantic_delta_summary@2',
       evidenceKind: DETERMINISTIC_EVIDENCE_KIND,
       realProviderAcceptance: false,
+      semanticCoverage: {status: 'INCONCLUSIVE', uncoveredFacets: ['model prose and declaration consistency', 'native source execution mechanism']},
+      passedMeaning: 'deterministic_assertions_only',
       passed,
       queryCount: QUERIES.length,
       conditionCount: CONDITIONS.length,

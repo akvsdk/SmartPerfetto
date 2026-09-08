@@ -22,6 +22,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'js-yaml';
 import type { ExpectedCall } from './types';
+import type {AnalysisReportRequirementCondition} from '../types/analysisDelivery';
 import {canonicalContentHash} from '../services/selfEvolution/canonicalJson';
 import {
   currentEffectiveRuntimeRegistrySnapshot,
@@ -36,7 +37,7 @@ export interface PhaseHint {
   keywords: string[];
   constraints: string;
   criticalTools: string[];
-  /** Optional per-phase hard cap for named tool attempts. */
+  /** @deprecated Read only for historical overlay/fingerprint compatibility; never enforces tool admission. */
   maxToolCalls?: Readonly<Record<string, number>>;
   /** When true, this hint is injected as unconditional fallback if keyword matching fails. */
   critical: boolean;
@@ -51,39 +52,32 @@ export interface StrategyDetailSection {
   title: string;
   keywords: string[];
   content: string;
-  /** Preferred fallback when keyword matching is weak. */
+  /** Author-designated default detail for discovery; never selects a plan phase. */
   default: boolean;
 }
 
-export interface StrategyDetailMatch {
-  detail: StrategyDetailSection;
-  score: number;
-  matchedKeywords: string[];
-}
-
 /**
- * A single mandatory aspect a plan must touch — sourced from a scene's
- * `plan_template.mandatory_aspects` frontmatter. The submit_plan /
- * revise_plan hard-gate fails when no plan phase mentions any of the
- * `matchKeywords`.
+ * Historical plan advice from `plan_template.mandatory_aspects` frontmatter.
+ * These fields remain readable in pinned strategy snapshots; they do not
+ * validate or require phases, words, tools, or waiver text in an agent's plan.
  */
 export interface PlanMandatoryAspect {
   /** Stable identifier for diff-friendly tracking (e.g. `frame_jank_analysis`). */
   id: string;
   matchKeywords: string[];
-  /** If present, this aspect is enforced only when the submitted plan mentions one of these terms. */
+  /** Historical discovery metadata, not an execution trigger. */
   triggerKeywords?: string[];
   suggestion: string;
-  /** Calls that must be declared on at least one matching plan phase. */
+  /** Author-suggested calls retained as advice, not mandatory execution. */
   requiredExpectedCalls?: ExpectedCall[];
-  /** At least one of these calls must be declared on a matching plan phase. */
+  /** Author-suggested alternatives. */
   alternativeExpectedCalls?: ExpectedCall[];
-  /** Calls selected by detected context; every matching group is additive. */
+  /** Historical contextual suggestions; no automatic keyword selection. */
   conditionalRequiredExpectedCalls?: Array<{
     triggerKeywords: string[];
     requiredExpectedCalls: ExpectedCall[];
   }>;
-  /** When false, submit_plan must cover this aspect in the plan; waivers are ignored. */
+  /** Historical field; no longer grants or denies a waiver. */
   waivable?: boolean;
 }
 
@@ -101,14 +95,12 @@ export interface FinalReportContractRequirement {
   id: string;
   label: string;
   description?: string;
-  /**
-   * Optional JavaScript regex patterns that make a required section conditional.
-   * When present, the section is enforced only if the user's query mentions
-   * the evidence surface described by these triggers.
-   */
+  condition?: AnalysisReportRequirementCondition;
+  /** @deprecated Historical configuration only; semantic review decides applicability. */
   triggerPatterns: string[];
+  /** @deprecated Historical configuration only; never proves semantic coverage. */
   patterns: string[];
-  /** AND-of-OR groups. Each inner group must match at least one pattern. */
+  /** @deprecated Historical AND-of-OR groups, retained for readable old snapshots. */
   patternGroups: string[][];
   /** Strategy-owned deterministic recovery copy for missing report structure. */
   recoveryText: { zh: string[]; en: string[] };
@@ -137,6 +129,8 @@ export type StrategyKind = 'normal' | 'contract_only';
 
 export interface StrategyDefinition {
   scene: string;
+  /** Scene meaning for semantic classification; contains no execution steps. */
+  classificationDescription?: string;
   /** contract_only strategies expose contracts without classifier/prompt injection. */
   strategyKind: StrategyKind;
   priority: number;
@@ -150,9 +144,8 @@ export interface StrategyDefinition {
   /** Phase-level hints for mid-analysis restatement injection. */
   phaseHints: PhaseHint[];
   /**
-   * Plan template — mandatory aspects every submitted plan must cover for
-   * this scene. `null` (vs. an empty mandatoryAspects array) means the
-   * scene has deliberately opted out of plan-template validation.
+   * Optional historical plan advice. `null` means no advice was declared;
+   * neither this field nor its absence imposes an execution requirement.
    */
   planTemplate: PlanTemplate | null;
   /**
@@ -327,39 +320,44 @@ function parseStrategyDetails(scene: string, markdown: string): { coreContent: s
   return { coreContent, detailSections };
 }
 
-function normalizeLookupText(value: string | undefined): string {
-  return (value || '').toLowerCase();
-}
-
-function phaseLikeToText(phase: {
-  id?: string;
-  name?: string;
-  goal?: string;
-  expectedTools?: string[];
-  expectedCalls?: ExpectedCall[];
-}): string {
-  return [
-    phase.id,
-    phase.name,
-    phase.goal,
-    ...(phase.expectedTools || []),
-    ...(phase.expectedCalls || []).map(call => call.skillId || call.tool),
-  ].filter(Boolean).join(' ').toLowerCase();
-}
-
-function detailMatchScore(detail: StrategyDetailSection, phaseText: string): StrategyDetailMatch {
-  const matchedKeywords: string[] = [];
-  let score = detail.default ? 1 : 0;
-  for (const keyword of detail.keywords) {
-    const normalized = normalizeLookupText(keyword);
-    if (!normalized) continue;
-    if (phaseText.includes(normalized)) {
-      matchedKeywords.push(keyword);
-      score += normalized === detail.id.toLowerCase() ? 8 : 4;
-    }
-  }
-  if (phaseText.includes(detail.title.toLowerCase())) score += 6;
-  return { detail, score, matchedKeywords };
+/** Read semantic requirement declarations; legacy patterns remain inert metadata. */
+export function parseFinalReportContract(value: unknown): FinalReportContract | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const strings = (items: unknown): string[] => Array.isArray(items)
+    ? items.filter((item): item is string => typeof item === 'string') : [];
+  const sections = Array.isArray(raw.required_sections) ? raw.required_sections : [];
+  return {
+    requiredSections: sections.flatMap((value): FinalReportContractRequirement[] => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const section = value as Record<string, unknown>;
+      const id = typeof section.id === 'string' ? section.id.trim() : '';
+      if (!id) return [];
+      const recovery = section.recovery_text && typeof section.recovery_text === 'object'
+        ? section.recovery_text as Record<string, unknown> : undefined;
+      const rawCondition = section.condition && typeof section.condition === 'object'
+        ? section.condition as Record<string, unknown> : undefined;
+      const condition: AnalysisReportRequirementCondition | undefined = rawCondition?.kind === 'strong_case_retrieval'
+        ? {kind: 'strong_case_retrieval'}
+        : rawCondition?.kind === 'semantic' && typeof rawCondition.description === 'string' && rawCondition.description.trim()
+          ? {kind: 'semantic', description: rawCondition.description.trim()}
+          : 'condition' in section ? {kind: 'unresolved', reason: 'invalid_condition'}
+            : 'trigger_patterns' in section ? {kind: 'unresolved', reason: 'legacy_trigger_patterns'} : undefined;
+      return [{
+        id,
+        label: typeof section.label === 'string' && section.label.trim() ? section.label.trim() : id,
+        ...(typeof section.description === 'string' && section.description.trim()
+          ? {description: section.description.trim()} : {}),
+        required: section.required !== false,
+        ...(condition ? {condition} : {}),
+        triggerPatterns: strings(section.trigger_patterns),
+        patterns: strings(section.patterns),
+        patternGroups: Array.isArray(section.pattern_groups)
+          ? section.pattern_groups.map(strings).filter(group => group.length > 0) : [],
+        recoveryText: {zh: strings(recovery?.zh), en: strings(recovery?.en)},
+      }];
+    }),
+  };
 }
 
 function parseStrategyFile(filePath: string): StrategyDefinition | null {
@@ -418,48 +416,7 @@ function parseStrategyFile(filePath: string): StrategyDefinition | null {
     };
   }
 
-  const rawFinalReportContract = frontmatter.final_report_contract as Record<string, unknown> | undefined;
-  let finalReportContract: FinalReportContract | null = null;
-  if (rawFinalReportContract) {
-    const requiredSections = (
-      rawFinalReportContract.required_sections as Array<Record<string, unknown>> | undefined
-    ) || [];
-    finalReportContract = {
-      requiredSections: requiredSections
-        .map(section => {
-          const patterns = (section.patterns as string[]) || [];
-          const triggerPatterns = (section.trigger_patterns as string[]) || [];
-          const patternGroups = Array.isArray(section.pattern_groups)
-            ? (section.pattern_groups as unknown[])
-              .filter(group => Array.isArray(group))
-              .map(group => (group as unknown[]).filter(item => typeof item === 'string') as string[])
-              .filter(group => group.length > 0)
-            : [];
-          const rawRecoveryText = section.recovery_text as Record<string, unknown> | undefined;
-          const recoveryText = {
-            zh: Array.isArray(rawRecoveryText?.zh)
-              ? rawRecoveryText.zh.filter((line): line is string => typeof line === 'string')
-              : [],
-            en: Array.isArray(rawRecoveryText?.en)
-              ? rawRecoveryText.en.filter((line): line is string => typeof line === 'string')
-              : [],
-          };
-          return {
-            id: (section.id as string) || '',
-            label: (section.label as string) || (section.id as string) || '',
-            description: (section.description as string | undefined) || undefined,
-            triggerPatterns,
-            patterns,
-            patternGroups,
-            recoveryText,
-            required: (section.required as boolean | undefined) ?? true,
-          };
-        })
-        .filter(section => section.id && section.label && (
-          section.patterns.length > 0 || section.patternGroups.length > 0
-        )),
-    };
-  }
+  const finalReportContract = parseFinalReportContract(frontmatter.final_report_contract);
 
   const rawVerifierMisdiagnosisPatterns =
     frontmatter.verifier_misdiagnosis_patterns as Array<Record<string, unknown>> | undefined;
@@ -488,6 +445,8 @@ function parseStrategyFile(filePath: string): StrategyDefinition | null {
 
   return {
     scene: frontmatter.scene as string,
+    ...(typeof frontmatter.classification_description === 'string' && frontmatter.classification_description.trim()
+      ? {classificationDescription: frontmatter.classification_description.trim()} : {}),
     strategyKind,
     priority: (frontmatter.priority as number) ?? 99,
     effort: (frontmatter.effort as string) ?? 'high',
@@ -562,6 +521,7 @@ function cloneStrategyDefinition(definition: StrategyDefinition): StrategyDefini
           requiredSections:
             definition.finalReportContract.requiredSections.map(section => ({
               ...section,
+              ...(section.condition ? {condition: {...section.condition}} : {}),
               triggerPatterns: [...section.triggerPatterns],
               patterns: [...section.patterns],
               patternGroups: section.patternGroups.map(group => [...group]),
@@ -970,8 +930,8 @@ export function loadStrategies(): Map<string, StrategyDefinition> {
   return new Map(baseStrategies());
 }
 
-export function getStrategyContent(scene: string): string | undefined {
-  const def = loadStrategies().get(scene);
+export function getStrategyContent(scene: string, registry?: ReadonlyStrategyRegistrySnapshot): string | undefined {
+  const def = registry ? registry.getStrategy(scene) : loadStrategies().get(scene);
   const content = def?.strategyKind === 'contract_only' ? undefined : def?.content;
   if (content) {
     currentRunManifestAttributionSink()?.recordScene({
@@ -983,8 +943,8 @@ export function getStrategyContent(scene: string): string | undefined {
   return content;
 }
 
-export function getStrategyDetails(scene: string): StrategyDetailSection[] {
-  const def = loadStrategies().get(scene);
+export function getStrategyDetails(scene: string, registry?: ReadonlyStrategyRegistrySnapshot): StrategyDetailSection[] {
+  const def = registry ? registry.getStrategy(scene) : loadStrategies().get(scene);
   if (def?.strategyKind === 'contract_only') return [];
   return def?.detailSections || [];
 }
@@ -992,6 +952,7 @@ export function getStrategyDetails(scene: string): StrategyDetailSection[] {
 export function getStrategyDetailByRef(
   detailRef: string,
   fallbackScene?: string,
+  registry?: ReadonlyStrategyRegistrySnapshot,
 ): StrategyDetailSection | undefined {
   const trimmed = detailRef.trim();
   if (!trimmed) return undefined;
@@ -999,31 +960,8 @@ export function getStrategyDetailByRef(
     ? trimmed.split(':', 2)
     : [fallbackScene || '', trimmed];
   if (!sceneFromRef || !idFromRef) return undefined;
-  return getStrategyDetails(sceneFromRef)
+  return getStrategyDetails(sceneFromRef, registry)
     .find(detail => detail.id === idFromRef || detail.ref === `${sceneFromRef}:${idFromRef}`);
-}
-
-export function matchStrategyDetailForPhase(
-  scene: string | undefined,
-  phase: {
-    id?: string;
-    name?: string;
-    goal?: string;
-    expectedTools?: string[];
-    expectedCalls?: ExpectedCall[];
-  } | undefined,
-): StrategyDetailMatch | undefined {
-  if (!scene || !phase) return undefined;
-  const details = getStrategyDetails(scene);
-  if (details.length === 0) return undefined;
-  const phaseText = phaseLikeToText(phase);
-  const scored = details
-    .map(detail => detailMatchScore(detail, phaseText))
-    .sort((a, b) => b.score - a.score);
-  const best = scored[0];
-  if (best && best.score > 0) return best;
-  const fallback = details.find(detail => detail.default) || details[0];
-  return { detail: fallback, score: 0, matchedKeywords: [] };
 }
 
 export function buildStrategyDetailExcerpt(
@@ -1051,24 +989,18 @@ export function getRegisteredScenes(): StrategyDefinition[] {
 }
 
 /** Get phase-level restatement hints for a scene. Returns [] if scene has no hints. */
-export function getPhaseHints(scene: string): PhaseHint[] {
-  const def = loadStrategies().get(scene);
+export function getPhaseHints(scene: string, registry?: ReadonlyStrategyRegistrySnapshot): PhaseHint[] {
+  const def = registry ? registry.getStrategy(scene) : loadStrategies().get(scene);
   if (def?.strategyKind === 'contract_only') return [];
   return def?.phaseHints || [];
 }
 
 /**
- * Get the plan template for a scene loaded from `plan_template:`
- * frontmatter. Returns `null` for unknown scenes and for scenes that
- * deliberately opted out (no `plan_template` block in their frontmatter).
- *
- * Phase 2.1 of v2.1 — strategies migrated to frontmatter take priority
- * over the legacy hardcoded `SCENE_PLAN_TEMPLATES` map; the legacy map
- * remains as a fallback in `scenePlanTemplates.ts` until every strategy
- * has migrated.
+ * Read optional plan advice from the selected registry. Unknown scenes and
+ * absent declarations return null; an explicit pin never falls back to globals.
  */
-export function getPlanTemplate(scene: string): PlanTemplate | null {
-  const def = loadStrategies().get(scene);
+export function getPlanTemplate(scene: string, registry?: ReadonlyStrategyRegistrySnapshot): PlanTemplate | null {
+  const def = registry ? registry.getStrategy(scene) : loadStrategies().get(scene);
   if (def?.strategyKind === 'contract_only') return null;
   return def?.planTemplate ?? null;
 }
@@ -1077,8 +1009,8 @@ export function getPlanTemplate(scene: string): PlanTemplate | null {
  * Get the scene-owned final report completeness contract. Returns null for
  * scenes that have no declarative contract yet.
  */
-export function getFinalReportContract(scene: string): FinalReportContract | null {
-  return loadStrategies().get(scene)?.finalReportContract ?? null;
+export function getFinalReportContract(scene: string, registry?: ReadonlyStrategyRegistrySnapshot): FinalReportContract | null {
+  return (registry ? registry.getStrategy(scene) : loadStrategies().get(scene))?.finalReportContract ?? null;
 }
 
 export function getAllVerifierMisdiagnosisPatterns(): VerifierMisdiagnosisPattern[] {

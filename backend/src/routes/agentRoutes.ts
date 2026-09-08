@@ -32,14 +32,15 @@ import {
 import { deriveUiActionProposals } from '../services/uiActionProposalDeriver';
 import {
   buildRawTraceComparisonReportSection,
-  comparisonIdentityFromReportSection,
+  resolveCapturedComparisonIdentity,
 } from '../services/comparisonAppendixService';
+import type {FinalResultQualityIssue} from '../services/finalResultQualityGate';
+import {finalizeAnalysisResult, type AnalysisFinalizationOwner} from '../services/finalizeAnalysisResult';
+import {takeFinalizationContext, type RuntimeFinalizationContext} from '../agentRuntime/analysisFinalizationContext';
+import {resolveRuntimeTurnPolicy} from '../agentRuntime/runtimeTurnPolicy';
+import type {AnalysisCaseRetrievalState} from '../types/analysisDelivery';
+import {copyAnalysisDeliveryFields, projectStoredConclusionSourceMetadata} from '../services/security/analysisDeliveryProjection';
 import {
-  applyFinalResultQualityGate,
-  completeFinalResultComparisonIdentity,
-} from '../services/finalResultQualityGate';
-import {
-  deriveEvidenceBackedConclusionContractForNarrative,
   normalizeNarrativeForClient as sharedNormalizeNarrative,
   resolveConclusionOutputModeForTurn,
 } from '../services/agentResultNormalizer';
@@ -121,7 +122,6 @@ import { finalizeAgentDrivenSession } from './agent/finalizeAgentDrivenSession';
 import {executeManagedTraceSummaryV1} from '../services/managedTraceSummary';
 import {buildTraceSummaryAttributionV1} from '../services/traceSummaryAttribution';
 import {unavailableTraceSummaryV1} from '../services/traceSummaryExecutor';
-import { projectStateTimelineRunResult } from './agent/stateTimelineRunProjection';
 import { AssistantApplicationService } from '../assistant/application/assistantApplicationService';
 import { StreamProjector, SSE_RING_BUFFER_SIZE, type BufferedSseEvent } from '../assistant/stream/streamProjector';
 import {
@@ -156,7 +156,6 @@ import {
   persistCompletedAnalysisResultSnapshot,
   resolveAnalysisResultSceneType,
 } from '../services/analysisResultSnapshotPipeline';
-import {runPreparedAnalysisClaimVerification} from '../services/evidence/analysisRelationPreparation';
 import {
   getDefaultAndroidInternalsPackResolver,
 } from '../services/androidInternalsPack/androidInternalsPackResolver';
@@ -165,6 +164,7 @@ import type { FocusInteraction } from '../agent/context/focusStore';
 // DataEnvelope types for v2.0 data contract
 import {
   createDataEnvelope,
+  validateDataEnvelope,
   generateEventId,
   type AnalysisCompletedEvent,
   type DataEnvelope,
@@ -172,11 +172,6 @@ import {
 import { buildTraceContextDataEnvelopes, decorateTraceContextDatasets } from '../agentRuntime/traceContextEvidence';
 import {recordAdaptiveRoutingPostEvidenceBestEffort} from '../agentRuntime/adaptiveRoutingProjection';
 import type { ConclusionContract } from '../agent/core/conclusionContract';
-import {
-  projectSafeSourceProvenance,
-  sanitizeConclusionSourceContract,
-  type SafeSourceProvenanceProjection,
-} from '../services/codebase/sourceClaimVerifier';
 import {sanitizeSourceUseDecision} from '../services/codebase/sourceUseDecision';
 import {
   projectPrimaryAnalysisOptions,
@@ -185,6 +180,7 @@ import {
 } from '../services/codebase/analysisSourceActivationPolicy';
 import {resetRuntimeForSourceActivation} from '../services/codebase/analysisSourceContextTransition';
 import {
+  AnalysisSourceSupplementFailure,
   cancelAnalysisSourceSupplement,
   runAnalysisSourceSupplement,
   type AnalysisSourceSupplementMetrics,
@@ -211,8 +207,6 @@ import { openCaseCandidateOutbox } from '../services/caseEvolution/caseCandidate
 import {caseCandidateKnowledgeScope} from '../services/caseEvolution/caseCandidateBuilder';
 import {
   attachCaseHitsToContractSync,
-  projectEvidenceSignaturesByCluster,
-  verifyAndPruneCaseRecommendations,
 } from '../services/caseEvolution/attachCaseHitsToContract';
 import {
   isCaseEvolutionCaptureEnabled,
@@ -235,6 +229,7 @@ import {
   privateAnalysisQueryMessage,
   projectPrivateAnalysisReceipt,
   projectPrivateAnalysisResult,
+  copyAnalysisResultForSnapshot,
   projectPrivateFindings,
   projectPrivateConclusion,
   projectPrivateStructuredValue,
@@ -246,6 +241,7 @@ import {
   AnalysisContextAuthorizationChangedError,
   assertCurrentAnalysisContextAuthorization,
   buildAnalysisContextAuthorizationFingerprint,
+  type AnalysisContextSelection,
 } from '../services/resolvedAnalysisContext';
 import {buildSmartDeepDiveAnalysisContext} from '../services/effectiveAnalysisMode';
 import {
@@ -608,7 +604,79 @@ function isSessionRunCancelled(
   );
 }
 
+interface HttpFinalizationRun {
+  owner: AnalysisFinalizationOwner;
+  controller: AbortController;
+  assertCurrent(): void;
+  release(): void;
+}
+
+const httpFinalizationRuns = new WeakMap<AnalysisSession, Map<string, HttpFinalizationRun>>();
+
+function abortHttpFinalizationRuns(session: AnalysisSession, runId?: string): void {
+  for (const [id, run] of httpFinalizationRuns.get(session) ?? []) {
+    if (!runId || id === runId) run.controller.abort(new DOMException('Analysis cancelled', 'AbortError'));
+  }
+}
+
+function createHttpFinalizationRun(
+  session: AnalysisSession,
+  runId: string,
+  selection: AnalysisContextSelection,
+  scope: KnowledgeScope,
+  fingerprint: string,
+  dispatchedFingerprint?: string,
+): HttpFinalizationRun {
+  const controller = new AbortController();
+  const runs = httpFinalizationRuns.get(session) ?? new Map<string, HttpFinalizationRun>();
+  httpFinalizationRuns.set(session, runs);
+  runs.get(runId)?.controller.abort(new DOMException('Analysis superseded', 'AbortError'));
+  const owner: AnalysisFinalizationOwner = {
+    runId, signal: controller.signal,
+    ...(dispatchedFingerprint !== undefined ? {analysisContextFingerprint: dispatchedFingerprint} : {}),
+    isCurrent: () => assistantAppService.getSession(session.sessionId) === session &&
+      isCurrentRunOwner(session, runId) && !isSessionRunCancelled(session, runId),
+    assertAuthorized: () => assertCurrentAnalysisContextAuthorization(selection, scope, fingerprint),
+  };
+  const run: HttpFinalizationRun = {
+    owner, controller,
+    assertCurrent: () => {
+      controller.signal.throwIfAborted();
+      if (!owner.isCurrent()) throw new DOMException('Analysis superseded', 'AbortError');
+      owner.assertAuthorized();
+    },
+    release: () => {if (runs.get(runId) === run) runs.delete(runId);},
+  };
+  runs.set(runId, run);
+  return run;
+}
+
+async function awaitHttpFinalizationOperation<T>(
+  operation: Promise<T>, run: HttpFinalizationRun, deadlineMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const signal = run.controller.signal;
+  let onAbort: () => void = () => {};
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, {once: true});
+    if (signal.aborted) onAbort();
+    timer = setTimeout(() => reject(new DOMException('Finalization deadline exceeded', 'TimeoutError')),
+      Math.max(0, Math.min(deadlineMs - Date.now(), 2_147_483_647)));
+  });
+  try {
+    const value = await Promise.race([operation, interrupted]);
+    run.assertCurrent();
+    if (Date.now() >= deadlineMs) throw new DOMException('Finalization deadline exceeded', 'TimeoutError');
+    return value;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 function markSessionRunCancelled(session: AnalysisSession, runId: string, reason: string): void {
+  abortHttpFinalizationRuns(session, runId);
   if (!session.cancelledRuns) session.cancelledRuns = {};
   session.cancelledRuns[runId] = {
     cancelled: true,
@@ -624,6 +692,7 @@ function markSessionRunCancelled(session: AnalysisSession, runId: string, reason
 }
 
 function setCurrentSessionRun(session: AnalysisSession, run: AnalyzeSessionRunContext): AnalyzeSessionRunContext {
+  if (session.activeRun?.runId !== run.runId) abortHttpFinalizationRuns(session);
   session.activeRun = cloneRunContext(run);
   session.lastRun = cloneRunContext(run);
   registerSessionRun(session, run);
@@ -738,6 +807,7 @@ async function resetSessionRuntimeForSourceActivation(
 }
 
 async function abortAndCleanupSession(sessionId: string, session: AnalysisSession, component: string): Promise<void> {
+  abortHttpFinalizationRuns(session);
   await cancelActiveAnalysisSourceEnrichment(session, 'session_cancelled');
   await abortSessionBestEffort(session, component);
   cleanupSessionBestEffort(sessionId, session, component);
@@ -753,6 +823,7 @@ async function retireAuthorizationChangedSession(
   session: AnalysisSession,
   updateHandler: (update: StreamingUpdate) => void,
 ): Promise<void> {
+  abortHttpFinalizationRuns(session);
   // Stop the event source before awaiting runtime cleanup. Cleanup may itself
   // flush callbacks, so the output guard must also remain revoked throughout
   // that asynchronous window.
@@ -1128,6 +1199,7 @@ interface AnalysisSession {
     message?: string;
     metrics?: AnalysisSourceSupplementMetrics;
     errorCode?: 'analysis_source_enrichment_failed';
+    finalResult?: AgentRuntimeAnalysisResult;
   };
   androidInternalsPackPin?: import('../services/androidInternalsPack/types').AndroidInternalsPackIdentity;
   /** Reference trace ID for comparison mode (dual-trace analysis) */
@@ -1506,16 +1578,15 @@ function sanitizePersistedAnalysisCompletedEvent(
   if (!conclusion.trim() && !privateKnowledge) return event;
   const {
     conclusionContract,
-    sourceProvenance,
     sourceProjectionApplied,
   } = projectAnalysisCompletedConclusionContract(
     data?.conclusionContract,
-    session.result?.sourceUseDecision,
+    data?.sourceUseDecision,
   );
 
   const result: AgentRuntimeAnalysisResult = {
     sessionId: session.sessionId,
-    success: data?.success !== false && Boolean(conclusion.trim()),
+    success: data?.success === true,
     findings: Array.isArray(data?.findings) ? data.findings : [],
     hypotheses: Array.isArray(data?.hypotheses) ? data.hypotheses : [],
     conclusion,
@@ -1526,12 +1597,9 @@ function sanitizePersistedAnalysisCompletedEvent(
     terminationReason: data?.terminationReason,
     terminationMessage: data?.terminationMessage,
     conclusionContract,
-    ...(sourceProvenance
-      ? {
-          sourceUseDecision: sourceProvenance.sourceUseDecision,
-          sourceReferences: sourceProvenance.sourceUseDecision.references,
-        }
-      : {}),
+    sourceUseDecision: sanitizeSourceUseDecision(data?.sourceUseDecision),
+    sourceClaimVerificationResult: data?.sourceClaimVerificationResult,
+    ...copyAnalysisDeliveryFields(data ?? {}),
     claimSupport: data?.claimSupport,
     claimVerificationResult: data?.claimVerificationResult,
     identityResolutions: data?.identityResolutions,
@@ -1540,13 +1608,7 @@ function sanitizePersistedAnalysisCompletedEvent(
     uiActionProposals: data?.uiActionProposals,
   };
 
-  const issue = applyFinalResultQualityGate({
-    result,
-    query: session.query,
-    sceneType: result.conclusionContract?.metadata?.sceneId ??
-      resolveAnalysisResultSceneType(session.query, session.dataEnvelopes),
-  });
-  if (!issue && !privateKnowledge && !sourceProjectionApplied) return event;
+  if (!privateKnowledge && !sourceProjectionApplied) return event;
   const outputLanguage = sessionOutputLanguage(session);
   const trustedPrivateProjection = privateKnowledge &&
     data?.privateProjectionVersion === PRIVATE_ANALYSIS_EVENT_PROJECTION_VERSION;
@@ -1560,6 +1622,10 @@ function sanitizePersistedAnalysisCompletedEvent(
         conclusionContract: undefined,
         claimSupport: undefined,
         claimVerificationResult: undefined,
+        sourceClaimVerificationResult: undefined,
+        sourceUseDecision: undefined,
+        turnIntent: undefined, completion: undefined, outputOrigin: undefined, runtimeAppendix: undefined,
+        reportAssessment: undefined, deliveryAssurance: undefined,
         identityResolutions: undefined,
         uiActionProposals: [],
       }
@@ -1571,6 +1637,9 @@ function sanitizePersistedAnalysisCompletedEvent(
   const nextData = privateKnowledge
     ? {
         privateProjectionVersion: PRIVATE_ANALYSIS_EVENT_PROJECTION_VERSION,
+        ...copyAnalysisDeliveryFields(durableResult),
+        sourceUseDecision: durableResult.sourceUseDecision,
+        sourceClaimVerificationResult: durableResult.sourceClaimVerificationResult,
         ...(typeof data?.success === 'boolean' ? {success: durableResult.success} : {}),
         conclusion: durableResult.conclusion,
         ...(Object.prototype.hasOwnProperty.call(data, 'answer')
@@ -1612,9 +1681,9 @@ function sanitizePersistedAnalysisCompletedEvent(
         resultSnapshotId: typeof data?.resultSnapshotId === 'string'
           ? data.resultSnapshotId.slice(0, 160)
           : undefined,
-        terminalRunStatus: data?.terminalRunStatus === 'quota_exceeded'
-          ? 'quota_exceeded'
-          : 'completed',
+        terminalRunStatus: ['completed', 'failed', 'cancelled', 'quota_exceeded'].includes(data?.terminalRunStatus)
+          ? data.terminalRunStatus
+          : undefined,
         observability: data?.observability && typeof data.observability === 'object'
           ? {
               ...(typeof data.observability.runId === 'string'
@@ -1805,6 +1874,7 @@ async function cancelActiveAnalysisSourceEnrichment(
 ): Promise<boolean> {
   const state = session.analysisSourceEnrichment;
   if (!state || state.status !== 'running') return false;
+  abortHttpFinalizationRuns(session, state.runId);
   state.status = 'cancelled';
   state.completedAt = Date.now();
   await cancelAnalysisSourceSupplement(
@@ -1812,6 +1882,8 @@ async function cancelActiveAnalysisSourceEnrichment(
     session.sessionId,
     state.runId,
   );
+  if (assistantAppService.getSession(session.sessionId) !== session ||
+    session.analysisSourceEnrichment !== state || !isCurrentRunOwner(session, state.runId)) return true;
   publishAnalysisSourceEvent(session, state.runId, 'analysis_source_enrichment_cancelled', {
     reason,
   });
@@ -1826,12 +1898,18 @@ function startAnalysisSourceEnrichment(
     traceId: string;
     question: string;
     primaryConclusion: string;
+    analysisOptions: AnalysisOptions;
+    finalizationRun: HttpFinalizationRun;
   },
 ): void {
   const state = session.analysisSourceEnrichment;
-  const authorization = session.sourceAuthorization;
-  if (!state || state.runId !== input.runId || state.status !== 'running' || !authorization) return;
+  const run = input.finalizationRun;
+  const isCurrent = () => session.analysisSourceEnrichment === state && state?.status === 'running' &&
+    !run.controller.signal.aborted && run.owner.isCurrent();
+  if (!state || state.runId !== input.runId || !isCurrent()) {run.release(); return;}
+  run.assertCurrent();
   publishAnalysisSourceEvent(session, input.runId, 'analysis_source_enrichment_started', {});
+  run.assertCurrent();
   void runAnalysisSourceSupplement({
     orchestrator: session.orchestrator,
     sessionId: session.sessionId,
@@ -1839,37 +1917,39 @@ function startAnalysisSourceEnrichment(
     traceId: input.traceId,
     question: input.question,
     primaryConclusion: input.primaryConclusion,
-    analysisOptions: {
-      providerId: session.providerId,
-      outputLanguage: sessionOutputLanguage(session),
-      codeAwareMode: authorization.codeAwareMode,
-      codebaseIds: authorization.codebaseIds,
-      analysisContextFingerprint: authorization.analysisContextFingerprint,
-      tenantId: session.tenantId,
-      workspaceId: session.workspaceId,
-      userId: session.userId,
-    },
+    analysisOptions: input.analysisOptions,
+    signal: run.controller.signal,
+    isCurrent,
+    assertAuthorized: run.owner.assertAuthorized,
   }).then(outcome => {
-    if (session.analysisSourceEnrichment !== state || state.status !== 'running') return;
+    if (!isCurrent()) return;
+    run.assertCurrent();
     state.status = 'completed';
     state.completedAt = Date.now();
     state.message = outcome.message;
     state.metrics = outcome.metrics;
+    state.finalResult = outcome.finalResult;
     publishAnalysisSourceEvent(session, input.runId, 'analysis_source_enrichment_completed', {
-      message: outcome.message,
-      metrics: outcome.metrics,
+      message: outcome.message, metrics: outcome.metrics, finalResult: outcome.finalResult,
     });
+    run.assertCurrent();
     finishAnalysisSourceEventStream(session, input.runId);
-  }).catch(() => {
-    if (session.analysisSourceEnrichment !== state || state.status !== 'running') return;
+  }).catch(error => {
+    if (!isCurrent()) return;
+    try {run.assertCurrent();} catch {return;}
     state.status = 'failed';
     state.completedAt = Date.now();
     state.errorCode = 'analysis_source_enrichment_failed';
+    if (error instanceof AnalysisSourceSupplementFailure) {
+      state.finalResult = error.finalResult;
+      state.metrics = error.metrics;
+    }
     publishAnalysisSourceEvent(session, input.runId, 'analysis_source_enrichment_failed', {
-      errorCode: state.errorCode,
+      errorCode: state.errorCode, finalResult: state.finalResult, metrics: state.metrics,
     });
+    run.assertCurrent();
     finishAnalysisSourceEventStream(session, input.runId);
-  });
+  }).finally(() => run.release()).catch(() => undefined);
 }
 
 function loadPersistedCompletedAnalysisSseEvents(session: AnalysisSession, runId?: string): BufferedSseEvent[] {
@@ -1900,17 +1980,6 @@ function loadPersistedCompletedAnalysisSseEvents(session: AnalysisSession, runId
   const hasCancelledTerminal = events.some((event) => event.eventType === 'analysis_cancelled');
   if ((!hasCompletedTerminal && !hasCancelledTerminal) || !events.some((event) => event.eventType === 'end')) {
     return [];
-  }
-  const replayState =
-    runId && !isCurrentRunOwner(session, scope.runId) ? getRunSseReplayState(session, scope.runId) : session;
-  replayState.sseEventSeq = Math.max(replayState.sseEventSeq || 0, ...events.map((event) => event.seqId));
-  const existing = new Set(replayState.sseEventBuffer.map((event) => `${event.seqId}:${event.eventType}`));
-  for (const event of events) {
-    const key = `${event.seqId}:${event.eventType}`;
-    if (!existing.has(key)) replayState.sseEventBuffer.push(event);
-  }
-  if (replayState.sseEventBuffer.length > SSE_RING_BUFFER_SIZE) {
-    replayState.sseEventBuffer.splice(0, replayState.sseEventBuffer.length - SSE_RING_BUFFER_SIZE);
   }
   return events;
 }
@@ -2139,38 +2208,7 @@ function toJsonSafe<T>(value: T): T {
 }
 
 function buildDisplayTurnResult(turn: ConversationTurn): ConversationTurn['result'] {
-  if (!turn.result) return turn.result;
-  const message = typeof turn.result.message === 'string' ? turn.result.message : '';
-  const resultForGate: AgentRuntimeAnalysisResult = {
-    sessionId: turn.id,
-    success: turn.result.success !== false,
-    findings: Array.isArray(turn.findings) ? turn.findings : [],
-    hypotheses: [],
-    conclusion: message,
-    confidence: typeof turn.result.confidence === 'number' ? turn.result.confidence : 0.5,
-    rounds: 1,
-    totalDurationMs: 0,
-    partial: turn.result.partial,
-    terminationReason: turn.result.terminationReason as AgentRuntimeAnalysisResult['terminationReason'],
-    terminationMessage: turn.result.terminationMessage,
-    conclusionContract: turn.result.conclusionContract as AgentRuntimeAnalysisResult['conclusionContract'],
-    claimSupport: turn.result.claimSupport,
-    claimVerificationResult: turn.result.claimVerificationResult,
-    identityResolutions: turn.result.identityResolutions,
-  };
-  applyFinalResultQualityGate({
-    result: resultForGate,
-    query: turn.query,
-    sceneType: resultForGate.conclusionContract?.metadata?.sceneId,
-  });
-  return {
-    ...turn.result,
-    message: resultForGate.conclusion,
-    confidence: resultForGate.confidence,
-    partial: resultForGate.partial,
-    terminationReason: resultForGate.terminationReason,
-    terminationMessage: resultForGate.terminationMessage,
-  };
+  return turn.result;
 }
 
 function buildTurnSummary(
@@ -2189,7 +2227,7 @@ function buildTurnSummary(
     : displayResult?.message;
   const confidence = typeof displayResult?.confidence === 'number' ? displayResult.confidence : undefined;
   const sanitizedConclusion =
-    typeof projectedMessage === 'string' ? normalizeNarrativeForClient(projectedMessage) : '';
+    typeof projectedMessage === 'string' ? projectedMessage : '';
   const conclusionPreview = sanitizedConclusion ? sanitizedConclusion.replace(/\s+/g, ' ').slice(0, 240) : undefined;
 
   return {
@@ -2247,6 +2285,9 @@ function buildTurnDetail(
               conclusionContract: displayResult.conclusionContract as ConclusionContract | undefined,
               claimSupport: displayResult.claimSupport,
               claimVerificationResult: displayResult.claimVerificationResult,
+              sourceClaimVerificationResult: displayResult.sourceClaimVerificationResult,
+              sourceUseDecision: displayResult.sourceUseDecision,
+              ...copyAnalysisDeliveryFields(displayResult),
               identityResolutions: displayResult.identityResolutions,
             }, outputLanguage)
           : displayResult)
@@ -2277,10 +2318,7 @@ function buildRecoveredResultFromContext(
     return null;
   }
 
-  const conclusion =
-    typeof turn.result.message === 'string' && turn.result.message.trim().length > 0
-      ? turn.result.message
-      : `已恢复会话历史。可通过 /api/agent/v1/${sessionId}/turns 查看历史轮次。`;
+  const conclusion = typeof turn.result.message === 'string' ? turn.result.message : '';
   const confidence = typeof turn.result.confidence === 'number' ? turn.result.confidence : 0.5;
 
   return {
@@ -2298,67 +2336,30 @@ function buildRecoveredResultFromContext(
     conclusionContract: turn.result.conclusionContract as AgentRuntimeAnalysisResult['conclusionContract'],
     claimSupport: turn.result.claimSupport,
     claimVerificationResult: turn.result.claimVerificationResult,
+    sourceClaimVerificationResult: turn.result.sourceClaimVerificationResult,
+    sourceUseDecision: turn.result.sourceUseDecision,
+    ...copyAnalysisDeliveryFields(turn.result),
     identityResolutions: turn.result.identityResolutions,
   };
-}
-
-function annotateRecoveredResultQuality(
-  sessionId: string,
-  session: AnalysisSession,
-  result: AgentRuntimeAnalysisResult,
-  query?: string,
-): void {
-  const issue = applyFinalResultQualityGate({
-    result,
-    query: query || session.query,
-    sceneType: result.conclusionContract?.metadata?.sceneId ??
-      resolveAnalysisResultSceneType(session.query, session.dataEnvelopes),
-  });
-  if (!issue) return;
-
-  const context = sessionContextManager.get(sessionId, session.traceId) || sessionContextManager.get(sessionId);
-  context?.annotateLatestCompletedTurn({
-    success: result.success,
-    findings: result.findings,
-    message: result.conclusion,
-    confidence: result.confidence,
-    partial: result.partial,
-    terminationReason: result.terminationReason,
-    terminationMessage: result.terminationMessage,
-    conclusionContract: result.conclusionContract,
-    claimSupport: result.claimSupport,
-    claimVerificationResult: result.claimVerificationResult,
-    identityResolutions: result.identityResolutions,
-  });
 }
 
 function recoverResultForSessionIfNeeded(
   sessionId: string,
   session: AnalysisSession,
 ): AgentRuntimeAnalysisResult | null {
-  if (session.result) {
-    annotateRecoveredResultQuality(sessionId, session, session.result);
-    return session.result;
+  const runId = getCompletedResultRunId(session);
+  const belongsToRun = (result: AgentRuntimeAnalysisResult): boolean => result.sessionId === sessionId &&
+    (!runId || [result.completion?.runId, result.analysisReceipt?.runId]
+      .every(storedRunId => !storedRunId || storedRunId === runId));
+  if (session.result) return belongsToRun(session.result) ? session.result : null;
+  const snapshot = SessionPersistenceService.getInstance().loadSessionStateSnapshot(sessionId);
+  const snapshotRunId = snapshot?.lastRun?.runId ?? snapshot?.activeRun?.runId;
+  if (snapshot?.finalResult && runId && snapshotRunId === runId && belongsToRun(snapshot.finalResult)) {
+    return snapshot.finalResult;
   }
-
   const resolved = resolveSessionContextForReview(sessionId);
-  if (!resolved) {
-    return null;
-  }
-
-  const recovered = buildRecoveredResultFromContext(sessionId, resolved.context);
-  if (!recovered) {
-    return null;
-  }
-
-  session.result = recovered;
-  const turns = resolved.context.getAllTurns();
-  const latestTurn = turns.length > 0 ? turns[turns.length - 1] : null;
-  if (latestTurn?.query) {
-    session.query = latestTurn.query;
-  }
-  annotateRecoveredResultQuality(sessionId, session, recovered, latestTurn?.query);
-  return recovered;
+  const recovered = resolved ? buildRecoveredResultFromContext(sessionId, resolved.context) : null;
+  return recovered && belongsToRun(recovered) ? recovered : null;
 }
 
 function buildFallbackIntentFromQuery(query?: string): Intent | null {
@@ -2870,7 +2871,10 @@ async function handleAnalyzeRequest(
       onSessionSecurityCleanup: sessionId => {
         revokeCodeAwareOutputGuards(sessionId);
         const active = assistantAppService.getSession(sessionId);
-        if (active) void cancelActiveAnalysisSourceEnrichment(active, 'analysis_context_changed');
+        if (active) {
+          abortHttpFinalizationRuns(active);
+          void cancelActiveAnalysisSourceEnrichment(active, 'analysis_context_changed');
+        }
       },
     });
 
@@ -3012,6 +3016,8 @@ async function handleAnalyzeRequest(
           smartAction: options.smartAction ?? 'preview',
           smartSelection: options.smartSelection,
           forceRefresh: options.forceRefresh === true,
+          providerId: sessionForRun.providerId,
+          analysisContextFingerprint: sessionForRun.analysisContextFingerprint,
           analysisMode: options.analysisMode,
           blockedStrategyIds,
           owner: ownerFieldsFromContext(requestContext),
@@ -3676,76 +3682,40 @@ router.get('/:sessionId/status', (req, res) => {
     observability: buildSessionObservability(session),
   };
 
-  if (session.status === 'completed' || session.status === 'quota_exceeded') {
+  if (session.status === 'completed' || session.status === 'quota_exceeded' || (session.status === 'failed' && session.result)) {
     const recoveredResult = recoverResultForSessionIfNeeded(sessionId, session);
     if (recoveredResult) {
-      const conclusion = normalizeNarrativeForClient(recoveredResult.conclusion);
-      const clientFindings = buildClientFindings(recoveredResult.findings, session.scenes || []);
-      const resultContract = buildSessionResultContract(session, clientFindings);
-      const sceneIdHint = resolveConclusionSceneIdHint({
-        sessionId,
-        query: session.query,
-        findings: recoveredResult.findings,
-        dataEnvelopes: session.dataEnvelopes,
-        currentTurn: session.runSequence,
-      });
-      const conclusionContract =
-        deriveEvidenceBackedConclusionContractForNarrative(recoveredResult.conclusion, session.dataEnvelopes || [], {
-          ...conclusionContractDeriveOptionsForSession(
-            session,
-            recoveredResult,
-            sceneIdHint,
-            session.analysisMode,
-          ),
-        }) || undefined;
-      const qualityArtifacts =
-        recoveredResult.claimSupport && recoveredResult.claimVerificationResult && recoveredResult.identityResolutions
-          ? {
-              claimSupport: recoveredResult.claimSupport,
-              claimVerificationResult: recoveredResult.claimVerificationResult,
-              identityResolutions: recoveredResult.identityResolutions,
-            }
-          : ensureAnalysisQualityArtifacts(session, conclusionContract, recoveredResult);
       const completedPayload = ensureCompletedAnalysisResultPayload(session);
+      const result = completedPayload?.result ?? projectStoredHttpResult(session, recoveredResult);
       const finalArtifacts = completedPayload?.finalArtifacts;
-      const rawCompletedConclusion = completedPayload?.normalizedConclusion || conclusion;
-      const normalizedCompletedContract = completedPayload?.normalizedConclusionContract || conclusionContract;
       const privateKnowledge = sessionUsesPrivateKnowledge(session);
       const outputLanguage = sessionOutputLanguage(session);
-      const normalizedCompletedConclusion = privateKnowledge
-        ? projectPrivateConclusion({
-            sessionId,
-            conclusion: rawCompletedConclusion,
-            success: recoveredResult.success,
-            language: outputLanguage,
-          })
-        : rawCompletedConclusion;
-      const projectedCompletedContract = privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, normalizedCompletedContract)
-        : normalizedCompletedContract;
-      const projectedQualityArtifacts = privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, qualityArtifacts)
-        : qualityArtifacts;
-      const projectedFindings = privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, clientFindings)
-        : clientFindings;
+      const normalizedCompletedConclusion = result.conclusion;
+      const projectedCompletedContract = result.conclusionContract;
+      const projectedQualityArtifacts = result;
+      const projectedFindings = result.findings;
+      const resultContract = buildSessionResultContract(session, projectedFindings);
       response.result = {
+        ...copyAnalysisDeliveryFields(result),
+        sourceUseDecision: result.sourceUseDecision,
+        sourceClaimVerificationResult: result.sourceClaimVerificationResult,
+        success: result.success,
         answer: normalizedCompletedConclusion,
         conclusion: normalizedCompletedConclusion,
         conclusionContract: projectedCompletedContract,
         claimSupport: projectedQualityArtifacts.claimSupport,
         claimVerificationResult: projectedQualityArtifacts.claimVerificationResult,
         identityResolutions: projectedQualityArtifacts.identityResolutions,
-        confidence: recoveredResult.confidence,
-        totalDurationMs: recoveredResult.totalDurationMs,
-        rounds: recoveredResult.rounds,
-        partial: recoveredResult.partial,
+        confidence: result.confidence,
+        totalDurationMs: result.totalDurationMs,
+        rounds: result.rounds,
+        partial: result.partial,
         terminationReason: privateKnowledge
-          ? projectPrivateTerminationReason(recoveredResult.terminationReason)
-          : recoveredResult.terminationReason,
+          ? projectPrivateTerminationReason(result.terminationReason)
+          : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(recoveredResult.terminationMessage, outputLanguage)
-          : recoveredResult.terminationMessage,
+          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage)
+          : result.terminationMessage,
         reportUrl: finalArtifacts?.reportUrl,
         reportError: privateKnowledge ? undefined : finalArtifacts?.reportError,
         resultSnapshotId: finalArtifacts?.resultSnapshotId,
@@ -4551,6 +4521,8 @@ async function runSmartAnalysis(
     smartAction: 'preview' | 'analyze';
     smartSelection?: SceneAnalysisSelection;
     forceRefresh: boolean;
+    providerId?: string | null;
+    analysisContextFingerprint?: string;
     analysisMode?: AnalyzeMode;
     blockedStrategyIds?: string[];
     owner: ResourceOwnerFields;
@@ -4578,6 +4550,16 @@ async function runSmartAnalysis(
   session.lastActivityAt = Date.now();
   persistSessionRunState(session, 'running', undefined, runId);
   const runHeartbeatInterval = startSessionRunHeartbeat(session, runId);
+  const authorizationSelection: AnalysisContextSelection = {
+    codeAwareMode: session.sourceAuthorization?.codeAwareMode ?? options.codeAwareMode,
+    codebaseIds: [...(session.sourceAuthorization?.codebaseIds ?? options.codebaseIds ?? [])],
+    knowledgeSourceIds: [...(options.knowledgeSourceIds ?? [])],
+  };
+  const knowledgeScope = {...options.knowledgeScope};
+  const authorizationFingerprint = session.analysisContextFingerprint ??
+    buildAnalysisContextAuthorizationFingerprint(authorizationSelection, knowledgeScope);
+  const finalizationRun = createHttpFinalizationRun(session, runId, authorizationSelection,
+    knowledgeScope, authorizationFingerprint, options.analysisContextFingerprint);
   const cancelToken = smartCancelBridge.create(sessionId, runId);
   let dispatchedToAgentDeepDive = false;
   const privateKnowledge = sessionUsesPrivateKnowledge(session);
@@ -4596,6 +4578,7 @@ async function runSmartAnalysis(
   });
 
   try {
+    finalizationRun.assertCurrent();
     const smartRegistry = currentEffectiveSkillRegistry();
     if (!smartRegistry) {
       throw new Error('effective_runtime_registry_snapshot_missing_for_run');
@@ -4649,6 +4632,7 @@ async function runSmartAnalysis(
       return;
     }
 
+    finalizationRun.assertCurrent();
     if (options.smartAction === 'preview') {
       const result = buildSmartSceneSelectionReport({
         sessionId,
@@ -4663,12 +4647,17 @@ async function runSmartAnalysis(
         });
         return;
       }
+      const finalized = await finalizeAnalysisResult({result, owner: finalizationRun.owner, query,
+        dataEnvelopes: session.dataEnvelopes, caseRetrieval: {status: 'not_checked', recommendations: []}});
+      finalizationRun.assertCurrent();
       completeAgentDrivenSessionWithResult({
         sessionId,
         query,
         traceId,
         session,
-        result,
+        result: finalized.result,
+        qualityIssue: finalized.qualityIssue,
+        assertCurrent: finalizationRun.assertCurrent,
         runId: options.runContext.runId,
         logComponent: 'SmartAnalysis',
       });
@@ -4722,6 +4711,8 @@ async function runSmartAnalysis(
       knowledgeScope: options.knowledgeScope,
       outputLanguage,
       analysisMode: options.analysisMode,
+      providerId: options.providerId,
+      analysisContextFingerprint: options.analysisContextFingerprint,
       codeAwareMode: options.codeAwareMode,
       codebaseIds: options.codebaseIds,
       knowledgeSourceIds: options.knowledgeSourceIds,
@@ -4763,6 +4754,7 @@ async function runSmartAnalysis(
       );
     }
   } finally {
+    finalizationRun.release();
     smartCancelBridge.release(sessionId, runId);
     if (runHeartbeatInterval) {
       clearInterval(runHeartbeatInterval);
@@ -4778,6 +4770,8 @@ export function buildSmartDeepDiveRunOptions(input: {
   knowledgeScope?: KnowledgeScope;
   outputLanguage: OutputLanguage;
   analysisMode?: AnalyzeMode;
+  providerId?: string | null;
+  analysisContextFingerprint?: string;
   codeAwareMode?: import('../services/codebase/codeAwareFeature').CodeAwareMode;
   codebaseIds?: readonly string[];
   knowledgeSourceIds?: readonly string[];
@@ -4785,6 +4779,8 @@ export function buildSmartDeepDiveRunOptions(input: {
 }): Record<string, unknown> {
   return {
     traceProcessorService: input.traceProcessorService,
+    providerId: input.providerId,
+    analysisContextFingerprint: input.analysisContextFingerprint,
     runContext: input.runContext,
     blockedStrategyIds: input.blockedStrategyIds,
     selectionContext: input.dispatch.selectionContext,
@@ -4973,7 +4969,10 @@ function completeAgentDrivenSessionWithResult(input: {
   result: AgentRuntimeAnalysisResult;
   runId?: string;
   logComponent: string;
+  qualityIssue?: FinalResultQualityIssue;
+  assertCurrent?: () => void;
 }): void {
+  input.assertCurrent?.();
   if (isSessionRunCancelled(input.session, input.runId)) {
     input.session.logger.warn(input.logComponent, 'Skipping late result after cancellation', {
       sessionId: input.sessionId,
@@ -4988,14 +4987,7 @@ function completeAgentDrivenSessionWithResult(input: {
     });
     return;
   }
-  finalizeAgentDrivenSession({
-    ...input,
-    outputLanguage: sessionOutputLanguage(input.session),
-    comparisonIdentity: comparisonIdentityFromReportSection(
-      input.session.comparisonReportSection,
-    ),
-  }, {
-    applyFinalResultQualityGate,
+  finalizeAgentDrivenSession(input, {
     isRunCurrent: (session, runId) => !runId || isCurrentRunOwner(session as AnalysisSession, runId),
     broadcast: broadcastToAgentDrivenClients,
     buildConversationStepUpdate,
@@ -5012,6 +5004,9 @@ function completeAgentDrivenSessionWithResult(input: {
         conclusionContract: result.conclusionContract,
         claimSupport: result.claimSupport,
         claimVerificationResult: result.claimVerificationResult,
+        sourceClaimVerificationResult: result.sourceClaimVerificationResult,
+        sourceUseDecision: result.sourceUseDecision,
+        ...copyAnalysisDeliveryFields(result),
         identityResolutions: result.identityResolutions,
       });
     },
@@ -5019,7 +5014,9 @@ function completeAgentDrivenSessionWithResult(input: {
     markSessionRunStatus,
     persistAgentTurn,
     refreshPersistedAgentSnapshot,
-    ensureCompletedAnalysisSseEvents,
+    ensureCompletedAnalysisSseEvents: (session, runId) => ensureCompletedAnalysisSseEvents(session, runId, {
+      entry: 'new_finalization', assertCurrent: input.assertCurrent,
+    }),
     sendAgentDrivenResult,
   });
 }
@@ -5518,8 +5515,8 @@ registerTeachingRoutes(router);
 registerAgentReportRoutes(router, {
   getSession: (sessionId) => assistantAppService.getSession(sessionId),
   recoverResultForSessionIfNeeded,
-  normalizeNarrativeForClient,
-  buildClientFindings,
+  normalizeNarrativeForClient: narrative => narrative,
+  buildClientFindings: copyStoredClientFindings,
   buildSessionResultContract,
   getCompletedPayload: ensureCompletedAnalysisResultPayload,
 });
@@ -5643,7 +5640,7 @@ export function collectPublishedSceneRootCauses(scope: KnowledgeScope | undefine
 }
 
 export async function captureCaseCandidatesAfterQualityArtifacts(
-  input: CaptureCaseCandidatesAfterQualityArtifactsInput,
+  input: CaptureCaseCandidatesAfterQualityArtifactsInput & {assertCurrent?: () => void},
 ): Promise<void> {
   try {
     if (sessionUsesPrivateKnowledge(input.session)) {
@@ -5683,7 +5680,9 @@ export async function captureCaseCandidatesAfterQualityArtifacts(
 
     const computeTraceHash =
       input.computeTraceHash || ((traceId) => computeTraceContentHash(getTraceProcessorService(), traceId));
+    input.assertCurrent?.();
     const traceContentHash = await computeTraceHash(input.traceId);
+    input.assertCurrent?.();
     // §1.2 flooding guard: build the set of (scene::rootCause) keys the
     // published library already covers, so capture skips clusters that
     // already have published guidance. Defaults to scanning the live library.
@@ -5700,6 +5699,7 @@ export async function captureCaseCandidatesAfterQualityArtifacts(
           existingPublishedSceneRootCauses,
         }));
 
+    input.assertCurrent?.();
     await saveCandidates({
       result: input.result,
       conclusionContract: input.normalizedConclusionContract,
@@ -5783,11 +5783,40 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     requestId: session.activeRun?.requestId,
     runSequence: session.activeRun?.sequence,
   });
+  options = {...options,
+    codebaseIds: Array.isArray(options.codebaseIds) ? [...options.codebaseIds] : undefined,
+    knowledgeSourceIds: Array.isArray(options.knowledgeSourceIds) ? [...options.knowledgeSourceIds] : undefined,
+  };
   const decoratedTraceContext = decorateTraceContextDatasets(options.traceContext, traceId);
   options.traceContext = decoratedTraceContext;
   if (!runIdForAnalysis) {
     throw new Error(`Missing run id for session ${sessionId}`);
   }
+  const authorizationSelection: AnalysisContextSelection = {
+    codeAwareMode: session.sourceAuthorization?.codeAwareMode ?? options.codeAwareMode,
+    codebaseIds: [...(session.sourceAuthorization?.codebaseIds ?? options.codebaseIds ?? [])],
+    knowledgeSourceIds: [...(options.knowledgeSourceIds ?? [])],
+  };
+  const knowledgeScope: KnowledgeScope = {...(options.knowledgeScope ?? {
+    tenantId: session.tenantId, workspaceId: session.workspaceId, userId: session.userId,
+  })};
+  const authorizationFingerprint = session.analysisContextFingerprint ??
+    buildAnalysisContextAuthorizationFingerprint(authorizationSelection, knowledgeScope);
+  const finalizationRun = createHttpFinalizationRun(session, runIdForAnalysis,
+    authorizationSelection, knowledgeScope, authorizationFingerprint, options.analysisContextFingerprint);
+  const startedAt = session.activeRun!.startedAt;
+  const startupDeadlineMs = Number.isFinite(options.taskTimeoutMs) && options.taskTimeoutMs > 0
+    ? startedAt + options.taskTimeoutMs : Number.POSITIVE_INFINITY;
+  let runtimeDeadlineMs = startupDeadlineMs;
+  let allowAutomaticPrefetch = false;
+  let finalizationContext: RuntimeFinalizationContext | undefined;
+  let contextTransferred = false;
+  let acceptingUpdates = true;
+  const rawDataEnvelopes: DataEnvelope[] = [...(session.dataEnvelopes ?? [])];
+  const canPrefetch = () => {
+    finalizationRun.assertCurrent();
+    return allowAutomaticPrefetch && Date.now() < runtimeDeadlineMs;
+  };
   const agentQuery =
     session.agentQuery && session.query === query
       ? session.agentQuery
@@ -5821,7 +5850,12 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
 
   // Set up streaming via event listener on orchestrator
   const handleUpdate = (update: StreamingUpdate) => {
-    if (isStaleRun(session, runIdForAnalysis) || isSessionRunCancelled(session, runIdForAnalysis)) return;
+    if (!acceptingUpdates) return;
+    try {finalizationRun.assertCurrent();} catch {return;}
+    if (update.type === 'data') {
+      const envelopes = Array.isArray(update.content) ? update.content : [update.content];
+      rawDataEnvelopes.push(...envelopes.filter((item): item is DataEnvelope => validateDataEnvelope(item).length === 0));
+    }
     session.lastActivityAt = Date.now();
     const sourceAware = sessionUsesPrivateKnowledge({
       codeAwareMode: options.codeAwareMode,
@@ -5840,19 +5874,15 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     if (projectedUpdate.type !== 'answer_token') {
       logger.debug('Stream', `Update: ${projectedUpdate.type}`, projectedUpdate.content);
     }
-    const normalizedUpdate = augmentConclusionUpdateWithEvidenceIndex(
-      session,
-      normalizeAgentDrivenUpdate(projectedUpdate, outputLanguage),
-    );
+    const normalizedUpdate = normalizeAgentDrivenUpdate(projectedUpdate, outputLanguage);
+
+    if (normalizedUpdate.type === 'conclusion' || normalizedUpdate.type === 'answer_token') return;
+    finalizationRun.assertCurrent();
 
     // Final narrative is emitted through analysis_completed after deterministic
     // evidence/claim verification has run. Suppress early conclusion events so
     // clients do not render an unverified terminal answer.
-    const shouldBroadcastOriginalUpdate =
-      normalizedUpdate.type !== 'conclusion' && normalizedUpdate.type !== 'answer_token';
-    if (shouldBroadcastOriginalUpdate) {
-      broadcastToAgentDrivenClients(sessionId, normalizedUpdate, runIdForAnalysis);
-    }
+    broadcastToAgentDrivenClients(sessionId, normalizedUpdate, runIdForAnalysis);
 
     // Also derive a conversation_step for the timeline/observability layer.
     const conversationStep = buildConversationStepUpdate(session, normalizedUpdate, runIdForAnalysis);
@@ -5918,7 +5948,7 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     // (answer_token, thought, conclusion, etc.) are already broadcast above
     // and remapping would cause duplicate delivery to the frontend.
     const eventType = mapToAgentDrivenEventType(normalizedUpdate);
-    if (shouldBroadcastOriginalUpdate && eventType !== normalizedUpdate.type) {
+    if (eventType !== normalizedUpdate.type) {
       broadcastToAgentDrivenClients(
         sessionId,
         {
@@ -5939,67 +5969,12 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
   session.orchestratorUpdateHandler = handleUpdate;
   session.orchestrator.on('update', handleUpdate);
 
-  // Run state_timeline in parallel while keeping it inside the run-owned lease.
-  // Only execute when explicitly requested (e.g. scene reconstruction flow),
-  // NOT on every analyze call — raw state lane data needs LLM reasoning before display.
-  let stateTimelinePromise: Promise<void> = Promise.resolve();
-  if (options.executeStateTimeline && options.traceProcessorService) {
-    stateTimelinePromise = runWithTraceProcessorLease(() =>
-      executeStateTimelineSkill(options.traceProcessorService, traceId),
-    )
-      .then((envelopes) => {
-        const projected = projectStateTimelineRunResult({
-          envelopes,
-          isStaleRun: () => isStaleRun(session, runIdForAnalysis),
-          isRunCancelled: () => isSessionRunCancelled(session, runIdForAnalysis),
-          isRunActive: () => {
-            const status = resolveSessionRun(session, runIdForAnalysis)?.status;
-            return status === 'pending' || status === 'running';
-          },
-          updateArtifacts: (result) => updateSceneReconstructionArtifactsFromEnvelopes(session, result),
-          emitData: (envelope) => {
-            broadcastToAgentDrivenClients(
-              sessionId,
-              {
-                type: 'data',
-                content: envelope,
-                timestamp: Date.now(),
-                id: generateEventId('data', sessionId),
-              },
-              runIdForAnalysis,
-            );
-          },
-          emitTrackData: () => {
-            broadcastToAgentDrivenClients(
-              sessionId,
-              {
-                type: 'track_data',
-                content: {
-                  tracks: session.trackEvents || [],
-                  scenes: session.scenes || [],
-                },
-                timestamp: Date.now(),
-                id: generateEventId('track_data', sessionId),
-              },
-              runIdForAnalysis,
-            );
-          },
-        });
-        if (!projected) return;
-        logger.info('StateTimeline', 'State timeline lanes broadcast', {
-          laneCount: Object.keys(session.stateTimeline || {}).length,
-          envelopeCount: envelopes.length,
-        });
-      })
-      .catch((err) => {
-        logger.warn('StateTimeline', 'state_timeline skill failed (non-fatal)', {
-          error: String(err?.message || err),
-        });
-      });
-  }
-
+  try {
+  finalizationRun.assertCurrent();
   const traceContextEnvelopes = appendTraceContextDataEnvelopes(session, decoratedTraceContext, traceId);
+  rawDataEnvelopes.push(...traceContextEnvelopes);
   if (traceContextEnvelopes.length > 0) {
+    finalizationRun.assertCurrent();
     broadcastToAgentDrivenClients(
       sessionId,
       {
@@ -6011,11 +5986,9 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     );
   }
 
-  try {
     console.log('[AgentRoutes.AgentDriven] Starting orchestrator.analyze...');
-    let result;
-    try {
-      result = await logger.timed('AgentDrivenAnalysis', 'analyze', async () => {
+    finalizationRun.assertCurrent();
+    let result = await logger.timed('AgentDrivenAnalysis', 'analyze', async () => {
         const analyze = () =>
           session.orchestrator.analyze(agentQuery, sessionId, traceId, {
             traceProcessorService: options.traceProcessorService,
@@ -6042,39 +6015,35 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
             tenantId: session.tenantId,
             workspaceId: session.workspaceId,
             userId: session.userId,
-            runId: session.activeRun?.runId,
+            runId: runIdForAnalysis,
             runManifestAttributionSink: options.runManifestAttributionSink,
+          }).then(nativeResult => {
+            finalizationContext = takeFinalizationContext(nativeResult);
+            acceptingUpdates = false;
+            session.orchestrator.off('update', handleUpdate);
+            finalizationRun.assertCurrent();
+            if (finalizationContext?.runId !== undefined && finalizationContext.runId !== runIdForAnalysis) {
+              throw new Error('finalization_run_identity_mismatch');
+            }
+            runtimeDeadlineMs = Math.min(startupDeadlineMs, finalizationContext?.deadlineMs ?? 0);
+            allowAutomaticPrefetch = finalizationContext !== undefined &&
+              resolveRuntimeTurnPolicy(finalizationContext.turnIntent, options.analysisMode).allowAutomaticPrefetch;
+            return nativeResult;
           });
         return runWithTraceProcessorLease(analyze);
       });
-    } finally {
-      await stateTimelinePromise;
-    }
-    console.log('[AgentRoutes.AgentDriven] analyze completed, success:', result.success);
-    if (session.analysisContextFingerprint && sessionUsesPrivateKnowledge(session)) {
-      assertCurrentAnalysisContextAuthorization(
-        {
-          codeAwareMode: session.sourceAuthorization?.codeAwareMode ?? session.codeAwareMode,
-          codebaseIds: session.sourceAuthorization?.codebaseIds ?? session.codebaseIds,
-          knowledgeSourceIds: session.knowledgeSourceIds,
-        },
-        options.knowledgeScope ?? {
-          tenantId: session.tenantId,
-          workspaceId: session.workspaceId,
-          userId: session.userId,
-        },
-        session.analysisContextFingerprint,
-      );
-    }
-    const runIsInactive = () =>
-      isSessionRunCancelled(session, runIdForAnalysis) || isStaleRun(session, runIdForAnalysis);
-    if (runIsInactive()) {
-      logger.info('AgentDrivenAnalysis', 'Ignoring inactive analysis success', {
-        sessionId,
-        runId: runIdForAnalysis,
-        cancelled: isSessionRunCancelled(session, runIdForAnalysis),
-      });
-      return;
+    finalizationRun.assertCurrent();
+    if (canPrefetch() && options.executeStateTimeline && options.traceProcessorService) {
+      try {
+        const envelopes = await awaitHttpFinalizationOperation(runWithTraceProcessorLease(() =>
+          executeStateTimelineSkill(options.traceProcessorService, traceId)), finalizationRun, runtimeDeadlineMs);
+        rawDataEnvelopes.push(...envelopes);
+        updateSceneReconstructionArtifactsFromEnvelopes(session, envelopes);
+        for (const envelope of envelopes) {
+          finalizationRun.assertCurrent();
+          broadcastToAgentDrivenClients(sessionId, {type: 'data', content: envelope, timestamp: Date.now()}, runIdForAnalysis);
+        }
+      } catch {finalizationRun.assertCurrent();}
     }
 
     // Ensure trackEvents/scenes are computed for completed sessions (even without SSE clients)
@@ -6082,17 +6051,17 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
       updateSceneReconstructionArtifactsFromEnvelopes(session, session.dataEnvelopes as DataEnvelope[]);
     }
 
-    if (session.referenceTraceId && options.traceProcessorService) {
+    if (canPrefetch() && options.referenceTraceId && options.traceProcessorService) {
       let comparisonReportSection: typeof session.comparisonReportSection;
       try {
-        comparisonReportSection = await runWithTraceProcessorLease(() =>
+        comparisonReportSection = await awaitHttpFinalizationOperation(runWithTraceProcessorLease(() =>
           buildRawTraceComparisonReportSection(options.traceProcessorService, {
             currentTraceId: traceId,
-            referenceTraceId: session.referenceTraceId!,
+            referenceTraceId: options.referenceTraceId,
           }),
-        );
+        ), finalizationRun, runtimeDeadlineMs);
       } catch (comparisonSectionError: any) {
-        if (runIsInactive()) return;
+        finalizationRun.assertCurrent();
         const comparisonTitle = localize(
           outputLanguage,
           'SmartPerfetto 确定性对比附录',
@@ -6121,120 +6090,70 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
           limitations: [comparisonFailure],
         };
       }
-      if (runIsInactive()) {
-        logger.info('AgentDrivenAnalysis', 'Ignoring comparison result for inactive run', {
-          sessionId,
-          runId: runIdForAnalysis,
-        });
-        return;
-      }
+      finalizationRun.assertCurrent();
       session.comparisonSource = 'raw_trace_pair';
       session.comparisonReportSection = comparisonReportSection;
     }
 
+    if (canPrefetch() && options.traceProcessorService) {
     try {
-      const traceSummaryExecution = await runWithTraceProcessorLease(() =>
+      const traceSummaryExecution = await awaitHttpFinalizationOperation(runWithTraceProcessorLease(() =>
         executeManagedTraceSummaryV1(options.traceProcessorService, traceId, 'current'),
-      );
-      if (runIsInactive()) return;
+      ), finalizationRun, runtimeDeadlineMs);
+      finalizationRun.assertCurrent();
       session.traceSummary = buildTraceSummaryAttributionV1(traceSummaryExecution);
     } catch {
-      if (runIsInactive()) return;
+      finalizationRun.assertCurrent();
       session.traceSummary = buildTraceSummaryAttributionV1(
         unavailableTraceSummaryV1('trace_processor_session_unavailable'),
       );
     }
 
-    if (runIsInactive()) return;
-    result.conclusion = completeFinalResultComparisonIdentity({
-      conclusion: result.conclusion,
-      identity: comparisonIdentityFromReportSection(session.comparisonReportSection),
-      outputLanguage,
-    });
-    let sceneIdHint: string | undefined;
-    if (result.success || result.partial === true) {
-      // Read the case-evolution config ONCE per request so the attach-flag
-      // and capture-flag decisions see the same snapshot (MINOR-2). Both the
-      // retriever-attach gate below and the capture call below consume this.
-      const caseEvolutionConfig = loadCaseEvolutionConfig();
-      sceneIdHint = resolveConclusionSceneIdHint({
-        sessionId,
-        query,
-        findings: result.findings,
-        dataEnvelopes: session.dataEnvelopes,
-        currentTurn: session.runSequence,
-      });
-      let normalizedConclusionContract = (deriveEvidenceBackedConclusionContractForNarrative(
-        result.conclusion,
-        session.dataEnvelopes || [],
-        {
-          ...conclusionContractDeriveOptionsForSession(
-            session,
-            result,
-            sceneIdHint,
-            options.analysisMode,
-          ),
-        },
-      ) || undefined) as ConclusionContract | undefined;
-      if (normalizedConclusionContract) {
-        if (isCaseEvolutionRetrieveEnabled(caseEvolutionConfig)) {
-          const attached = attachCaseHitsToContractSync({
-            conclusionContract: normalizedConclusionContract,
-            dataEnvelopes: session.dataEnvelopes || [],
-            sceneType: sceneIdHint,
-            architectureType: resolveCaseEvolutionArchitectureType(session, traceId),
-            knowledgeScope: options.knowledgeScope,
-          });
-          normalizedConclusionContract = attached.contract;
-        }
-        result.conclusionContract = normalizedConclusionContract;
-      }
-      ensureAnalysisQualityArtifacts(session, normalizedConclusionContract, result);
-      if (normalizedConclusionContract?.caseRecommendations?.length) {
-        const pruned = verifyAndPruneCaseRecommendations({
-          contract: normalizedConclusionContract,
-          evidenceSignaturesByCluster: projectEvidenceSignaturesByCluster(
-            session.dataEnvelopes || [],
-            normalizedConclusionContract,
-          ),
-          narrative: result.conclusion,
-          scope: options.knowledgeScope,
+    }
+    finalizationRun.assertCurrent();
+    const sceneIdHint = finalizationContext?.turnIntent.status === 'resolved'
+      ? finalizationContext.turnIntent.sceneId : result.conclusionContract?.metadata?.sceneId;
+    const caseEvolutionConfig = loadCaseEvolutionConfig();
+    let caseRetrieval: AnalysisCaseRetrievalState = {status: 'not_checked', recommendations: []};
+    if (canPrefetch() && result.conclusionContract && isCaseEvolutionRetrieveEnabled(caseEvolutionConfig)) {
+      try {
+        const attached = attachCaseHitsToContractSync({
+          conclusionContract: result.conclusionContract, dataEnvelopes: rawDataEnvelopes,
+          sceneType: sceneIdHint, architectureType: resolveCaseEvolutionArchitectureType(session, traceId), knowledgeScope,
         });
-        normalizedConclusionContract = pruned.contract;
-        result.conclusionContract = normalizedConclusionContract;
-        if (pruned.issues.length > 0) {
-          result.claimVerificationResult = mergeCaseRecommendationVerificationIssues(
-            result.claimVerificationResult,
-            pruned.issues,
-          );
-          session.claimVerificationResult = result.claimVerificationResult;
-        }
+        finalizationRun.assertCurrent();
+        caseRetrieval = {status: 'checked', recommendations: attached.hits};
+      } catch {
+        finalizationRun.assertCurrent();
+        caseRetrieval = {status: 'unavailable', recommendations: []};
       }
+    }
+    finalizationRun.assertCurrent();
+    const comparisonIdentity = options.referenceTraceId ? await resolveCapturedComparisonIdentity({
+      currentTraceId: traceId, referenceTraceId: options.referenceTraceId, dataEnvelopes: rawDataEnvelopes,
+      context: finalizationContext, signal: finalizationRun.owner.signal, reportSection: session.comparisonReportSection,
+    }) : undefined;
+    finalizationRun.assertCurrent();
+    contextTransferred = true;
+    const finalized = await finalizeAnalysisResult({
+      result, context: finalizationContext, owner: finalizationRun.owner, query,
+      dataEnvelopes: rawDataEnvelopes, comparisonReportSection: session.comparisonReportSection,
+      comparisonIdentity,
+      caseRetrieval,
+    });
+    finalizationRun.assertCurrent();
+    result = finalized.result;
+    if (canPrefetch() && (result.success || result.partial === true)) {
       void captureCaseCandidatesAfterQualityArtifacts({
-        sessionId,
-        traceId,
-        session,
-        result,
-        normalizedConclusionContract,
-        sceneIdHint,
-        runIdForAnalysis,
-        knowledgeScope: options.knowledgeScope,
-        caseEvolutionConfig,
-        logger,
+        sessionId, traceId, session, result, normalizedConclusionContract: result.conclusionContract,
+        sceneIdHint, runIdForAnalysis, knowledgeScope, caseEvolutionConfig, logger,
+        assertCurrent: () => {
+          finalizationRun.assertCurrent();
+          if (Date.now() >= runtimeDeadlineMs) throw new DOMException('Run deadline exceeded', 'TimeoutError');
+        },
       });
     }
 
-    const shouldStartDeepSourceEnrichment =
-      result.success &&
-      session.sourceActivation === 'deep_supplement' &&
-      Boolean(session.sourceAuthorization);
-    if (shouldStartDeepSourceEnrichment) {
-      session.analysisSourceEnrichment = {
-        runId: runIdForAnalysis,
-        status: 'running',
-        startedAt: Date.now(),
-      };
-    }
     completeAgentDrivenSessionWithResult({
       sessionId,
       query,
@@ -6244,25 +6163,17 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
       result,
       runId: runIdForAnalysis,
       logComponent: 'AgentDrivenAnalysis',
+      qualityIssue: finalized.qualityIssue,
+      assertCurrent: finalizationRun.assertCurrent,
     });
-    if (shouldStartDeepSourceEnrichment) {
-      session.orchestrator.off('update', handleUpdate);
-      if (session.orchestratorUpdateHandler === handleUpdate) {
-        session.orchestratorUpdateHandler = undefined;
-      }
-      startAnalysisSourceEnrichment(session, {
-        runId: runIdForAnalysis,
-        traceId,
-        question: query,
-        primaryConclusion: result.conclusion,
-      });
-    }
   } catch (error: any) {
+    if (!finalizationRun.owner.isCurrent()) return;
     const privateKnowledge = sessionUsesPrivateKnowledge(session);
     const authorizationChanged = error instanceof AnalysisContextAuthorizationChangedError ||
       error?.code === 'analysis_context_changed_restart_required';
     if (authorizationChanged) {
       await retireAuthorizationChangedSession(sessionId, session, handleUpdate);
+      if (!finalizationRun.owner.isCurrent()) return;
     }
     const publicErrorMessage = privateKnowledge
       ? privateAnalysisFailureMessage(outputLanguage)
@@ -6320,6 +6231,9 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     logger.close();
     throw error;
   } finally {
+    acceptingUpdates = false;
+    if (!contextTransferred) finalizationContext?.dispose();
+    finalizationRun.release();
     if (runHeartbeatInterval) {
       clearInterval(runHeartbeatInterval);
     }
@@ -6331,29 +6245,6 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     modelRouter.off('llmTelemetry', onLlmTelemetry);
   }
 }
-
-function mergeCaseRecommendationVerificationIssues(
-  existing: ClaimVerificationResult | undefined,
-  issues: ClaimVerificationResult['issues'],
-): ClaimVerificationResult {
-  if (existing) {
-    return {
-      ...existing,
-      issues: [...existing.issues, ...issues],
-    };
-  }
-  return {
-    schemaVersion: 'claim_verifier@1',
-    status: 'partial',
-    policy: 'record_only',
-    passed: false,
-    checkedClaimCount: 0,
-    unsupportedClaimCount: 0,
-    claimResults: [],
-    issues,
-  };
-}
-
 
 function escapeHtmlForInlineHtml(value: unknown): string {
   return String(value ?? '')
@@ -6421,7 +6312,11 @@ function buildConversationStepUpdate(
   runId?: string,
 ): StreamingUpdate | null {
   const language = sessionOutputLanguage(session);
-  const derived = deriveTimelineStep(update, language);
+  const derived = deriveTimelineStep(update, language, {
+    comparisonActive: Boolean(session.referenceTraceId) || session.comparisonSource === 'analysis_result_snapshots',
+    currentTraceId: session.traceId,
+    referenceTraceId: session.referenceTraceId,
+  });
   if (!derived) return null;
 
   const {phase, role, text} = derived;
@@ -7885,63 +7780,6 @@ function augmentConclusionUpdateWithEvidenceIndex(session: AnalysisSession, upda
   };
 }
 
-function ensureAnalysisQualityArtifacts(
-  session: AnalysisSession,
-  conclusionContract?: ConclusionContract,
-  resultOverride?: AgentRuntimeAnalysisResult,
-): {
-  claimSupport?: ClaimSupportV1[];
-  claimVerificationResult?: ClaimVerificationResult;
-  identityResolutions?: IdentityResolutionV1[];
-} {
-  const result = resultOverride || session.result;
-  if (!result) return {};
-
-  if (result.claimSupport && result.claimVerificationResult && result.identityResolutions) {
-    session.claimSupport = result.claimSupport;
-    session.claimVerificationResult = result.claimVerificationResult;
-    session.identityResolutions = result.identityResolutions;
-    const context = sessionContextManager.get(session.sessionId, session.traceId);
-    context?.annotateLatestCompletedTurn({
-      conclusionContract,
-      claimSupport: result.claimSupport,
-      claimVerificationResult: result.claimVerificationResult,
-      identityResolutions: result.identityResolutions,
-    });
-    return {
-      claimSupport: result.claimSupport,
-      claimVerificationResult: result.claimVerificationResult,
-      identityResolutions: result.identityResolutions,
-    };
-  }
-
-  const artifacts = runPreparedAnalysisClaimVerification({
-    conclusionContract,
-    dataEnvelopes: session.dataEnvelopes || [],
-    comparisonReportSection: session.comparisonReportSection,
-    policy: 'record_only',
-  });
-
-  result.claimSupport = artifacts.claimSupport;
-  result.claimVerificationResult = artifacts.claimVerificationResult;
-  result.identityResolutions = artifacts.identityResolutions;
-  const context = sessionContextManager.get(session.sessionId, session.traceId);
-  context?.annotateLatestCompletedTurn({
-    conclusionContract,
-    claimSupport: artifacts.claimSupport,
-    claimVerificationResult: artifacts.claimVerificationResult,
-    identityResolutions: artifacts.identityResolutions,
-  });
-  session.claimSupport = artifacts.claimSupport;
-  session.claimVerificationResult = artifacts.claimVerificationResult;
-  session.identityResolutions = artifacts.identityResolutions;
-  return {
-    claimSupport: artifacts.claimSupport,
-    claimVerificationResult: artifacts.claimVerificationResult,
-    identityResolutions: artifacts.identityResolutions,
-  };
-}
-
 function collectEvidenceRefsFromText(text: string | undefined): Set<string> {
   const refs = new Set<string>();
   const matches = String(text || '').match(/data:[A-Za-z0-9_.:-]+/g) || [];
@@ -8162,7 +8000,7 @@ interface CompletedAnalysisResultPayload {
   uiActionProposals?: AgentRuntimeAnalysisResult['uiActionProposals'];
   clientFindings: ReturnType<typeof buildClientFindings>;
   resultContract: ReturnType<typeof buildSessionResultContract>;
-  finalArtifacts: CompletedAnalysisFinalArtifacts;
+  finalArtifacts: Partial<CompletedAnalysisFinalArtifacts>;
 }
 
 function ensureCompletedAnalysisFinalArtifacts(
@@ -8175,8 +8013,10 @@ function ensureCompletedAnalysisFinalArtifacts(
     qualityArtifacts: CompletedAnalysisResultPayload['qualityArtifacts'];
     resultForClient: AgentRuntimeAnalysisResult;
     runId?: string;
+    assertCurrent?: () => void;
   },
 ): CompletedAnalysisFinalArtifacts {
+  input.assertCurrent?.();
   const runId = input.runId;
   const artifactCache = ((session as any).completedAnalysisFinalArtifactsByRunId ||= {}) as Record<
     string,
@@ -8287,6 +8127,7 @@ function ensureCompletedAnalysisFinalArtifacts(
       });
 
       const html = generator.generateAgentDrivenHTML(reportData);
+      input.assertCurrent?.();
       persistReport(reportId, {
         html,
         generatedAt: Date.now(),
@@ -8303,6 +8144,7 @@ function ensureCompletedAnalysisFinalArtifacts(
       finalArtifacts.reportUrl = reportUrl;
       console.log(`[AgentRoutes] Generated agent-driven HTML report: ${reportId} (${html.length} bytes)`);
     } catch (error: any) {
+      input.assertCurrent?.();
       reportId = undefined;
       finalArtifacts.reportError = error.message || 'Unknown error';
       console.error('[AgentRoutes] Failed to generate agent-driven HTML report:', {
@@ -8346,6 +8188,7 @@ function ensureCompletedAnalysisFinalArtifacts(
         finalArtifacts,
         providerId: session.providerId ?? null,
       });
+      input.assertCurrent?.();
       const resultSnapshot = persistCompletedAnalysisResultSnapshot({
         tenantId: session.tenantId,
         workspaceId: session.workspaceId,
@@ -8354,7 +8197,8 @@ function ensureCompletedAnalysisFinalArtifacts(
         sessionId: session.sessionId,
         runId,
         reportId: finalArtifacts.reportId,
-        sceneType: resolveAnalysisResultSceneType(session.query, session.dataEnvelopes),
+        sceneType: result.turnIntent?.status === 'resolved' ? result.turnIntent.sceneId
+          : result.conclusionContract?.metadata?.sceneId ?? 'general',
         query: privateKnowledge
           ? privateAnalysisQueryMessage(outputLanguage)
           : session.query,
@@ -8362,6 +8206,9 @@ function ensureCompletedAnalysisFinalArtifacts(
         conclusion: privateKnowledge
           ? durableResultForClient.conclusion
           : input.normalizedConclusion,
+        ...copyAnalysisDeliveryFields(durableResultForClient),
+        success: durableResultForClient.success,
+        sourceClaimVerificationResult: durableResultForClient.sourceClaimVerificationResult,
         conclusionContract: durableResultForClient.conclusionContract,
         sourceUseDecision: durableResultForClient.sourceUseDecision,
         claimSupport: durableResultForClient.claimSupport,
@@ -8401,6 +8248,7 @@ function ensureCompletedAnalysisFinalArtifacts(
         };
       }
     } catch (snapshotError: any) {
+      input.assertCurrent?.();
       console.warn('[AgentRoutes] Failed to persist analysis result snapshot:', {
         sessionId: session.sessionId,
         runId,
@@ -8409,6 +8257,7 @@ function ensureCompletedAnalysisFinalArtifacts(
     }
   }
 
+  input.assertCurrent?.();
   if (runId) {
     artifactCache[runId] = finalArtifacts;
   } else {
@@ -8417,167 +8266,68 @@ function ensureCompletedAnalysisFinalArtifacts(
   return finalArtifacts;
 }
 
+interface CompletedPublication {
+  entry: 'new_finalization';
+  assertCurrent?: () => void;
+}
+
+function copyStoredClientFindings(findings: AgentRuntimeAnalysisResult['findings']): ClientFindingPayload[] {
+  return findings.map((finding, index) => ({...finding, id: finding.id ?? `finding_${index + 1}`}));
+}
+
+function projectStoredHttpResult(session: AnalysisSession, result: AgentRuntimeAnalysisResult): AgentRuntimeAnalysisResult {
+  return sessionUsesPrivateKnowledge(session)
+    ? projectPrivateAnalysisResult(session.sessionId, result, sessionOutputLanguage(session))
+    : copyAnalysisResultForSnapshot(result);
+}
+
 function ensureCompletedAnalysisResultPayload(
   session: AnalysisSession,
   runId?: string,
+  publication?: CompletedPublication,
 ): CompletedAnalysisResultPayload | undefined {
   const completedRunId = getCompletedResultRunId(session, runId);
-  const result = session.result;
-  if (!result) return undefined;
-  const replayOnlyScene = isSceneReplayOnlyQuery(session.query);
-  const hasEvidenceBackedConclusion = result.success || result.partial === true;
-  const isSmartResult = result.conclusionContract?.metadata?.sceneId === 'smart';
-  const normalizedConclusion = replayOnlyScene
-    ? buildSceneReplayNarrative(session.scenes || [])
-    : hasEvidenceBackedConclusion
-      ? appendEvidenceIndexIfMissing(
-          normalizeNarrativeForClient(result.conclusion),
-          session.dataEnvelopes || [],
-          sessionOutputLanguage(session),
-        )
-      : normalizeNarrativeForClient(result.conclusion);
-  const sceneIdHint = replayOnlyScene
-    ? undefined
-    : resolveConclusionSceneIdHint({
-        sessionId: session.sessionId,
-        query: session.query,
-        findings: result.findings,
-        dataEnvelopes: session.dataEnvelopes,
-        currentTurn: session.runSequence,
-      });
-  const normalizedConclusionContract = replayOnlyScene
-    ? undefined
-    : isSmartResult
-      ? (result.conclusionContract as ConclusionContract)
-      : hasEvidenceBackedConclusion
-        ? deriveEvidenceBackedConclusionContractForNarrative(result.conclusion, session.dataEnvelopes || [], {
-            ...conclusionContractDeriveOptionsForSession(
-              session,
-              result,
-              sceneIdHint,
-              session.analysisMode,
-            ),
-          }) || undefined
-        : undefined;
-  const qualityArtifacts =
-    hasEvidenceBackedConclusion && !replayOnlyScene
-      ? ensureAnalysisQualityArtifacts(session, normalizedConclusionContract)
-      : {};
-  let quickRun = finalizeQuickRunReceipt(session, {
-    result,
-    qualityArtifacts,
-    runId: completedRunId,
-  });
-  if (quickRun) {
-    result.quickRun = quickRun;
-  }
-  if (normalizedConclusionContract) {
-    result.conclusionContract = normalizedConclusionContract;
-  }
-  if (!replayOnlyScene) {
-    const readPathQualityIssue = applyFinalResultQualityGate({
-      result,
-      query: session.query,
-      sceneType: sceneIdHint ?? result.conclusionContract?.metadata?.sceneId,
+  // A run-scoped replay can never borrow a later turn's body or receipt.
+  if (runId && runId !== getSessionRunId(session)) return undefined;
+  const stored = recoverResultForSessionIfNeeded(session.sessionId, session);
+  if (!stored) return undefined;
+  const storedRunId = stored.completion?.runId ?? stored.analysisReceipt?.runId;
+  if (completedRunId && storedRunId && storedRunId !== completedRunId) return undefined;
+  if (!publication && !storedRunId && (session.status === 'running' || session.status === 'pending')) return undefined;
+  publication?.assertCurrent?.();
+  if (publication) {
+    const qualityArtifacts = {claimSupport: stored.claimSupport, claimVerificationResult: stored.claimVerificationResult,
+      identityResolutions: stored.identityResolutions};
+    stored.quickRun = finalizeQuickRunReceipt(session, {result: stored, qualityArtifacts, runId: completedRunId});
+    stored.uiActionProposals = deriveUiActionProposals({dataEnvelopes: session.dataEnvelopes ?? [],
+      currentTraceId: session.traceId, existingProposals: stored.uiActionProposals});
+    publication.assertCurrent?.();
+    const finalArtifacts = ensureCompletedAnalysisFinalArtifacts(session, {
+      result: stored, hasEvidenceBackedConclusion: stored.success || stored.partial === true,
+      normalizedConclusion: stored.conclusion, normalizedConclusionContract: stored.conclusionContract,
+      qualityArtifacts, resultForClient: stored, runId: completedRunId, assertCurrent: publication.assertCurrent,
     });
-    if (readPathQualityIssue) {
-      sessionContextManager.get(session.sessionId, session.traceId)?.annotateLatestCompletedTurn({
-        success: result.success,
-        findings: result.findings,
-        message: result.conclusion,
-        confidence: result.confidence,
-        partial: result.partial,
-        terminationReason: result.terminationReason,
-        terminationMessage: result.terminationMessage,
-        conclusionContract: result.conclusionContract,
-        claimSupport: result.claimSupport,
-        claimVerificationResult: result.claimVerificationResult,
-        identityResolutions: result.identityResolutions,
-      });
-      quickRun = finalizeQuickRunReceipt(session, {
-        result,
-        qualityArtifacts,
-        runId: completedRunId,
-      });
-      if (quickRun) {
-        result.quickRun = quickRun;
-      }
-    }
+    publication.assertCurrent?.();
+    stored.analysisReceipt = buildAnalysisReceiptForReference(finalArtifacts.receiptReference, {
+      session, result: stored, runId: completedRunId, qualityArtifacts, quickRun: stored.quickRun,
+      finalArtifacts, providerId: session.providerId ?? null,
+    });
+    if (completedRunId) getActiveRunManifestLifecycle(runManifestScopeFromSession(session),
+      session.sessionId, completedRunId)?.dispose();
   }
-  let resultForClient: AgentRuntimeAnalysisResult =
-    normalizedConclusion === result.conclusion &&
-    normalizedConclusionContract === result.conclusionContract &&
-    qualityArtifacts.claimSupport === result.claimSupport &&
-    qualityArtifacts.claimVerificationResult === result.claimVerificationResult &&
-    qualityArtifacts.identityResolutions === result.identityResolutions &&
-    quickRun === result.quickRun
-      ? result
-      : {
-          ...result,
-          conclusion: normalizedConclusion,
-          conclusionContract: normalizedConclusionContract,
-          ...qualityArtifacts,
-          quickRun,
-        };
-  const uiActionProposals = replayOnlyScene
-    ? []
-    : deriveUiActionProposals({
-        dataEnvelopes: session.dataEnvelopes || [],
-        currentTraceId: session.traceId,
-        existingProposals: result.uiActionProposals,
-      });
-  result.uiActionProposals = uiActionProposals;
-  resultForClient = {
-    ...resultForClient,
-    uiActionProposals,
-  };
-  const clientFindings = replayOnlyScene ? [] : buildClientFindings(result.findings, session.scenes || []);
-  const resultContract = buildSessionResultContract(session, clientFindings);
-  const finalArtifacts = ensureCompletedAnalysisFinalArtifacts(session, {
-    result,
-    hasEvidenceBackedConclusion,
-    normalizedConclusion,
-    normalizedConclusionContract,
-    qualityArtifacts,
-    resultForClient: resultForClient as AgentRuntimeAnalysisResult,
-    runId: completedRunId,
-  });
-  const analysisReceipt = buildAnalysisReceiptForReference(
-    finalArtifacts.receiptReference,
-    {
-      session,
-      result: resultForClient,
-      runId: completedRunId,
-      qualityArtifacts,
-      quickRun,
-      finalArtifacts,
-      providerId: session.providerId ?? null,
-    },
-  );
-  result.analysisReceipt = analysisReceipt;
-  resultForClient = {
-    ...resultForClient,
-    analysisReceipt,
-  };
-  if (completedRunId) {
-    getActiveRunManifestLifecycle(
-      runManifestScopeFromSession(session),
-      session.sessionId,
-      completedRunId,
-    )?.dispose();
-  }
+  const result = projectStoredHttpResult(session, stored);
+  const finalArtifacts = (completedRunId
+    ? (session as any).completedAnalysisFinalArtifactsByRunId?.[completedRunId]
+    : (session as any).completedAnalysisFinalArtifacts) ?? {};
+  const clientFindings = copyStoredClientFindings(result.findings);
   return {
-    result,
-    replayOnlyScene,
-    normalizedConclusion,
-    normalizedConclusionContract,
-    qualityArtifacts,
-    quickRun,
-    analysisReceipt,
-    uiActionProposals,
-    clientFindings,
-    resultContract,
-    finalArtifacts,
+    result, replayOnlyScene: false, normalizedConclusion: result.conclusion,
+    normalizedConclusionContract: result.conclusionContract,
+    qualityArtifacts: {claimSupport: result.claimSupport, claimVerificationResult: result.claimVerificationResult,
+      identityResolutions: result.identityResolutions},
+    quickRun: result.quickRun, analysisReceipt: result.analysisReceipt,
+    uiActionProposals: result.uiActionProposals, clientFindings,
+    resultContract: buildSessionResultContract(session, clientFindings), finalArtifacts,
   };
 }
 
@@ -8600,91 +8350,29 @@ function analysisCompletedData(
 function projectAnalysisCompletedConclusionContract(
   value: unknown,
   actualSourceUseDecision?: unknown,
-): {
-  conclusionContract?: ConclusionContract;
-  sourceProvenance?: SafeSourceProvenanceProjection;
-  sourceProjectionApplied: boolean;
-} {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    (value as Record<string, unknown>).schemaVersion !== 'conclusion_contract_v1'
-  ) {
-    return {
-      ...(value ? {conclusionContract: value as ConclusionContract} : {}),
-      sourceProjectionApplied: false,
-    };
-  }
-  const rawContract = value as ConclusionContract;
-  const actualDecision = sanitizeSourceUseDecision(actualSourceUseDecision);
-  const sourceProjectionApplied = Boolean(
-    rawContract.sourceUseDecision ||
-    rawContract.sourceReferences ||
-    rawContract.sourceClaimBindings ||
-    actualDecision,
-  );
-  const sanitizedContract = sanitizeConclusionSourceContract(rawContract, {
-    actualSourceUseDecision: actualDecision ?? null,
-  });
-  const sourceProvenance = actualDecision
-    ? projectSafeSourceProvenance({
-        conclusionContract: sanitizedContract,
-        actualSourceUseDecision: actualDecision,
-      })
-    : undefined;
-  if (!sourceProvenance) {
-    return {
-      conclusionContract: sanitizedContract,
-      sourceProjectionApplied,
-    };
-  }
-  return {
-    conclusionContract: {
-      ...sanitizedContract,
-      sourceUseDecision: sourceProvenance.sourceUseDecision,
-      sourceReferences: sourceProvenance.sourceUseDecision.references,
-      sourceClaimBindings: sourceProvenance.sourceClaimBindings,
-    },
-    sourceProvenance,
-    sourceProjectionApplied,
-  };
+): {conclusionContract?: ConclusionContract; sourceProjectionApplied: boolean} {
+  const contract = projectStoredConclusionSourceMetadata(value, actualSourceUseDecision) as ConclusionContract | undefined;
+  return {conclusionContract: contract, sourceProjectionApplied: contract !== value};
 }
 
-function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: string): BufferedSseEvent[] {
+function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: string, publication?: CompletedPublication): BufferedSseEvent[] {
   const completedRunId = getCompletedResultRunId(session, runId);
-  const sseCache = ((session as any).completedAnalysisSseEventsByRunId ||= {}) as Record<
-    string,
-    {
-      qualityGateVersion?: number;
-      events: BufferedSseEvent[];
-    }
-  >;
-  const runCache = completedRunId ? sseCache[completedRunId] : undefined;
-  const cached = completedRunId
-    ? runCache?.events
-    : ((session as any).completedAnalysisSseEvents as BufferedSseEvent[] | undefined);
-  const cachedVersion = completedRunId
-    ? runCache?.qualityGateVersion
-    : (session as any).completedAnalysisSseEventsQualityGateVersion;
-  if (cached?.length && cachedVersion === COMPLETED_ANALYSIS_SSE_EVENTS_QUALITY_GATE_VERSION) {
-    return cached;
-  }
-
-  const completedPayload = ensureCompletedAnalysisResultPayload(session, completedRunId);
-  if (!completedPayload) {
+  const sseCache = (session as any).completedAnalysisSseEventsByRunId as Record<string, {events: BufferedSseEvent[]}> | undefined;
+  const cached = completedRunId ? sseCache?.[completedRunId]?.events
+    : (session as any).completedAnalysisSseEvents as BufferedSseEvent[] | undefined;
+  if (cached?.length && !publication) return cached.map(event => ({...event,
+    eventData: sanitizePersistedAnalysisCompletedEvent(session, event as unknown as SerializedAgentEvent).eventData}));
+  if (!publication) {
     const persisted = loadPersistedCompletedAnalysisSseEvents(session, completedRunId);
-    if (persisted.length > 0) {
-      if (completedRunId) {
-        sseCache[completedRunId] = { events: persisted };
-      } else {
-        (session as any).completedAnalysisSseEvents = persisted;
-        delete (session as any).completedAnalysisSseEventsQualityGateVersion;
-      }
-      return persisted;
-    }
-    return [];
+    if (persisted.length) return persisted;
   }
+  const completedPayload = ensureCompletedAnalysisResultPayload(session, completedRunId, publication);
+  if (!completedPayload) return [];
+  const appendEvent = (target: AnalysisSession, eventType: string, payload: Record<string, unknown>, id?: string): BufferedSseEvent => {
+    publication?.assertCurrent?.();
+    if (publication) return appendAndPersistReplayableSessionEvent(target, eventType, payload, id);
+    return {seqId: target.sseEventSeq ?? 0, eventType, eventData: JSON.stringify(payload), runId: id};
+  };
   const {
     result,
     normalizedConclusion,
@@ -8700,20 +8388,9 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
   const observability = buildStreamObservability(session, completedRunId);
   const privateKnowledge = sessionUsesPrivateKnowledge(session);
   const outputLanguage = sessionOutputLanguage(session);
-  const projectedConclusion = privateKnowledge
-    ? projectPrivateConclusion({
-        sessionId: session.sessionId,
-        conclusion: normalizedConclusion,
-        success: result.success,
-        language: outputLanguage,
-      })
-    : normalizedConclusion;
-  const projectedConclusionContract = privateKnowledge
-    ? projectPrivateStructuredValue(session.sessionId, normalizedConclusionContract)
-    : normalizedConclusionContract;
-  const projectedQualityArtifacts = privateKnowledge
-    ? projectPrivateStructuredValue(session.sessionId, qualityArtifacts)
-    : qualityArtifacts;
+  const projectedConclusion = normalizedConclusion;
+  const projectedConclusionContract = normalizedConclusionContract;
+  const projectedQualityArtifacts = qualityArtifacts;
   const projectedUiActionProposals = privateKnowledge
     ? projectPrivateStructuredValue(session.sessionId, uiActionProposals)
     : uiActionProposals;
@@ -8737,7 +8414,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
   const events: BufferedSseEvent[] = [];
   const progressEvent =
     latestBufferedProgressEvent(session, completedRunId) ??
-    appendAndPersistReplayableSessionEvent(
+    appendEvent(
       session,
       'progress',
       {
@@ -8760,7 +8437,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
 
   if (finalArtifacts.resultSnapshotEventData) {
     events.push(
-      appendAndPersistReplayableSessionEvent(
+      appendEvent(
         session,
         'snapshot_created',
         {
@@ -8778,17 +8455,21 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
   // Send analysis_completed event with full result. Keep it replayable so a
   // reconnect between conclusion and report generation can recover reportUrl.
   events.push(
-    appendAndPersistReplayableSessionEvent(
+    appendEvent(
       session,
       'analysis_completed',
       {
         type: 'analysis_completed',
         architecture: 'agent-driven',
         ...observability,
-        data: analysisCompletedData({
+        data: {
           ...(privateKnowledge
             ? {privateProjectionVersion: PRIVATE_ANALYSIS_EVENT_PROJECTION_VERSION}
             : {}),
+          ...copyAnalysisDeliveryFields(result),
+          success: result.success,
+          sourceUseDecision: result.sourceUseDecision,
+          sourceClaimVerificationResult: result.sourceClaimVerificationResult,
           conclusion: projectedConclusion,
           conclusionContract: projectedConclusionContract,
           claimSupport: projectedQualityArtifacts.claimSupport,
@@ -8849,8 +8530,8 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
           resultSnapshotId: finalArtifacts.resultSnapshotId,
           sourceEnrichmentPending: session.analysisSourceEnrichment?.status === 'running',
           observability,
-          terminalRunStatus: session.status === 'quota_exceeded' ? 'quota_exceeded' : 'completed',
-        }, result.sourceUseDecision),
+          terminalRunStatus: terminalRunStatusForResult(result),
+        },
         timestamp: Date.now(),
       },
       completedRunId,
@@ -8860,7 +8541,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
   // Backward-compatible scene reconstruction payload (used by the legacy /scene-reconstruct clients).
   if ((session.scenes?.length || 0) > 0 || (session.trackEvents?.length || 0) > 0) {
     events.push(
-      appendAndPersistReplayableSessionEvent(
+      appendEvent(
         session,
         'scene_reconstruction_completed',
         {
@@ -8899,7 +8580,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
 
   if (session.analysisSourceEnrichment?.status !== 'running') {
     events.push(
-      appendAndPersistReplayableSessionEvent(
+      appendEvent(
         session,
         'end',
         {
@@ -8910,12 +8591,13 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
       ),
     );
   }
-  if (completedRunId) {
-    sseCache[completedRunId] = {
+  if (publication && completedRunId) {
+    const writableCache = ((session as any).completedAnalysisSseEventsByRunId ||= {});
+    writableCache[completedRunId] = {
       events,
       qualityGateVersion: COMPLETED_ANALYSIS_SSE_EVENTS_QUALITY_GATE_VERSION,
     };
-  } else {
+  } else if (publication) {
     (session as any).completedAnalysisSseEvents = events;
     (session as any).completedAnalysisSseEventsQualityGateVersion = COMPLETED_ANALYSIS_SSE_EVENTS_QUALITY_GATE_VERSION;
   }
@@ -8985,6 +8667,9 @@ const sessionCleanupInterval = setInterval(() => {
 sessionCleanupInterval.unref?.();
 
 export const agentRoutesPrivacyProjectionTestSeam = {
+  ensureCompletedAnalysisSseEvents,
+  recoverResultForSessionIfNeeded,
+  ensureCompletedAnalysisResultPayload,
   buildTurnSummary,
   buildTurnDetail,
   sanitizePersistedAnalysisCompletedEvent,
@@ -9012,6 +8697,10 @@ export const agentRoutesSmartPreviewSelectionTestSeam = {
 };
 
 export const agentRoutesCancellationTestSeam = {
+  runAgentDrivenAnalysis,
+  createHttpFinalizationRun,
+  startAnalysisSourceEnrichment,
+  abortHttpFinalizationRuns,
   setSession: (sessionId: string, session: AnalysisSession) =>
     assistantAppService.setSession(sessionId, session),
   deleteSession: (sessionId: string) => assistantAppService.deleteSession(sessionId),

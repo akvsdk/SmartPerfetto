@@ -35,13 +35,15 @@ import { createSessionLogger } from '../../services/sessionLogger';
 import { SessionPersistenceService } from '../../services/sessionPersistenceService';
 import { getHTMLReportGenerator } from '../../services/htmlReportGenerator';
 import { buildAgentDrivenReportData } from '../../services/agentReportData';
-import { normalizeResultForReport } from '../../services/agentResultNormalizer';
 import { buildAnalysisReceipt } from '../../services/analysisReceiptBuilder';
 import {recordAdaptiveRoutingPostEvidenceBestEffort} from '../../agentRuntime/adaptiveRoutingProjection';
 import { deriveUiActionProposals } from '../../services/uiActionProposalDeriver';
 import { persistAgentTurn } from '../../services/persistAgentSession';
-import { applyFinalResultQualityGate } from '../../services/finalResultQualityGate';
-import {runPreparedAnalysisClaimVerification} from '../../services/evidence/analysisRelationPreparation';
+import {finalizeAnalysisResult} from '../../services/finalizeAnalysisResult';
+import {resolveCapturedComparisonIdentity} from '../../services/comparisonAppendixService';
+import type {FinalResultQualityIssue} from '../../services/finalResultQualityGate';
+import {takeFinalizationContext, type RuntimeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
+import {resolveRuntimeTurnPolicy} from '../../agentRuntime/runtimeTurnPolicy';
 import {executeManagedTraceSummaryV1} from '../../services/managedTraceSummary';
 import {buildTraceSummaryAttributionV1} from '../../services/traceSummaryAttribution';
 import {unavailableTraceSummaryV1} from '../../services/traceSummaryExecutor';
@@ -108,10 +110,7 @@ import {
   resolveAnalysisSourceActivation,
 } from '../../services/codebase/analysisSourceActivationPolicy';
 import {resetRuntimeForSourceActivation} from '../../services/codebase/analysisSourceContextTransition';
-import {
-  runAnalysisSourceSupplement,
-  type AnalysisSourceSupplementOutcome,
-} from '../../services/codebase/analysisSourceSupplement';
+import type {AnalysisSourceSupplementOutcome} from '../../services/codebase/analysisSourceSupplement';
 import {
   privateAnalysisFailureMessage,
   privateAnalysisQueryMessage,
@@ -126,6 +125,8 @@ import {
 } from '../../services/selfEvolution/runManifestLifecycle';
 
 export interface RunTurnInput {
+  /** Cancels runtime execution and finalization until the turn is committed. */
+  signal?: AbortSignal;
   tracePath?: string;
   traceId?: string;
   referenceTraceId?: string;
@@ -292,6 +293,27 @@ export function shouldExposeLiveStreamingUpdate(update: StreamingUpdate): boolea
  *   (the same DB the HTTP server uses — intentional, so REPL sessions are
  *   visible to the web UI and vice versa).
  */
+async function awaitCliFinalizationOperation<T>(operation: Promise<T>, signal: AbortSignal, deadlineMs: number): Promise<T> {
+  let onAbort: () => void = () => {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, {once: true});
+    if (signal.aborted) onAbort();
+    timer = setTimeout(() => reject(new DOMException('Finalization deadline exceeded', 'TimeoutError')),
+      Math.max(0, Math.min(deadlineMs - Date.now(), 2_147_483_647)));
+  });
+  try { return await Promise.race([operation, interrupted]); }
+  finally {clearTimeout(timer); signal.removeEventListener('abort', onAbort);}
+}
+
+interface CliAnalysisRunOwner {
+  runId: string;
+  controller: AbortController;
+  sessionId?: string;
+  abortRuntime?: () => void;
+}
+
 export class CliAnalyzeService {
   private static checkedTraceProcessorPath: string | null = null;
   private static traceProcessorInstallPromise: Promise<void> | null = null;
@@ -308,6 +330,9 @@ export class CliAnalyzeService {
   private readonly persistence: SessionPersistenceService;
   private readonly analyzeService: AgentAnalyzeSessionService<AnalyzeManagedSession>;
   private readonly ownedSessionIds = new Set<string>();
+  private readonly activeRuns = new Set<CliAnalysisRunOwner>();
+  private readonly currentSessionRuns = new Map<string, CliAnalysisRunOwner>();
+  private shuttingDown = false;
   /**
    * Traces this service loaded, so teardown can destroy exactly those.
    *
@@ -330,7 +355,10 @@ export class CliAnalyzeService {
       // Only invoked on resume; PR1 covers fresh analyze only. Returning null
       // lets prepareSession fall through to a new session rather than throw.
       buildRecoveredResultFromContext: () => null,
-      onSessionSecurityCleanup: revokeCodeAwareOutputGuards,
+      onSessionSecurityCleanup: sessionId => {
+        this.currentSessionRuns.get(sessionId)?.controller.abort(new AnalysisContextAuthorizationChangedError());
+        revokeCodeAwareOutputGuards(sessionId);
+      },
     });
   }
 
@@ -395,6 +423,29 @@ export class CliAnalyzeService {
   }
 
   async runTurn(input: RunTurnInput): Promise<RunTurnOutput> {
+    if (this.shuttingDown) throw new DOMException('CLI service is shutting down', 'AbortError');
+    const run: CliAnalysisRunOwner = {runId: randomUUID(), controller: new AbortController()};
+    this.activeRuns.add(run);
+    const abort = () => run.controller.abort(input.signal?.reason);
+    const abortRuntime = () => run.abortRuntime?.();
+    input.signal?.addEventListener('abort', abort, {once: true});
+    run.controller.signal.addEventListener('abort', abortRuntime, {once: true});
+    if (input.signal?.aborted) abort();
+    const release = () => {
+      input.signal?.removeEventListener('abort', abort);
+      run.controller.signal.removeEventListener('abort', abortRuntime);
+      this.activeRuns.delete(run);
+      if (run.sessionId && this.currentSessionRuns.get(run.sessionId) === run) this.currentSessionRuns.delete(run.sessionId);
+    };
+    try {
+      return await this.runOwnedTurn(input, run);
+    } finally {
+      release();
+    }
+  }
+
+  private async runOwnedTurn(input: RunTurnInput, run: CliAnalysisRunOwner): Promise<RunTurnOutput> {
+    run.controller.signal.throwIfAborted();
     // Resolve traceId: either passed in (we assume caller already loaded), or load now.
     let traceId = input.traceId;
     if (!traceId) {
@@ -402,6 +453,7 @@ export class CliAnalyzeService {
         throw new Error('runTurn requires either tracePath or traceId');
       }
       traceId = await this.loadTrace(input.tracePath);
+      run.controller.signal.throwIfAborted();
     }
 
     const knowledgeScope = resolveCodebaseScope();
@@ -415,6 +467,7 @@ export class CliAnalyzeService {
 
     if (isCliE2eFakeMode()) {
       const output = await runCliE2eFakeTurn(effectiveInput, traceId);
+      run.controller.signal.throwIfAborted();
       this.ownedSessionIds.add(output.sessionId);
       return output;
     }
@@ -437,7 +490,6 @@ export class CliAnalyzeService {
       (primaryOptions.codeAwareMode !== 'off' && primaryOptions.codebaseIds?.length) ||
       primaryOptions.knowledgeSourceIds?.length
     );
-    const durablePrivateKnowledge = primaryPrivateKnowledge || sourceActivation === 'deep_supplement';
     const { sessionId, session } = this.analyzeService.prepareSession({
       traceId,
       query: input.query,
@@ -453,6 +505,22 @@ export class CliAnalyzeService {
         knowledgeSourceIds: primaryOptions.knowledgeSourceIds,
       },
     });
+    this.currentSessionRuns.get(sessionId)?.controller.abort(new DOMException('CLI run superseded', 'AbortError'));
+    this.currentSessionRuns.set(sessionId, run);
+    run.sessionId = sessionId;
+    run.abortRuntime = () => {
+      void Promise.resolve().then(() => session.orchestrator.abortSession?.(sessionId)).catch(() => undefined);
+    };
+    let ownedRunSequence: number | undefined;
+    const assertActive = () => {
+      run.controller.signal.throwIfAborted();
+      if (this.currentSessionRuns.get(sessionId) !== run ||
+        (ownedRunSequence !== undefined && session.runSequence !== ownedRunSequence)) {
+        throw new DOMException('CLI run is no longer current', 'AbortError');
+      }
+      assertCurrentAnalysisContextAuthorization(effectiveInput, knowledgeScope, analysisContextFingerprint);
+    };
+    assertActive();
     this.ownedSessionIds.add(sessionId);
     const resetQuery = await resetRuntimeForSourceActivation({
       orchestrator: session.orchestrator,
@@ -463,6 +531,7 @@ export class CliAnalyzeService {
       queryHistory: session.queryHistory,
       conclusionHistory: session.conclusionHistory,
     });
+    assertActive();
     if (resetQuery) session.agentQuery = resetQuery;
     session.sourceActivation = sourceActivation;
     session.sourceAuthorization =
@@ -491,6 +560,7 @@ export class CliAnalyzeService {
     // turn index used by appendMessages (msg-<session>-turn<N>-role) is unique
     // across turns rather than colliding with prior turns of the same session.
     session.runSequence = (session.runSequence || 0) + 1;
+    ownedRunSequence = session.runSequence;
     session.queryHistory ??= [];
     session.queryHistory.push({
       turn: session.runSequence,
@@ -509,8 +579,9 @@ export class CliAnalyzeService {
     const runtimeRegistrySnapshot = await getEffectiveRuntimeRegistrySnapshot({
       scope: resolvedScope,
     });
+    assertActive();
     const runManifestLifecycle = createRunManifestLifecycle({
-      runId: randomUUID(),
+      runId: run.runId,
       sessionId,
       scope: {
         tenantId: resolvedScope.tenantId,
@@ -530,20 +601,23 @@ export class CliAnalyzeService {
       ),
       runtimeRegistrySnapshot,
     });
-    const cliTurnPath = durablePrivateKnowledge ? undefined : input.resolveCliTurnPath(sessionId, input.turn);
+    const cliTurnPath = primaryPrivateKnowledge ? undefined : input.resolveCliTurnPath(sessionId, input.turn);
 
     try {
       return await withRunManifestLifecycle(runManifestLifecycle, async () => {
         // Surface sessionId to the caller now, before analyze() starts emitting
         // events. Without this, callers must buffer events until runTurn resolves,
         // which accumulates the entire analyze run's output in memory.
+        assertActive();
         input.onSessionReady?.(sessionId);
+        assertActive();
 
         const orchestrator = session.orchestrator;
 
         // Subscribe to live updates. Wrap in off()-on-finally to avoid handler leaks
         // if runTurn is called multiple times within one CLI process (REPL path).
         const handler = (update: StreamingUpdate) => {
+          try { assertActive(); } catch (error) { run.controller.abort(error); return; }
           const envelopes = envelopesFromStreamingUpdate(update);
           if (envelopes.length > 0) {
             session.dataEnvelopes.push(...envelopes);
@@ -556,6 +630,7 @@ export class CliAnalyzeService {
           );
           if (!shouldExposeLiveStreamingUpdate(projectedUpdate)) return;
           try {
+            assertActive();
             input.onEvent(projectedUpdate);
           } catch (err) {
             // Don't let a renderer bug kill the analysis — log and continue.
@@ -565,6 +640,9 @@ export class CliAnalyzeService {
         orchestrator.on('update', handler);
 
         let result: AnalysisResult;
+        let context: RuntimeFinalizationContext | undefined;
+        let contextTransferred = false;
+        let finalQualityIssue: FinalResultQualityIssue | undefined;
         const agentQuery =
           session.agentQuery && session.query === input.query
             ? session.agentQuery
@@ -572,6 +650,7 @@ export class CliAnalyzeService {
         try {
           result = await orchestrator.analyze(agentQuery, sessionId, traceId, {
             providerId: session.providerId,
+            runId: run.runId,
             referenceTraceId: effectiveReferenceTraceId,
             analysisMode: requestedAnalysisMode,
             codeAwareMode: primaryOptions.codeAwareMode,
@@ -582,9 +661,49 @@ export class CliAnalyzeService {
             runManifestAttributionSink: runManifestLifecycle.builder,
             ...knowledgeScope,
           });
-          if (primaryPrivateKnowledge) {
-            assertCurrentAnalysisContextAuthorization(effectiveInput, knowledgeScope, analysisContextFingerprint);
+          context = takeFinalizationContext(result);
+          orchestrator.off('update', handler);
+          assertActive();
+          if (context && context.runId !== run.runId) throw new Error('finalization_run_identity_mismatch');
+          const runtimeDeadlineMs = context?.deadlineMs ?? 0;
+          const allowAutomaticPrefetch = context
+            ? resolveRuntimeTurnPolicy(context.turnIntent, requestedAnalysisMode).allowAutomaticPrefetch : false;
+          if (allowAutomaticPrefetch && Date.now() < runtimeDeadlineMs) {
+            try {
+              const summary = await awaitCliFinalizationOperation(
+                executeManagedTraceSummaryV1(getTraceProcessorService(), traceId, 'current'), run.controller.signal, runtimeDeadlineMs);
+              assertActive();
+              session.traceSummary = buildTraceSummaryAttributionV1(summary);
+            } catch {
+              assertActive();
+              session.traceSummary = buildTraceSummaryAttributionV1(unavailableTraceSummaryV1('trace_processor_session_unavailable'));
+            }
           }
+          assertActive();
+          const comparisonIdentityRead = effectiveReferenceTraceId
+            ? resolveCapturedComparisonIdentity({currentTraceId: traceId,
+              referenceTraceId: effectiveReferenceTraceId, dataEnvelopes: session.dataEnvelopes as DataEnvelope[],
+              context, signal: run.controller.signal, reportSection: session.comparisonReportSection})
+            : undefined;
+          const comparisonIdentity = comparisonIdentityRead
+            ? context ? await awaitCliFinalizationOperation(comparisonIdentityRead, run.controller.signal, runtimeDeadlineMs)
+              : await comparisonIdentityRead
+            : undefined;
+          assertActive();
+          contextTransferred = true;
+          const finalized = await finalizeAnalysisResult({result, context, query: input.query,
+            owner: {runId: run.runId, signal: run.controller.signal,
+              ...(primaryOptions.analysisContextFingerprint !== undefined
+                ? {analysisContextFingerprint: primaryOptions.analysisContextFingerprint} : {}),
+              isCurrent: () => this.currentSessionRuns.get(sessionId) === run && session.runSequence === ownedRunSequence,
+              assertAuthorized: () => assertCurrentAnalysisContextAuthorization(effectiveInput, knowledgeScope, analysisContextFingerprint)},
+            dataEnvelopes: session.dataEnvelopes as DataEnvelope[], comparisonReportSection: session.comparisonReportSection,
+            ...(comparisonIdentity ? {comparisonIdentity} : {}),
+            caseRetrieval: {status: 'not_checked', recommendations: []},
+          });
+          assertActive();
+          result = finalized.result;
+          finalQualityIssue = finalized.qualityIssue;
         } catch (error) {
           if (error instanceof AnalysisContextAuthorizationChangedError) {
             orchestrator.off('update', handler);
@@ -597,32 +716,15 @@ export class CliAnalyzeService {
           throw error;
         } finally {
           orchestrator.off('update', handler);
+          if (!contextTransferred) context?.dispose();
         }
+        assertActive();
         session.codeAwareMode = primaryOptions.codeAwareMode;
         session.codebaseIds = primaryOptions.codebaseIds;
         session.knowledgeSourceIds = primaryOptions.knowledgeSourceIds;
-        const normalized = normalizeResultForReport(result, {
-          dataEnvelopes: session.dataEnvelopes as DataEnvelope[],
-          runSequence: session.runSequence,
-          requestedAnalysisMode,
-        });
-        result.conclusion = normalized.conclusion;
-        if (normalized.conclusionContract) {
-          result.conclusionContract = normalized.conclusionContract;
-        }
-        const qualityArtifacts = runPreparedAnalysisClaimVerification({
-          conclusionContract: normalized.conclusionContract,
-          dataEnvelopes: session.dataEnvelopes as DataEnvelope[],
-          comparisonReportSection: session.comparisonReportSection,
-          policy: 'record_only',
-        });
-        result.claimSupport = qualityArtifacts.claimSupport;
-        result.claimVerificationResult = qualityArtifacts.claimVerificationResult;
-        result.identityResolutions = qualityArtifacts.identityResolutions;
-        session.claimSupport = qualityArtifacts.claimSupport;
-        session.claimVerificationResult = qualityArtifacts.claimVerificationResult;
-        session.identityResolutions = qualityArtifacts.identityResolutions;
-        const finalQualityIssue = applyFinalResultQualityGate({ result, query: input.query });
+        session.claimSupport = result.claimSupport;
+        session.claimVerificationResult = result.claimVerificationResult;
+        session.identityResolutions = result.identityResolutions;
         if (finalQualityIssue) {
           try {
             input.onEvent({
@@ -640,6 +742,7 @@ export class CliAnalyzeService {
             console.error('[CliAnalyzeService] onEvent handler threw:', (err as Error).message);
           }
         }
+        assertActive();
         result.uiActionProposals = deriveUiActionProposals({
           dataEnvelopes: session.dataEnvelopes as DataEnvelope[],
           currentTraceId: traceId,
@@ -655,19 +758,7 @@ export class CliAnalyzeService {
             sourceDerived: sourceActivation === 'bounded_explicit' ? true : undefined,
           });
         }
-        try {
-          session.traceSummary = buildTraceSummaryAttributionV1(
-            await executeManagedTraceSummaryV1(
-              getTraceProcessorService(),
-              traceId,
-              'current',
-            ),
-          );
-        } catch {
-          session.traceSummary = buildTraceSummaryAttributionV1(
-            unavailableTraceSummaryV1('trace_processor_session_unavailable'),
-          );
-        }
+        assertActive();
         recordAdaptiveRoutingPostEvidenceBestEffort({
           builder: runManifestLifecycle.builder,
           result,
@@ -688,11 +779,11 @@ export class CliAnalyzeService {
             : {}),
           session,
           result,
-          qualityArtifacts,
           quickRun: result.quickRun,
           providerId: session.providerId ?? null,
           cliTurnPath,
         });
+        assertActive();
         session.result = result;
         sessionContextManager.get(sessionId, traceId)?.annotateLatestCompletedTurn({
           success: result.success,
@@ -702,22 +793,23 @@ export class CliAnalyzeService {
           partial: result.partial,
           terminationReason: result.terminationReason,
           terminationMessage: result.terminationMessage,
-          conclusionContract: normalized.conclusionContract,
-          claimSupport: qualityArtifacts.claimSupport,
-          claimVerificationResult: qualityArtifacts.claimVerificationResult,
-          identityResolutions: qualityArtifacts.identityResolutions,
+          conclusionContract: result.conclusionContract,
+          claimSupport: result.claimSupport,
+          claimVerificationResult: result.claimVerificationResult,
+          identityResolutions: result.identityResolutions,
         });
 
         // Persist to SQLite BEFORE building the report — the snapshot is stashed on
         // the session as `_lastSnapshot` and read by the HTML generator. Routes
         // through the same shared helper the HTTP layer uses, so any future schema
         // change applies to both paths automatically.
+        assertActive();
         persistAgentTurn({
           session,
           sessionId,
           traceId,
           query: input.query,
-          result: { conclusion: result.conclusion, totalDurationMs: result.totalDurationMs },
+          result,
         });
 
         const persistedSnapshot = (
@@ -756,36 +848,13 @@ export class CliAnalyzeService {
             ? orchestrator.getSdkSessionId(sessionId, effectiveReferenceTraceId)
             : undefined;
 
+        assertActive();
         const reportOutput = this.buildReportHtml(session, result);
         const durableResult = primaryPrivateKnowledge
           ? projectPrivateAnalysisResult(sessionId, result, outputLanguage)
           : result;
-        let sourceSupplementTask: Promise<AnalysisSourceSupplementOutcome | undefined> | undefined;
-        if (sourceActivation === 'deep_supplement' && session.sourceAuthorization) {
-          const supplementRunId = `cli-turn-${input.turn}`;
-          input.onEvent({
-            type: 'analysis_source_enrichment_started',
-            content: {runId: supplementRunId},
-            timestamp: Date.now(),
-          });
-          sourceSupplementTask = runAnalysisSourceSupplement({
-            orchestrator,
-            sessionId,
-            runId: supplementRunId,
-            traceId,
-            question: input.query,
-            primaryConclusion: result.conclusion,
-            analysisOptions: {
-              providerId: session.providerId,
-              outputLanguage,
-              codeAwareMode: session.sourceAuthorization.codeAwareMode,
-              codebaseIds: session.sourceAuthorization.codebaseIds,
-              analysisContextFingerprint,
-              ...knowledgeScope,
-            },
-          }).catch(() => undefined);
-        }
 
+        assertActive();
         return {
           sessionId,
           traceId,
@@ -804,8 +873,7 @@ export class CliAnalyzeService {
               ? persistedProviderSnapshotHash
               : (session.providerSnapshotHash ?? null),
           codeAwareMode: effectiveCodeAwareMode,
-          privateKnowledge: durablePrivateKnowledge,
-          ...(sourceSupplementTask ? {sourceSupplementTask} : {}),
+          privateKnowledge: primaryPrivateKnowledge,
         };
       });
     } catch (error) {
@@ -829,42 +897,14 @@ export class CliAnalyzeService {
   }
 
   /**
-   * Build the HTML report for a completed turn. Routes through the shared
-   * `normalizeResultForReport` + `buildAgentDrivenReportData` pipeline the
-   * HTTP path uses, so CLI and web UI emit identical reports for the same
-   * session (same sanitized conclusion text, same derived conclusionContract).
+   * Render the finalized result without re-normalizing its signed conclusion or verification.
    */
   private buildReportHtml(
     session: AnalyzeManagedSession,
     result: AnalysisResult,
   ): { html?: string; error?: string } {
     try {
-      const normalized = normalizeResultForReport(result, {
-        dataEnvelopes: session.dataEnvelopes as DataEnvelope[],
-      });
-      const reportData = buildAgentDrivenReportData({
-        session,
-        result: {
-          sessionId: session.sessionId,
-          success: normalized.success,
-          findings: normalized.findings,
-          hypotheses: normalized.hypotheses,
-          conclusion: normalized.conclusion,
-          conclusionContract: normalized.conclusionContract,
-          sourceUseDecision: normalized.sourceUseDecision ?? result.sourceUseDecision,
-          claimSupport: normalized.claimSupport ?? result.claimSupport,
-          claimVerificationResult: normalized.claimVerificationResult ?? result.claimVerificationResult,
-          identityResolutions: normalized.identityResolutions ?? result.identityResolutions,
-          confidence: normalized.confidence,
-          rounds: normalized.rounds,
-          totalDurationMs: normalized.totalDurationMs,
-          partial: normalized.partial,
-          terminationReason: normalized.terminationReason,
-          terminationMessage: normalized.terminationMessage,
-          analysisReceipt: normalized.analysisReceipt ?? result.analysisReceipt,
-          uiActionProposals: normalized.uiActionProposals ?? result.uiActionProposals,
-        },
-      });
+      const reportData = buildAgentDrivenReportData({session, result});
       const html = getHTMLReportGenerator().generateAgentDrivenHTML(reportData);
       return { html };
     } catch (err) {
@@ -921,6 +961,8 @@ export class CliAnalyzeService {
    * trace_processor_shell subprocess — otherwise Node waits on it.
    */
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    for (const run of this.activeRuns) run.controller.abort(new DOMException('CLI shutdown', 'AbortError'));
     for (const sessionId of this.ownedSessionIds) clearCodeAwareOutputGuards(sessionId);
     this.ownedSessionIds.clear();
     try {

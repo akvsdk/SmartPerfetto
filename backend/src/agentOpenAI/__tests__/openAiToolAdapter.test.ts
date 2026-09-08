@@ -6,8 +6,22 @@ import { describe, expect, it, jest } from '@jest/globals';
 import { z } from 'zod';
 import { createOpenAIToolsFromMcpDefinitions } from '../openAiToolAdapter';
 import { createTraceProcessorQueryCancelledError } from '../../services/traceProcessorCancellation';
+import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
+import {McpToolRegistry} from '../../agentv3/mcpToolRegistry';
 
 describe('createOpenAIToolsFromMcpDefinitions', () => {
+  it('keeps producer facts through a real registry and OpenAI adapter despite notes and large output', async () => {
+    const registry = new McpToolRegistry();
+    registry.registerShared({
+      name: 'execute_sql', description: 'Read data', inputSchema: {}, exposure: 'public',
+      handler: async () => createRuntimeToolResult({success: false, planPhaseId: 'p1', error: 'x'.repeat(14000)}, {
+        decorate: text => '[accuracy] {"success":true}\n' + text,
+      }),
+    });
+    const [adapted] = createOpenAIToolsFromMcpDefinitions(registry.list());
+    const output = await (adapted as any).invoke({} as any, '{}');
+    expect(readRuntimeToolResultFacts(output)).toEqual({success: false, planPhaseId: 'p1'});
+  });
   it('converts optional Claude MCP Zod fields into OpenAI strict-compatible JSON Schema', async () => {
     const handler = jest.fn(async (args: Record<string, unknown>, _extra: unknown) => ({
       content: [{ type: 'text', text: JSON.stringify(args) }],

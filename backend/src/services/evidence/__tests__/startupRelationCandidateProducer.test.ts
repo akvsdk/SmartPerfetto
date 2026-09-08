@@ -4,6 +4,7 @@
 
 import {createDataEnvelope, type DataEnvelope} from '../../../types/dataContract';
 import {buildEvidenceContract} from '../evidenceContractBuilder';
+import {getCapturedAnchorFacts} from '../evidenceCapture';
 import {produceStartupRelationCandidates} from '../startupRelationCandidateProducer';
 
 function envelope(
@@ -28,7 +29,7 @@ function envelope(
 }
 
 describe('startupRelationCandidateProducer', () => {
-  it('emits stable verified overlap candidates from exact startup and Binder rows', () => {
+  it('emits stable exact overlap candidates without granting ordinary rows clock authority', () => {
     const startups = envelope(
       'get_startups', 'data:startup', ['start_ts', 'end_ts'],
       [['9007199254740993', '9007199254741093']],
@@ -52,10 +53,24 @@ describe('startupRelationCandidateProducer', () => {
         object: expect.objectContaining({evidenceRefId: 'data:binder', rowIndex: 0}),
       }),
     ]);
-    expect(buildEvidenceContract({
+    const built = buildEvidenceContract({
       dataEnvelopes: [startups, binder], relationCandidates: first,
-    }).relations[0]).toEqual(expect.objectContaining({
-      verificationStatus: 'verified', reasonCode: 'overlap_verified',
+    });
+    const startupAnchor = built.anchors.find(anchor => anchor.evidenceRefId === 'data:startup')!;
+    const binderAnchor = built.anchors.find(anchor => anchor.evidenceRefId === 'data:binder')!;
+    expect(startupAnchor.timeRange).toEqual({
+      startTs: '9007199254740993', endTs: '9007199254741093', unit: 'ns', source: 'row',
+    });
+    expect(binderAnchor.timeRange).toEqual({
+      startTs: '9007199254741000', endTs: '9007199254741010', unit: 'ns', source: 'row',
+    });
+    expect(BigInt(binderAnchor.timeRange!.endTs) - BigInt(binderAnchor.timeRange!.startTs)).toBe(10n);
+    expect(BigInt(binderAnchor.timeRange!.startTs)).toBeGreaterThan(BigInt(startupAnchor.timeRange!.startTs));
+    expect(BigInt(binderAnchor.timeRange!.endTs)).toBeLessThan(BigInt(startupAnchor.timeRange!.endTs));
+    expect(getCapturedAnchorFacts(startupAnchor)).toBeUndefined();
+    expect(getCapturedAnchorFacts(binderAnchor)).toBeUndefined();
+    expect(built.relations[0]).toEqual(expect.objectContaining({
+      verificationStatus: 'candidate', supportLevel: 'inference', reasonCode: 'overlap_range_missing',
     }));
   });
 
@@ -71,7 +86,9 @@ describe('startupRelationCandidateProducer', () => {
     expect(built.anchors.find(anchor => anchor.evidenceRefId === 'data:binder')?.timeRange).toEqual({
       startTs: '19', endTs: '20', unit: 'ns', source: 'row',
     });
-    expect(built.relations[0]?.verificationStatus).toBe('verified');
+    expect(built.relations[0]).toEqual(expect.objectContaining({
+      verificationStatus: 'candidate', supportLevel: 'inference', reasonCode: 'overlap_range_missing',
+    }));
   });
 
   it.each([

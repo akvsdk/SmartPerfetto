@@ -31,10 +31,28 @@ import {
   type OpenCodeSdkModuleLoader,
 } from '../openCodeRuntime';
 import type { RuntimeFactoryInput } from '../runtimeRegistry';
+import type {AnalysisPlanV3} from '../../agentv3/types';
+import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../runtimeToolResult';
+import {McpToolRegistry} from '../../agentv3/mcpToolRegistry';
 import type { QueryResult, TraceInfo, TraceProcessorService } from '../../services/traceProcessorService';
 import { createTraceProcessorQueryCancelledError } from '../../services/traceProcessorCancellation';
-import * as quickEvidenceDirectAnswer from '../quickEvidenceDirectAnswer';
+import {runOpenCodeIntentTransport} from '../engines/opencode/openCodeIntentTransport';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import {createClaudeMcpServer} from '../../agentv3/claudeMcpServer';
+import * as claudeMcpModule from '../../agentv3/claudeMcpServer';
+import * as turnIntentModule from '../analysisTurnIntent';
+import * as sqlKnowledgeBase from '../../services/sqlKnowledgeBase';
+import * as runtimePromptContext from '../runtimePromptContext';
+import * as finalResultQualityGate from '../../services/finalResultQualityGate';
+import * as providerManager from '../../services/providerManager';
+import * as sourceClaimVerifier from '../../services/codebase/sourceClaimVerifier';
+import * as finalizationContext from '../analysisFinalizationContext';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import {
+  clearCodeAwareOutputGuards,
+  registerCodeAwareCanary,
+  revokeCodeAwareOutputGuards,
+} from '../../services/security/codeAwareOutputRegistry';
 import {
   createRuntimeSourceFinalizationFixture,
   SOURCE_FINALIZATION_CANARY,
@@ -43,6 +61,18 @@ import {
 import {createRuntimePerformanceRecorder} from '../runtimePerformance';
 import type {RunManifestAttributionSink} from '../../types/selfEvolution';
 import * as evaluationRuntimeHooks from '../../services/selfEvolution/evaluationRuntimeHooks';
+
+const mockOpenCodeIntentTransport = jest.fn<typeof runOpenCodeIntentTransport>();
+jest.mock('../engines/opencode/openCodeIntentTransport', () => ({
+  runOpenCodeIntentTransport: (input: Parameters<typeof runOpenCodeIntentTransport>[0]) => mockOpenCodeIntentTransport(input),
+}));
+const BOUNDED_INTENT = {
+  schemaVersion: 1, taskKind: 'fact', sceneId: 'general', scope: 'bounded_question',
+  recommendedComplexity: 'quick', deliverable: 'answer', evidenceAccess: 'read_new',
+};
+function useIntent(decision: Record<string, unknown>): void {
+  mockOpenCodeIntentTransport.mockResolvedValue({status: 'ok', text: JSON.stringify(decision)});
+}
 
 const mockClaudeVerifierVerifyConclusion = jest.fn();
 jest.mock('../engines/claude/claudeVerifier', () => {
@@ -59,6 +89,8 @@ type FakeTraceProcessorService = TraceProcessorService & {
 };
 
 beforeEach(() => {
+  mockOpenCodeIntentTransport.mockReset();
+  useIntent(BOUNDED_INTENT);
   const actualVerifier = jest.requireActual('../engines/claude/claudeVerifier') as any;
   mockClaudeVerifierVerifyConclusion.mockReset();
   mockClaudeVerifierVerifyConclusion.mockImplementation((...args: unknown[]) => (
@@ -274,6 +306,8 @@ function mockOpenCodePreparation(
     hypotheses,
     uncertaintyFlags: [],
     analysisRunSpec: {
+      runtime: {kind: OPENCODE_RUNTIME_KIND},
+      query: {text: prompt},
       outputLanguage: 'zh-CN',
       traceContext: {datasetCount: 0},
       mode: {},
@@ -293,6 +327,20 @@ function openCodeAssistantResponse(id: string, text: string): unknown {
       parts: [{type: 'text', text}],
     },
   };
+}
+
+function readPromptContextFrame(system: string | undefined, context: string): unknown {
+  for (const line of system?.split('\n') ?? []) {
+    try {
+      const frame: unknown = JSON.parse(line);
+      if (frame && typeof frame === 'object' && 'context' in frame && frame.context === context && 'data' in frame) {
+        return frame.data;
+      }
+    } catch {
+      // External prose assets surround the typed context frames.
+    }
+  }
+  return undefined;
 }
 
 function createOpenCodeReportModuleLoader(
@@ -321,6 +369,475 @@ function createOpenCodeReportModuleLoader(
     })),
   }));
 }
+
+function createNativeIntentHarness(input: {
+  decision?: Record<string, unknown>;
+  classifierResponse?: unknown;
+  answer?: string;
+  finish?: string;
+  nativeError?: boolean;
+  beforeClassifierReply?: () => Promise<void>;
+  beforeAnswerReply?: () => Promise<void>;
+  env?: Record<string, string>;
+  selection?: RuntimeFactoryInput['selection'];
+} = {}) {
+  const native = jest.requireActual('../engines/opencode/openCodeIntentTransport') as {
+    runOpenCodeIntentTransport: typeof runOpenCodeIntentTransport;
+  };
+  mockOpenCodeIntentTransport.mockImplementation(native.runOpenCodeIntentTransport);
+  const traceProcessor = createFakeTraceProcessorService();
+  const configs: any[] = [];
+  const prompts: any[] = [];
+  const directories: string[] = [];
+  const serverCloses: Array<ReturnType<typeof jest.fn>> = [];
+  const aborts: Array<ReturnType<typeof jest.fn>> = [];
+  let tools: any[] = [];
+  const moduleLoader = jest.fn<OpenCodeSdkModuleLoader>(async () => ({
+    createOpencodeWithEnv: async (options: Record<string, unknown>) => {
+      const index = configs.length;
+      configs.push(options.config);
+      const close = jest.fn<() => void>();
+      const abort = jest.fn(async () => ({}));
+      serverCloses.push(close);
+      aborts.push(abort);
+      return {
+        server: {url: 'http://127.0.0.1:4106', close},
+        client: {session: {
+          create: async request => {
+            directories.push(request.query?.directory ?? '');
+            return {data: {id: `native-${index}`}};
+          },
+          abort,
+          prompt: async request => {
+            prompts.push(request);
+            if (index === 0) {
+              expect(traceProcessor.query).not.toHaveBeenCalled();
+              await input.beforeClassifierReply?.();
+              return input.classifierResponse ?? {data: {
+                info: {id: 'intent-message', role: 'assistant', finish: 'stop',
+                  time: {completed: Date.now()}, modelID: 'light-model'},
+                parts: [{type: 'text', text: JSON.stringify(input.decision ?? BOUNDED_INTENT)}],
+              }};
+            }
+            await input.beforeAnswerReply?.();
+            return {data: {
+              info: {id: 'current-message', role: 'assistant', finish: input.finish ?? 'stop',
+                ...(input.nativeError ? {error: {name: 'ProviderError'}} : {}),
+                time: {completed: Date.now()}, modelID: 'main-model'},
+              parts: [{type: 'text', text: input.answer ?? '已有证据仅支持这个局部结论'}],
+            }};
+          },
+        }},
+      };
+    },
+  }));
+  const bridgeClose = jest.fn(async () => undefined);
+  const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
+    selection: input.selection ?? {kind: OPENCODE_RUNTIME_KIND, source: 'env'}, traceProcessorService: traceProcessor,
+  }), {
+    env: {
+      SMARTPERFETTO_OPENCODE_MODEL_JSON: JSON.stringify({providerID: 'smartperfetto',
+        modelID: 'main-model', smallModel: 'light-model'}),
+      AGENT_QUICK_MAX_TURNS: '3', AGENT_MAX_TURNS: '9',
+      ...input.env,
+    },
+    moduleLoader,
+    bridgeStarter: (async (definitions: any[]) => {
+      tools = definitions;
+      return {port: 4107, token: 'fixture-token', requestTimeoutMs: 5000, close: bridgeClose,
+        getDiagnostics: () => ({connectionCount: 0, requestCount: 0})};
+    }) as any,
+  });
+  return {runtime, traceProcessor, configs, prompts, directories, serverCloses, aborts,
+    moduleLoader, bridgeClose, getTools: () => tools};
+}
+
+describe('OpenCode native turn intent and delivery', () => {
+  it.each([false, true])('keeps pending exploration advisory after native completion or failure: failed=%s', async nativeError => withBackendDataDir(async () => {
+    const body = 'The observed value is 17.';
+    const harness = createNativeIntentHarness({answer: body, nativeError, beforeAnswerReply: async () => {
+      const submitPlan = harness.getTools().find(tool => tool.name === 'submit_plan');
+      await submitPlan.shared.handler({phases: [{id: 'explore', name: 'Optional exploration',
+        goal: 'Investigate a further explanation', expectedTools: ['execute_sql']}], successCriteria: 'Explore the open question'});
+      const submitHypothesis = harness.getTools().find(tool => tool.name === 'submit_hypothesis');
+      await submitHypothesis.shared.handler({id: 'open-hypothesis', statement: 'A separate cause may exist.'});
+    }});
+    const sessionId = `opencode-advisory-${nativeError}`;
+    const result = await harness.runtime.analyze('Read the current value', sessionId, 'trace-opencode', {runId: sessionId});
+    expect(harness.prompts).toHaveLength(2); // One intent request and one answer request.
+    expect(result.conclusion).toBe(body);
+    expect(result.completion).toMatchObject({status: nativeError ? 'failed' : 'completed',
+      conclusionFingerprint: analysisDeliveryFingerprint(body)});
+    expect(result.success).toBe(!nativeError);
+    expect(result.partial === true).toBe(nativeError);
+    expect(result.terminationReason).toBe(nativeError ? 'quality_gate_failed' : undefined);
+    const verification = await mockClaudeVerifierVerifyConclusion.mock.results[0].value;
+    expect(verification).toMatchObject({heuristicIssues: expect.arrayContaining([
+      expect.objectContaining({type: 'plan_deviation', severity: 'error'}),
+      expect.objectContaining({type: 'unresolved_hypothesis', severity: 'error'}),
+    ])});
+    const snapshot = harness.runtime.takeSnapshot(sessionId, 'trace-opencode', createSnapshotFields());
+    expect(snapshot.analysisPlan?.phases).toEqual([expect.objectContaining({id: 'explore', status: 'pending'})]);
+    expect(snapshot.claudeHypotheses).toEqual([expect.objectContaining({id: 'open-hypothesis', status: 'formed'})]);
+  }));
+
+  it('attaches a single final context to the exact projected object and dispatches review on the pinned main model', async () => withBackendDataDir(async () => {
+    const attach = jest.spyOn(finalizationContext, 'attachFinalizationContext');
+    const readView = jest.spyOn(ArtifactStore.prototype, 'createEvidenceReadView');
+    let context: ReturnType<typeof finalizationContext.takeFinalizationContext>;
+    try {
+      const harness = createNativeIntentHarness({env: {SMARTPERFETTO_OPENCODE_PROMPT_TIMEOUT_MS: '5000'}});
+      const options = {runId: 'final-run', referenceTraceId: 'trace-reference', analysisContextFingerprint: 'opencode-auth-pin'};
+      const result = await harness.runtime.analyze('same scope', 'final-context', 'trace-opencode', options);
+      expect(attach).toHaveBeenCalledTimes(1);
+      expect(attach.mock.calls[0][0]).toBe(result);
+      expect(finalizationContext.takeFinalizationContext({...result})).toBeUndefined();
+      context = finalizationContext.takeFinalizationContext(result);
+      expect(context).toBeDefined();
+      options.analysisContextFingerprint = 'later-auth-context';
+      const providerQuery = context!.getProviderQuery(new AbortController().signal);
+      expect(providerQuery).toEqual({text: 'same scope', analysisContextFingerprint: 'opencode-auth-pin'});
+      expect(Object.isFrozen(providerQuery)).toBe(true);
+      expect(JSON.stringify(result)).not.toContain('"providerQuery"');
+      expect(finalizationContext.takeFinalizationContext(result)).toBeUndefined();
+      expect(context?.traceIdentity).toEqual({currentTraceId: 'trace-opencode', referenceTraceId: 'trace-reference'});
+      expect(context?.deliveryContext).toMatchObject({acceptedCandidate: result.completion});
+      expect(readView).toHaveBeenCalledTimes(1);
+      expect(readView.mock.calls[0][0]).toMatchObject({allowedTraces: [
+        {traceId: 'trace-opencode', traceSide: 'current'},
+        {traceId: 'trace-reference', traceSide: 'reference'},
+      ], ownerKey: expect.any(String)});
+      const response = await context!.dispatchText({
+        prompt: 'Review the current candidate', systemPrompt: '',
+        signal: new AbortController().signal, deadlineMs: context!.deadlineMs + 60_000,
+        outputByteLimit: 8192,
+      });
+      expect(response).toMatchObject({status: 'ok', actualModel: 'main-model'});
+      expect(mockOpenCodeIntentTransport.mock.calls[1][0].deadlineMs).toBe(context!.deadlineMs);
+      expect(harness.configs[2]).toMatchObject({model: 'smartperfetto/main-model', mcp: {}, instructions: [],
+        agent: {smartperfetto: {maxSteps: 1}}});
+      expect(harness.prompts[2].body.model).toEqual({providerID: 'smartperfetto', modelID: 'main-model'});
+      expect(Object.values(harness.prompts[2].body.tools).every(enabled => enabled === false)).toBe(true);
+      expect(harness.serverCloses[2]).toHaveBeenCalledTimes(1);
+      expect(fs.existsSync(path.dirname(harness.directories[2]))).toBe(false);
+    } finally {
+      context?.dispose(); readView.mockRestore(); attach.mockRestore();
+    }
+  }));
+
+  it('retains failure state in finalization without granting another model dispatch', async () => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({nativeError: true});
+    const result = await harness.runtime.analyze('same scope', 'final-failed', 'trace-opencode', {runId: 'failed-run'});
+    const context = finalizationContext.takeFinalizationContext(result);
+    try {
+      expect(context?.deliveryContext).toMatchObject({completion: {runId: 'failed-run', status: 'failed'}});
+      expect(context?.hasSemanticTransport).toBe(false);
+      expect(await context?.dispatchText({prompt: 'unused', systemPrompt: '', signal: new AbortController().signal,
+        deadlineMs: Date.now() + 5000, outputByteLimit: 8192})).toEqual({status: 'unavailable', reason: 'invalid_configuration'});
+      expect(harness.prompts).toHaveLength(2);
+    } finally {
+      context?.dispose();
+    }
+  }));
+
+  it.each([
+    ['zh', '这个观察包含 PRIVATE_CANARY，需要保留已有证据边界'],
+    ['en', 'This observation contains PRIVATE_CANARY with an explicit evidence boundary'],
+    ['ar', 'تحتوي هذه الملاحظة على PRIVATE_CANARY مع حدود الأدلة'],
+  ])('carries a redacted %s candidate through the returned delivery context', async (language, answer) => withBackendDataDir(async () => {
+    const sessionId = `privacy-redacted-${language}`;
+    registerCodeAwareCanary(sessionId, 'PRIVATE_CANARY');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const gate = jest.spyOn(finalResultQualityGate, 'applyFinalResultQualityGate');
+    try {
+      const harness = createNativeIntentHarness({answer});
+      const result = await harness.runtime.analyze('same scope', sessionId, 'trace-opencode');
+      const projectionResult = projection.mock.results[0];
+      if (projectionResult.type !== 'return') throw new Error('Source projection did not return');
+      const projected = projectionResult.value;
+      expect(projected.conclusionProjection.disposition).toBe('redacted');
+      expect(result.outputOrigin).toBe('sdk_final');
+      expect(result.completion?.status).toBe('completed');
+      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
+      expect(result.completion?.conclusionFingerprint).not.toBe(analysisDeliveryFingerprint(answer));
+      expect(gate.mock.calls[0][0].context).toBe(projected.deliveryContext);
+      expect(mockClaudeVerifierVerifyConclusion.mock.calls[0][2]).toMatchObject({deliveryContext: projected.deliveryContext});
+      expect(JSON.stringify(result)).not.toContain('PRIVATE_CANARY');
+    } finally {
+      gate.mockRestore(); projection.mockRestore(); clearCodeAwareOutputGuards(sessionId);
+    }
+  }));
+
+  it.each([
+    ['zh', '原始模型结论'], ['en', 'Native model conclusion'], ['ar', 'استنتاج النموذج الأصلي'],
+  ])('does not certify a whole %s privacy replacement as an SDK answer', async (language, answer) => withBackendDataDir(async () => {
+    const sessionId = `privacy-replaced-${language}`;
+    revokeCodeAwareOutputGuards(sessionId);
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const gate = jest.spyOn(finalResultQualityGate, 'applyFinalResultQualityGate');
+    try {
+      const harness = createNativeIntentHarness({answer});
+      const result = await harness.runtime.analyze('same scope', sessionId, 'trace-opencode');
+      const projectionResult = projection.mock.results[0];
+      if (projectionResult.type !== 'return') throw new Error('Source projection did not return');
+      const projected = projectionResult.value;
+      expect(projected.conclusionProjection.disposition).toBe('replaced');
+      expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback'});
+      expect(result.completion?.status).toBe('unknown');
+      expect(gate.mock.calls[0][0].context).toBe(projected.deliveryContext);
+      expect(mockClaudeVerifierVerifyConclusion.mock.calls[0][2]).toMatchObject({deliveryContext: projected.deliveryContext});
+      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
+    } finally {
+      gate.mockRestore(); projection.mockRestore(); clearCodeAwareOutputGuards(sessionId);
+    }
+  }));
+
+  it('retains native failure after partial privacy redaction', async () => withBackendDataDir(async () => {
+    const sessionId = 'privacy-native-failure';
+    registerCodeAwareCanary(sessionId, 'PRIVATE_CANARY');
+    try {
+      const harness = createNativeIntentHarness({answer: 'Partial PRIVATE_CANARY output', nativeError: true});
+      const result = await harness.runtime.analyze('same scope', sessionId, 'trace-opencode');
+      expect(result).toMatchObject({success: false, partial: true,
+        completion: {status: 'failed', reason: 'provider_error'}});
+      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
+    } finally {
+      clearCodeAwareOutputGuards(sessionId);
+    }
+  }));
+
+  it('checks the native empty answer before privacy suppression can supply text', async () => withBackendDataDir(async () => {
+    const sessionId = 'privacy-native-empty';
+    revokeCodeAwareOutputGuards(sessionId);
+    try {
+      const harness = createNativeIntentHarness({answer: ''});
+      const result = await harness.runtime.analyze('same scope', sessionId, 'trace-opencode');
+      expect(result).toMatchObject({conclusion: '', success: false, partial: true});
+      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(''));
+    } finally {
+      clearCodeAwareOutputGuards(sessionId);
+    }
+  }));
+
+  it('does not finalize or publish a late private answer after cancellation', async () => withBackendDataDir(async () => {
+    const sessionId = 'privacy-native-cancel';
+    registerCodeAwareCanary(sessionId, 'PRIVATE_CANARY');
+    const entered = createDeferred<void>();
+    const pending = createDeferred<void>();
+    const gate = jest.spyOn(finalResultQualityGate, 'applyFinalResultQualityGate');
+    try {
+      const harness = createNativeIntentHarness({answer: 'Late PRIVATE_CANARY output', beforeAnswerReply: async () => {
+        entered.resolve(); await pending.promise;
+      }});
+      const updates: any[] = [];
+      harness.runtime.on('update', update => updates.push(update));
+      const operation = harness.runtime.analyze('same scope', sessionId, 'trace-opencode');
+      const rejected = expect(operation).rejects.toThrow();
+      await entered.promise;
+      await harness.runtime.abortSession(sessionId);
+      await rejected;
+      pending.resolve();
+      expect(gate).not.toHaveBeenCalled();
+      expect(updates.length).toBeGreaterThan(0);
+      expect(updates.some(update => update.type === 'conclusion')).toBe(false);
+      expect(JSON.stringify(updates)).not.toContain('PRIVATE_CANARY');
+    } finally {
+      pending.resolve(); gate.mockRestore(); clearCodeAwareOutputGuards(sessionId);
+    }
+  }));
+
+  it.each([
+    ['short unheaded answer', '值来自已核对的证据'],
+    ['provider error discussed as trace content', '日志里的 provider error 是本次调查对象'],
+    ['long report-shaped prose', '# Analysis\n\n' + '已观察到的局部事实。'.repeat(150)],
+  ])('uses SDK completion for %s', async (_label, answer) => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({answer});
+    const result = await harness.runtime.analyze('same scope', 'intent-body', 'trace-opencode', {
+      analysisMode: 'full', runId: 'current-run',
+    });
+    expect(result.conclusion).toBe(answer);
+    expect(result.turnIntent).toMatchObject({status: 'resolved', scope: 'bounded_question', deliverable: 'answer'});
+    expect(result.completion).toMatchObject({status: 'completed', runId: 'current-run',
+      sdkFinishReason: 'stop', conclusionFingerprint: analysisDeliveryFingerprint(answer)});
+    expect(result.outputOrigin).toBe('sdk_final');
+    expect(harness.configs.map(config => config.agent.smartperfetto.maxSteps)).toEqual([1, 9]);
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+    expect(harness.serverCloses.every(close => close.mock.calls.length === 1)).toBe(true);
+    expect(fs.existsSync(path.dirname(harness.directories[0]))).toBe(false);
+  }));
+
+  it('registers the native classifier model and keeps fast comparison tools', async () => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({decision: {...BOUNDED_INTENT, taskKind: 'comparison'}});
+    const result = await harness.runtime.analyze('same scope', 'intent-comparison', 'trace-opencode', {
+      analysisMode: 'fast', referenceTraceId: 'trace-reference',
+    });
+    expect(result.quickRun).toMatchObject({enforcement: 'timeout_only', hardCapTurns: 3, actualTurns: 1});
+    expect(harness.configs[0]).toMatchObject({model: 'smartperfetto/light-model', mcp: {}, instructions: [],
+      provider: {smartperfetto: {models: {'light-model': {id: 'light-model'}}}}});
+    expect(Object.values(harness.configs[0].tools).every(value => value === false)).toBe(true);
+    expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(3);
+    expect(harness.getTools().map(tool => tool.name)).toEqual(expect.arrayContaining([
+      'submit_plan', 'execute_sql_on', 'compare_skill', 'execute_sql', 'fetch_artifact',
+    ]));
+    expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+  }));
+
+  it.each(['bounded_question', 'scene_wide'])('denies new evidence independently of %s context scope', async scope => withBackendDataDir(async () => {
+    const getContextForAI = jest.fn(() => 'new context must not be fetched');
+    const knowledge = jest.spyOn(sqlKnowledgeBase, 'getExtendedKnowledgeBase')
+      .mockResolvedValue({getContextForAI} as any);
+    try {
+      const harness = createNativeIntentHarness({decision: {...BOUNDED_INTENT,
+        taskKind: 'investigation', scope, evidenceAccess: 'existing_only'}});
+      const result = await harness.runtime.analyze('same scope', `intent-existing-${scope}`, 'trace-opencode', {
+        analysisMode: 'full', referenceTraceId: 'trace-reference', codeAwareMode: 'off',
+      });
+      expect(result.turnIntent).toMatchObject({status: 'resolved', scope, evidenceAccess: 'existing_only'});
+      const names = harness.getTools().map(tool => tool.name);
+      expect(names).toContain('fetch_artifact');
+      expect(names).not.toContain('execute_sql');
+      expect(names).not.toContain('execute_sql_on');
+      expect(names).not.toContain('lookup_aosp_source');
+      expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+      expect(knowledge).not.toHaveBeenCalled();
+      expect(getContextForAI).not.toHaveBeenCalled();
+    } finally {
+      knowledge.mockRestore();
+    }
+  }));
+
+  it('passes the exact classifier registry pin to the actual MCP factory', async () => withBackendDataDir(async () => {
+    const resolver = jest.spyOn(turnIntentModule, 'createAnalysisTurnIntentResolver');
+    const mcp = jest.spyOn(claudeMcpModule, 'createClaudeMcpServer');
+    try {
+      const harness = createNativeIntentHarness();
+      const result = await harness.runtime.analyze('same scope', 'intent-registry-pin', 'trace-opencode');
+      expect(resolver).toHaveBeenCalledTimes(1);
+      expect(mcp).toHaveBeenCalledTimes(1);
+      const resolverResult = resolver.mock.results[0];
+      if (resolverResult.type !== 'return') throw new Error('Intent resolver was not created');
+      const captured = resolverResult.value.strategyRegistry;
+      expect(mcp.mock.calls[0][0].strategyRegistry).toBe(captured);
+      expect(result.turnIntent?.registryFingerprint).toBe(captured.registryFingerprint);
+    } finally {
+      mcp.mockRestore();
+      resolver.mockRestore();
+    }
+  }));
+
+  it.each(['fast', 'full'] as const)('preserves known pair package identities for bounded %s answers', async analysisMode => withBackendDataDir(async () => {
+    const originalPairBuilder = runtimePromptContext.buildRuntimeTracePairIdentityContext;
+    const pair = jest.spyOn(runtimePromptContext, 'buildRuntimeTracePairIdentityContext')
+      .mockImplementation(input => {
+        const identity = originalPairBuilder(input);
+        return identity ? {...identity, referencePackageName: 'com.reference.app'} : undefined;
+      });
+    const gate = jest.spyOn(finalResultQualityGate, 'applyFinalResultQualityGate');
+    try {
+      const harness = createNativeIntentHarness({decision: {...BOUNDED_INTENT, taskKind: 'comparison'}});
+      await harness.runtime.analyze('same scope', `intent-pair-${analysisMode}`, 'trace-opencode', {
+        analysisMode, packageName: 'com.current.app', referenceTraceId: 'trace-reference',
+      });
+      expect(pair).toHaveBeenCalledTimes(1);
+      expect(gate).toHaveBeenCalledTimes(1);
+      expect(gate.mock.calls[0][0].comparisonIdentity).toEqual({
+        currentPackageName: 'com.current.app', referencePackageName: 'com.reference.app',
+      });
+      expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+    } finally {
+      gate.mockRestore();
+      pair.mockRestore();
+    }
+  }));
+
+  it.each(['env', 'provider'] as const)('preserves configured %s instructions for a full bounded answer', async source => withBackendDataDir(async () => {
+    const provider = source === 'provider' ? jest.spyOn(providerManager, 'getProviderService')
+      .mockReturnValue({getRawProvider: () => ({
+        name: 'configured provider', models: {primary: 'main-model', light: 'light-model'},
+        connection: {openCodeSystemPrompt: 'configured-provider-instruction'},
+      })} as any) : undefined;
+    try {
+      const harness = createNativeIntentHarness({
+        env: {SMARTPERFETTO_OPENCODE_SYSTEM_PROMPT: 'configured-env-instruction'},
+        ...(source === 'provider' ? {selection: {
+          kind: OPENCODE_RUNTIME_KIND, source: 'provider', providerId: 'configured-provider',
+        } as const} : {}),
+      });
+      await harness.runtime.analyze('same scope', `intent-config-${source}`, 'trace-opencode', {analysisMode: 'full'});
+      expect(harness.prompts[1].body.system).toContain(`configured-${source}-instruction`);
+      expect(harness.prompts[0].body.system).not.toContain(`configured-${source}-instruction`);
+      expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(9);
+    } finally {
+      provider?.mockRestore();
+    }
+  }));
+
+  it.each(['resolved', 'unavailable'] as const)('does not automatically retrieve knowledge for %s on-demand turns', async status => withBackendDataDir(async () => {
+    const getContextForAI = jest.fn(() => 'new context must not be fetched');
+    const knowledge = jest.spyOn(sqlKnowledgeBase, 'getExtendedKnowledgeBase')
+      .mockResolvedValue({getContextForAI} as any);
+    try {
+      const harness = createNativeIntentHarness(status === 'unavailable'
+        ? {classifierResponse: {error: {code: 'model_not_found'}}} : {});
+      const result = await harness.runtime.analyze('same scope', `intent-no-prefetch-${status}`, 'trace-opencode', {
+        analysisMode: 'full',
+      });
+      expect(result.turnIntent).toMatchObject({status, scope: 'bounded_question', evidenceAccess: 'read_new'});
+      expect(harness.getTools().map(tool => tool.name)).toContain('execute_sql');
+      expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+      expect(knowledge).not.toHaveBeenCalled();
+      expect(getContextForAI).not.toHaveBeenCalled();
+    } finally {
+      knowledge.mockRestore();
+    }
+  }));
+
+  it('does not repeat an unavailable light model for the main answer', async () => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({classifierResponse: {error: {code: 'model_not_found'}}});
+    const result = await harness.runtime.analyze('same scope', 'intent-fallback', 'trace-opencode');
+    expect(result.turnIntent).toMatchObject({status: 'unavailable', scope: 'bounded_question'});
+    expect(harness.prompts[0].body.model).toEqual({providerID: 'smartperfetto', modelID: 'light-model'});
+    expect(harness.prompts[1].body.model).toEqual({providerID: 'smartperfetto', modelID: 'main-model'});
+    expect(harness.configs[1].small_model).toBeUndefined();
+    expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+  }));
+
+  it.each(['length', 'tool-calls', 'unrecognized'])('does not certify native finish %s as completed', async finish => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({finish});
+    const result = await harness.runtime.analyze('same scope', `intent-${finish}`, 'trace-opencode');
+    expect(result.completion?.status).not.toBe('completed');
+    expect(result.completion?.sdkFinishReason).toBe(finish);
+    expect(result.partial).toBe(true);
+    expect(harness.prompts).toHaveLength(2);
+  }));
+
+  it('cancels classification before starting answer context and cleans its host', async () => withBackendDataDir(async () => {
+    const pending = createDeferred<void>();
+    const entered = createDeferred<void>();
+    const harness = createNativeIntentHarness({beforeClassifierReply: async () => {
+      entered.resolve(); await pending.promise;
+    }});
+    const operation = harness.runtime.analyze('same scope', 'intent-cancel', 'trace-opencode');
+    await entered.promise;
+    await harness.runtime.abortSession('intent-cancel');
+    await expect(operation).rejects.toThrow();
+    pending.resolve();
+    expect(harness.prompts).toHaveLength(1);
+    expect(harness.configs).toHaveLength(1);
+    expect(harness.traceProcessor.query).not.toHaveBeenCalled();
+    expect(harness.serverCloses[0]).toHaveBeenCalledTimes(1);
+  }));
+
+  it('does not complete a submitted plan because the answer resembles a report', () => {
+    const plan = createCompletedScrollingPlanWithFinalPhase();
+    expect(getOpenCodePlanCompletionStatus(null)).toMatchObject({complete: true, hasPlan: false, pending: []});
+    expect(completeOpenCodeFinalReportPhaseIfDelivered(plan, '# Report\n' + 'Evidence '.repeat(1000), 'en')).toBeUndefined();
+    expect(getOpenCodePlanCompletionStatus(plan).complete).toBe(false);
+    expect(plan.phases[1].status).toBe('in_progress');
+    expect(sanitizeOpenCodeConclusionText('Process narration\n\n# Report')).toBe('Process narration\n\n# Report');
+  });
+});
 
 describe('experimental OpenCode runtime contract', () => {
   it('cleans stale dead-owner private directories without deleting a live owner', () => {
@@ -935,7 +1452,7 @@ describe('experimental OpenCode runtime contract', () => {
     expect(extractOpenCodeAssistantText(response)).toBe('最终报告正文');
   });
 
-  it('prefers a full assistant report over a later short assistant summary', () => {
+  it('accepts the latest assistant message independently of headings or length', () => {
     const fullReport = [
       '# 启动性能分析报告',
       '',
@@ -961,7 +1478,7 @@ describe('experimental OpenCode runtime contract', () => {
       ],
     };
 
-    expect(extractOpenCodeAssistantText(response)).toBe(fullReport);
+    expect(extractOpenCodeAssistantText(response)).toBe('分析完成，完整报告已经生成。');
   });
 
   it('uses OpenCode promptAsync and polls completed assistant messages', async () => {
@@ -1653,7 +2170,7 @@ describe('experimental OpenCode runtime contract', () => {
       await expect(Promise.race([
         pending,
         new Promise((_, reject) => setTimeout(() => reject(new Error('outer-test-timeout')), 500)),
-      ])).rejects.toThrow('OpenCode prompt timed out after 50ms');
+      ])).rejects.toMatchObject({name: 'TimeoutError', code: 'OPENCODE_PROMPT_TIMEOUT'});
     } finally {
       hungMessages.reject(new Error('late endpoint rejection'));
       await pending.catch(() => undefined);
@@ -1685,7 +2202,7 @@ describe('experimental OpenCode runtime contract', () => {
       await expect(Promise.race([
         pending,
         new Promise((_, reject) => setTimeout(() => reject(new Error('outer-test-timeout')), 500)),
-      ])).rejects.toThrow('OpenCode prompt timed out after 50ms');
+      ])).rejects.toMatchObject({name: 'TimeoutError', code: 'OPENCODE_PROMPT_TIMEOUT'});
     } finally {
       hungPrompt.reject(new Error('late prompt rejection'));
       await pending.catch(() => undefined);
@@ -1976,6 +2493,25 @@ describe('experimental OpenCode runtime contract', () => {
     ]);
   });
 
+  it('preserves actual result facts through registry, bridge, and shortened response events', async () => {
+    const registry = new McpToolRegistry();
+    registry.registerShared({
+      name: 'execute_sql', description: 'Read data', inputSchema: {}, exposure: 'public',
+      handler: async () => createRuntimeToolResult({success: false, planPhaseId: 'p1', error: 'x'.repeat(14000)}, {
+        decorate: text => '[accuracy] {"success":true}\n' + text,
+      }),
+    });
+    const updates: any[] = [];
+    const tracker = {current: null, prePlanToolCallLog: []} as any;
+    const response = await dispatchOpenCodeBridgeRequest(registry.list(), {
+      jsonrpc: '2.0', id: 'receipt-opencode', method: 'tools/call',
+      params: {name: 'execute_sql', arguments: {}},
+    }, update => updates.push(update), {analysisPlan: tracker});
+    expect(readRuntimeToolResultFacts((response as any).result)).toEqual({success: false, planPhaseId: 'p1'});
+    expect(tracker.prePlanToolCallLog).toEqual([expect.objectContaining({success: false})]);
+    expect(updates.find(update => update.type === 'agent_response')).toMatchObject({content: {isError: true}});
+  });
+
   it('projects private wiki results before emitting OpenCode responses', async () => {
     const updates: any[] = [];
     await dispatchOpenCodeBridgeRequest([{
@@ -2101,19 +2637,19 @@ describe('experimental OpenCode runtime contract', () => {
   });
 
   it('treats completed and skipped OpenCode plan phases as closed', () => {
-    expect(getOpenCodePlanCompletionStatus({
+    const plan: AnalysisPlanV3 = {
       phases: [
-        { id: 'p1', status: 'completed', summary: '已完成概览采集并记录关键证据。' },
-        { id: 'p2', status: 'skipped', summary: '已确认该阶段在当前 trace 中不可验证并跳过。' },
+        {id: 'p1', name: 'Review', goal: 'Assess available evidence', expectedTools: [], status: 'completed'},
+        {id: 'p2', name: 'Optional follow-up', goal: 'Resolve additional evidence', expectedTools: [],
+          status: 'skipped', skipDisposition: {kind: 'evidence_unavailable'}},
       ],
-    } as any)).toMatchObject({ complete: true, pending: [] });
+      successCriteria: 'Answer within available evidence', submittedAt: 1, toolCallLog: [],
+    };
+    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({complete: true, pending: []});
 
-    expect(getOpenCodePlanCompletionStatus({
-      phases: [
-        { id: 'p1', status: 'completed', summary: '已完成概览采集并记录关键证据。' },
-        { id: 'p2', status: 'in_progress' },
-      ],
-    } as any)).toMatchObject({ complete: false, pending: ['p2'] });
+    plan.phases[1].status = 'in_progress';
+    delete plan.phases[1].skipDisposition;
+    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({complete: false, pending: ['p2']});
   });
 
   it('does not treat a completed OpenCode phase as closed when required tool evidence is missing', () => {
@@ -2141,881 +2677,24 @@ describe('experimental OpenCode runtime contract', () => {
     ]);
   });
 
-  it('auto-closes only the final OpenCode report phase after a deliverable report is present', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '概览采集',
-          goal: '采集滑动概览',
-          status: 'completed',
-          summary: '已采集滑动概览、掉帧数量和最长帧耗时等关键证据。',
-        },
-        {
-          id: 'p3',
-          name: '综合结论',
-          goal: '输出完整分析报告',
-          status: 'in_progress',
-        },
-      ],
-    } as any;
-    const report = [
-      '# 滑动性能分析报告',
-      '',
-      '## 代表帧分析',
-      '- evidence/source: art-frame-detail 显示主线程阻塞 18.2ms。',
-      '',
-      '## 优化建议',
-      '- 将长任务拆分到异步阶段。',
-    ].join('\n');
 
-    const closed = completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 42);
 
-    expect(closed?.id).toBe('p3');
-    expect(plan.phases[1]).toMatchObject({
-      status: 'completed',
-      completedAt: 42,
-      summary: expect.stringContaining('最终报告已由 OpenCode 直接交付'),
-    });
-    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({ complete: true, pending: [] });
-  });
 
-  it('auto-closes the sole pending OpenCode conclusion phase after a deliverable report is present', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '架构检测与概览采集',
-          goal: '执行 scrolling_analysis 获取帧统计和卡顿分布',
-          status: 'completed',
-          summary: '已完成帧统计、掉帧分布和关键证据采集。',
-        },
-        {
-          id: 'p2',
-          name: '根因深钻',
-          goal: '对主要 reason_code 选取代表帧完成结构化深钻',
-          status: 'completed',
-          summary: '已完成代表帧根因、阻塞调用和阻塞链交叉验证。',
-        },
-        {
-          id: 'p3',
-          name: 'CPU与系统验证',
-          goal: '分析 CPU 调度、频率等系统层因素',
-          status: 'completed',
-          summary: '已完成 CPU 调度、频率和系统侧证据核对。',
-        },
-        {
-          id: 'p4',
-          name: '综合结论',
-          goal: '汇总所有证据，输出结构化最终报告',
-          status: 'pending',
-        },
-      ],
-    } as any;
-    const report = [
-      '## 综合结论',
-      '',
-      '主线程 animation 回调是主要卡顿来源。',
-      '',
-      '## 代表帧分析',
-      '- evidence/source: art-frame-detail 显示主线程阻塞 59.31ms。',
-      '',
-      '## 优化建议',
-      '- 将长任务拆分到异步阶段。',
-    ].join('\n');
 
-    const closed = completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 45);
 
-    expect(closed?.id).toBe('p4');
-    expect(plan.phases[3]).toMatchObject({
-      status: 'completed',
-      completedAt: 45,
-      summary: expect.stringContaining('最终报告已由 OpenCode 直接交付'),
-    });
-    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({complete: true, pending: []});
-  });
 
-  it('does not auto-close a sole pending phase that is not conclusion-like', () => {
-    const plan = {
-      phases: [{
-        id: 'p1',
-        name: '代表帧深钻',
-        goal: '调用 jank_frame_detail 获取代表帧证据',
-        status: 'pending',
-      }],
-    } as any;
-    const report = '## 综合结论\n\n主线程 animation 回调是主要卡顿来源。';
 
-    expect(completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 46))
-      .toBeUndefined();
-    expect(plan.phases[0].status).toBe('pending');
-  });
 
-  it('does not auto-close a pending conclusion phase with missing expected-call evidence', () => {
-    const plan = {
-      phases: [{
-        id: 'p1',
-        name: '综合结论',
-        goal: '汇总证据并输出完整报告',
-        expectedCalls: [{tool: 'invoke_skill', skillId: 'blocking_chain_analysis'}],
-        status: 'pending',
-      }],
-      toolCallLog: [],
-    } as any;
-    const report = '## 综合结论\n\n主线程 animation 回调是主要卡顿来源。';
 
-    expect(completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 47))
-      .toBeUndefined();
-    expect(plan.phases[0].status).toBe('pending');
-  });
 
-  it('auto-closes the real startup report-output phase after a deliverable report is present', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '启动概览与类型判定',
-          goal: '获取启动指标、TTID/TTFD 和启动类型',
-          status: 'completed',
-          summary: '已完成启动类型、TTID/TTFD 和主线程热点证据采集。',
-        },
-        {
-          id: 'p2',
-          name: '启动阶段分解与阻塞分析',
-          goal: '分解阶段耗时和关键阻塞关系',
-          status: 'completed',
-          summary: '已完成四象限、热点任务、阻塞链和关键阶段证据核对。',
-        },
-        {
-          id: 'p3',
-          name: '根因综合与报告输出',
-          goal: '综合所有证据，输出启动分析报告、根因编号引用、分层建议',
-          status: 'in_progress',
-        },
-      ],
-    } as any;
-    const report = [
-      '## 综合结论',
-      '',
-      '冷启动耗时 1338.65ms，ChaosTask 是主要热点。',
-      '',
-      '## 优化建议',
-      '- [App 层] 将非关键初始化移至首帧后。',
-      '',
-      '## 证据索引',
-      '- evidence/source: art-startup-detail',
-    ].join('\n');
 
-    const closed = completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 44);
 
-    expect(closed?.id).toBe('p3');
-    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({complete: true, pending: []});
-  });
 
-  it('requests one bounded final-report continuation and uses only the corrected OpenCode report', async () => {
-    const initialReport = [
-      '# Final Report',
-      '',
-      '## 综合结论',
-      '已完成滑动证据采集，但本稿尚未展开场景合同必需小节。',
-    ].join('\n');
-    const correctedReport = [
-      '# Final Report',
-      '',
-      '## 综合结论',
-      '当前采集窗口共 347 帧，真实掉帧 1 帧，最长帧 62.73ms。',
-      '',
-      '## 峰值/口径指标',
-      '真实掉帧 1 帧；最长帧 62.73ms；Buffer Stuffing 假阳性已单独排除。',
-      '',
-      '## 掉帧与根因分布',
-      '| 根因 | 帧数 | 占比 |',
-      '| --- | ---: | ---: |',
-      '| workload_heavy | 1 | 100% |',
-      '',
-      '## 代表帧分析',
-      '代表帧 frame_id=59665234，帧耗时 62.73ms，超预算 7.5x，vsync_missed=7。',
-      'jank_frame_detail 证据显示主线程 animation 回调内的同步重计算构成关键阻塞链。',
-      '',
-      '## 优化建议',
-      '将同步重计算拆分并移出主线程 animation 回调。',
-    ].join('\n');
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', initialReport),
-        openCodeAssistantResponse('corrected', correctedReport),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, createCompletedScrollingPlanWithFinalPhase());
 
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-continuation',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
 
-    expect(promptInputs).toHaveLength(2);
-    expect((promptInputs[1] as any).body.parts[0].text).toContain('Final Report Contract');
-    expect((promptInputs[1] as any).body.parts[0].text).toContain('掉帧与根因分布');
-    expect(result.conclusion).toContain('## 掉帧与根因分布');
-    expect(result.conclusion).toContain('## 代表帧分析');
-    expect(result.conclusion).not.toContain('本稿尚未展开');
-    expect(result.partial).not.toBe(true);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
 
-  it('delivers a verified completed final-phase report instead of an older OpenCode compaction summary', async () => {
-    const completedReport = [
-      '## 综合结论与报告',
-      '',
-      '当前采集窗口共 347 帧，真实掉帧 1 帧，最长帧 62.73ms。',
-      '',
-      '## 峰值/口径指标',
-      '真实掉帧 1 帧；最长帧 62.73ms；Buffer Stuffing 假阳性已单独排除。',
-      '',
-      '## 掉帧与根因分布',
-      '| 根因 | 帧数 | 占比 |',
-      '| --- | ---: | ---: |',
-      '| workload_heavy | 1 | 100% |',
-      '',
-      '## 代表帧分析',
-      '代表帧 frame_id=59665234，帧耗时 62.73ms，超预算 7.5x，vsync_missed=7。',
-      'jank_frame_detail 证据显示主线程 animation 回调内的同步重计算构成关键阻塞链。',
-      '',
-      '## 优化建议',
-      '将同步重计算拆分并移出主线程 animation 回调。',
-    ].join('\n');
-    const plan = createCompletedScrollingPlanWithFinalPhase();
-    plan.phases[1].status = 'completed';
-    plan.phases[1].summary = completedReport;
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('compaction', [
-          '## Objective',
-          '分析滑动性能。',
-          '',
-          '## Work State',
-          '仍在整理最终报告。',
-          '',
-          '## Next Move',
-          '继续输出最终报告。',
-        ].join('\n')),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, plan);
 
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-final-phase-report',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
 
-    expect(promptInputs).toHaveLength(1);
-    expect(result.conclusion).toContain('## 综合结论');
-    expect(result.conclusion).toContain('## 掉帧与根因分布');
-    expect(result.conclusion).not.toContain('## Objective');
-    expect(result.partial).not.toBe(true);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('includes the exact missing startup contract section in the continuation prompt', async () => {
-    const startupReport = (includeRootCauseSection: boolean) => [
-      '## 综合结论',
-      '',
-      '本次为温启动，dur_ms=1339ms，TTID=1912ms，TTFD 不可用；关键延迟集中在应用主线程同步初始化。',
-      '',
-      '## 阶段耗时分解',
-      'startup_detail 的 evidence/source: art-startup-detail 显示主线程热点 self_ms=456ms，占已观测启动窗口的 34.1%。',
-      '',
-      '## 关键证据链',
-      'evidence/source: art-startup-detail 将 456ms 主线程热点定位到 bindApplication 阶段；evidence/source: art-main-thread 记录同一窗口内连续同步初始化。',
-      '两条证据在时间窗口与线程身份上相互印证，当前没有观察到等量级的平台侧阻塞证据。',
-      ...(includeRootCauseSection ? [
-        '',
-        '## 根因编号引用',
-        'SR12：bindApplication 阶段的同步初始化占比过高；对应 evidence/source: art-startup-detail，self_ms=456ms。',
-      ] : []),
-      '',
-      '## 已排除因素',
-      '当前 trace 未显示足以解释 1339ms 启动窗口的平台侧 Binder、锁竞争或磁盘 IO 证据。',
-      '',
-      '## App/系统分层建议',
-      '**[App 层]** 将 art-startup-detail 指向的非关键同步初始化移至首帧后，并复测 TTID 与 456ms 热点。',
-      '**[系统/平台层]** 当前 trace 没有平台归因证据，不建议据此修改系统调度或 IO 策略。',
-    ].join('\n');
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', startupReport(false)),
-        openCodeAssistantResponse('corrected', startupReport(true)),
-      ], promptInputs, close),
-    });
-    mockOpenCodePreparation(
-      runtime,
-      createCompletedStartupPlanWithFinalPhase(),
-      'anr',
-      '请调用 anr_analysis 检查这个启动 Trace 是否包含 ANR。',
-    );
-
-    const result = await runtime.analyze(
-      '请调用 anr_analysis 检查这个启动 Trace 是否包含 ANR。',
-      'session-opencode-startup-contract-continuation',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(2);
-    expect((promptInputs[1] as any).body.parts[0].text).toContain('根因编号引用');
-    expect(result.conclusion).toContain('## 根因编号引用');
-    expect(result.conclusion).toContain('SR12');
-    expect(result.partial).not.toBe(true);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('requests one bounded continuation when a complete report violates the kernel-wait boundary', async () => {
-    const completeScrollingReport = (kernelBoundary: string) => [
-      '# Final Report',
-      '',
-      '## 综合结论',
-      '当前采集窗口共 347 帧，真实掉帧 1 帧，最长帧 62.73ms。',
-      '',
-      '## 峰值/口径指标',
-      '真实掉帧 1 帧；最长帧 62.73ms；Buffer Stuffing 假阳性已单独排除。',
-      '',
-      '## 掉帧与根因分布',
-      '| 根因 | 帧数 | 占比 |',
-      '| --- | ---: | ---: |',
-      '| workload_heavy | 1 | 100% |',
-      '',
-      '## 代表帧分析',
-      '代表帧 frame_id=59665234，帧耗时 62.73ms，超预算 7.5x，vsync_missed=7。',
-      'jank_frame_detail 证据显示主线程 animation 回调内的同步重计算构成关键阻塞链。',
-      '',
-      '## 内核等待边界',
-      kernelBoundary,
-      '',
-      '## 优化建议',
-      '将同步重计算拆分并移出主线程 animation 回调。',
-    ].join('\n');
-    const initialReport = completeScrollingReport('D 状态证明磁盘 IO 是根因。');
-    const correctedReport = completeScrollingReport(
-      'D 状态只是不可中断等待，仍需 IO 证据才能证明根因。当前 trace 未提供可验证的文件或数据库活动，因此本报告不把它列为磁盘 IO 根因。',
-    );
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', initialReport),
-        openCodeAssistantResponse('corrected', correctedReport),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, createCompletedScrollingPlanWithFinalPhase());
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-quality-continuation',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(2);
-    expect((promptInputs[1] as any).body.parts[0].text).toContain(
-      'D/DK 只能说明不可中断等待',
-    );
-    expect((promptInputs[1] as any).body.parts[0].text).toContain(
-      'D 状态证明磁盘 IO 是根因',
-    );
-    expect(result.conclusion).toContain('不把它列为磁盘 IO 根因');
-    expect(result.conclusion).not.toContain('D 状态证明磁盘 IO 是根因');
-    expect(result.partial).not.toBe(true);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps an invalid OpenCode continuation partial instead of repairing it into success', async () => {
-    const initialReport = '# Final Report\n\n## 综合结论\n初稿缺少滑动场景合同结构。';
-    const invalidContinuation = '我已经检查了报告，但还需要继续整理结构。';
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', initialReport),
-        openCodeAssistantResponse('invalid', invalidContinuation),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, createCompletedScrollingPlanWithFinalPhase());
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-invalid-continuation',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(2);
-    expect(result.conclusion).toBe(initialReport);
-    expect(result.partial).toBe(true);
-    expect(result.terminationReason).toBe('plan_incomplete');
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('uses bounded plan continuations and requires a fresh report after evidence completion', async () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '概览证据',
-          goal: '采集概览证据',
-          expectedTools: [],
-          status: 'in_progress',
-          summary: '',
-        },
-        {
-          id: 'p2',
-          name: '根因证据',
-          goal: '采集根因证据',
-          expectedTools: [],
-          status: 'pending',
-          summary: '',
-        },
-        {
-          id: 'p3',
-          name: '综合结论',
-          goal: '输出完整最终报告',
-          expectedTools: [],
-          status: 'pending',
-          summary: '',
-        },
-      ],
-      successCriteria: '完成证据采集并输出最终报告',
-      submittedAt: 1,
-      toolCallLog: [],
-    };
-    const initialReport = '# Final Report\n\n## 综合结论\n这是补证前的旧报告。';
-    const correctedReport = [
-      '# Final Report',
-      '',
-      '## 综合结论',
-      '当前采集窗口共 347 帧，真实掉帧 1 帧，最长帧 62.73ms。',
-      '',
-      '## 峰值/口径指标',
-      '真实掉帧 1 帧；最长帧 62.73ms；Buffer Stuffing 假阳性已单独排除。',
-      '',
-      '## 掉帧与根因分布',
-      '| 根因 | 帧数 | 占比 |',
-      '| --- | ---: | ---: |',
-      '| workload_heavy | 1 | 100% |',
-      '',
-      '## 代表帧分析',
-      '代表帧 frame_id=59665234，帧耗时 62.73ms，超预算 7.5x，vsync_missed=7。',
-      'jank_frame_detail 证据显示同步重计算构成关键阻塞链。',
-      '',
-      '## 优化建议',
-      '将同步重计算拆分并移出主线程 animation 回调。',
-    ].join('\n');
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', initialReport),
-        () => {
-          plan.phases[0].status = 'completed';
-          plan.phases[0].summary = '概览证据已经完成采集、身份核对、口径确认和关键指标复核。';
-          return openCodeAssistantResponse('plan-1', '已闭合 p1，继续处理剩余阶段。');
-        },
-        () => {
-          plan.phases[1].status = 'completed';
-          plan.phases[1].summary = '根因证据已经完成采集、因果链核对和反向证据排除。';
-          plan.phases[2].status = 'completed';
-          plan.phases[2].summary = '全部证据阶段已经完成，等待输出吸收最新证据的最终报告。';
-          return openCodeAssistantResponse('plan-2', '所有计划阶段已经闭合。');
-        },
-        openCodeAssistantResponse('corrected', correctedReport),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, plan);
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-plan-completion',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(4);
-    expect((promptInputs[1] as any).body.parts[0].text).toContain('p1');
-    expect((promptInputs[2] as any).body.parts[0].text).toContain('p2');
-    expect((promptInputs[3] as any).body.parts[0].text).toContain('Final Report Contract');
-    expect(result.conclusion).toContain('## 掉帧与根因分布');
-    expect(result.conclusion).not.toContain('补证前的旧报告');
-    expect(result.partial).not.toBe(true);
-    expect(result.rounds).toBe(4);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('stops after two plan continuations and remains partial when required evidence is still missing', async () => {
-    const plan = createCompletedScrollingPlanWithFinalPhase();
-    plan.phases[0].status = 'completed';
-    plan.phases[0].summary = '阶段摘要足够长，但 legacy expectedTools 的匹配工具证据仍然缺失。';
-    plan.phases[0].expectedCalls = [];
-    plan.toolCallLog = [];
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', '# Final Report\n\n## 综合结论\n证据仍未补齐。'),
-        openCodeAssistantResponse('plan-1', '第一次补全仍未获得所需工具证据。'),
-        openCodeAssistantResponse('plan-2', '第二次补全仍未获得所需工具证据。'),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, plan);
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-plan-still-incomplete',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(3);
-    expect((promptInputs[1] as any).body.parts[0].text).toContain(
-      '"missingGenericToolEvidence": true',
-    );
-    expect(result.partial).toBe(true);
-    expect(result.terminationMessage).toContain('p1');
-    expect(result.rounds).toBe(3);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('uses one independent continuation to resolve a formed hypothesis', async () => {
-    const plan = createCompletedScrollingPlanWithFinalPhase();
-    plan.phases[1].status = 'completed';
-    plan.phases[1].summary = '完整最终报告阶段已经完成并记录了足够长的交付摘要。';
-    const hypotheses: any[] = [{
-      id: 'h1',
-      statement: '同步重计算是代表帧的主要根因',
-      basis: '代表帧耗时与主线程热点重叠',
-      status: 'formed',
-      supportingEvidence: [],
-    }];
-    const completeReport = [
-      '# Final Report',
-      '',
-      '## 综合结论',
-      '当前采集窗口共 347 帧，真实掉帧 1 帧，最长帧 62.73ms。',
-      '',
-      '## 峰值/口径指标',
-      '真实掉帧 1 帧；最长帧 62.73ms；Buffer Stuffing 假阳性已单独排除。',
-      '',
-      '## 掉帧与根因分布',
-      '| 根因 | 帧数 | 占比 |',
-      '| --- | ---: | ---: |',
-      '| workload_heavy | 1 | 100% |',
-      '',
-      '## 代表帧分析',
-      '代表帧 frame_id=59665234，帧耗时 62.73ms，超预算 7.5x，vsync_missed=7。',
-      'jank_frame_detail 证据确认同步重计算构成关键阻塞链。',
-      '',
-      '## 优化建议',
-      '将同步重计算拆分并移出主线程 animation 回调。',
-    ].join('\n');
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', completeReport),
-        () => {
-          hypotheses[0].status = 'confirmed';
-          hypotheses[0].supportingEvidence = ['art-frame-detail'];
-          return openCodeAssistantResponse('hypothesis', completeReport);
-        },
-      ], promptInputs, close),
-    });
-    mockOpenCodePreparation(runtime, plan, 'scrolling', '分析滑动性能', hypotheses);
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-hypothesis-resolution',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(2);
-    expect((promptInputs[1] as any).body.parts[0].text).toContain('"id": "h1"');
-    expect(result.hypotheses[0].status).toBe('confirmed');
-    expect(result.partial).not.toBe(true);
-    expect(result.rounds).toBe(2);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps a non-abort plan-continuation failure sticky partial', async () => {
-    const plan = createCompletedScrollingPlanWithFinalPhase();
-    plan.phases[0].status = 'in_progress';
-    plan.phases[0].summary = '';
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', '# Final Report\n\n## 综合结论\n当前报告仍缺证。'),
-        new Error('provider stream terminated'),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, plan);
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-plan-continuation-failed',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(2);
-    expect(result.partial).toBe(true);
-    expect(result.terminationMessage).toContain('计划补全失败');
-    expect(result.rounds).toBe(2);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps the original OpenCode report partial when a continuation fails', async () => {
-    const initialReport = '# Final Report\n\n## 综合结论\n初稿缺少滑动场景合同结构。';
-    const promptInputs: unknown[] = [];
-    const close = jest.fn();
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: createOpenCodeReportModuleLoader([
-        openCodeAssistantResponse('initial', initialReport),
-        new Error('provider stream terminated'),
-      ], promptInputs, close),
-    });
-    mockOpenCodeScrollingPreparation(runtime, createCompletedScrollingPlanWithFinalPhase());
-
-    const result = await runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-failed-continuation',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-
-    expect(promptInputs).toHaveLength(2);
-    expect(result.conclusion).toBe(initialReport);
-    expect(result.partial).toBe(true);
-    expect(result.terminationMessage).toContain('补写失败');
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it('rethrows a real aborted OpenCode plan continuation and closes each resource once', async () => {
-    const promptInputs: unknown[] = [];
-    const closeServer = jest.fn<() => void>();
-    let rejectContinuation: ((reason?: unknown) => void) | undefined;
-    let continuationStartedResolve: (() => void) | undefined;
-    const continuationStarted = new Promise<void>(resolve => {
-      continuationStartedResolve = resolve;
-    });
-    const prompt = jest.fn(async (input: unknown) => {
-      promptInputs.push(input);
-      if (promptInputs.length === 1) {
-        return openCodeAssistantResponse(
-          'initial',
-          '# Final Report\n\n## 综合结论\n初稿缺少滑动场景合同结构。',
-        );
-      }
-      continuationStartedResolve?.();
-      return new Promise<never>((_resolve, reject) => {
-        rejectContinuation = reject;
-      });
-    });
-    const abort = jest.fn(async () => {
-      rejectContinuation?.(new Error('OpenCode prompt aborted'));
-      return {data: true};
-    });
-    const runtime = new OpenCodeRuntime(createFakeRuntimeInput({
-      selection: {kind: OPENCODE_RUNTIME_KIND, source: 'env'},
-    }), {
-      env: {
-        SMARTPERFETTO_OPENCODE_MODEL_JSON:
-          '{"providerID":"smartperfetto","modelID":"test-model"}',
-      },
-      moduleLoader: jest.fn(async () => ({
-        createOpencodeWithEnv: jest.fn(async () => ({
-          server: {url: 'http://127.0.0.1:4106', close: closeServer},
-          client: {
-            session: {
-              create: jest.fn(async () => ({data: {id: 'ses-opencode-report'}})),
-              prompt,
-              abort,
-            },
-          },
-        })),
-      })),
-    });
-    const plan = createCompletedScrollingPlanWithFinalPhase();
-    plan.phases[0].status = 'in_progress';
-    plan.phases[0].summary = '';
-    mockOpenCodeScrollingPreparation(runtime, plan);
-
-    const analysis = runtime.analyze(
-      '分析滑动性能',
-      'session-opencode-aborted-continuation',
-      'trace-opencode',
-      {analysisMode: 'full'},
-    );
-    const rejection = analysis.then(
-      () => undefined,
-      error => error as Error,
-    );
-    await continuationStarted;
-    const activeHandle = (runtime as any).activeSessions.get(
-      'session-opencode-aborted-continuation',
-    );
-    const originalCloseBridge = activeHandle.closeBridge;
-    const closeBridge = jest.fn(async () => originalCloseBridge?.());
-    activeHandle.closeBridge = closeBridge;
-
-    await runtime.abortSession('session-opencode-aborted-continuation');
-
-    await expect(rejection).resolves.toMatchObject({message: 'OpenCode prompt aborted'});
-    expect(promptInputs).toHaveLength(2);
-    expect(abort).toHaveBeenCalledTimes(1);
-    expect(closeServer).toHaveBeenCalledTimes(1);
-    expect(closeBridge).toHaveBeenCalledTimes(1);
-  });
-
-  it('recognizes a structurally named conclusion phase when auto-closing a delivered report', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '启动证据对比',
-          goal: '采集并核对双端启动证据',
-          status: 'completed',
-          summary: '已完成双端启动证据对比与根因交叉验证。',
-        },
-        {
-          id: 'p2',
-          name: '结构化结论',
-          goal: '输出 Delta 表格、根因分析和分层建议',
-          status: 'in_progress',
-        },
-      ],
-    } as any;
-    const report = [
-      '## 综合结论',
-      '',
-      '左侧冷启动显著慢于右侧。',
-      '',
-      '## 关键证据',
-      '- evidence/source: art-startup 显示 TTID 差异。',
-    ].join('\n');
-
-    const closed = completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 43);
-
-    expect(closed?.id).toBe('p2');
-    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({ complete: true, pending: [] });
-  });
-
-  it('removes provider process narration before a delivered OpenCode report', () => {
-    expect(sanitizeOpenCodeConclusionText([
-      'Now I have all evidence. Let me produce the final comprehensive analysis report.',
-      '',
-      '---',
-      '',
-      '## 综合结论',
-      '',
-      '主线程 animation 回调是主要卡顿来源。',
-    ].join('\n'))).toBe([
-      '## 综合结论',
-      '',
-      '主线程 animation 回调是主要卡顿来源。',
-    ].join('\n'));
-  });
-
-  it('does not auto-close OpenCode phases when earlier work is still pending', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '概览采集',
-          goal: '采集滑动概览',
-          status: 'in_progress',
-        },
-        {
-          id: 'p3',
-          name: '综合结论',
-          goal: '输出完整分析报告',
-          status: 'pending',
-        },
-      ],
-    } as any;
-    const report = '# 滑动性能分析报告\n\n## 代表帧分析\n- evidence/source: art-frame-detail';
-
-    expect(completeOpenCodeFinalReportPhaseIfDelivered(plan, report, 'zh-CN', () => 42)).toBeUndefined();
-    expect(getOpenCodePlanCompletionStatus(plan)).toMatchObject({ complete: false, pending: ['p1', 'p3'] });
-  });
 
   it('projects OpenCode events without synthesizing route terminal events', () => {
     expect(projectOpenCodeEventToStreamingUpdate({
@@ -3144,13 +2823,14 @@ describe('experimental OpenCode runtime contract', () => {
     );
 
     const prompt = record.promptInput as {body?: {system?: string}} | undefined;
-    expect(prompt?.body?.system).toContain('cb-opencode-quick');
-    expect(prompt?.body?.system).toContain('metadata_only');
-    expect(prompt?.body?.system).toContain('源码使用决策契约');
+    expect(readPromptContextFrame(prompt?.body?.system, 'source_authorization')).toMatchObject({
+      mode: 'metadata_only', codebaseIds: ['cb-opencode-quick'], evidenceAccess: 'read_new',
+    });
     expect(result).toMatchObject({
       success: false,
       partial: true,
-      terminationReason: 'plan_incomplete',
+      conclusion: '',
+      completion: expect.objectContaining({status: 'unknown'}),
       sourceUseDecision: expect.objectContaining({status: 'pending'}),
     });
   });
@@ -3313,6 +2993,7 @@ describe('experimental OpenCode runtime contract', () => {
   });
 
   it('injects dual-trace pane mapping into the OpenCode comparison system prompt', async () => {
+    useIntent({...BOUNDED_INTENT, taskKind: 'comparison', sceneId: 'startup', scope: 'scene_wide', deliverable: 'report', recommendedComplexity: 'full'});
     const record: { createOptions?: Record<string, unknown>; promptInput?: unknown; closeCount: number } = {
       closeCount: 0,
     };
@@ -3373,137 +3054,19 @@ describe('experimental OpenCode runtime contract', () => {
     );
 
     const promptInput = record.promptInput as { body?: { system?: string } } | undefined;
-    expect(promptInput?.body?.system).toContain('## 对比模式');
-    expect(promptInput?.body?.system).toContain('### 窗口映射');
-    expect(promptInput?.body?.system).toContain('左侧/基线 Trace');
-    expect(promptInput?.body?.system).toContain('右侧/对比 Trace');
-    expect(promptInput?.body?.system).toContain('共有表/视图**: 0 个，不可直接对比');
-    expect(promptInput?.body?.system).toContain('android_current_only');
-    expect(promptInput?.body?.system).toContain('android_reference_only');
+    expect(readPromptContextFrame(promptInput?.body?.system, 'comparison_identity')).toMatchObject({
+      referenceTraceId: 'trace-reference', capabilityProbeStatus: 'checked',
+      tracePairContext: {layout: 'horizontal', primarySide: 'left', referenceSide: 'right', panes: [
+        {side: 'left', traceSide: 'current', traceId: 'trace-current'},
+        {side: 'right', traceSide: 'reference', traceId: 'trace-reference'},
+      ]},
+    });
+    expect(readPromptContextFrame(promptInput?.body?.system, 'comparison_details')).toMatchObject({
+      commonCapabilities: [], capabilityDiff: {currentOnly: ['android_current_only'], referenceOnly: ['android_reference_only']},
+    });
   });
 
-  it('answers default auto trace facts directly without loading the OpenCode SDK', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      expect(sql).toContain('runtime_cpu_core_count');
-      return {
-        columns: [
-          'observed_cpu_count',
-          'observed_cpus',
-          'universe_source',
-          'cpu_table_count',
-          'cpu_table_cpus',
-          'source_table',
-        ],
-        rows: [[
-          7,
-          '0, 1, 2, 3, 4, 5, 6',
-          'sched_observed',
-          7,
-          '0, 1, 2, 3, 4, 5, 6',
-          'sched_slice/thread_state',
-        ]],
-        durationMs: 2,
-      };
-    });
-    const record: { createOptions?: Record<string, unknown>; promptInput?: unknown; closeCount: number } = {
-      closeCount: 0,
-    };
-    const moduleLoader = createFakeModuleLoader(record);
-    const runtime = new OpenCodeRuntime(
-      createFakeRuntimeInput({
-        traceProcessorService,
-        selection: { kind: OPENCODE_RUNTIME_KIND, source: 'env' },
-      }),
-      {
-        env: {
-          SMARTPERFETTO_OPENCODE_MODEL_JSON: '{"providerID":"smartperfetto","modelID":"test-model"}',
-        },
-        moduleLoader,
-      },
-    );
-    const updates: unknown[] = [];
-    runtime.on('update', update => updates.push(update));
 
-    const result = await runtime.analyze(
-      '这个 trace 的 CPU 有几个核心？',
-      'session-opencode-auto-quick',
-      'trace-opencode',
-    );
-
-    expect(moduleLoader).not.toHaveBeenCalled();
-    expect(record.promptInput).toBeUndefined();
-    expect(record.createOptions).toBeUndefined();
-    expect(record.closeCount).toBe(0);
-    expect(result.quickRun).toMatchObject({
-      requestedMode: 'auto',
-      resolvedMode: 'quick',
-      actualTurns: 0,
-      stopReason: 'answered',
-      evidence: {
-        currentRunDataEnvelopes: 1,
-        citedEvidenceRefs: 1,
-      },
-    });
-    expect(result.rounds).toBe(0);
-    expect(result.conclusion).toContain('7 个 CPU 核心');
-    expect(result.conclusionContract?.claims?.[0]?.references?.[0]).toMatchObject({
-      column: 'observed_cpu_count',
-      value: 7,
-    });
-    expect(result.terminationReason).toBeUndefined();
-    expect(traceProcessorService.query).toHaveBeenCalledTimes(1);
-    expect(updates).toEqual([
-      expect.objectContaining({ type: 'data' }),
-      expect.objectContaining({ type: 'progress' }),
-      expect.objectContaining({ type: 'conclusion' }),
-      expect.objectContaining({ type: 'answer_token' }),
-    ]);
-  });
-
-  it('does not pre-run quick direct evidence for auto full scrolling diagnostics', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const record: { createOptions?: Record<string, unknown>; promptInput?: unknown; closeCount: number } = {
-      closeCount: 0,
-    };
-    const moduleLoader = createFakeModuleLoader(record);
-    const runtime = new OpenCodeRuntime(
-      createFakeRuntimeInput({
-        traceProcessorService,
-        selection: { kind: OPENCODE_RUNTIME_KIND, source: 'env' },
-      }),
-      {
-        env: {
-          SMARTPERFETTO_OPENCODE_MODEL_JSON: '{"providerID":"smartperfetto","modelID":"test-model"}',
-        },
-        moduleLoader,
-      },
-    );
-    runtime.restoreArchitectureCache('trace-opencode-full-scroll', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-    const directEvidence = jest.spyOn(
-      quickEvidenceDirectAnswer,
-      'buildRuntimeQuickEvidenceAttempt',
-    );
-
-    try {
-      const result = await runtime.analyze(
-        '分析滑动性能',
-        'session-opencode-full-scroll',
-        'trace-opencode-full-scroll',
-      );
-
-      expect(directEvidence).not.toHaveBeenCalled();
-      expect(moduleLoader).toHaveBeenCalledTimes(1);
-      expect(record.promptInput).toBeDefined();
-      expect(result.quickRun).toBeUndefined();
-    } finally {
-      directEvidence.mockRestore();
-    }
-  });
 
   it('bounds the OpenCode architecture cache with shared LRU semantics', () => {
     const runtime = new OpenCodeRuntime(createFakeRuntimeInput());
@@ -3521,167 +3084,8 @@ describe('experimental OpenCode runtime contract', () => {
     expect(runtime.getCachedArchitecture('trace-50')).toBeUndefined();
   });
 
-  it('skips focus detection for package-scoped trace fact fallback preparation', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const sqlQueries: string[] = [];
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      sqlQueries.push(sql);
-      return { columns: [], rows: [], durationMs: 1 };
-    });
-    const record: { createOptions?: Record<string, unknown>; promptInput?: unknown; closeCount: number } = {
-      closeCount: 0,
-    };
-    const moduleLoader = createFakeModuleLoader(record);
-    const runtime = new OpenCodeRuntime(
-      createFakeRuntimeInput({
-        traceProcessorService,
-        selection: { kind: OPENCODE_RUNTIME_KIND, source: 'env' },
-      }),
-      {
-        env: {
-          SMARTPERFETTO_OPENCODE_MODEL_JSON: '{"providerID":"smartperfetto","modelID":"test-model"}',
-        },
-        moduleLoader,
-      },
-    );
-    runtime.restoreArchitectureCache('trace-opencode', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
 
-    await runtime.analyze(
-      '滑动 FPS 是多少？',
-      'session-opencode-package-fallback',
-      'trace-opencode',
-      { packageName: 'com.example.app' },
-    );
 
-    expect(moduleLoader).toHaveBeenCalledTimes(1);
-    expect(record.promptInput).toBeDefined();
-    expect(sqlQueries.some(sql => sql.includes('runtime_frame_metrics'))).toBe(true);
-    expect(sqlQueries.some(sql => sql.includes('android_battery_stats_event_slices'))).toBe(false);
-    expect(sqlQueries.some(sql => sql.includes('android_oom_adj_intervals'))).toBe(false);
-  });
-
-  it('reuses quick-evidence focus state on fallback without repeating OpenCode preflight queries', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const sqlQueries: string[] = [];
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      sqlQueries.push(sql);
-      if (sql.includes('android_battery_stats_event_slices')) {
-        return {
-          columns: ['package_name', 'total_duration_ns', 'switch_count'],
-          rows: [['com.example.app', 2_000_000_000, 2]],
-          durationMs: 1,
-        };
-      }
-      if (sql.includes('runtime_frame_metrics')) {
-        return {
-          columns: [
-            'package_name',
-            'process_names',
-            'upid_count',
-            'total_frames',
-            'window_start_ns',
-            'window_end_ns',
-            'duration_s',
-            'fps',
-            'source_table',
-          ],
-          rows: [],
-          durationMs: 1,
-        };
-      }
-      throw new Error(`Unexpected SQL: ${sql}`);
-    });
-    const attemptSpy = jest.spyOn(quickEvidenceDirectAnswer, 'buildRuntimeQuickEvidenceAttempt');
-    const record: { createOptions?: Record<string, unknown>; promptInput?: unknown; closeCount: number } = {
-      closeCount: 0,
-    };
-    const moduleLoader = createFakeModuleLoader(record);
-    const runtime = new OpenCodeRuntime(
-      createFakeRuntimeInput({
-        traceProcessorService,
-        selection: { kind: OPENCODE_RUNTIME_KIND, source: 'env' },
-      }),
-      {
-        env: {
-          SMARTPERFETTO_OPENCODE_MODEL_JSON: '{"providerID":"smartperfetto","modelID":"test-model"}',
-          SMARTPERFETTO_ADMITTED_RUNTIME_CANDIDATES: 'task4',
-        },
-        moduleLoader,
-      },
-    );
-    runtime.restoreArchitectureCache('trace-opencode-reused-quick-attempt', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-
-    await runtime.analyze(
-      '滑动 FPS 是多少？',
-      'session-opencode-reused-quick-attempt',
-      'trace-opencode-reused-quick-attempt',
-    );
-
-    expect(attemptSpy).toHaveBeenCalledTimes(1);
-    expect(moduleLoader).toHaveBeenCalledTimes(1);
-    expect(record.promptInput).toBeDefined();
-    expect(sqlQueries.filter(sql => sql.includes('android_battery_stats_event_slices'))).toHaveLength(1);
-    expect(sqlQueries.filter(sql => sql.includes('runtime_frame_metrics'))).toHaveLength(1);
-    expect(sqlQueries.filter(sql => sql.includes('android_oom_adj_intervals'))).toHaveLength(0);
-  });
-
-  it('answers acknowledgement follow-ups directly without loading the OpenCode SDK', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const record: { createOptions?: Record<string, unknown>; promptInput?: unknown; closeCount: number } = {
-      closeCount: 0,
-    };
-    const moduleLoader = createFakeModuleLoader(record);
-    const runtime = new OpenCodeRuntime(
-      createFakeRuntimeInput({
-        traceProcessorService,
-        selection: { kind: OPENCODE_RUNTIME_KIND, source: 'env' },
-      }),
-      {
-        env: {},
-        moduleLoader,
-      },
-    );
-    const updates: unknown[] = [];
-    runtime.on('update', update => updates.push(update));
-
-    const result = await runtime.analyze(
-      '谢谢',
-      'session-opencode-ack',
-      'trace-opencode',
-    );
-
-    expect(moduleLoader).not.toHaveBeenCalled();
-    expect(record.promptInput).toBeUndefined();
-    expect(record.createOptions).toBeUndefined();
-    expect(record.closeCount).toBe(0);
-    expect(traceProcessorService.query).not.toHaveBeenCalled();
-    expect(result).toMatchObject({
-      success: true,
-      conclusion: '收到。',
-      confidence: 1,
-      rounds: 0,
-      quickRun: {
-        requestedMode: 'auto',
-        resolvedMode: 'quick',
-        actualTurns: 0,
-        stopReason: 'answered',
-      },
-    });
-    expect(result.claimVerificationResult).toBeUndefined();
-    expect(updates).toEqual([
-      expect.objectContaining({ type: 'progress' }),
-      expect.objectContaining({ type: 'conclusion' }),
-      expect.objectContaining({ type: 'answer_token' }),
-    ]);
-  });
 
   it('hydrates OpenCode opaque session state and prompts the restored session', async () => {
     await withBackendDataDir(async (dataDir) => {
@@ -3889,7 +3293,7 @@ describe('experimental OpenCode runtime contract', () => {
         ], promptInputs, close),
       });
       mockOpenCodePreparation(runtime, {
-        phases: [{id: 'p1', name: 'evidence', status: 'completed', summary: 'evidence complete'}],
+        phases: [{id: 'p1', name: 'evidence', goal: 'Review available evidence', expectedTools: [], status: 'completed', summary: 'evidence complete'}],
         successCriteria: 'done',
         submittedAt: 1,
         toolCallLog: [],
@@ -3898,15 +3302,15 @@ describe('experimental OpenCode runtime contract', () => {
       await expect(runtime.analyze('分析滑动性能', 'session-opencode-no-output', 'trace-opencode', {
         analysisMode: 'full',
         runManifestAttributionSink: createNoopAttributionSink(runtimePerformanceRecorder),
-      })).resolves.toMatchObject({success: true});
+      })).resolves.toMatchObject({success: false, partial: true, conclusion: ''});
 
       const receipt = runtimePerformanceRecorder.seal();
       expect(receipt.firstOutputMs).toBeUndefined();
       const finalizationPhases = receipt.phases.filter(phase => phase.name === 'finalization');
       expect(finalizationPhases).toHaveLength(1);
-      expect(finalizationPhases[0]).toEqual(expect.objectContaining({outcome: 'ok'}));
+      expect(finalizationPhases[0]).toEqual(expect.objectContaining({outcome: 'error'}));
       expect(receipt.phases).toEqual(expect.arrayContaining([
-        expect.objectContaining({name: 'finalization', outcome: 'ok'}),
+        expect.objectContaining({name: 'finalization', outcome: 'error'}),
       ]));
     });
   });
@@ -4063,7 +3467,7 @@ describe('experimental OpenCode runtime contract', () => {
         notes: [],
         hypotheses: [],
         uncertaintyFlags: [],
-        analysisRunSpec: {outputLanguage: 'zh-CN', traceContext: {datasetCount: 0}, mode: {adaptiveRouting: undefined}},
+        analysisRunSpec: {runtime: {kind: OPENCODE_RUNTIME_KIND}, query: {text: '分析滑动性能'}, outputLanguage: 'zh-CN', traceContext: {datasetCount: 0}, mode: {adaptiveRouting: undefined}},
       });
 
       const analysis = runtime.analyze('分析滑动性能', sessionId, traceId, {
@@ -4182,7 +3586,7 @@ describe('experimental OpenCode runtime contract', () => {
         await expect(Promise.race([
           analysis,
           new Promise((_, reject) => setTimeout(() => reject(new Error('outer-test-timeout')), 500)),
-        ])).rejects.toThrow('OpenCode prompt timed out after 50ms');
+        ])).rejects.toMatchObject({name: 'TimeoutError', code: 'OPENCODE_PROMPT_TIMEOUT'});
         expect(closeServer).toHaveBeenCalledTimes(1);
         expect(closeBridge).toHaveBeenCalledTimes(1);
       } finally {

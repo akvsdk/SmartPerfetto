@@ -113,15 +113,28 @@ export function normalizeTraceProcessorQueryPriority(
   return fallback;
 }
 
-function resolveWorkerThreadPath(): { filename: string; execArgv: string[] } {
+function resolveWorkerThreadPath(): {
+  filename: string;
+  execArgv: string[];
+  eval?: boolean;
+  workerData?: {loaderPath: string; entryPath: string};
+} {
   const jsPath = path.join(__dirname, 'traceProcessorSqlWorkerThread.js');
   if (fs.existsSync(jsPath)) {
     return { filename: jsPath, execArgv: [] };
   }
 
   return {
-    filename: path.join(__dirname, 'traceProcessorSqlWorkerThread.ts'),
-    execArgv: ['--require', 'tsx/cjs'],
+    // An ESM preload can make Node treat a .ts worker entry as ESM before the
+    // tsx CJS hook sees it. Bootstrap as CJS and explicitly require the entry.
+    // Resolve loader paths in the parent; data never becomes executable text.
+    filename: 'const {workerData} = require("node:worker_threads"); require(workerData.loaderPath); require(workerData.entryPath);',
+    execArgv: [],
+    eval: true,
+    workerData: {
+      loaderPath: require.resolve('tsx/cjs'),
+      entryPath: path.join(__dirname, 'traceProcessorSqlWorkerThread.ts'),
+    },
   };
 }
 
@@ -423,6 +436,7 @@ export class TraceProcessorSqlWorker {
     const workerPath = resolveWorkerThreadPath();
     const worker = new Worker(workerPath.filename, {
       execArgv: workerPath.execArgv,
+      ...(workerPath.eval ? {eval: true, workerData: workerPath.workerData} : {}),
       env: process.env,
     });
 

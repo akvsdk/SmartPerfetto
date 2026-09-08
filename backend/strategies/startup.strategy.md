@@ -3,6 +3,7 @@
 
 ---
 scene: startup
+classification_description: "Application launch behavior and performance, including launch type and time to initial or full display."
 priority: 2
 effort: medium
 required_capabilities:
@@ -81,9 +82,9 @@ final_report_contract:
     - id: startup_diagnostic_api_boundary
       label: 启动诊断 API/外部指标边界
       description: '当用户主动提到 ApplicationStartInfo、App Performance Score、Vitals、APM 或 A/B 时，区分当前 trace、诊断 API 记录、外部聚合/实验数据、版本/时钟边界和缺失证据。'
-      trigger_patterns:
-        - 'ApplicationStartInfo|getHistoricalProcessStartReasons|STARTUP_STATE|START_TIMESTAMP|START_REASON|START_COMPONENT'
-        - 'App Performance Score|Android Vitals|Play Vitals|Macrobenchmark|online APM|\bAPM\b|A/B|experiment'
+      condition:
+        kind: semantic
+        description: '当问题要求解释启动诊断记录、外部性能指标、基准测试或实验结果，或将它们与当前 trace 对照时适用。'
       pattern_groups:
         - ['启动诊断 API/外部指标边界', 'startup diagnostic API', 'external metric boundary', 'ApplicationStartInfo', 'App Performance Score', 'Vitals', 'APM', 'A/B']
         - ['diagnostic_api', 'external_aggregate', 'experiment', 'ApplicationStartInfo', 'getHistoricalProcessStartReasons', 'STARTUP_STATE', 'START_TIMESTAMP', 'START_REASON', 'START_COMPONENT', 'App Performance Score', 'Play Vitals', 'Android Vitals']

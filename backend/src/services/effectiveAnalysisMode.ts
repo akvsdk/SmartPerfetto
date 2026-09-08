@@ -14,20 +14,12 @@ export interface AnalysisModeContext {
   assistantSurface?: AnalysisOptions['assistantSurface'];
 }
 
-export function analysisContextRequiresFullMode(context: AnalysisModeContext): boolean {
-  return Boolean(
-    context.referenceTraceId ||
-    context.knowledgeSourceIds?.length,
-  );
-}
-
-/** Private RAG and dual-trace capabilities remain full-runtime only. */
+/** Budget preference is independent of evidence capabilities and authorization. */
 export function resolveEffectiveAnalysisMode(
   requested: AnalysisOptions['analysisMode'],
   context: AnalysisModeContext,
 ): AnalysisMode {
-  if (context.assistantSurface === 'conversation') return 'fast';
-  return analysisContextRequiresFullMode(context) ? 'full' : requested ?? 'auto';
+  return requested ?? (context.assistantSurface === 'conversation' ? 'fast' : 'auto');
 }
 
 export interface SmartDeepDiveAnalysisContext {
@@ -39,14 +31,14 @@ export interface SmartDeepDiveAnalysisContext {
 
 /**
  * Preserve the exact private-context allowlists when Smart Profile hands its
- * selected scenes to the full agent runtime. Smart deep dives default to full;
- * an explicit fast request remains fast unless RAG or comparison needs full.
+ * selected scenes to the agent runtime. Smart deep dives default to full;
+ * an explicit fast request remains fast with the same authorized capabilities.
  */
 export function buildSmartDeepDiveAnalysisContext(
   requested: AnalysisOptions['analysisMode'],
   context: AnalysisModeContext,
 ): SmartDeepDiveAnalysisContext {
-  const effectiveMode = resolveEffectiveAnalysisMode(requested, context);
+  const effectiveMode = resolveEffectiveAnalysisMode(requested ?? 'full', context);
   return {
     analysisMode: effectiveMode === 'fast' ? 'fast' : 'full',
     ...(context.codeAwareMode ? {codeAwareMode: context.codeAwareMode} : {}),

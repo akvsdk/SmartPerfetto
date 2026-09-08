@@ -81,6 +81,11 @@ display:
       type: percentage
       format: percentage
 
+process_scope:
+  role: identity_metadata
+  limitations:
+    - Stage durations are derived from caller-supplied window boundaries, not independently measured thread slices.
+
 sql: |
   WITH timing AS (
     SELECT

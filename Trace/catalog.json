@@ -6627,6 +6627,7 @@
             "mode": "semantic",
             "source_file": "backend/skills/composite/scrolling_analysis.skill.yaml",
             "parameters": {
+              "enable_frame_details": true,
               "enable_expert_probes": true,
               "frame_variance_probe_min_janky_frames": 1,
               "frame_variance_transition_threshold_ms": 1,

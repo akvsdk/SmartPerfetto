@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+import type {Options} from '@anthropic-ai/claude-agent-sdk';
+import type {ClaudeAgentConfig} from './claudeConfig';
+import {intentTransportTextResult, runIntentTransport, type IntentTransportInput} from '../../intentTransport';
+
+interface ClaudeClassifierQuery extends AsyncIterable<unknown> {
+  close(): void | Promise<void>;
+}
+
+export interface ClaudeIntentSdk {
+  query(input: {prompt: string; options: Options}): ClaudeClassifierQuery;
+}
+
+export interface ClaudeIntentTransportInput extends IntentTransportInput {
+  config: Pick<ClaudeAgentConfig, 'lightModel' | 'cwd'>;
+  /** Already resolved by createSdkEnv for the current provider scope. */
+  sdkEnv: Record<string, string | undefined>;
+  /** Already resolved by getSdkBinaryOption using that same scoped environment. */
+  sdkBinaryOptions: Pick<Options, 'pathToClaudeCodeExecutable'>;
+  loadSdk(): Promise<ClaudeIntentSdk>;
+}
+
+function object(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+}
+
+function hasToolUse(message: Record<string, unknown>): boolean {
+  const content = object(message.message)?.content;
+  const event = object(message.event);
+  const isToolBlock = (value: unknown) => {
+    const type = object(value)?.type;
+    return type === 'tool_use' || type === 'tool_result';
+  };
+  return (Array.isArray(content) && content.some(isToolBlock))
+    || (event?.type === 'content_block_start' && isToolBlock(event.content_block))
+    || message.tool_use_result !== undefined
+    || message.deferred_tool_use != null
+    || (Array.isArray(message.permission_denials) && message.permission_denials.length > 0)
+    || (message.type === 'system' && message.subtype === 'permission_denied');
+}
+
+/** Uses the caller's pinned Claude environment for one isolated classification query. */
+export function runClaudeIntentTransport(input: ClaudeIntentTransportInput) {
+  return runIntentTransport(input, async scope => {
+    if (!input.config.lightModel?.trim() || !input.config.cwd?.trim()) {
+      return {status: 'unavailable', reason: 'invalid_configuration'};
+    }
+    const sdk = await input.loadSdk();
+    scope.throwIfInactive();
+    const abortController = new AbortController();
+    const onAbort = () => abortController.abort();
+    scope.signal.addEventListener('abort', onAbort, {once: true});
+    let queryHasClose = false;
+    scope.onCleanup(() => {
+      if (!queryHasClose) scope.signal.removeEventListener('abort', onAbort);
+    });
+    if (scope.signal.aborted) onAbort();
+    const query = sdk.query({
+      prompt: input.prompt,
+      options: {
+        ...input.sdkBinaryOptions,
+        model: input.config.lightModel,
+        cwd: input.config.cwd,
+        env: input.sdkEnv,
+        systemPrompt: input.systemPrompt,
+        maxTurns: 1,
+        tools: [], allowedTools: [], mcpServers: {}, strictMcpConfig: true,
+        settingSources: [], skills: [], plugins: [], persistSession: false,
+        permissionMode: 'dontAsk',
+        abortController,
+        stderr: () => undefined,
+      },
+    });
+    queryHasClose = true;
+    scope.onCleanup(async () => {
+      try { await query.close(); } finally { scope.signal.removeEventListener('abort', onAbort); }
+    });
+    scope.throwIfInactive();
+    const iterator = query[Symbol.asyncIterator]();
+    while (true) {
+      const entry = await iterator.next();
+      scope.throwIfInactive();
+      if (entry.done) return {status: 'unavailable', reason: 'invalid_response'};
+      const message = object(entry.value);
+      if (!message) continue;
+      if (hasToolUse(message)) return {status: 'unavailable', reason: 'tool_use'};
+      if (message.type === 'system'
+        && (message.subtype === 'model_refusal_fallback' || message.subtype === 'model_refusal_no_fallback')) {
+        return {status: 'unavailable', reason: 'invalid_response'};
+      }
+      if (message.type !== 'result') continue;
+      if (message.subtype !== 'success' || message.is_error !== false || message.stop_reason === 'refusal') {
+        return {status: 'unavailable', reason: 'invalid_response'};
+      }
+      if (message.stop_reason === 'tool_use') return {status: 'unavailable', reason: 'tool_use'};
+      if (message.stop_reason === 'max_tokens') return {status: 'unavailable', reason: 'incomplete_output'};
+      // Some SDK success producers omit the raw provider stop reason or emit null.
+      if (message.stop_reason != null && message.stop_reason !== 'end_turn' && message.stop_reason !== 'stop_sequence') {
+        return {status: 'unavailable', reason: 'invalid_response'};
+      }
+      const models = Object.keys(object(message.modelUsage) ?? {});
+      return intentTransportTextResult(typeof message.result === 'string' ? message.result : '', input, {
+        ...(models.length === 1 ? {actualModel: models[0]} : {}),
+        ...(typeof message.stop_reason === 'string' ? {finishReason: message.stop_reason} : {}),
+      });
+    }
+  });
+}

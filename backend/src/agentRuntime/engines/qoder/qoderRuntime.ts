@@ -3,12 +3,16 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import { EventEmitter } from 'events';
+import {randomUUID} from 'node:crypto';
+import {mkdtemp, rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import type {
   AnalysisOptions,
   AnalysisResult,
   IOrchestrator,
 } from '../../../agent/core/orchestratorTypes';
-import type { ConversationTurn, Finding, StreamingUpdate } from '../../../agent/types';
+import type { Finding, StreamingUpdate } from '../../../agent/types';
 import type { ArchitectureInfo } from '../../../agent/detectors/types';
 import { createArchitectureDetector } from '../../../agent/detectors/architectureDetector';
 import { sessionContextManager } from '../../../agent/context/enhancedSessionContext';
@@ -20,6 +24,7 @@ import {
   recordEvaluationTokenDeltaIfPresent,
 } from '../../../services/selfEvolution/evaluationRuntimeHooks';
 import { ArtifactStore } from '../../../agentv3/artifactStore';
+import {resolveRuntimeEvidenceStore} from '../../runtimeEvidenceContext';
 import {
   buildNegativePatternSection,
   buildPatternContextSection,
@@ -29,14 +34,12 @@ import {
   createClaudeMcpServer,
   loadLearnedSqlFixPairs,
 } from '../../../agentv3/claudeMcpServer';
-import {
-  buildQuickSystemPrompt,
-  buildSystemPrompt,
-} from '../../../agentv3/claudeSystemPrompt';
+import {buildSystemPrompt} from '../../../agentv3/claudeSystemPrompt';
 import { extractFindingsFromText } from '../../../agentv3/claudeFindingExtractor';
 import { detectFocusApps, type DetectedFocusApp } from '../../../agentv3/focusAppDetector';
 import { localize, parseOutputLanguage, type OutputLanguage } from '../../../agentv3/outputLanguage';
-import { classifyScene, type SceneType } from '../../../agentv3/sceneClassifier';
+import {buildComplexityClassifierInput} from '../../../agentv3/queryComplexityContext';
+import {estimateAnalysisConfidence} from '../../../agentv3/analysisTermination';
 import { probeTraceCompleteness } from '../../../agentv3/traceCompletenessProber';
 import type {
   AnalysisNote,
@@ -54,17 +57,24 @@ import {
   type SessionFieldsForSnapshot,
   type SessionStateSnapshot,
 } from '../../../agentv3/sessionStateSnapshot';
-import {
-  applyFinalResultQualityGate,
-  hasDeliverableFinalReportHeading,
-} from '../../../services/finalResultQualityGate';
+import {applyFinalResultQualityGate} from '../../../services/finalResultQualityGate';
+import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisDeliveryContext, type AnalysisOutputOrigin} from '../../../types/analysisDelivery';
 import { verifyConclusion } from '../claude/claudeVerifier';
 import {
   createCodeAwareStreamingTextProjection,
   sanitizeCodeAwareText,
+  sanitizeCodeAwareTextWithReceipt,
+  type CodeAwareTextProjectionReceipt,
 } from '../../../services/security/codeAwareOutputRegistry';
 import { analysisContextUsesPrivateKnowledge } from '../../../services/resolvedAnalysisContext';
-import {finalizeSourceAwareAnalysisResult} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
+import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
+import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
+import {formatToolCallNarration, formatToolResultNarration} from '../../../agentv3/toolNarration';
+import {planPhaseUpdatedContent} from '../../../agentv3/planPhaseEvents';
+import {readRuntimeToolResultFacts} from '../../runtimeToolResult';
+import type {RuntimeToolObserver} from '../../runtimeToolObserver';
+import {summarizeExternalToolResult} from '../../runtimeLimits';
 import type { RuntimeSelection } from '../../runtimeSelection';
 import type { RuntimeEngineDefinition, RuntimeFactoryInput } from '../../runtimeRegistry';
 import {
@@ -73,11 +83,18 @@ import {
   type RuntimePerformanceOutcome,
   type RuntimePerformanceRun,
 } from '../../runtimePerformance';
-import { createAnalysisRunSpec, type AnalysisRunSpec } from '../../analysisRunSpec';
+import {createAnalysisRunSpec} from '../../analysisRunSpec';
+import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
+import {resolveRuntimeTurnPolicy} from '../../runtimeTurnPolicy';
+import {INTENT_TRANSPORT_CLEANUP_TIMEOUT_MS, runIntentTransport} from '../../intentTransport';
+import {runQoderIntentTransport} from './qoderIntentTransport';
+import type {IntentTransportInput, IntentTransportResult} from '../../intentTransport';
+import {attachFinalizationContext} from '../../analysisFinalizationContext';
+import type {ReadonlyStrategyRegistrySnapshot} from '../../../services/selfEvolution/effectiveRuntimeRegistryContext';
 import {
   createRuntimeSkillNotesBudget,
-  isTruncationVerificationIssue,
-  repairTruncatedFinalReport,
+  buildQuickRunReceipt,
+  quickStopReasonFromTermination,
   resolveQuickTurnBudget,
   toProtocolHypothesis,
 } from '../../runtimeCommon';
@@ -85,26 +102,14 @@ import { knowledgeScopeFromAnalysisOptions } from '../../runtimeScopes';
 import {
   buildQuickConversationContext,
   buildRuntimeTracePairComparisonContext,
+  buildRuntimeTracePairIdentityContext,
 } from '../../runtimePromptContext';
 import { buildRuntimeCaseBackgroundContext } from '../../../services/caseEvolution/caseBackgroundContext';
-import {PRIOR_EVIDENCE_ONLY_FOLLOWUP_REASON} from '../../../agentv3/queryComplexityClassifier';
-import { resolveRuntimeQuickMode } from '../../quickModeResolution';
 import { RuntimeExecutionGuard, type RuntimeExecutionLease } from '../../runtimeExecutionGuard';
-import {isRuntimeCandidateAdmitted} from '../../runtimeCandidateAdmission';
-import {buildAdaptiveRoutingForQuickResolution} from '../../adaptiveRoutingProjection';
-import {resetPrePlanToolCallsForNewRun} from '../../../agentv3/planToolCallRecorder';
 import {
-  buildRuntimeQuickEvidenceAttempt,
-  selectReusableRuntimeQuickEvidenceAttempt,
-  type RuntimeQuickEvidenceCounts,
-  type RuntimeQuickEvidenceDirectAnswer,
-  type RuntimeQuickEvidenceAttempt,
-} from '../../quickEvidenceDirectAnswer';
-import {
-  buildQuickDirectEvidenceAnalysisResult,
-  emitQuickDirectAnswerEvents,
-  emitQuickDirectQualityGateIssue,
-} from '../../quickDirectResult';
+  recordPlanOrPrePlanToolCall,
+  resetPrePlanToolCallsForNewRun,
+} from '../../../agentv3/planToolCallRecorder';
 import { isTraceProcessorQueryCancelledError } from '../../../services/traceProcessorCancellation';
 import { QODER_AGENT_RUNTIME_KIND } from '../../runtimeKinds';
 import {
@@ -123,6 +128,7 @@ import {
   type QoderRuntimeConfig,
   type EnvLike,
   truthyEnv,
+  numericEnv,
 } from './qoderConfig';
 
 export type QoderRuntimeKind = typeof QODER_AGENT_RUNTIME_KIND;
@@ -277,6 +283,58 @@ function buildQoderCancelledResult(
   };
 }
 
+async function settleQoderWork(work: Promise<unknown>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work.catch(() => undefined),
+      new Promise<void>(resolve => {timer = setTimeout(resolve, INTENT_TRANSPORT_CLEANUP_TIMEOUT_MS);}),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function bindQoderDelivery(
+  result: AnalysisResult,
+  executionLease: RuntimeExecutionLease,
+  turnIntent: AnalysisTurnIntent | undefined,
+  outputOrigin: AnalysisOutputOrigin,
+  status: AnalysisCompletion['status'],
+  reason?: AnalysisCompletion['reason'],
+  sdkFinishReason?: string,
+  projectionOptions: {
+    sourceUse?: Parameters<typeof finalizeSourceAwareAnalysisResultWithProjection>[1];
+    project?: (body: string) => CodeAwareTextProjectionReceipt;
+  } = {},
+): AnalysisDeliveryContext {
+  const runId = executionLease.key.runId!;
+  const candidate = {
+    runId, attemptId: 'main', candidateRef: `${runId}:qoder:main`,
+    conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion),
+  };
+  const completion: AnalysisCompletion = {
+    ...candidate, schemaVersion: 1, runtimeKind: QODER_AGENT_RUNTIME_KIND, status,
+    ...(reason ? {reason} : {}), ...(sdkFinishReason ? {sdkFinishReason} : {}),
+  };
+  result.turnIntent = turnIntent;
+  result.completion = completion;
+  result.outputOrigin = outputOrigin;
+  const nativeContext: AnalysisDeliveryContext = {
+    entry: 'runtime_draft', acceptedCandidate: candidate, completion, outputOrigin, turnIntent,
+  };
+  const priorProjection = projectionOptions.project
+    ? projectionOptions.project(result.conclusion)
+    : sanitizeCodeAwareTextWithReceipt(result.sessionId, result.conclusion);
+  result.conclusion = priorProjection.text;
+  const projected = finalizeSourceAwareAnalysisResultWithProjection(result, projectionOptions.sourceUse, {
+    priorProjection, context: nativeContext,
+  });
+  if (!projected.deliveryContext) throw new Error('Qoder delivery context was lost during privacy projection');
+  if (projected.conclusionProjection.disposition === 'replaced') result.confidence = 0;
+  return projected.deliveryContext;
+}
+
 const QODER_LIGHT_MODEL_PURPOSES = new Set([
   'compact',
   'compression',
@@ -295,6 +353,16 @@ interface QoderActiveSession {
   sdkQuery?: QoderQueryLike;
   assistantText: string;
   toolCallCount: number;
+  turnIntent?: AnalysisTurnIntent;
+  sourceUse?: Parameters<typeof finalizeSourceAwareAnalysisResultWithProjection>[1];
+  timedOut?: boolean;
+  timeoutMs?: number;
+  deadlineMs?: number;
+  strategyRegistry?: ReadonlyStrategyRegistrySnapshot;
+  artifactStore?: ArtifactStore;
+  delivery?: {result: AnalysisResult; context: AnalysisDeliveryContext};
+  dispatchText?: (input: IntentTransportInput) => Promise<IntentTransportResult>;
+  armMainBudget(timeoutMs: number): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,31 +407,43 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       runtime: QODER_AGENT_RUNTIME_KIND,
       sessionId,
       referenceTraceId: normalizedOptions.referenceTraceId,
-      runId: normalizedOptions.runId,
+      runId: normalizedOptions.runId ?? randomUUID(),
     });
     const runtimePerformance = createRuntimePerformanceRun(
       normalizedOptions.runManifestAttributionSink,
     );
     const analysisStartedAt = Date.now();
+    let mainBudgetTimer: ReturnType<typeof setTimeout> | undefined;
     const sessionState: QoderActiveSession = {
       abortController: new AbortController(),
       aborted: false,
       assistantText: '',
       toolCallCount: 0,
+      armMainBudget: timeoutMs => {
+        sessionState.timeoutMs = timeoutMs;
+        sessionState.deadlineMs = Date.now() + timeoutMs;
+        mainBudgetTimer = setTimeout(() => {
+          sessionState.timedOut = true;
+          sessionState.aborted = true;
+          sessionState.abortController.abort();
+          void this.executionGuard.abortSession(sessionId, new Error('Qoder SDK analysis timed out')).catch(() => undefined);
+          void sessionState.sdkQuery?.interrupt().catch(() => undefined);
+        }, timeoutMs);
+        mainBudgetTimer.unref?.();
+      },
     };
     this.activeSessions.set(sessionId, sessionState);
     let runtimePerformanceOutcome: RuntimePerformanceOutcome = 'ok';
     let result: AnalysisResult | undefined;
+    let onExecutionAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      onExecutionAbort = () => reject(executionLease.signal.reason ?? new Error('Qoder analysis aborted'));
+      executionLease.signal.addEventListener('abort', onExecutionAbort, {once: true});
+    });
+    const analysis = this.analyzeGuarded(query, sessionId, traceId, normalizedOptions,
+      executionLease, runtimePerformance, sessionState);
     try {
-      result = await this.analyzeGuarded(
-        query,
-        sessionId,
-        traceId,
-        normalizedOptions,
-        executionLease,
-        runtimePerformance,
-        sessionState,
-      );
+      result = await Promise.race([analysis, aborted]);
       runtimePerformanceOutcome = executionLease.signal.aborted
         ? 'cancelled'
         : result.success === false ? 'error' : 'ok';
@@ -374,25 +454,78 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         executionLease.signal,
       );
       if (runtimePerformanceOutcome === 'cancelled') {
+        await settleQoderWork(analysis);
         result = buildQoderCancelledResult(
           sessionId,
           analysisStartedAt,
           normalizedOptions.outputLanguage
             ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE),
         );
+        if (sessionState.timedOut) {
+          const timeoutText = localize(normalizedOptions.outputLanguage ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE),
+            `Qoder SDK 分析在 ${sessionState.timeoutMs}ms 后超时。`,
+            `Qoder SDK analysis timed out after ${sessionState.timeoutMs}ms.`);
+          result.conclusion = timeoutText;
+          result.terminationMessage = timeoutText;
+          runtimePerformanceOutcome = 'error';
+        }
+        const context = bindQoderDelivery(result, executionLease, sessionState.turnIntent, 'runtime_fallback',
+          sessionState.timedOut ? 'incomplete' : 'cancelled', sessionState.timedOut ? 'timeout' : 'cancelled',
+          undefined, {sourceUse: sessionState.sourceUse});
+        sessionState.delivery = {result, context};
         return result;
       }
-      throw error;
+      const message = describeQoderSdkError(error);
+      result = {
+        sessionId, success: false, findings: [], hypotheses: [], conclusion: message,
+        confidence: 0, rounds: 0, totalDurationMs: Date.now() - analysisStartedAt,
+        partial: true, terminationReason: 'execution_error', terminationMessage: message,
+      };
+      const context = bindQoderDelivery(result, executionLease, sessionState.turnIntent, 'runtime_fallback', 'failed', 'provider_error',
+        undefined, {sourceUse: sessionState.sourceUse});
+      sessionState.delivery = {result, context};
+      return result;
     } finally {
+      clearTimeout(mainBudgetTimer);
+      if (onExecutionAbort) executionLease.signal.removeEventListener('abort', onExecutionAbort);
       const finalizationPhase = runtimePerformance.startPhase('finalization');
       try {
-        if (this.activeSessions.get(sessionId) === sessionState) {
-          this.activeSessions.delete(sessionId);
+        if (result && sessionState.delivery?.result === result && sessionState.turnIntent
+          && sessionState.strategyRegistry && sessionState.deadlineMs !== undefined) {
+          const ownerKey = analysisDeliveryFingerprint({runId: executionLease.key.runId, sessionId,
+            runtime: this.selection.kind, tenantId: normalizedOptions.tenantId, workspaceId: normalizedOptions.workspaceId,
+            userId: normalizedOptions.userId, providerId: normalizedOptions.providerId,
+            analysisContextFingerprint: normalizedOptions.analysisContextFingerprint});
+          attachFinalizationContext(result, {
+            runId: executionLease.key.runId!, sessionId, deadlineMs: sessionState.deadlineMs,
+            turnIntent: sessionState.turnIntent, strategyRegistry: sessionState.strategyRegistry,
+            traceIdentity: {currentTraceId: traceId, referenceTraceId: normalizedOptions.referenceTraceId},
+            deliveryContext: sessionState.delivery.context,
+            sourceUse: sessionState.sourceUse?.getSourceUseDecision(),
+            evidenceReadView: sessionState.artifactStore?.createEvidenceReadView({
+              allowedTraces: [{traceId, traceSide: 'current'},
+                ...(normalizedOptions.referenceTraceId
+                  ? [{traceId: normalizedOptions.referenceTraceId, traceSide: 'reference' as const}] : [])],
+              ownerKey,
+            }),
+            ...(result.success && result.outputOrigin === 'sdk_final' && result.completion?.status === 'completed'
+              && !executionLease.signal.aborted ? {
+                providerQuery: {text: query, analysisContextFingerprint: normalizedOptions.analysisContextFingerprint},
+                dispatchText: sessionState.dispatchText,
+              } : {}),
+          });
         }
-        executionLease.settle();
       } finally {
-        finalizationPhase.end(runtimePerformanceOutcome);
-        runtimePerformance.finalize(runtimePerformanceOutcome);
+        try {
+          if (this.activeSessions.get(sessionId) === sessionState) {
+            if (executionLease.signal.aborted) this.sessionOpaqueStates.delete(sessionId);
+            this.activeSessions.delete(sessionId);
+          }
+          executionLease.settle();
+        } finally {
+          finalizationPhase.end(runtimePerformanceOutcome);
+          runtimePerformance.finalize(runtimePerformanceOutcome);
+        }
       }
     }
   }
@@ -410,131 +543,15 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
     const startTime = Date.now();
     const traceProcessorService = options.traceProcessorService ?? this.input.traceProcessorService;
 
-    // Scene classification
-    const sceneType = classifyScene(query);
-    const outputLanguage = options?.outputLanguage
+    const outputLanguage = options.outputLanguage
       ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
     const packageName = options.packageName?.trim() || undefined;
-    const normalizedOptions = options ?? {};
-    const deferTracePreflightToModel = options?.assistantSurface === 'conversation';
+    const normalizedOptions = options;
     const sessionContext = sessionContextManager.getOrCreate(sessionId, traceId);
     const previousTurns = sessionContext.getAllTurns?.() ?? [];
     const privateAnalysisContext = analysisContextUsesPrivateKnowledge(normalizedOptions);
-    if (privateAnalysisContext) {
-      this.sessionOpaqueStates.delete(sessionId);
-    }
+    if (privateAnalysisContext) this.sessionOpaqueStates.delete(sessionId);
     const knowledgeScope = knowledgeScopeFromAnalysisOptions(normalizedOptions);
-
-    const quickModeResolution = resolveRuntimeQuickMode({
-      query,
-      sceneType,
-      analysisMode: options?.analysisMode,
-      conversationSurface: deferTracePreflightToModel,
-      selectionContext: options?.selectionContext,
-      packageName,
-      hasReferenceTrace: Boolean(options?.referenceTraceId),
-      previousTurns,
-    });
-    const priorEvidenceOnlyFollowUp =
-      quickModeResolution.localReason === PRIOR_EVIDENCE_ONLY_FOLLOWUP_REASON;
-    const skipFocusDetection = deferTracePreflightToModel || (
-      priorEvidenceOnlyFollowUp && quickModeResolution.skipFocusDetection
-    );
-    const skipTracePreflightDetection = deferTracePreflightToModel || (
-      priorEvidenceOnlyFollowUp && quickModeResolution.skipTracePreflightDetection
-    );
-    runtimePerformance.finishClassification('ok');
-    const task9Admitted = isRuntimeCandidateAdmitted('task9', this.env);
-    let skillRegistryReady: Promise<void> | undefined;
-    const initializeSkillRegistry = (): Promise<void> => {
-      if (skillRegistryReady) return skillRegistryReady;
-      const skillRegistryPhase = runtimePerformance.startPhase('skill_registry');
-      skillRegistryReady = (async () => {
-        try {
-          await ensureSkillRegistryInitialized();
-          executionLease.throwIfAborted();
-          skillRegistryPhase.end('ok');
-        } catch (error) {
-          skillRegistryPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
-          throw error;
-        }
-      })();
-      return skillRegistryReady;
-    };
-    if (!task9Admitted) {
-      await initializeSkillRegistry();
-    }
-    let quickEvidenceAttempt: RuntimeQuickEvidenceAttempt | undefined;
-    if (quickModeResolution.quickMode) {
-      const quickEvidencePhase = runtimePerformance.startPhase('quick_evidence');
-      try {
-        quickEvidenceAttempt = await buildRuntimeQuickEvidenceAttempt({
-          query,
-          traceId,
-          packageName,
-          selectionContext: options?.selectionContext,
-          traceProcessorService,
-          outputLanguage,
-          quickFocusAppPreEvidence: quickModeResolution.quickFocusAppPreEvidence,
-          quickProcessIdentityPreEvidence: quickModeResolution.quickProcessIdentityPreEvidence,
-          quickTraceFactPreEvidence: quickModeResolution.quickTraceFactPreEvidence,
-          quickScrollingTriagePreEvidence: quickModeResolution.quickScrollingTriagePreEvidence,
-          emitUpdate: update => this.emitUpdate(update),
-        });
-        executionLease.throwIfAborted();
-        quickEvidencePhase.end('ok');
-      } catch (error) {
-        quickEvidencePhase.end(runtimeOutcomeFromError(error, executionLease.signal));
-        throw error;
-      }
-    }
-    executionLease.throwIfAborted();
-    if (quickEvidenceAttempt?.directAnswer) {
-      const directOptions = {
-        ...normalizedOptions,
-        ...(quickEvidenceAttempt.effectivePackageName ? {
-          packageName: quickEvidenceAttempt.effectivePackageName,
-        } : {}),
-      };
-      const directAnalysisRunSpec = createAnalysisRunSpec({
-        query,
-        sessionId,
-        traceId,
-        options: directOptions,
-        runtimeSelection: this.selection,
-        engineCapabilities: getQoderEngineCapabilities(),
-        sceneType,
-        outputLanguage,
-        previousTurns,
-        resolvedMode: 'quick',
-        budget: { model: 'runtime-pre-evidence' },
-        adaptiveRouting: buildAdaptiveRoutingForQuickResolution({
-          options: directOptions,
-          resolution: quickModeResolution,
-        }),
-      });
-      return this.buildDirectQuickEvidenceResult({
-        query,
-        sessionId,
-        options: directOptions,
-        startedAt: startTime,
-        sceneType,
-        outputLanguage,
-        sessionContext,
-        previousTurns,
-        analysisRunSpec: directAnalysisRunSpec,
-        directAnswer: quickEvidenceAttempt.directAnswer,
-        evidenceCounts: quickEvidenceAttempt.evidenceCounts,
-        persistSessionTurn: !privateAnalysisContext,
-        executionLease,
-        runtimePerformance,
-      });
-    }
-
-    const reusableQuickEvidenceAttempt = selectReusableRuntimeQuickEvidenceAttempt(
-      quickEvidenceAttempt,
-      this.env,
-    );
 
     let sdkModulePromise: Promise<QoderSdkModule> | undefined;
     const startSdkModuleLoad = (): Promise<QoderSdkModule> => {
@@ -570,9 +587,55 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       void sdkModulePromise.catch(() => undefined);
       return sdkModulePromise;
     };
-    if (task9Admitted) startSdkModuleLoad();
+    let authPromise: Promise<unknown> | undefined;
+    const resolveRunAuth = (sdk: QoderSdkModule): Promise<unknown> =>
+      authPromise ??= Promise.resolve().then(() => this.resolveAuth(sdk));
+    const scopedSdkEnv = buildQoderSdkEnv(this.env);
+    const dispatchQoderText = (
+      input: IntentTransportInput,
+      config: QoderRuntimeConfig,
+      loadSdk: () => Promise<QoderSdkModule>,
+      resolveAuth: (sdk: QoderSdkModule) => Promise<unknown>,
+    ): Promise<IntentTransportResult> => runIntentTransport(input, async scope => {
+      const directory = await mkdtemp(join(tmpdir(), 'smartperfetto-qoder-text-'));
+      scope.onCleanup(() => rm(directory, {recursive: true, force: true}));
+      scope.throwIfInactive();
+      return runQoderIntentTransport({
+        ...input, signal: scope.signal, loadSdk,
+        resolveAuth: sdk => resolveAuth(sdk as QoderSdkModule),
+        config, scopedEnv: scopedSdkEnv, isolatedClassifierDirectory: directory,
+      });
+    });
+    const intentResolver = createAnalysisTurnIntentResolver({
+      context: buildComplexityClassifierInput({
+        query, sceneType: 'general', selectionContext: options.selectionContext,
+        hasReferenceTrace: Boolean(options.referenceTraceId), previousTurns,
+        requestedMode: options.analysisMode,
+      }),
+      signal: executionLease.signal,
+      deadlineMs: Date.now() + (numericEnv(this.env.AGENT_CLASSIFIER_TIMEOUT_MS) ?? 30_000),
+      dispatch: input => dispatchQoderText(input, this.config, startSdkModuleLoad, resolveRunAuth),
+    });
+    sessionState.strategyRegistry = intentResolver.strategyRegistry;
+    const turnIntent = await intentResolver.resolve();
+    sessionState.turnIntent = turnIntent;
+    const policy = resolveRuntimeTurnPolicy(turnIntent, options.analysisMode);
+    const sceneType = turnIntent.sceneId;
+    const isQuickMode = policy.budgetMode === 'quick';
+    const quickBudget = resolveQuickTurnBudget({
+      env: this.env, hardCapTurns: this.config.quickMaxTurns,
+      targetEnvKeys: ['AGENT_QUICK_TARGET_TURNS'],
+      hardCapEnvKeys: ['AGENT_QUICK_MAX_TURNS', 'QODER_QUICK_MAX_TURNS'],
+      enforcement: 'turn_cap',
+    });
+    const maxTurns = isQuickMode ? quickBudget.hardCapTurns : this.config.maxTurns;
 
-    const effectivePackageName = packageName ?? reusableQuickEvidenceAttempt?.effectivePackageName;
+    sessionState.armMainBudget(maxTurns * (isQuickMode ? this.config.quickPerTurnMs : this.config.fullPerTurnMs));
+    const skipFocusDetection = !policy.allowAutomaticPrefetch;
+    const skipTracePreflightDetection = !policy.allowAutomaticPrefetch;
+    const effectivePackageName = packageName;
+    runtimePerformance.finishClassification(turnIntent.status === 'resolved' ? 'ok' : 'error');
+    executionLease.throwIfAborted();
 
     // Architecture detection
     let architecture: ArchitectureInfo | undefined;
@@ -603,8 +666,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
     if (!skipFocusDetection) {
       const focusPhase = runtimePerformance.startPhase('focus');
       try {
-        const focusResult = reusableQuickEvidenceAttempt?.focusResult
-          ?? await detectFocusApps(
+        const focusResult = await detectFocusApps(
             traceProcessorService,
             traceId,
             { timeRange: options?.timeRange as { startNs: number; endNs: number } | undefined },
@@ -652,7 +714,9 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       sceneType,
       outputLanguage,
       previousTurns,
-      resolvedMode: quickModeResolution.quickMode ? 'quick' : 'full',
+      resolvedMode: policy.budgetMode,
+      resolvedModel: this.config.model,
+      turnIntent,
       budget: {
         model: this.config.model,
         maxTurns: this.config.maxTurns,
@@ -660,17 +724,15 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         fullPathPerTurnMs: this.config.fullPerTurnMs,
         quickPathPerTurnMs: this.config.quickPerTurnMs,
       },
-      adaptiveRouting: buildAdaptiveRoutingForQuickResolution({
-        options: normalizedOptions,
-        resolution: quickModeResolution,
-      }),
     });
 
     // Build comparison context before assembling the shared system prompt so
     // both the model and the MCP tools receive the same dual-trace contract.
     const referenceTraceId = options?.referenceTraceId;
-    let comparisonContext: import('../../../agentv3/types').ComparisonContext | undefined;
-    if (referenceTraceId) {
+    let comparisonContext = buildRuntimeTracePairIdentityContext({
+      referenceTraceId, tracePairContext: options.tracePairContext,
+    });
+    if (referenceTraceId && policy.allowAutomaticPrefetch) {
       const comparisonPhase = runtimePerformance.startPhase('comparison');
       try {
         const detectedComparisonContext = await buildRuntimeTracePairComparisonContext({
@@ -680,7 +742,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
           tracePairContext: options?.tracePairContext,
         });
         executionLease.throwIfAborted();
-        comparisonContext = detectedComparisonContext;
+        comparisonContext = detectedComparisonContext ?? comparisonContext;
         comparisonPhase.end('ok');
       } catch (error) {
         comparisonPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
@@ -706,6 +768,9 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
 
     const analysisContext: ClaudeAnalysisContext = {
       query,
+      turnIntent,
+      strategyRegistry: intentResolver.strategyRegistry,
+      onDemandContext: policy.onDemandContext,
       packageName: effectivePackageName,
       sceneType,
       architecture,
@@ -719,13 +784,13 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       conversationSummary: previousTurns.length > 0
         ? sessionContext.generatePromptContext(2000)
         : undefined,
-      patternContext: privateAnalysisContext
+      patternContext: privateAnalysisContext || !policy.allowAutomaticPrefetch
         ? undefined
         : buildPatternContextSection(traceFeatures, knowledgeScope),
-      negativePatternContext: privateAnalysisContext
+      negativePatternContext: privateAnalysisContext || !policy.allowAutomaticPrefetch
         ? undefined
         : buildNegativePatternSection(traceFeatures, knowledgeScope),
-      caseBackgroundContext: buildRuntimeCaseBackgroundContext({
+      caseBackgroundContext: !policy.allowAutomaticPrefetch ? undefined : buildRuntimeCaseBackgroundContext({
         sceneType,
         architectureType: architecture?.type,
         knowledgeScope,
@@ -737,25 +802,22 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       codebaseIds: options?.codebaseIds,
     };
 
-    const systemPrompt = quickModeResolution.quickMode
-      ? buildQuickSystemPrompt({
-          architecture,
-          packageName: effectivePackageName,
-          focusApps,
-          focusMethod: focusAppMethod,
-          selectionContext: options?.selectionContext,
-          outputLanguage,
-          codeAwareMode: options?.codeAwareMode,
-          codebaseIds: options?.codebaseIds,
-        })
-      : buildSystemPrompt(analysisContext);
+    const systemPrompt = buildSystemPrompt(analysisContext);
 
     // Merge with optional env system prompt
     const finalSystemPrompt = this.config.systemPrompt
       ? `${this.config.systemPrompt}\n\n${systemPrompt}`
       : systemPrompt;
 
-    await initializeSkillRegistry();
+    const skillRegistryPhase = runtimePerformance.startPhase('skill_registry');
+    try {
+      await ensureSkillRegistryInitialized();
+      executionLease.throwIfAborted();
+      skillRegistryPhase.end('ok');
+    } catch (error) {
+      skillRegistryPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
+      throw error;
+    }
     executionLease.throwIfAborted();
 
     // Build MCP tools
@@ -767,14 +829,14 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       effectiveSkillRegistry.getFragmentCache(),
     );
 
-    const artifactStore = privateAnalysisContext
-      ? new ArtifactStore()
-      : this.artifactStores.get(sessionId) ?? new ArtifactStore();
+    const artifactStore = resolveRuntimeEvidenceStore(normalizedOptions, {sessionId, traceId},
+      () => privateAnalysisContext ? new ArtifactStore() : this.artifactStores.get(sessionId) ?? new ArtifactStore());
     if (!privateAnalysisContext) this.artifactStores.set(sessionId, artifactStore);
+    sessionState.artifactStore = artifactStore;
 
-    const isQuickMode = quickModeResolution.quickMode;
     const skillNotesBudget = createRuntimeSkillNotesBudget(isQuickMode);
-    const recentSqlErrors = loadLearnedSqlFixPairs(5, knowledgeScope, normalizedOptions);
+    const recentSqlErrors = policy.allowAutomaticPrefetch
+      ? loadLearnedSqlFixPairs(5, knowledgeScope, normalizedOptions) : [];
 
     // Shared mutable session state (same reference pattern as Claude runtime)
     let planState = privateAnalysisContext ? undefined : this.sessionPlans.get(sessionId);
@@ -802,72 +864,132 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
     }
 
     const watchdogWarning: { current: string | null } = { current: null };
+    const isRunDeliverable = () => this.activeSessions.get(sessionId) === sessionState
+      && !sessionState.aborted
+      && !sessionState.abortController.signal.aborted
+      && !executionLease.signal.aborted;
+    const emitToolUpdate = (update: StreamingUpdate) => {
+      if (isRunDeliverable()) this.emitUpdate(update);
+    };
+    const startedToolCallIds = new Set<string>();
+    const settledToolCallIds = new Set<string>();
+    const toolObserver: RuntimeToolObserver = event => {
+      const isDeliverable = () => isRunDeliverable()
+        && !event.extra.signal?.aborted;
+      if (!isDeliverable()) return;
 
-    const mcp = priorEvidenceOnlyFollowUp
-      ? undefined
-      : isQuickMode
-        ? createClaudeMcpServer({
-            conversationTraceAttached: options?.assistantSurface === 'conversation'
-              ? options.conversationTraceAttached === true
-              : undefined,
-            runManifestAttributionSink: options?.runManifestAttributionSink,
-            sessionId,
-            traceId,
-            traceProcessorService,
-            skillExecutor,
-            packageName: effectivePackageName,
-            emitUpdate: (update: StreamingUpdate) => this.emitUpdate(update),
-            artifactStore,
-            recentSqlErrors,
-            skillNotesBudget,
-            sceneType,
-            watchdogWarning,
-            lightweight: true,
-            outputLanguage,
-            knowledgeScope,
-            codeAwareMode: options?.codeAwareMode,
-            codebaseIds: options?.codebaseIds,
-            knowledgeSourceIds: options?.knowledgeSourceIds,
-            sourceUsePolicy: options?.sourceUsePolicy,
-            analysisContextFingerprint: options?.analysisContextFingerprint,
-            androidInternalsPackPin: options?.androidInternalsPackPin,
-          })
-        : createClaudeMcpServer({
-            conversationTraceAttached: options?.assistantSurface === 'conversation'
-              ? options.conversationTraceAttached === true
-              : undefined,
-            runManifestAttributionSink: options?.runManifestAttributionSink,
-            sessionId,
-            traceId,
-            userQuery: query,
-            traceProcessorService,
-            skillExecutor,
-            packageName: effectivePackageName,
-            emitUpdate: (update: StreamingUpdate) => this.emitUpdate(update),
-            analysisNotes: notes,
-            artifactStore,
-            cachedArchitecture: architecture,
-            recentSqlErrors,
-            analysisPlan: planState,
-            watchdogWarning,
-            hypotheses,
-            sceneType,
-            uncertaintyFlags,
-            referenceTraceId,
-            comparisonContext,
-            skillNotesBudget,
-            outputLanguage,
-            knowledgeScope,
-            codeAwareMode: options?.codeAwareMode,
-            codebaseIds: options?.codebaseIds,
-            knowledgeSourceIds: options?.knowledgeSourceIds,
-            sourceUsePolicy: options?.sourceUsePolicy,
-            analysisContextFingerprint: options?.analysisContextFingerprint,
-            androidInternalsPackPin: options?.androidInternalsPackPin,
+      const {toolCallId, toolName, params} = event;
+      if (event.phase === 'started') {
+        if (startedToolCallIds.has(toolCallId)) return;
+        startedToolCallIds.add(toolCallId);
+        sessionState.toolCallCount += 1;
+        this.emitUpdate({
+          type: 'agent_task_dispatched',
+          content: {
+            taskId: toolCallId,
+            toolName,
+            args: params,
+            message: formatToolCallNarration(toolName, params, outputLanguage),
+          },
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      if (settledToolCallIds.has(toolCallId)) return;
+      settledToolCallIds.add(toolCallId);
+      const rawResult = event.phase === 'completed' ? event.result : {
+        success: false,
+        error: event.error instanceof Error ? event.error.message : String(event.error),
+      };
+      const resultFacts = readRuntimeToolResultFacts(rawResult);
+      const codeReferences = extractSourceLookupCodeReferences(toolName, rawResult);
+      const projectedResult = projectToolResultForExternalSurface(toolName, rawResult);
+      const resultText = summarizeExternalToolResult(projectedResult);
+      recordPlanOrPrePlanToolCall(planState, {
+        toolCallId,
+        toolName,
+        input: params,
+        resultText,
+        resultFacts,
+        returnedCodeReferences: codeReferences.length > 0,
+        returnedCodeReferenceHints: codeReferences,
+        onPhaseAutoCompleted: phase => {
+          if (!isDeliverable()) return;
+          this.emitUpdate({
+            type: 'plan_phase_updated',
+            content: planPhaseUpdatedContent({
+              phaseId: phase.id,
+              phaseName: phase.name,
+              status: 'completed',
+              summary: phase.summary,
+              origin: 'auto',
+            }),
+            timestamp: Date.now(),
           });
+        },
+      });
+      if (!isDeliverable()) return;
+      this.emitUpdate({
+        type: 'agent_response',
+        content: {
+          taskId: toolCallId,
+          toolName,
+          result: resultText,
+          resultNarration: formatToolResultNarration({
+            toolName,
+            args: params,
+            result: projectedResult,
+            isError: resultFacts.success === false,
+            language: outputLanguage,
+          }),
+          isError: resultFacts.success === false,
+        },
+        timestamp: Date.now(),
+      });
+    };
+
+    const mcp = createClaudeMcpServer({
+      allowNewEvidence: policy.allowNewEvidence,
+      strategyRegistry: intentResolver.strategyRegistry,
+      lightweight: isQuickMode,
+      toolObserver,
+      conversationTraceAttached: options?.assistantSurface === 'conversation'
+        ? options.conversationTraceAttached === true
+        : undefined,
+      runManifestAttributionSink: options?.runManifestAttributionSink,
+      sessionId,
+      traceId,
+      userQuery: query,
+      traceProcessorService,
+      skillExecutor,
+      packageName: effectivePackageName,
+      emitUpdate: emitToolUpdate,
+      analysisNotes: notes,
+      artifactStore,
+      cachedArchitecture: architecture,
+      recentSqlErrors,
+      analysisPlan: planState,
+      watchdogWarning,
+      hypotheses,
+      sceneType,
+      uncertaintyFlags,
+      referenceTraceId,
+      comparisonContext,
+      skillNotesBudget,
+      outputLanguage,
+      knowledgeScope,
+      codeAwareMode: options?.codeAwareMode,
+      codebaseIds: options?.codebaseIds,
+      knowledgeSourceIds: options?.knowledgeSourceIds,
+      sourceUsePolicy: options?.sourceUsePolicy,
+      analysisContextFingerprint: options?.analysisContextFingerprint,
+      androidInternalsPackPin: options?.androidInternalsPackPin,
+    });
     const mcpServer = mcp?.server;
     const allowedToolNames = mcp?.allowedTools ?? [];
     const sourceUse = mcp?.sourceUse;
+    sessionState.sourceUse = sourceUse;
 
     // The user prompt uses the shared, localized trace-context formatter. All
     // runtime methodology remains in strategies through the shared system prompt.
@@ -884,24 +1006,28 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
 
     const { abortController } = sessionState;
 
-    const maxTurns = quickModeResolution.quickMode
-      ? this.config.quickMaxTurns
-      : this.config.maxTurns;
-
     let q: QoderQueryLike | undefined;
     let answerProjection: ReturnType<typeof createCodeAwareStreamingTextProjection> | undefined;
     let emitProjectionTail = false;
 
     try {
-      const resolveModel = this.createModelPolicy();
+      const resolveModel = this.createModelPolicy(turnIntent.status === 'resolved');
 
-      // The import started immediately after the deterministic quick path
-      // missed, so it overlaps only with independent trace preflight.
       const sdk = await startSdkModuleLoad();
       executionLease.throwIfAborted();
 
       // Resolve auth
-      const auth = this.resolveAuth(sdk);
+      const auth = await resolveRunAuth(sdk);
+      executionLease.throwIfAborted();
+      // Final review reuses this run's established SDK/auth and primary model.
+      // It never consults the settled run lease or resumes its SDK conversation.
+      // Qoder exposes no supported output-token setting; the native transport
+      // enforces one SDK turn plus the caller's byte, terminal and time limits.
+      if (this.config.model) {
+        const finalizationConfig = {...this.config, lightModel: undefined};
+        sessionState.dispatchText = input => dispatchQoderText(input, finalizationConfig,
+          async () => sdk, async () => auth);
+      }
 
       // Never resume a provider conversation across a private-knowledge run.
       const existingOpaque = this.sessionOpaqueStates.get(sessionId);
@@ -917,7 +1043,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       const sdkOptions: QoderSdkOptions = {
         auth,
         cwd: this.env.TMPDIR || '/tmp',
-        systemPrompt: resumeSessionId ? undefined : finalSystemPrompt,
+        systemPrompt: finalSystemPrompt,
         maxTurns,
         model: this.config.model,
         tools: [],
@@ -957,21 +1083,16 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
 
       let assistantText = '';
       let sdkFinalResultText = '';
-      let sdkResultMeta: { success: boolean; subtype?: string; errors?: string; numTurns?: number } = {
+      let sdkFinalBodySupplied = false;
+      let sdkResultMeta: {
+        success: boolean; subtype?: string; errors?: string; numTurns?: number;
+        status: AnalysisCompletion['status']; reason?: AnalysisCompletion['reason']; stopReason?: string;
+      } = {
+        status: 'unknown',
         success: false,
         subtype: 'missing_result',
         errors: 'Qoder SDK stream ended without a result message',
       };
-      let timedOut = false;
-
-      const perTurnMs = isQuickMode ? this.config.quickPerTurnMs : this.config.fullPerTurnMs;
-      const timeoutMs = maxTurns * perTurnMs;
-      const timeoutText = localize(
-        outputLanguage,
-        `Qoder SDK 分析在 ${timeoutMs}ms 后超时。`,
-        `Qoder SDK analysis timed out after ${timeoutMs}ms.`,
-      );
-
       const processStream = async () => {
         for await (const message of sdkQuery) {
           if (sessionState.aborted) {
@@ -1001,21 +1122,28 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
             recordEvaluationTokenDeltaIfPresent(
               msg.usage ?? msg.tokens ?? msg,
             );
-            const subtype = typeof msg.subtype === 'string' ? msg.subtype : 'success';
-            if (subtype === 'success' && msg.is_error !== true) {
-              const resultText = typeof msg.result === 'string' ? msg.result : extractAssistantText(message);
-              if (resultText) {
-                sdkFinalResultText = resultText;
-              }
-              sdkResultMeta = { success: true, numTurns: typeof msg.num_turns === 'number' ? msg.num_turns : undefined };
-            } else {
-              const errors = Array.isArray(msg.errors)
-                ? (msg.errors as string[]).join('; ')
-                : typeof msg.result === 'string' && msg.result.trim()
-                  ? msg.result
-                  : subtype;
-              sdkResultMeta = { success: false, subtype, errors };
-            }
+            const subtype = typeof msg.subtype === 'string' ? msg.subtype : undefined;
+            const stopReason = typeof msg.stop_reason === 'string' ? msg.stop_reason : undefined;
+            const success = subtype === 'success' && msg.is_error === false
+              && (msg.stop_reason == null || stopReason === 'end_turn' || stopReason === 'stop_sequence');
+            const reason: AnalysisCompletion['reason'] = subtype === 'error_max_turns' ? 'turn_limit'
+              : stopReason === 'max_tokens' ? 'output_limit'
+              : (subtype && subtype !== 'success') || msg.is_error === true ? 'provider_error' : undefined;
+            const numTurns = typeof msg.num_turns === 'number' && Number.isSafeInteger(msg.num_turns)
+              && msg.num_turns >= 0 ? msg.num_turns : undefined;
+            sdkFinalBodySupplied = typeof msg.result === 'string';
+            sdkFinalResultText = sdkFinalBodySupplied ? msg.result as string : '';
+            sdkResultMeta = {
+              success, subtype, stopReason, numTurns, reason,
+              status: success ? 'completed' : reason === 'turn_limit' || reason === 'output_limit'
+                ? 'incomplete' : reason === 'provider_error' ? 'failed' : 'unknown',
+              ...(!success ? {errors: Array.isArray(msg.errors)
+                ? msg.errors.filter((value): value is string => typeof value === 'string').join('; ')
+                : subtype ?? 'Qoder SDK result did not establish completion'} : {}),
+            };
+            // This receipt terminates the current attempt. A later stale message
+            // cannot replace its body, session identity or completion facts.
+            return;
           } else if (msgType === 'system') {
             if (isRecord(message)) {
               const subtype = message.subtype;
@@ -1025,31 +1153,10 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
                   this.sessionOpaqueStates.set(sessionId, { version: 1, sdkSessionId: initSessionId });
                 }
               }
-              if (typeof subtype === 'string') {
-                this.emitUpdate({
-                  type: 'progress',
-                  content: `Qoder: ${subtype}`,
-                  timestamp: Date.now(),
-                });
-              }
             }
           }
         }
       };
-
-      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutTimer = setTimeout(() => {
-          const timeoutError = new Error('Qoder SDK analysis timed out');
-          timedOut = true;
-          sessionState.aborted = true;
-          void this.executionGuard.abortSession(sessionId, timeoutError).catch(() => undefined);
-          void sdkQuery.interrupt().catch(() => undefined);
-          reject(timeoutError);
-        }, timeoutMs);
-        if (typeof timeoutTimer === 'object' && 'unref' in timeoutTimer) timeoutTimer.unref();
-      });
-      void timeoutPromise.catch(() => undefined);
 
       let onExecutionAbort: (() => void) | undefined;
       const abortPromise = new Promise<never>((_, reject) => {
@@ -1068,124 +1175,77 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       const streamPromise = processStream();
       void streamPromise.catch(() => undefined);
       try {
-        await Promise.race([streamPromise, timeoutPromise, abortPromise]);
+        await Promise.race([streamPromise, abortPromise]);
         providerPhase.end('ok');
-      } catch (timeoutError) {
-        providerPhase.end(runtimeOutcomeFromError(timeoutError, executionLease.signal));
-        if (!timedOut) throw timeoutError;
+      } catch (error) {
+        providerPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
+        throw error;
       } finally {
-        if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
         if (onExecutionAbort) {
           executionLease.signal.removeEventListener('abort', onExecutionAbort);
         }
       }
-      if (timedOut) {
-        return finalizeSourceAwareAnalysisResult({
-          sessionId,
-          success: false,
-          findings: [],
-          hypotheses: [],
-          conclusion: timeoutText,
-          confidence: 0,
-          rounds: 0,
-          totalDurationMs: Date.now() - startTime,
-          partial: true,
-          terminationReason: 'timeout',
-          terminationMessage: timeoutText,
-        }, sourceUse);
-      }
       executionLease.throwIfAborted();
 
-      // Apply code-aware sanitization
-      assistantText = activeAnswerProjection.projectComplete(sdkFinalResultText || assistantText);
-      sessionState.assistantText = assistantText;
-      const sdkErrorText = sanitizeCodeAwareText(
-        sessionId,
-        sdkResultMeta.errors || `Qoder SDK returned ${sdkResultMeta.subtype}`,
-      );
-
-      // Extract findings
-      const findings: Finding[] = extractFindingsFromText(assistantText);
-
-      // Build analysis result based on SDK result discriminated union
-      const totalDurationMs = Date.now() - startTime;
-      const hasFinalReport = hasDeliverableFinalReportHeading(assistantText);
-
-      let terminationReason: string | undefined;
-      if (!sdkResultMeta.success) {
-        terminationReason = sdkResultMeta.subtype === 'error_max_turns' ? 'max_turns' : 'execution_error';
-      } else if (!hasFinalReport) {
-        terminationReason = 'max_turns';
-      }
-
+      // Native completion and authorship are established before any privacy
+      // transformation. Only the issued projection chain may transfer them.
+      const originalBody = sdkFinalBodySupplied ? sdkFinalResultText : assistantText;
+      const nativeCompleted = sdkResultMeta.success && sdkFinalBodySupplied && !!sdkFinalResultText.trim();
+      const sdkErrorText = sdkResultMeta.errors || 'Qoder SDK did not supply a final answer';
+      const usesErrorFallback = !originalBody && !sdkResultMeta.success;
+      const outputOrigin: AnalysisOutputOrigin = usesErrorFallback ? 'runtime_fallback'
+        : sdkFinalBodySupplied ? 'sdk_final' : assistantText ? 'assistant_stream' : 'runtime_fallback';
+      const findings = extractFindingsFromText(originalBody);
+      const terminationReason: AnalysisResult['terminationReason'] = sdkResultMeta.reason === 'turn_limit'
+        ? 'max_turns' : nativeCompleted ? undefined : 'execution_error';
       const result: AnalysisResult = {
-        sessionId,
-        success: sdkResultMeta.success,
-        findings,
+        sessionId, success: nativeCompleted, findings,
         hypotheses: hypotheses.map(hypothesis => toProtocolHypothesis(hypothesis, QODER_AGENT_RUNTIME_KIND)),
-        conclusion: sdkResultMeta.success ? assistantText : sdkErrorText,
-        confidence: sdkResultMeta.success ? 0.75 : 0,
-        rounds: sdkResultMeta.numTurns ?? (sessionState.toolCallCount > 0 ? Math.ceil(sessionState.toolCallCount / 3) : 1),
-        totalDurationMs,
-        partial: !hasFinalReport || !sdkResultMeta.success,
-        terminationReason: terminationReason as AnalysisResult['terminationReason'],
-        terminationMessage: sdkResultMeta.success ? undefined : sdkErrorText,
+        conclusion: usesErrorFallback ? sdkErrorText : originalBody,
+        confidence: nativeCompleted ? estimateAnalysisConfidence({findings}) : 0,
+        rounds: sdkResultMeta.numTurns ?? 0,
+        totalDurationMs: Date.now() - startTime,
+        partial: !nativeCompleted,
+        terminationReason,
+        terminationMessage: nativeCompleted ? undefined : sdkErrorText,
       };
-      // Verify conclusion (non-fatal)
-      if (!quickModeResolution.quickMode) {
-        try {
-          executionLease.throwIfAborted();
-          const verificationPhase = runtimePerformance.startPhase('verification');
-          let verification: Awaited<ReturnType<typeof verifyConclusion>>;
-          try {
-            verification = await verifyConclusion(findings, assistantText, {
-            emitUpdate: (update: StreamingUpdate) => this.emitUpdate(update),
-            enableLLM: false,
-            plan: planState.current,
-            sceneType,
-            outputLanguage,
-            query,
-            emitIssueProgress: false,
-          });
-            verificationPhase.end('ok');
-          } catch (error) {
-            verificationPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
-            throw error;
-          }
-          executionLease.throwIfAborted();
-          const verificationIssue = [
-            ...verification.heuristicIssues,
-            ...(verification.llmIssues || []),
-          ].find(issue => issue.severity === 'error');
-
-          if (verificationIssue && isTruncationVerificationIssue(verificationIssue)) {
-            const repaired = repairTruncatedFinalReport({
-              conclusion: assistantText,
-              plan: planState.current,
-              hypotheses,
-              outputLanguage,
-            });
-            if (repaired) {
-              assistantText = repaired;
-              result.conclusion = repaired;
-              result.findings = extractFindingsFromText(repaired);
-            }
-          }
-        } catch {
-          executionLease.throwIfAborted();
-          // Non-fatal — verification is best-effort
+      const deliveryContext = bindQoderDelivery(result, executionLease, turnIntent, outputOrigin,
+        sdkResultMeta.status === 'completed' && !nativeCompleted ? 'unknown' : sdkResultMeta.status,
+        sdkResultMeta.reason, sdkResultMeta.stopReason,
+        {sourceUse, project: body => activeAnswerProjection.projectCompleteWithReceipt(body)});
+      sessionState.assistantText = result.conclusion;
+      sessionState.delivery = {result, context: deliveryContext};
+      const verificationPhase = runtimePerformance.startPhase('verification');
+      try {
+        const verification = await verifyConclusion(result.findings, result.conclusion, {
+          emitUpdate: update => { if (isRunDeliverable()) this.emitUpdate(update); },
+          enableLLM: false, plan: planState.current, hypotheses, sceneType, outputLanguage,
+          deliveryContext, conclusionContract: result.conclusionContract,
+          emitIssueProgress: false, allowPersistentLearning: !privateAnalysisContext,
+        });
+        executionLease.throwIfAborted();
+        verificationPhase.end('ok');
+        if ([...verification.heuristicIssues, ...(verification.llmIssues ?? [])]
+          .some(issue => issue.severity === 'error' && issue.type !== 'plan_deviation' && issue.type !== 'unresolved_hypothesis')) {
+          result.partial = true;
+          result.terminationReason ??= 'quality_gate_failed';
+          result.confidence = Math.min(result.confidence, estimateAnalysisConfidence({findings: result.findings, partial: true}));
         }
+      } catch (error) {
+        verificationPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
+        executionLease.throwIfAborted();
+        // No advisory verifier failure can certify the result. The shared final
+        // assessment will retain unavailable/not-checked assurance explicitly.
       }
-
-      // Apply final result quality gate
-      executionLease.throwIfAborted();
-      finalizeSourceAwareAnalysisResult(result, sourceUse);
-      applyFinalResultQualityGate({
-        result,
-        query,
-        sceneType,
-        deferFocusedEvidenceFinalization: true,
+      if (isQuickMode) result.quickRun = buildQuickRunReceipt({
+        requestedMode: options.analysisMode ?? 'auto', turnIntent, budget: quickBudget,
+        actualTurns: result.rounds, elapsedMs: result.totalDurationMs,
+        stopReason: quickStopReasonFromTermination({partial: result.partial,
+          terminationReason: result.terminationReason, actualTurns: result.rounds,
+          targetTurns: quickBudget.targetTurns, hardCapTurns: quickBudget.hardCapTurns}),
       });
+      executionLease.throwIfAborted();
+      applyFinalResultQualityGate({result, context: deliveryContext, deferFocusedEvidenceFinalization: true});
 
       if (!privateAnalysisContext) {
         executionLease.throwIfAborted();
@@ -1214,13 +1274,13 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
 
       // Update session state
       executionLease.throwIfAborted();
-      notes.push(
-        { section: 'observation', content: `Analysis completed: ${findings.length} findings`, priority: 'low', timestamp: Date.now() },
-      );
       emitProjectionTail = result.success && !privateAnalysisContext;
 
       return result;
     } catch (error) {
+      // The outer run owns cancellation/timeout finalization. A late attempt
+      // must not clear a newer run's opaque state or publish another result.
+      if (executionLease.signal.aborted) throw error;
       const totalDurationMs = Date.now() - startTime;
       const errorMessage = describeQoderSdkError(error);
       const safeErrorMessage = sanitizeCodeAwareText(sessionId, errorMessage);
@@ -1229,25 +1289,15 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         || (error instanceof Error && error.name === 'AbortError')
         || isTraceProcessorQueryCancelledError(error);
 
-      // Clear stale session on missing-conversation errors so next call starts fresh
-      if (/No conversation found with session ID/i.test(errorMessage)) {
-        this.sessionOpaqueStates.delete(sessionId);
-      }
+      // A failed/cancelled attempt is not a resumable proof of conversation state.
+      this.sessionOpaqueStates.delete(sessionId);
+      if (!isAborted) this.emitUpdate({
+        type: 'error', content: {message: safeErrorMessage}, timestamp: Date.now(),
+      });
 
-      if (isAborted) {
-        this.sessionOpaqueStates.delete(sessionId);
-      } else {
-        this.emitUpdate({
-          type: 'error',
-          content: { message: safeErrorMessage },
-          timestamp: Date.now(),
-        });
-      }
-
-      const isAuthError = /auth|unauthorized|invalid.*token|access.*denied/i.test(errorMessage);
       const abortedMessage = localize(outputLanguage, '分析已中止。', 'Analysis was aborted.');
 
-      return finalizeSourceAwareAnalysisResult({
+      const result: AnalysisResult = {
         sessionId,
         success: false,
         findings: [],
@@ -1256,8 +1306,8 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
           ? abortedMessage
           : localize(
               outputLanguage,
-              `Qoder Agent SDK 分析失败：${safeErrorMessage}`,
-              `Qoder Agent SDK analysis failed: ${safeErrorMessage}`,
+              `Qoder Agent SDK 分析失败：${errorMessage}`,
+              `Qoder Agent SDK analysis failed: ${errorMessage}`,
             ),
         confidence: 0,
         rounds: 0,
@@ -1266,17 +1316,16 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         terminationReason: isAborted ? 'timeout' : 'execution_error',
         terminationMessage: isAborted
           ? abortedMessage
-          : isAuthError
-          ? localize(
-              outputLanguage,
-              `认证失败：${safeErrorMessage}`,
-              `Authentication failed: ${safeErrorMessage}`,
-            )
-          : safeErrorMessage,
-      }, sourceUse);
+          : errorMessage,
+      };
+      const context = bindQoderDelivery(result, executionLease, turnIntent, 'runtime_fallback',
+        isAborted ? 'cancelled' : 'failed', isAborted ? 'cancelled' : 'provider_error',
+        undefined, {sourceUse});
+      sessionState.delivery = {result, context};
+      return result;
     } finally {
       sessionState.sdkQuery = undefined;
-      await q?.close().catch(() => undefined);
+      if (q) await settleQoderWork(Promise.resolve().then(() => q!.close()));
       let projectedTail = '';
       try {
         projectedTail = answerProjection?.flush() ?? '';
@@ -1307,7 +1356,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
     return sdk.qodercliAuth();
   }
 
-  private createModelPolicy(): QoderSdkOptions['resolveModel'] {
+  private createModelPolicy(allowLightModel = true): QoderSdkOptions['resolveModel'] {
     const { apiKey, provider, baseUrl, style } = this.config.byok;
     const byokRequested = Boolean(apiKey || provider || baseUrl || style);
     if (!byokRequested) return undefined;
@@ -1322,7 +1371,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
     }
 
     return ({ purpose }) => {
-      const model = QODER_LIGHT_MODEL_PURPOSES.has(purpose)
+      const model = allowLightModel && QODER_LIGHT_MODEL_PURPOSES.has(purpose)
         ? this.config.lightModel || this.config.model!
         : this.config.model!;
       return {
@@ -1480,81 +1529,6 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
-
-  private buildDirectQuickEvidenceResult(input: {
-    query: string;
-    sessionId: string;
-    options: AnalysisOptions;
-    startedAt: number;
-    sceneType: SceneType;
-    outputLanguage: OutputLanguage;
-    sessionContext: ReturnType<typeof sessionContextManager.getOrCreate>;
-    previousTurns: ConversationTurn[];
-    analysisRunSpec: AnalysisRunSpec;
-    directAnswer: RuntimeQuickEvidenceDirectAnswer;
-    evidenceCounts: RuntimeQuickEvidenceCounts;
-    persistSessionTurn: boolean;
-    executionLease: RuntimeExecutionLease;
-    runtimePerformance: RuntimePerformanceRun;
-  }): AnalysisResult {
-    const quickBudget = resolveQuickTurnBudget({
-      env: this.env,
-      hardCapTurns: this.config.quickMaxTurns,
-      targetEnvKeys: ['AGENT_QUICK_TARGET_TURNS'],
-      hardCapEnvKeys: ['AGENT_QUICK_MAX_TURNS', 'QODER_QUICK_MAX_TURNS'],
-      enforcement: 'turn_cap',
-    });
-    const result = buildQuickDirectEvidenceAnalysisResult({
-      query: input.query,
-      sessionId: input.sessionId,
-      options: input.options,
-      startedAt: input.startedAt,
-      analysisRunSpec: input.analysisRunSpec,
-      budget: quickBudget,
-      directAnswer: input.directAnswer,
-      evidenceCounts: input.evidenceCounts,
-      previousTurns: input.previousTurns,
-    });
-    emitQuickDirectQualityGateIssue({
-      emitUpdate: update => this.emitUpdate(update),
-      module: 'qoderRuntime',
-      result,
-      query: input.query,
-      sceneType: input.sceneType,
-    });
-    if (input.persistSessionTurn) {
-      input.executionLease.throwIfAborted();
-      input.sessionContext.addTurn(
-        input.query,
-        {
-          primaryGoal: input.query,
-          aspects: [],
-          expectedOutputType: 'diagnosis',
-          complexity: 'simple',
-          followUpType: input.previousTurns.length > 0 ? 'extend' : 'initial',
-        },
-        {
-          agentId: QODER_AGENT_RUNTIME_KIND,
-          success: result.success,
-          findings: result.findings,
-          confidence: result.confidence,
-          message: result.conclusion,
-        },
-        result.findings,
-      );
-    }
-    input.executionLease.throwIfAborted();
-    input.runtimePerformance.recordFirstOutput();
-    emitQuickDirectAnswerEvents({
-      emitUpdate: update => this.emitUpdate(update),
-      result,
-      startedAt: input.startedAt,
-      outputLanguage: input.outputLanguage,
-      runtime: QODER_AGENT_RUNTIME_KIND,
-      model: 'runtime-pre-evidence',
-    });
-    return result;
-  }
 
   private emitUpdate(update: StreamingUpdate): void {
     this.emit('update', update);

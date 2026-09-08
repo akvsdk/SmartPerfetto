@@ -23,6 +23,7 @@ import {
 import { openEnterpriseDb } from '../../services/enterpriseDb';
 import { createAnalysisResultSnapshotRepository } from '../../services/analysisResultSnapshotStore';
 import analysisResultRoutes from '../analysisResultRoutes';
+import {getRegisteredScenes} from '../../agentv3/strategyLoader';
 
 const originalDbPath = process.env.SMARTPERFETTO_ENTERPRISE_DB_PATH;
 
@@ -201,6 +202,22 @@ describe('analysis result routes', () => {
       .get('/api/workspaces/workspace-a/analysis-results?sceneType=bad')
       .set('x-tenant-id', DEFAULT_TENANT_ID)
       .expect(400);
+  });
+
+  test('filters every registered scene ID and retains the legacy CPU snapshot category', async () => {
+    const db = openEnterpriseDb(dbPath);
+    try {
+      for (const sceneType of new Set([...getRegisteredScenes().map(scene => scene.scene), 'cpu'])) {
+        db.prepare('UPDATE analysis_result_snapshots SET scene_type = ? WHERE id = ?').run(sceneType, 'snapshot-a');
+        const response = await request(app())
+          .get('/api/workspaces/workspace-a/analysis-results')
+          .query({sceneType})
+          .set('x-tenant-id', DEFAULT_TENANT_ID)
+          .expect(200);
+        expect(response.body.results).toEqual(expect.arrayContaining([expect.objectContaining({id: 'snapshot-a', sceneType})]));
+        expect(response.body.results.every((item: {sceneType: string}) => item.sceneType === sceneType)).toBe(true);
+      }
+    } finally {db.close();}
   });
 
   test('updates owned snapshot visibility', async () => {

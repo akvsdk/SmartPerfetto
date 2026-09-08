@@ -23,6 +23,9 @@ runtime_perfetto:
   rpc_api_version: 14
   stdlib_tree: 54fc9f0b5c8dedb8772283b6786753fbb918da0d
 sql_fragments:
+  backend/skills/fragments/effective_target_processes.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/effective_target_processes.sql
   backend/skills/fragments/buffer_tx_frame_production.sql:
     disposition: exported
     destination: references/generated/runtime/fragments/buffer_tx_frame_production.sql
@@ -1251,6 +1254,36 @@ skills:
     disposition: exported
     destination: references/generated/skills/pipeline_webview_textureview_custom.md
 strategies:
+  backend/strategies/prompt-analysis-correction-en.template.md:
+    disposition: product-only
+    reason: SmartPerfetto structured candidate recovery protocol
+  backend/strategies/prompt-analysis-correction-zh.template.md:
+    disposition: product-only
+    reason: SmartPerfetto structured candidate recovery protocol
+  backend/strategies/prompt-analysis-turn-intent.template.md:
+    disposition: product-only
+    reason: SmartPerfetto native runtime intent classification protocol
+  backend/strategies/prompt-conclusion-contract-schema.template.md:
+    disposition: product-only
+    reason: SmartPerfetto conclusion declarations and captured evidence identifiers
+  backend/strategies/prompt-conversation-evidence-context.template.md:
+    disposition: product-only
+    reason: SmartPerfetto conversation artifact retention and authorization
+  backend/strategies/prompt-final-semantic-assessment.template.md:
+    disposition: product-only
+    reason: SmartPerfetto finalization semantic assessment protocol
+  backend/strategies/prompt-quick-sql-definitions.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime SQL catalog injection and execute_sql guidance
+  backend/strategies/prompt-turn-policy.template.md:
+    disposition: product-only
+    reason: SmartPerfetto resolved turn policy and source authorization
+  backend/strategies/report-runtime-delivery-appendix-en.template.md:
+    disposition: product-only
+    reason: SmartPerfetto incomplete delivery projection
+  backend/strategies/report-runtime-delivery-appendix-zh.template.md:
+    disposition: product-only
+    reason: SmartPerfetto incomplete delivery projection
   backend/strategies/analysis-source-activation-policy.yaml:
     disposition: product-only
     reason: SmartPerfetto request-scoped private source authorization and runtime budget orchestration
@@ -1295,9 +1328,6 @@ strategies:
   backend/strategies/code-aware.template.md:
     disposition: product-only
     reason: SmartPerfetto runtime, session, case, language, or codebase orchestration
-  backend/strategies/conversation-source-enrichment.template.md:
-    disposition: product-only
-    reason: SmartPerfetto bounded private source enrichment for completed conversation turns
   backend/strategies/comparison-conclusion.template.md:
     workflow: trace-comparison
     disposition: exported

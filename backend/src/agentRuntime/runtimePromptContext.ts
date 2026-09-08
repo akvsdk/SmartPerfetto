@@ -17,6 +17,27 @@ import {
 } from '../agentv3/outputLanguage';
 import {renderRequiredLocalizedStrategyTemplate} from '../agentv3/localizedStrategyTemplate';
 
+function freezeComparisonContext<T>(value: T, seen = new Set<object>()): T {
+  if (!value || typeof value !== 'object' || seen.has(value)) return value;
+  seen.add(value);
+  Object.values(value).forEach(child => freezeComparisonContext(child, seen));
+  return Object.freeze(value);
+}
+
+/** Pure pair identity. Presence of a reference trace does not authorize a probe. */
+export function buildRuntimeTracePairIdentityContext(input: {
+  referenceTraceId?: string;
+  tracePairContext?: TracePairContext;
+}): ComparisonContext | undefined {
+  if (!input.referenceTraceId) return undefined;
+  return freezeComparisonContext<ComparisonContext>({
+    referenceTraceId: input.referenceTraceId,
+    ...(input.tracePairContext ? {tracePairContext: structuredClone(input.tracePairContext)} : {}),
+    commonCapabilities: [],
+    capabilityProbeStatus: 'not_checked',
+  });
+}
+
 export async function buildRuntimeTracePairComparisonContext(input: {
   readonly traceProcessorService: TraceProcessorService;
   readonly currentTraceId: string;
@@ -28,18 +49,20 @@ export async function buildRuntimeTracePairComparisonContext(input: {
     error: unknown,
   ) => void;
 }): Promise<ComparisonContext | undefined> {
-  if (!input.referenceTraceId) return undefined;
+  const identity = buildRuntimeTracePairIdentityContext(input);
+  if (!identity) return undefined;
+  const referenceTraceId = identity.referenceTraceId;
   const capabilitySql = "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND (name LIKE 'android_%' OR name LIKE 'linux_%' OR name LIKE 'sched_%' OR name LIKE 'slices_%')";
   const [referenceFocus, referenceArchitecture, currentTables, referenceTables] = await Promise.all([
-    detectFocusApps(input.traceProcessorService, input.referenceTraceId).catch(() => ({
+    detectFocusApps(input.traceProcessorService, referenceTraceId).catch(() => ({
       apps: [],
       method: 'none' as const,
       primaryApp: undefined,
     })),
     (input.detectReferenceArchitecture
-      ? input.detectReferenceArchitecture(input.referenceTraceId)
+      ? input.detectReferenceArchitecture(referenceTraceId)
       : createArchitectureDetector().detect({
-          traceId: input.referenceTraceId,
+          traceId: referenceTraceId,
           traceProcessorService: input.traceProcessorService,
           packageName: undefined,
         })).catch(() => undefined),
@@ -47,7 +70,7 @@ export async function buildRuntimeTracePairComparisonContext(input: {
       input.onCapabilityQueryError?.('current', error);
       return null;
     }),
-    input.traceProcessorService.query(input.referenceTraceId, capabilitySql).catch(error => {
+    input.traceProcessorService.query(referenceTraceId, capabilitySql).catch(error => {
       input.onCapabilityQueryError?.('reference', error);
       return null;
     }),
@@ -55,7 +78,9 @@ export async function buildRuntimeTracePairComparisonContext(input: {
 
   let commonCapabilities: string[] = [];
   let capabilityDiff: ComparisonContext['capabilityDiff'];
-  if (currentTables && referenceTables) {
+  const capabilityProbeSucceeded = currentTables && referenceTables
+    && currentTables.error === undefined && referenceTables.error === undefined;
+  if (capabilityProbeSucceeded) {
     const current = new Set(currentTables.rows.map((row: unknown[]) => String(row[0])));
     const reference = new Set(referenceTables.rows.map((row: unknown[]) => String(row[0])));
     commonCapabilities = [...current].filter(name => reference.has(name)).sort();
@@ -67,12 +92,12 @@ export async function buildRuntimeTracePairComparisonContext(input: {
   }
 
   return {
-    referenceTraceId: input.referenceTraceId,
-    ...(input.tracePairContext ? { tracePairContext: input.tracePairContext } : {}),
+    ...identity,
     referencePackageName: referenceFocus.primaryApp,
     referenceFocusApps: referenceFocus.apps.length > 0 ? referenceFocus.apps : undefined,
     referenceArchitecture,
     commonCapabilities,
+    capabilityProbeStatus: capabilityProbeSucceeded ? 'checked' : 'unavailable',
     capabilityDiff,
   };
 }

@@ -2,6 +2,8 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import { copyScopeProvenance, scopeMetadata, type EvidenceScopeMetadata, type EvidenceScopeProvenanceV1 } from './identityContract';
+
 /**
  * SmartPerfetto Data Contract
  *
@@ -289,7 +291,7 @@ export type DataEnvelopePlanPhaseAttribution =
   | 'unexpected_tool'
   | 'none';
 
-export interface DataEnvelopeMeta {
+export interface DataEnvelopeMeta extends EvidenceScopeMetadata {
   /** Data type identifier */
   type: 'skill_result' | 'sql_result' | 'ai_response' | 'diagnostic' | 'chart';
 
@@ -309,7 +311,7 @@ export interface DataEnvelopeMeta {
   stepId?: string;
 
   /** Query execution state retained across Agent, report, snapshot, and UI projections. */
-  executionStatus?: 'observed' | 'empty' | 'optional_error';
+  executionStatus?: 'observed' | 'empty' | 'optional_error' | 'unavailable';
   executionMessage?: string;
   executionError?: string;
 
@@ -547,6 +549,7 @@ export function createDataEnvelope<T = DataPayload>(
     identityStatus?: import('./identityContract').IdentityResolutionStatus;
     identityWarnings?: string[];
     identityResolution?: import('./identityContract').IdentityResolutionV1;
+    scopeProvenance?: EvidenceScopeProvenanceV1;
     processIdentityWarning?: string;
     planPhaseId?: string;
     planPhaseTitle?: string;
@@ -587,6 +590,7 @@ export function createDataEnvelope<T = DataPayload>(
       identityStatus: options.identityStatus,
       identityWarnings: options.identityWarnings,
       identityResolution: options.identityResolution,
+      ...scopeMetadata(options.scopeProvenance),
       processIdentityWarning: options.processIdentityWarning,
       planPhaseId: options.planPhaseId,
       planPhaseTitle: options.planPhaseTitle,
@@ -883,7 +887,7 @@ export interface SectionData {
  *
  * This is the CORE structure that flows from backend to frontend.
  */
-export interface DisplayResult {
+export interface DisplayResult extends EvidenceScopeMetadata {
   /** Step ID from skill definition */
   stepId: string;
   /** Display title */
@@ -1135,6 +1139,16 @@ export interface AnalysisCompletedEvent {
     summary?: string;
     answer?: string;
     privateProjectionVersion?: number;
+    /** Finalized server metadata is optional on historical events. */
+    success?: boolean;
+    turnIntent?: import('../agentRuntime/analysisTurnIntent').AnalysisTurnIntent;
+    completion?: import('./analysisDelivery').AnalysisCompletion;
+    outputOrigin?: import('./analysisDelivery').AnalysisOutputOrigin;
+    runtimeAppendix?: import('./analysisDelivery').AnalysisRuntimeAppendix;
+    reportAssessment?: import('./analysisDelivery').FinalReportAssessment;
+    deliveryAssurance?: import('./analysisDelivery').AnalysisDeliveryAssurance;
+    sourceUseDecision?: import('../services/codebase/sourceUseDecision').SourceUseDecisionV1;
+    sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;
     conclusion?: string;
     conclusionContract?: import('../agent/core/conclusionContract').ConclusionContract;
     claimSupport?: import('./evidenceContract').ClaimSupportV1[];
@@ -1154,7 +1168,7 @@ export interface AnalysisCompletedEvent {
     smartScenePreview?: import('../agent/scene/types').SmartScenePreviewPayload;
     /** Primary result is terminal, but a separate source supplement is still running. */
     sourceEnrichmentPending?: boolean;
-    terminalRunStatus?: 'completed' | 'quota_exceeded';
+    terminalRunStatus?: 'completed' | 'failed' | 'cancelled' | 'quota_exceeded';
     findings: AnalysisCompletedFinding[];
     resultContract?: import('../assistant/contracts/assistantResultContract').AssistantResultContract;
     hypotheses?: AnalysisCompletedHypothesis[];
@@ -1431,6 +1445,7 @@ export function displayResultToEnvelope(
     source: `${skillId}:${result.stepId}`,
     skillId,
     stepId: result.stepId,
+    scopeProvenance: result.scopeProvenance,
     executionStatus: result.executionStatus,
     executionMessage: result.executionMessage,
     executionError: result.executionError,
@@ -1477,6 +1492,10 @@ export function layeredResultToEnvelopes(
  */
 export function envelopeToDisplayResult(envelope: DataEnvelope): DisplayResult {
   return {
+    ...scopeMetadata(envelope.meta.scopeProvenance),
+    executionStatus: envelope.meta.executionStatus,
+    executionMessage: envelope.meta.executionMessage,
+    executionError: envelope.meta.executionError,
     stepId: envelope.meta.stepId || envelope.meta.source,
     title: envelope.display.title,
     level: envelope.display.level || 'detail',
@@ -1587,6 +1606,14 @@ export function validateDataEnvelope(envelope: any): ValidationError[] {
   if (!envelope.meta || typeof envelope.meta !== 'object' || Array.isArray(envelope.meta)) {
     errors.push({ path: 'meta', message: 'meta must be a non-array object' });
   } else {
+    if (envelope.meta.scopeProvenance !== undefined) {
+      const scope = copyScopeProvenance(envelope.meta.scopeProvenance);
+      if (!scope || scope.invalid || scope.entries.some(entry =>
+          (envelope.meta.traceId && entry.scope.traceId !== envelope.meta.traceId) ||
+          (envelope.meta.traceSide && entry.scope.traceSide !== envelope.meta.traceSide))) {
+        errors.push({ path: 'meta.scopeProvenance', message: 'Invalid or cross-trace process scope provenance' });
+      }
+    }
     if (!VALID_DATA_ENVELOPE_META_TYPES.includes(envelope.meta.type)) {
       errors.push({
         path: 'meta.type',

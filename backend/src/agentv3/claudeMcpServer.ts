@@ -2,6 +2,8 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import {createRuntimeToolResult, runtimeToolReceiptMetadata} from '../agentRuntime/runtimeToolResult';
+import type {RuntimeToolObserver} from '../agentRuntime/runtimeToolObserver';
 import { tool as sdkTool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { createHash } from 'crypto';
@@ -25,6 +27,7 @@ import {
 import {buildSkillRegistryAttribution} from '../services/selfEvolution/skillFingerprint';
 import {
   currentEffectiveRuntimeRegistrySnapshot,
+  type ReadonlyStrategyRegistrySnapshot,
 } from '../services/selfEvolution/effectiveRuntimeRegistryContext';
 import {
   commitEvaluationExposureSince,
@@ -37,11 +40,9 @@ import {
   currentEvaluationTelemetryActive,
   recordEvaluationToolCall,
 } from '../services/selfEvolution/evaluationTelemetry';
-import {
-  evaluationPhaseHintInjectionContentHash,
-} from '../services/selfEvolution/evaluationTreatment';
 import { createArchitectureDetector } from '../agent/detectors/architectureDetector';
 import {resolveRegisteredDrillDownSkillParams} from '../agent/core/drillDownEntityResolver';
+import {findDrillDownSkillConfig} from '../agent/config/drillDownRegistry';
 import { createDataEnvelope, displayResultToEnvelope } from '../types/dataContract';
 import type {
   DisplayResult as SkillDisplayResult,
@@ -51,7 +52,7 @@ import type {
 import type { IdentityResolutionV1 } from '../types/identityContract';
 import type { StreamingUpdate } from '../agent/types';
 import type { ArchitectureInfo } from '../agent/detectors/types';
-import { isEvidenceCapableToolName, isInformationalToolName, phaseMatchesCall } from './types';
+import { isEvidenceCapableToolName, isInformationalToolName } from './types';
 import type { SqlSchemaEntry, SqlSchemaIndex, AnalysisNote, AnalysisPlanV3, PlanAspectWaiver, PlanPhase, PlanRevision, Hypothesis, ToolCallRecord, UncertaintyFlag } from './types';
 import type { SceneType } from './sceneClassifier';
 import { summarizeSqlResult, type SqlSummary } from './sqlSummarizer';
@@ -72,39 +73,34 @@ import {
   type TraceProcessorQueryProvenance,
   type TraceProcessorTraceSide,
 } from '../services/traceProcessorConnectionModel';
-import {getEffectiveIdentityConfig, sqlUsesProcessNameFilter} from '../services/processIdentity/identityGate';
+import {getConsumableProcessIdentitySelectors, sqlUsesProcessNameFilter} from '../services/processIdentity/identityGate';
+import {hasProcessIdentitySelector, PROCESS_IDENTITY_SELECTORS} from '../services/processIdentity/types';
+import type {EffectiveProcessScope} from '../services/processIdentity/effectiveProcessScope';
+import {getExactProcessScopeSupport} from '../services/skillEngine/processScopeSql';
+import {captureEvidenceTable, evidenceTableFor, type EvidenceTableWitness} from '../services/evidence/evidenceCapture';
+import {scopeMetadata, identityForScopeEvidence, mergeScopeProvenance, type EvidenceScopeProvenanceV1} from '../types/identityContract';
 import {assessScrollingJankClaimBoundary} from '../services/scrollingJankClaimBoundary';
 import { injectStdlibIncludes } from './sqlIncludeInjector';
 import { normalizeRawSql } from './rawSqlNormalizer';
 import {
   buildStrategyDetailExcerpt,
+  buildStrategyRegistrySnapshotFromDefinitions,
+  getRegisteredScenes,
   getStrategyDetailByRef,
   getStrategyDetails,
   loadPromptTemplate,
-  getPhaseHints,
-  matchStrategyDetailForPhase,
 } from './strategyLoader';
-import { matchPhaseHintForNextPhase } from './phaseHintMatcher';
 import { buildActivePhaseReminder } from './activePhaseReminder';
-import {
-  buildPlanTemplateTriggerContext,
-  hasAffirmativeKeywordMention,
-  validatePlanAgainstSceneTemplate,
-  MIN_WAIVER_REASON_CHARS,
-  type PlanValidationResult,
-} from './scenePlanTemplates';
 import {loadSourceInvestigationPolicy} from './sourceInvestigationPolicy';
 import { summarizeToolCallInput } from './toolCallSummary';
 import { buildQuickArtifactGuidance } from './quickAnswerContract';
 import {
-  findBestPhaseForExpectedCallGap,
   findCompletedPhaseEvidenceGaps,
-  findMissingExpectedCallsForPhase,
-  formatPlanEvidenceGap,
   getPhaseToolEvidenceStatus,
   replayPrePlanToolCalls,
 } from './planToolCallRecorder';
-import { isConclusionLikePlanPhase } from './planPhaseSemantics';
+import {hasValidPlanSkipDisposition, resolvePlanPhaseForCall} from './planPhaseSemantics';
+import {getAnalysisPlanCompletionStatus} from './planCompletionStatus';
 import { formatToolCallNarration, type ToolNarrationOptions } from './toolNarration';
 import { planPhaseUpdatedContent } from './planPhaseEvents';
 import type { ArtifactStore, CompactArtifactSummary } from './artifactStore';
@@ -205,6 +201,7 @@ import {
   filterRagLookup,
   type SanitizedRagResult,
 } from '../services/rag/lookupResponseFilter';
+import type {RagRetrievalResult} from '../types/sparkContracts';
 import {
   getDefaultAndroidInternalsPackStore,
   isAndroidInternalsPackRevoked,
@@ -473,7 +470,7 @@ function coerceOptionalInteger(
   return { value: numeric };
 }
 
-type PlanPhaseToolInput = Omit<PlanPhase, 'status' | 'expectedTools' | 'expectedCalls'> & {
+type PlanPhaseToolInput = Omit<PlanPhase, 'status' | 'expectedTools' | 'expectedCalls' | 'completionSource'> & {
   expectedTools?: unknown;
   expected_tools?: unknown;
   expectedCalls?: unknown;
@@ -810,50 +807,6 @@ function normalizePlanPhaseToolInput(input: PlanPhaseToolInput): Omit<PlanPhase,
   };
 }
 
-type MaterializedPlanExpectedCall = {
-  phaseId: string;
-  tool: string;
-  skillId: string;
-};
-
-function materializeMentionedRequiredSkillCalls<T extends Omit<PlanPhase, 'status'> & {status?: PlanPhase['status']}>(
-  phases: T[],
-  requirements: NonNullable<PlanValidationResult['missingAspectRequirements']>,
-): {phases: T[]; additions: MaterializedPlanExpectedCall[]} {
-  const normalizedPhases = phases.map(phase => ({
-    ...phase,
-    ...(phase.expectedTools ? {expectedTools: [...phase.expectedTools]} : {}),
-    ...(phase.expectedCalls ? {expectedCalls: phase.expectedCalls.map(call => ({...call}))} : {}),
-  })) as T[];
-  const additions: MaterializedPlanExpectedCall[] = [];
-
-  for (const requirement of requirements) {
-    for (const call of requirement.requiredExpectedCalls) {
-      const tool = shortExpectedToolName(call.tool);
-      const skillId = call.skillId ? shortExpectedToolName(call.skillId) : undefined;
-      if (!skillId || !SKILL_SCOPED_EXPECTED_CALL_TOOL_NAMES.has(tool)) continue;
-      if (normalizedPhases.some(phase => (phase.expectedCalls ?? []).some(existing =>
-        shortExpectedToolName(existing.tool) === tool
-        && shortExpectedToolName(existing.skillId ?? '') === skillId,
-      ))) continue;
-
-      const phase = normalizedPhases.find(candidate =>
-        candidate.status !== 'completed'
-        && candidate.status !== 'skipped'
-        && hasAffirmativeKeywordMention(`${candidate.name}\n${candidate.goal}`, skillId),
-      );
-      if (!phase) continue;
-      phase.expectedCalls = [...(phase.expectedCalls ?? []), {tool, skillId}];
-      if (!phase.expectedTools?.some(expectedTool => shortExpectedToolName(expectedTool) === tool)) {
-        phase.expectedTools = [...(phase.expectedTools ?? []), tool];
-      }
-      additions.push({phaseId: phase.id, tool, skillId});
-    }
-  }
-
-  return {phases: normalizedPhases, additions};
-}
-
 function normalizePlanWaivers(inputs: PlanAspectWaiver[]): PlanAspectWaiver[] {
   return inputs
     .map(input => {
@@ -892,102 +845,17 @@ function resolvePlanPhaseUpdateStatus(
 }
 
 function collectPlanPhaseShapeErrors(phases: Pick<PlanPhase, 'id' | 'name' | 'goal'>[]): string[] {
-  const errors: string[] = [];
+  const errors: string[] = phases.length === 0 ? ['phases must not be empty'] : [];
+  const phaseIds = new Set<string>();
   phases.forEach((phase, index) => {
     const label = phase.id || `phase#${index + 1}`;
     if (!phase.id) errors.push(`${label}.id is required`);
+    if (phaseIds.has(phase.id)) errors.push(`${label}.id is duplicated`);
+    phaseIds.add(phase.id);
     if (!phase.name) errors.push(`${label}.name is required`);
     if (!phase.goal) errors.push(`${label}.goal is required`);
   });
   return errors;
-}
-
-function moveConclusionPhasesLast<T extends Pick<PlanPhase, 'id' | 'name' | 'goal'>>(phases: T[]): T[] {
-  const conclusionPhases = phases.filter(isConclusionLikePlanPhase);
-  if (conclusionPhases.length === 0) return phases;
-  const nonConclusionPhases = phases.filter(phase => !isConclusionLikePlanPhase(phase));
-  return [...nonConclusionPhases, ...conclusionPhases];
-}
-
-type PhaseSemanticKind =
-  | 'architecture'
-  | 'artifact_review'
-  | 'overview'
-  | 'global_context'
-  | 'root_drill'
-  | 'gap_detection'
-  | 'conclusion';
-
-const PHASE_SEMANTIC_LABELS: Record<PhaseSemanticKind, string> = {
-  architecture: '架构检测',
-  artifact_review: '结构化证据读取',
-  overview: '概览采集',
-  global_context: '全局上下文',
-  root_drill: '根因深钻',
-  gap_detection: '缺帧检测',
-  conclusion: '综合结论',
-};
-
-const PHASE_SEMANTIC_PATTERNS: Array<{ kind: PhaseSemanticKind; pattern: RegExp }> = [
-  {
-    kind: 'conclusion',
-    pattern: /(综合结论|最终结论|结论输出|输出.*(?:结论|报告)|最终报告|优化建议|final conclusion|conclusion|final report|write final answer)/i,
-  },
-  {
-    kind: 'gap_detection',
-    pattern: /(缺帧|帧生产\s*gap|frame[_ -]?production[_ -]?gap|rt_no_drawframe|ui_no_frame|sf_backpressure|buffer stuffing 假阳性|gap 列表|gap overview)/i,
-  },
-  {
-    kind: 'root_drill',
-    pattern: /(根因深钻|根因诊断|代表帧|四象限|机制级|jank_frame_detail|blocking_chain|workload_heavy|lock_binder_wait|top slices?|主线程耗时|renderthread 耗时|root cause|drill)/i,
-  },
-  {
-    kind: 'global_context',
-    pattern: /(全局上下文|温控|thermal|视频|插帧|后台|background|干扰|系统干扰|global context)/i,
-  },
-  {
-    kind: 'artifact_review',
-    pattern: /(fetch_artifact|artifact|art-\d+|batch_frame_root_cause|reason_code|证据读取|evidence rows?)/i,
-  },
-  {
-    kind: 'architecture',
-    pattern: /(架构检测|渲染架构|textureview|surfaceview|webview|detect_architecture|architecture)/i,
-  },
-  {
-    kind: 'overview',
-    pattern: /(概览|批量根因分类|根因分布|reason_code\s*分布|batch_frame_root_cause|滑动性能概览|启动概览|启动事件|启动类型|数据质量|ttid|ttfd|dur\s*=|帧统计|掉帧分布|scrolling_analysis|startup_overview|overview|startup event|launch type)/i,
-  },
-];
-
-function inferPhaseSemanticKinds(text: string | undefined): PhaseSemanticKind[] {
-  if (!text) return [];
-  return PHASE_SEMANTIC_PATTERNS
-    .filter(({ pattern }) => pattern.test(text))
-    .map(({ kind }) => kind);
-}
-
-function findPhaseSemanticMismatch(
-  plan: AnalysisPlanV3,
-  phase: PlanPhase,
-  summary: string | undefined,
-): { summaryKind: PhaseSemanticKind; suggestedPhase: PlanPhase } | null {
-  const summaryKinds = inferPhaseSemanticKinds(summary);
-  if (summaryKinds.length === 0) return null;
-
-  const phaseKinds = new Set(inferPhaseSemanticKinds(`${phase.name} ${phase.goal}`));
-  if (phaseKinds.size === 0) return null;
-  if (summaryKinds.some(kind => phaseKinds.has(kind))) return null;
-
-  const mismatchedKind = summaryKinds.find(kind => !phaseKinds.has(kind));
-  if (!mismatchedKind) return null;
-
-  const suggestedPhase = plan.phases.find(candidate => {
-    if (candidate.id === phase.id) return false;
-    if (candidate.status === 'completed' || candidate.status === 'skipped') return false;
-    return inferPhaseSemanticKinds(`${candidate.name} ${candidate.goal}`).includes(mismatchedKind);
-  });
-
-  return suggestedPhase ? { summaryKind: mismatchedKind, suggestedPhase } : null;
 }
 
 const TIMESTAMP_EXPRESSION_PARAM_KEYS = new Set([
@@ -1092,7 +960,6 @@ interface SqlErrorFixPair {
  */
 /** TTL for error-fix pairs: 30 days. Older pairs may reference outdated schemas. */
 const ERROR_FIX_PAIR_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const RECENT_COMPLETED_PHASE_ATTRIBUTION_WINDOW_MS = 15 * 60 * 1000;
 
 /**
  * P0-G2: ReAct reasoning nudge — appended to successful data tool results.
@@ -1101,20 +968,8 @@ const RECENT_COMPLETED_PHASE_ATTRIBUTION_WINDOW_MS = 15 * 60 * 1000;
  */
 const REASONING_NUDGE_ZH = '\n\n[REFLECT] 在执行下一步之前：这个数据的关键发现是什么？是否支持/反驳你的假设？如有重要推断，请用 submit_hypothesis 或 write_analysis_note 记录。';
 const REASONING_NUDGE_EN = '\n\n[REFLECT] Before the next action: what is the key finding from this data? Does it support or refute your hypothesis? If there is an important inference, record it with submit_hypothesis or write_analysis_note.';
+/** Compatibility export for runtime callers; summary length no longer controls plan completion. */
 export const MIN_PHASE_SUMMARY_CHARS = 15;
-
-const EXPECTED_CALL_SKIP_CONDITION_PATTERN =
-  /(条件|触发条件|阈值|threshold|condition).{0,32}(未触发|未达到|未满足|不满足|not (?:triggered|met|satisfied)|below (?:the )?threshold)|(不是|并非)(?:冷|热|温)?启动|not (?:a )?(?:cold|warm|hot) start/i;
-const EXPECTED_CALL_SKIP_EVIDENCE_SUBJECT_PATTERN =
-  /(trace|跟踪|数据|信号|事件|窗口|进程|线程|帧|启动记录|schema|字段|列|表|模块|stdlib|data|signal|event|window|process|thread|frame|startup)/i;
-const EXPECTED_CALL_SKIP_UNAVAILABLE_PATTERN =
-  /(无(?:对应|相关|可用|足够)?|没有(?:对应|相关|可用|足够)?|缺少|缺失|不可用|不支持|无法执行|not (?:available|present|found|supported)|missing|absent|unavailable|unsupported|insufficient|no (?:matching |relevant |available )?)/i;
-
-function skipSummaryExplainsEvidenceBoundary(summary: string): boolean {
-  if (EXPECTED_CALL_SKIP_CONDITION_PATTERN.test(summary)) return true;
-  return EXPECTED_CALL_SKIP_EVIDENCE_SUBJECT_PATTERN.test(summary) &&
-    EXPECTED_CALL_SKIP_UNAVAILABLE_PATTERN.test(summary);
-}
 
 function sqlErrorLogFile(scope?: KnowledgeScope): string {
   if (!enterpriseKnowledgeStoreEnabled() && !scope) {
@@ -1328,6 +1183,10 @@ export interface ClaudeMcpServerOptions {
   packageName?: string;
   /** Callback to emit StreamingUpdate events (e.g. DataEnvelopes from skill results) */
   emitUpdate?: (update: StreamingUpdate) => void;
+  toolObserver?: RuntimeToolObserver;
+  /** Restrict-only typed turn policy; omitted preserves authorized evidence acquisition. */
+  allowNewEvidence?: boolean;
+  strategyRegistry?: ReadonlyStrategyRegistrySnapshot;
   /** Callback when invoke_skill returns a successful result (used for entity capture) */
   onSkillResult?: (result: { skillId: string; displayResults: Array<{ stepId?: string; data?: any }> }) => void;
   /** Mutable notes array for the write_analysis_note tool — passed by reference from analyze() scope */
@@ -1356,9 +1215,7 @@ export interface ClaudeMcpServerOptions {
   referenceTraceId?: string;
   /** Pre-computed comparison context (capabilities, metadata) for get_comparison_context tool */
   comparisonContext?: import('./types').ComparisonContext;
-  /** Lightweight mode for quick queries — only registers core data tools.
-   *  Skips planning, hypothesis, knowledge, patterns, notes, and comparison tools.
-   *  Also disables the plan gate since planning tools are not available. */
+  /** Lightweight response budgets; authorized tool capabilities are unchanged. */
   lightweight?: boolean;
   /** Conversation-only tool boundary. false exposes authorized source tools but no Trace tools. */
   conversationTraceAttached?: boolean;
@@ -1424,7 +1281,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   const { traceId, traceProcessorService, skillExecutor, packageName, emitUpdate, onSkillResult, analysisNotes, artifactStore } = options;
   const artifactAccessPolicy = resolveArtifactAccessPolicy(options.userQuery);
   const artifactSummaryState = new Map<string, { complete?: boolean }>();
-  const phaseToolCallCounts = new Map<string, Map<string, number>>();
   const recentSqlErrors: SqlErrorFixPair[] = options.recentSqlErrors || [];
   const watchdogRef = options.watchdogWarning;
   const skillNotesBudget = options.skillNotesBudget;
@@ -1435,6 +1291,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     currentRunManifestAttributionSink(),
   );
   const runtimeRegistrySnapshot = currentEffectiveRuntimeRegistrySnapshot();
+  const strategyRegistry = options.strategyRegistry ?? runtimeRegistrySnapshot?.strategyRegistry ??
+    buildStrategyRegistrySnapshotFromDefinitions({definitions: getRegisteredScenes(), overlayGeneration: 'mcp-base'});
   if (runManifestAttributionSink && !runtimeRegistrySnapshot) {
     throw new Error('effective_runtime_registry_snapshot_missing_for_run');
   }
@@ -1468,6 +1326,19 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   const retrievedData = <T extends Record<string, unknown>>(payload: T): T & {
     dataTrust: 'untrusted_retrieved_data';
   } => ({...payload, dataTrust: 'untrusted_retrieved_data'});
+  const ragToolResult = (
+    result: RagRetrievalResult | SanitizedRagResult,
+    shape: 'inline' | 'nested',
+  ) => {
+    // A top-level reason denotes whole-retrieval failure; zero hits alone do not.
+    const success = result.unsupportedReason === undefined;
+    const payload = shape === 'nested' ? {success, result} : {...result};
+    return {
+      _meta: runtimeToolReceiptMetadata({success}),
+      content: [{type: 'text' as const, text: JSON.stringify(retrievedData(payload))}],
+      ...(success ? {} : {isError: true}),
+    };
+  };
   const filterAndRecordKnowledgeDocuments = (
     value: SanitizedRagResult,
   ): SanitizedRagResult => {
@@ -1659,13 +1530,15 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   const toolRequestScope: ToolRequestScope = {
     sessionId: options.sessionId ?? traceId,
     hasCodebaseAccess: codeAwareMode !== 'off' && codebaseIds.length > 0,
+    allowNewEvidence: options.allowNewEvidence,
   };
   const initialSourceUseDecision = toolRequestScope.hasCodebaseAccess
     ? sanitizeSourceUseDecision({
         schemaVersion: SOURCE_USE_DECISION_SCHEMA_VERSION,
         codeAwareMode,
         selectedCodebaseIds: codebaseIds,
-        status: 'pending',
+        status: options.allowNewEvidence === false ? 'not_needed' : 'pending',
+        ...(options.allowNewEvidence === false ? {reasonCode: 'not_needed'} : {}),
         attemptedTools: [],
         queriedCodebaseIds: [],
         usedCodebaseIds: [],
@@ -1887,7 +1760,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       codebaseIds: queriedCodebaseIds,
       references,
       bodyAvailable: result.hits.some(hit => typeof hit.snippet === 'string' && hit.snippet.length > 0),
-      success: !result.unsupportedReason,
+      success: result.unsupportedReason === undefined,
       ...(blockingReasons.length > 0 ? {coverageComplete: false} : {}),
       incompleteReasons: blockingReasons,
     });
@@ -2080,94 +1953,17 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     };
   }
 
-  // Kept as the detected architecture itself so the trigger context is always
-  // derived through the shared helper, exactly like the pre-submit hint.
-  let architectureForTrigger: Partial<ArchitectureInfo> | undefined | null =
-    options.cachedArchitecture;
-
-  function getPlanTemplateTriggerContext(): string[] {
-    // Same helper the pre-submit hint uses, so the two can never diverge.
-    return buildPlanTemplateTriggerContext(options.userQuery, architectureForTrigger);
-  }
-
-  let pendingPlanRevisionGate: {
-    missingAspectIds: string[];
-    nonWaivableMissingAspectIds: string[];
-    warnings: string[];
-    requirements: NonNullable<PlanValidationResult['missingAspectRequirements']>;
-  } | null = null;
-
-  function clearPendingPlanRevisionGate(plan = options.analysisPlan?.current): void {
-    if (!pendingPlanRevisionGate) return;
-    if (plan?.unresolvedAspects) {
-      const resolvedIds = new Set(pendingPlanRevisionGate.missingAspectIds);
-      plan.unresolvedAspects = plan.unresolvedAspects.filter(id => !resolvedIds.has(id));
-      if (plan.unresolvedAspects.length === 0) delete plan.unresolvedAspects;
-    }
-    pendingPlanRevisionGate = null;
-  }
-
-  function buildPendingPlanRevisionResponse(toolName: string): Record<string, unknown> {
-    const gate = pendingPlanRevisionGate;
-    return {
-      success: false,
-      error: localize(
-        outputLanguage,
-        `架构检测触发了当前 plan 未覆盖的不可 waiver 场景硬门禁，必须先调用 revise_plan 补充结构化 expectedCalls，暂不能继续使用 ${toolName}。`,
-        `Architecture detection triggered non-waivable scene hard gates not covered by the current plan. Call revise_plan with structured expectedCalls before using ${toolName}.`,
-      ),
-      action_required: 'revise_plan',
-      blockedTool: toolName,
-      missingAspectIds: gate?.missingAspectIds ?? [],
-      nonWaivableMissingAspectIds: gate?.nonWaivableMissingAspectIds ?? [],
-      missingAspectSuggestions: gate?.warnings ?? [],
-      missingAspectRequirements: gate?.requirements ?? [],
-    };
-  }
-
-  function requireNoPendingPlanRevision(toolName: string): string | null {
-    return pendingPlanRevisionGate
-      ? JSON.stringify(buildPendingPlanRevisionResponse(toolName))
-      : null;
-  }
-
-  function buildStrategyDetailDelivery(
-    phase: Pick<PlanPhase, 'id' | 'name' | 'goal' | 'expectedTools' | 'expectedCalls'> | undefined,
-    reason: 'first_phase' | 'next_phase',
-  ): Record<string, unknown> | undefined {
-    const match = matchStrategyDetailForPhase(options.sceneType, phase);
-    if (!match) return undefined;
-    const excerpt = buildStrategyDetailExcerpt(match.detail);
-    console.log(`[MCP] Strategy detail ${reason}: ${match.detail.ref} for ${options.sceneType ?? 'unknown scene'} (score=${match.score})`);
-    return {
-      informational: true,
-      reason,
-      detailRef: match.detail.ref,
-      title: match.detail.title,
-      excerpt: excerpt.excerpt,
-      excerptTruncated: excerpt.truncated,
-      excerptMaxChars: excerpt.maxChars,
-      lookupTool: 'lookup_strategy_detail',
-      matchLog: {
-        sceneType: options.sceneType,
-        phaseId: phase?.id,
-        phaseName: phase?.name,
-        matchedKeywords: match.matchedKeywords,
-        score: match.score,
-      },
-      note: localize(
-        outputLanguage,
-        '此 detail 为 informational：用于指导下一步执行，不计入 expectedCalls，也不能替代 trace 证据。',
-        'This detail is informational: it guides execution, does not count as expectedCalls, and cannot replace trace evidence.',
-      ),
-    };
+  function executePreparedSkill(skillId: string, selectedTraceId: string, params: Record<string, any>,
+    inherited: Record<string, any>, processScope?: EffectiveProcessScope) {
+    return processScope ? skillExecutor.execute(skillId, selectedTraceId, params, inherited, processScope)
+      : skillExecutor.execute(skillId, selectedTraceId, params, inherited);
   }
 
   /** Normalize skill params while respecting the target Skill's declared inputs. */
   function normalizeSkillParams(
     params: Record<string, any> | undefined,
     defaultPackage?: string,
-    inputs?: ReadonlyArray<{name: string}>,
+    skill?: SkillDefinition,
   ): Record<string, any> {
     const p = { ...params };
     for (const key of Object.keys(p)) {
@@ -2175,15 +1971,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         p[key] = normalizeTimestampExpression(p[key]);
       }
     }
-    const hasDeclaredInputs = Array.isArray(inputs) && inputs.length > 0;
-    const declaredNames = new Set((inputs ?? []).map(input => input.name));
-    const acceptsProcessIdentity = !hasDeclaredInputs ||
-      declaredNames.has('process_name') ||
-      declaredNames.has('package');
-    if (acceptsProcessIdentity) {
-      if (defaultPackage && !p.process_name) p.process_name = defaultPackage;
-      if (p.process_name && !p.package) p.package = p.process_name;
-      if (p.package && !p.process_name) p.process_name = p.package;
+    const declaredNames = new Set((skill?.inputs ?? []).map(input => input.name));
+    const acceptsProcessIdentity = !skill || [...getConsumableProcessIdentitySelectors(skill)]
+      .some(key => key === 'process_name' || key === 'package');
+    if (acceptsProcessIdentity && defaultPackage && !hasProcessIdentitySelector(p)) {
+      p[declaredNames.has('process_name') && !declaredNames.has('package') ? 'process_name' : 'package'] = defaultPackage;
     }
     return p;
   }
@@ -2191,55 +1983,36 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   function undeclaredModelSkillParams(
     skill: SkillDefinition,
     params: Record<string, any> | undefined,
+    beforeEnrichment = false,
   ): string[] {
-    if (!params || !skill.inputs?.length) return [];
-    const allowed = new Set(skill.inputs.map(input => input.name));
-    for (const alias of skill.identity?.aliases ?? []) allowed.add(alias);
-    if (allowed.has('process_name')) allowed.add('package');
-    if (allowed.has('package')) allowed.add('process_name');
-    const identityConfig = getEffectiveIdentityConfig(skill);
-    if (identityConfig.policy !== 'none' && identityConfig.policy !== 'exempt') {
-      allowed.add('upid');
+    if (!params) return [];
+    const reserved = Object.keys(params).filter(key => key === '__process_scope' || key.startsWith('__process_scope.'));
+    const selectors = getConsumableProcessIdentitySelectors(skill);
+    const allowed = new Set([...(skill.inputs || []).map(input => input.name), ...selectors]);
+    if (beforeEnrichment) {
+      const registered = findDrillDownSkillConfig(skill.name);
+      if (registered?.dropEntityParamAfterResolution) {
+        for (const [key, source] of Object.entries(registered.paramMapping)) {
+          if (source === `${registered.entityType}Id`) allowed.add(key);
+        }
+      }
     }
-    return Object.keys(params).filter(key => !allowed.has(key)).sort();
+    // Legacy definitions without input schemas remain open for ordinary params,
+    // but identity selectors still need a declared consumer.
+    return [...new Set([...reserved, ...Object.keys(params).filter(key =>
+      !allowed.has(key) && (Boolean(skill.inputs) || PROCESS_IDENTITY_SELECTORS.includes(key)))])].sort();
   }
 
   function referenceSharedParamsForComparison(
     params: Record<string, any> | undefined,
     currentDefaultPackage?: string,
     referenceDefaultPackage?: string,
-    inputs?: ReadonlyArray<{name: string}>,
+    skill?: SkillDefinition,
   ): { params: Record<string, any>; identityRemapped: boolean } {
-    const p = { ...params };
-    const hasDeclaredInputs = Array.isArray(inputs) && inputs.length > 0;
-    const declaredNames = new Set((inputs ?? []).map(input => input.name));
-    const acceptsProcessIdentity = !hasDeclaredInputs ||
-      declaredNames.has('process_name') ||
-      declaredNames.has('package');
-    if (!acceptsProcessIdentity) return {params: p, identityRemapped: false};
-
-    const processName = typeof p.process_name === 'string' ? p.process_name : undefined;
-    const packageParam = typeof p.package === 'string' ? p.package : undefined;
-    const pointsAtCurrentPackage = Boolean(currentDefaultPackage && (
-      processName === currentDefaultPackage || packageParam === currentDefaultPackage
-    ));
-    const hasIdentityFilter = Boolean(processName || packageParam);
-
-    if (referenceDefaultPackage && (!hasIdentityFilter || pointsAtCurrentPackage)) {
-      if (processName !== referenceDefaultPackage || packageParam !== referenceDefaultPackage) {
-        p.process_name = referenceDefaultPackage;
-        p.package = referenceDefaultPackage;
-        return { params: p, identityRemapped: true };
-      }
-    }
-
-    if (!referenceDefaultPackage && pointsAtCurrentPackage) {
-      delete p.process_name;
-      delete p.package;
-      return { params: p, identityRemapped: true };
-    }
-
-    return { params: p, identityRemapped: false };
+    if (hasProcessIdentitySelector(params)) return {params: {...params}, identityRemapped: false};
+    const normalized = normalizeSkillParams(params, referenceDefaultPackage, skill);
+    return {params: normalized, identityRemapped: hasProcessIdentitySelector(normalized) &&
+      referenceDefaultPackage !== currentDefaultPackage};
   }
 
   /**
@@ -2478,167 +2251,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     };
   }
 
-  /**
-   * P0-G10: Enforce planning before analysis.
-   * Returns error JSON if plan is required but not yet submitted, null if OK.
-   * Only action tools (execute_sql, invoke_skill) are gated — informational
-   * and planning tools are exempt to allow plan formation.
-   */
+  /** Planning is optional; a submitted plan keeps its revision and evidence obligations. */
   const analysisPlanRef = options.analysisPlan;
-  const MAX_PLAN_ATTEMPTS = 5;
-  /** Track submit_plan attempts for scene-template hard gates. */
-  let planSubmitAttempts = 0;
-  /** Track revise_plan attempts separately so a revised plan cannot bypass the same gate. */
-  let planReviseAttempts = 0;
-
-  function validatePhasesAgainstSceneTemplate(
-    phases: ReadonlyArray<Pick<PlanPhase, 'name' | 'goal' | 'expectedTools' | 'expectedCalls'>>,
-    waivers?: ReadonlyArray<PlanAspectWaiver>,
-  ) {
-    const sourceInvestigation = sourceUseDecision && !options.lightweight
-      ? {
-          mode: 'code_aware_full' as const,
-          ...(explicitSourceUseDecisionReason
-            ? {decision: {
-                status: sourceUseDecision.status,
-                reason: explicitSourceUseDecisionReason,
-              }}
-            : {}),
-        }
-      : undefined;
-    return validatePlanAgainstSceneTemplate(
-      phases,
-      options.sceneType ?? (sourceInvestigation ? 'general' : undefined),
-      waivers,
-      {
-        triggerContext: getPlanTemplateTriggerContext(),
-        ...(sourceInvestigation ? {sourceInvestigation} : {}),
-      },
-    );
-  }
-
-  function buildPlanGateRejectPayload(input: {
-    missingAspectIds: string[];
-    nonWaivableMissingAspectIds: string[];
-    planWarnings: string[];
-    missingAspectRequirements: NonNullable<PlanValidationResult['missingAspectRequirements']>;
-    attempt: number;
-    tooShortWaivers?: PlanAspectWaiver[];
-    mode: 'submit_plan' | 'revise_plan';
-  }): Record<string, unknown> {
-    const isRevise = input.mode === 'revise_plan';
-    return {
-      success: false,
-      error: localize(
-        outputLanguage,
-        `${isRevise ? '修订后的计划' : '计划'}缺少 ${options.sceneType ?? '当前'} 场景的必要分析阶段`,
-        `${isRevise ? 'The revised plan' : 'The plan'} is missing mandatory analysis phases for the ${options.sceneType ?? 'current'} scene`,
-      ),
-      missingAspectIds: input.missingAspectIds,
-      nonWaivableMissingAspectIds: input.nonWaivableMissingAspectIds.length > 0
-        ? input.nonWaivableMissingAspectIds
-        : undefined,
-      missingAspectSuggestions: input.planWarnings,
-      missingAspectRequirements: input.missingAspectRequirements,
-      attempt: input.attempt,
-      maxAttempts: MAX_PLAN_ATTEMPTS,
-      tooShortWaivers: input.tooShortWaivers && input.tooShortWaivers.length > 0
-        ? input.tooShortWaivers
-        : undefined,
-      action_required: input.mode,
-      hint: localize(
-        outputLanguage,
-        input.nonWaivableMissingAspectIds.length > 0
-          ? `修复 plan，为不可 waiver 的 aspect 添加结构化 expectedCalls 后重新调用 ${input.mode}；这些 aspect 不能用 waivers 绕过。`
-          : `修复 plan 添加缺失阶段并重新调用 ${input.mode}，或在 waivers 中给出 ≥${MIN_WAIVER_REASON_CHARS} 字符的理由说明为什么无法覆盖。`,
-        input.nonWaivableMissingAspectIds.length > 0
-          ? `Fix the plan by adding structured expectedCalls for the non-waivable aspect(s), then call ${input.mode} again; waivers cannot bypass them.`
-          : `Add the missing phases and call ${input.mode} again, or provide a waiver reason of at least ${MIN_WAIVER_REASON_CHARS} characters explaining why it cannot be covered.`,
-      ),
-    };
-  }
-
-  function buildIncompatiblePlanCallsRejectPayload(
-    mode: 'submit_plan' | 'revise_plan',
-    incompatibleExpectedCalls: NonNullable<PlanValidationResult['incompatibleExpectedCalls']>,
-  ): Record<string, unknown> {
-    return {
-      success: false,
-      error: localize(
-        outputLanguage,
-        '计划声明了与当前用户意图/已检测架构不兼容的专属 Skill；不会把无关架构调用变成强制证据步骤。',
-        'The plan declares architecture-specific Skills incompatible with the current intent/detected architecture; unrelated calls will not become mandatory evidence steps.',
-      ),
-      incompatibleExpectedCalls,
-      action_required: mode,
-      hint: localize(
-        outputLanguage,
-        '删除不兼容的 expectedCall；保留 activeExpectedCalls 中与当前架构匹配的专属 Skill。',
-        'Remove the incompatible expectedCall and keep the architecture-specific Skills listed in activeExpectedCalls.',
-      ),
-    };
-  }
-
-  function recordArchitecturePlanGate(payload: Partial<ArchitectureInfo>): Record<string, unknown> {
-    architectureForTrigger = payload;
-    const plan = analysisPlanRef?.current;
-    if (!plan) return {};
-    const planValidation = validatePhasesAgainstSceneTemplate(plan.phases, plan.waivers);
-    const missingAspectIds = planValidation.missingAspectIds;
-    if (missingAspectIds.length === 0) {
-      clearPendingPlanRevisionGate(plan);
-      return {};
-    }
-
-    const nonWaivableMissingAspectIds = planValidation.nonWaivableMissingAspectIds ?? [];
-    if (nonWaivableMissingAspectIds.length > 0) {
-      pendingPlanRevisionGate = {
-        missingAspectIds,
-        nonWaivableMissingAspectIds,
-        warnings: planValidation.warnings,
-        requirements: planValidation.missingAspectRequirements ?? [],
-      };
-      plan.unresolvedAspects = Array.from(new Set([
-        ...(plan.unresolvedAspects ?? []),
-        ...missingAspectIds,
-      ]));
-    }
-
-    return {
-      planRevisionRequired: true,
-      missingAspectIds,
-      nonWaivableMissingAspectIds: nonWaivableMissingAspectIds.length > 0
-        ? nonWaivableMissingAspectIds
-        : undefined,
-      missingAspectSuggestions: planValidation.warnings,
-      missingAspectRequirements: planValidation.missingAspectRequirements ?? [],
-      action_required: 'revise_plan',
-      note: localize(
-        outputLanguage,
-        nonWaivableMissingAspectIds.length > 0
-          ? '架构检测触发了当前 plan 未覆盖的不可 waiver 场景硬门禁；请调用 revise_plan 补充对应 expectedCalls 后再继续。'
-          : '架构检测触发了当前 plan 未覆盖的场景检查项；建议调用 revise_plan 补充对应 expectedCalls 或 waiver。' ,
-        nonWaivableMissingAspectIds.length > 0
-          ? 'Architecture detection triggered non-waivable scene hard gates not covered by the current plan; call revise_plan with the corresponding expectedCalls before continuing.'
-          : 'Architecture detection triggered scene checks not covered by the current plan; call revise_plan with corresponding expectedCalls or a waiver.',
-      ),
-    };
-  }
-
-  function requirePlan(toolName: string): string | null {
-    if (!analysisPlanRef) return null; // Planning feature not enabled
-    if (analysisPlanRef.current) return requireNoPendingPlanRevision(toolName); // Plan already submitted
-    return JSON.stringify({
-      success: false,
-      error: localize(
-        outputLanguage,
-        `必须先调用 submit_plan 提交分析计划，然后才能使用 ${toolName}。请先制定你的分析计划，包含分析阶段、目标和预期工具。`,
-        `You must call submit_plan before using ${toolName}. Create an analysis plan with phases, goals, and expected tools first.`,
-      ),
-      action_required: 'submit_plan',
-    });
-  }
-
   // Phase 1-C: Conditional REASONING_NUDGE — only append for first N data tool calls.
   // After N calls, Claude should have internalized the reflect habit from system prompt.
   const REASONING_NUDGE_MAX_CALLS = 4;
@@ -2651,31 +2265,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
 
   let evidenceProducerOrdinal = 0;
   type PlanPhaseAttribution = 'active' | 'inferred' | 'missing' | 'ambiguous' | 'unexpected_tool' | 'none';
-  type EvidencePhaseOverride = {
-    phaseId?: string;
-    phaseTitle?: string;
-    phaseGoal?: string;
-    attribution?: PlanPhaseAttribution;
-    warning?: string;
-  };
-
-  function phaseHasToolExpectation(phase: PlanPhase): boolean {
-    return (phase.expectedCalls?.length || 0) > 0 || (phase.expectedTools?.length || 0) > 0;
-  }
-
-  function phaseMatchesToolInput(
-    phase: PlanPhase,
-    toolName: string,
-    input: Record<string, unknown>,
-  ): boolean {
-    const skillId = typeof input.skillId === 'string' ? input.skillId : undefined;
-    return phaseMatchesCall(phase, {
-      toolName,
-      timestamp: Date.now(),
-      skillId,
-    });
-  }
-
   function toolInputToPlanCallRecord(
     toolName: string,
     input: Record<string, unknown>,
@@ -2690,173 +2279,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     };
   }
 
-  function phaseExpectedCallsSatisfiedAfterEvidence(
-    phase: PlanPhase,
-    toolName: string,
-    input: Record<string, unknown>,
-  ): boolean {
-    const plan = analysisPlanRef?.current;
-    if (!plan) return true;
-    const toolCallLog = Array.isArray(plan.toolCallLog) ? plan.toolCallLog : [];
-    const records = [
-      ...toolCallLog,
-      toolInputToPlanCallRecord(toolName, input, phase.id),
-    ];
-    return getPhaseToolEvidenceStatus(plan, phase, records).satisfied;
-  }
-
-  function phaseSemanticScore(
-    phase: PlanPhase,
-    toolName: string,
-    input: Record<string, unknown>,
-  ): number {
-    const skillId = typeof input.skillId === 'string' ? input.skillId : undefined;
-    const sql = typeof input.sql === 'string' ? input.sql : '';
-    const expected = [
-      ...(phase.expectedTools || []),
-      ...(phase.expectedCalls || []).map(call => call.skillId || call.tool),
-    ].join(' ');
-    const text = `${phase.id} ${phase.name} ${phase.goal} ${expected}`.toLowerCase();
-    const inputText = JSON.stringify(input ?? {}).toLowerCase();
-    let score = 0;
-
-    if (skillId) {
-      const id = skillId.toLowerCase();
-      if (text.includes(id)) score += 100;
-      if (text.includes(id.replace(/_/g, ' '))) score += 60;
-      const hints: Record<string, string[]> = {
-        detect_architecture: ['架构', '渲染架构', '架构确认', '架构检测', '管线', 'pipeline', 'architecture'],
-        scrolling_analysis: ['滑动', 'scroll', '概览', '掉帧列表', '帧统计', '数据收集'],
-        startup_analysis: ['启动概览', '启动类型', '启动事件', 'startup', 'launch'],
-        startup_detail: ['启动详情', '四象限', '阻塞关系', '热点slice', '调度'],
-        startup_slow_reasons: ['慢原因', 'sr01', 'sr20', '交叉验证'],
-        memory_pressure_in_range: ['内存压力', 'memory', 'd状态', 'lmk', 'kswapd'],
-        blocking_chain_analysis: ['阻塞链', '阻塞关系', '唤醒', 'waker', 'blocked_functions', 'blocking_chain'],
-        lock_contention_in_range: ['锁竞争', 'futex', 'blocked_functions', '阻塞'],
-        binder_blocking_in_range: ['binder', '阻塞', '同步binder', 'ipc'],
-        jank_frame_detail: ['根因深钻', '单帧', '逐帧', 'jank_frame_detail', 'blocking_chain'],
-        frame_blocking_calls: ['根因深钻', '阻塞调用', 'frame_blocking_calls', 'blocking_chain'],
-        lock_binder_wait: ['根因深钻', '锁', 'binder', '阻塞', '等待', 'blocking_chain'],
-        frame_production_gap: ['缺帧', 'gap', '帧间', '隐形缺帧', '生产'],
-        batch_frame_root_cause: ['逐帧根因', 'reason_code', '根因分类'],
-      };
-      for (const hint of hints[id] || []) {
-        if (text.includes(hint.toLowerCase())) score += 20;
-      }
-      if (id === 'jank_frame_detail') {
-        if (/根因深钻|深钻|单帧|代表帧|最严重帧|机制级|detail|drill/.test(text)) score += 60;
-        if (/分布|分类|聚合|统计|batch|reason_code/.test(text) && !/深钻|单帧|代表帧|最严重帧|机制级/.test(text)) score -= 15;
-      }
-      if (id === 'blocking_chain_analysis') {
-        if (/阻塞链|阻塞关系|唤醒|waker|blocked_functions|blocking_chain|锁竞争|binder/.test(text)) score += 70;
-        if (/根因|深钻|机制|代表帧|最严重帧|单帧|深入诊断|detail|drill|root cause/.test(text)) score += 60;
-      }
-      if (id === 'memory_pressure_in_range') {
-        if (/内存压力|memory|lmk|kswapd|reclaim|gc|根因|交叉验证|排除/.test(text)) score += 70;
-      }
-      if (id === 'startup_slow_reasons') {
-        if (/慢原因|启动慢|sr\d+|sr01|sr20|根因|交叉验证|已知原因/.test(text)) score += 70;
-      }
-    }
-
-    if (toolName === 'detect_architecture') {
-      if (/架构|渲染架构|架构确认|架构检测|管线|architecture|pipeline|trace 时间范围|time range/.test(text)) score += 120;
-      if (/缺帧检测|frame_production_gap|gap detection/.test(text)) score -= 120;
-      if (/综合结论|结论|conclusion|报告|report/.test(text)) score -= 40;
-    }
-
-    if (toolName === 'fetch_artifact') {
-      if (/fetch_artifact|artifact|分页|全量|完整|掉帧数据|batch_frame_root_cause|根因数据/.test(text) &&
-        /全量|完整|掉帧|root_cause|batch_frame_root_cause|reason_code|artifact/.test(inputText)) {
-        score += 120;
-      }
-      if (/全量|完整|分页|batch_frame_root_cause|根因数据/.test(text) &&
-        /全量|完整|batch_frame_root_cause|reason_code|根因分布/.test(inputText)) {
-        score += 90;
-      }
-      if (/根因深钻|深钻|代表帧|最严重帧|机制级|blocking|jank_frame_detail|frame_blocking/.test(text) &&
-        /阻塞|blocking|代表|最严重|top_slice|jank_frame_detail|frame_blocking|主线程/.test(inputText)) {
-        score += 85;
-      }
-      if (/根因深钻|深钻|代表帧|最严重帧|机制级/.test(text) &&
-        /全量|完整|根因分布|batch_frame_root_cause/.test(inputText) &&
-        !/代表|最严重|阻塞|blocking|top_slice/.test(inputText)) {
-        score -= 40;
-      }
-      if (/概览|overview|滑动区间|帧统计|掉帧分布/.test(text) &&
-        /概览|summary|滑动区间|session|jank_type|性能概览/.test(inputText)) {
-        score += 60;
-      }
-      if (/综合结论|结论|conclusion|报告|report/.test(text)) score -= 30;
-    }
-
-    if (toolName === 'execute_sql' || toolName === 'execute_sql_on') {
-      const sqlText = sql.toLowerCase();
-      const isFrameOverviewSql =
-        /actual_frame_timeline_slice/.test(sqlText) &&
-        (
-          /min\s*\(\s*ts\s*\)/.test(sqlText) ||
-          /max\s*\(\s*ts\s*\+\s*dur\s*\)/.test(sqlText) ||
-          /count\s*\(\s*\*\s*\)/.test(sqlText) ||
-          /\b(frame_count|total_frames|layer_count)\b/.test(sqlText)
-        );
-      const isTraceRangeSql =
-        /actual_frame_timeline_slice/.test(sqlText) &&
-        /min\s*\(\s*ts\s*\)/.test(sqlText) &&
-        /max\s*\(\s*ts\s*\+\s*dur\s*\)/.test(sqlText);
-      const hasFrameOverviewPhaseHint =
-        /概览|overview|数据收集|采集|帧统计|帧率统计|滑动区间|时间范围|time range/.test(text);
-      if (isTraceRangeSql) {
-        if (/trace|时间范围|时间边界|边界|time range|range/.test(text)) score += 180;
-        if (/架构确认|确认.*架构|架构检测|检测.*架构|detect.*architecture|architecture.*detect/.test(text)) score += 60;
-        if (/hwui|producer|surfaceflinger|sf|合成|链路/.test(text) && !hasFrameOverviewPhaseHint) score -= 50;
-        if (/根因|深钻|逐帧|reason_code|综合结论|报告/.test(text) && !hasFrameOverviewPhaseHint) score -= 50;
-      }
-      if (isFrameOverviewSql) {
-        if (hasFrameOverviewPhaseHint) score += 80;
-        if (/根因|深钻|逐帧|diagnos|root cause/.test(text)) score -= 20;
-      }
-      const isRootCauseDrillSql = /\b(thread|thread_state|thread_slice|thread_track|slice|slice_self_dur|sched|futex|binder|blocking|root_cause|reason_code|top_slice|main_q4b|__intrinsic_batch_frame_root_cause)\b/.test(sqlText);
-      if (isRootCauseDrillSql) {
-        if (/根因|深钻|机制|阻塞|代表帧|逐帧|单帧|detail|drill|root cause|blocking/.test(text)) score += 80;
-        if (/概览|overview|帧统计|掉帧分布|数据收集|采集/.test(text)) score -= 10;
-      }
-      const isWebViewStartupSql = /webview|chromium|v8|crrenderermain|parsehtml|drawgl/.test(sqlText);
-      if (isWebViewStartupSql) {
-        if (/webview|chromium|v8|crrenderermain|parsehtml|drawgl|页面渲染/.test(text)) score += 140;
-        if (/综合结论|结论|conclusion|报告|report/.test(text) && !/webview|chromium|v8/.test(text)) score -= 30;
-      }
-      const sqlHints: Array<[RegExp, string[]]> = [
-        [/webview|chromium|v8|crrenderermain|parsehtml|drawgl/, ['webview', 'chromium', 'v8', '页面渲染']],
-        [/actual_frame_timeline|expected_frame_timeline|jank|frame/, ['滑动', '掉帧', '帧', 'frame']],
-        [/\bthread\b|thread_state|thread_slice|slice_self_dur|sched|cpu|freq/, ['线程', '调度', 'cpu', '频率', '热点', '主线程', '阻塞']],
-        [/memory|lmk|kswapd|reclaim/, ['内存', 'memory', 'lmk']],
-      ];
-      for (const [pattern, hints] of sqlHints) {
-        if (!pattern.test(sqlText)) continue;
-        for (const hint of hints) {
-          if (text.includes(hint.toLowerCase())) score += 15;
-        }
-      }
-    }
-
-    return score;
-  }
-
-  function inferSemanticPhase(
-    phases: PlanPhase[],
-    toolName: string,
-    input: Record<string, unknown>,
-  ): PlanPhase | undefined {
-    const scored = phases
-      .map(phase => ({ phase, score: phaseSemanticScore(phase, toolName, input) }))
-      .filter(item => item.score > 0)
-      .sort((a, b) => b.score - a.score);
-    if (scored.length === 0) return undefined;
-    if (scored.length === 1 || scored[0].score > scored[1].score) return scored[0].phase;
-    return undefined;
-  }
-
   function autoStartPhaseForEvidence(
     phase: PlanPhase,
     toolName: string,
@@ -2867,6 +2289,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
 
     closeSupersededInProgressPhases(plan, phase);
     phase.status = 'in_progress';
+    delete phase.completionSource;
     phase.completedAt = undefined;
     phase.summary = undefined;
 
@@ -2881,51 +2304,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     });
 
     return true;
-  }
-
-  function autoClosedPhaseSummary(closedPhase: PlanPhase, nextPhase: PlanPhase): string {
-    const artifacts = typeof artifactStore?.serialize === 'function'
-      ? artifactStore.serialize().filter(artifact => artifact.planPhaseId === closedPhase.id)
-      : [];
-    const titles = Array.from(new Set(
-      artifacts
-        .map(artifact => artifact.title || artifact.stepId)
-        .filter((title): title is string => typeof title === 'string' && title.trim().length > 0)
-    )).slice(0, 4);
-    const skillIds = Array.from(new Set(
-      artifacts
-        .map(artifact => artifact.skillId)
-        .filter((skillId): skillId is string => typeof skillId === 'string' && skillId.trim().length > 0)
-    )).slice(0, 3);
-    const moreCount = Math.max(0, artifacts.length - titles.length);
-    const titleSummary = titles.length
-      ? localize(
-          outputLanguage,
-          `：${titles.join('、')}${moreCount > 0 ? `等 ${moreCount} 个` : ''}`,
-          `: ${titles.join(', ')}${moreCount > 0 ? ` and ${moreCount} more` : ''}`,
-        )
-      : '';
-    const evidenceSummary = artifacts.length > 0
-      ? localize(
-          outputLanguage,
-          `本阶段已产生 ${artifacts.length} 个证据表${skillIds.length ? `（来源：${skillIds.join('、')}）` : ''}${titleSummary}。`,
-          `This phase produced ${artifacts.length} evidence table(s)${skillIds.length ? ` from ${skillIds.join(', ')}` : ''}${titleSummary}.`,
-        )
-      : localize(
-          outputLanguage,
-          `本阶段未记录 artifact，但已保留该阶段的工具调用和时间线事件。`,
-          `This phase did not record artifacts, but its tool calls and timeline events remain available.`,
-        );
-    // News first, bookkeeping after. The consumer prefixes the phase name and
-    // the completed verb, and shows only the leading sentence, so the reason
-    // this phase closed on its own has to come first; the evidence recap and
-    // goal stay for the report and the plan record, which is where they are
-    // actually consulted.
-    return localize(
-      outputLanguage,
-      `模型未给出完成摘要，按已收集证据自动收口。${evidenceSummary}阶段目标：${closedPhase.goal}。已进入后续阶段「${nextPhase.name}」。`,
-      `The model gave no completion summary, so the phase was closed on the evidence collected. ${evidenceSummary} Phase goal: ${closedPhase.goal}. Moved on to "${nextPhase.name}".`,
-    );
   }
 
   function closeSupersededInProgressPhases(plan: AnalysisPlanV3, nextPhase: PlanPhase): void {
@@ -2961,7 +2339,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           continue;
         }
 
-        const summary = autoClosedPhaseSummary(other, nextPhase);
+        const summary = other.summary ?? '';
         other.status = 'completed';
         other.completedAt = Date.now();
         other.summary = summary;
@@ -2992,43 +2370,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     const plan = analysisPlanRef?.current;
     const laterActive = plan ? laterInProgressPhase(plan, phase) : undefined;
     if (plan && phase.status === 'pending' && laterActive) {
-      const shouldClosePhase = phaseExpectedCallsSatisfiedAfterEvidence(phase, toolName, input);
-      if (!shouldClosePhase) {
-        return {
-          phase,
-          attribution: 'inferred',
-          warning: localize(
-            outputLanguage,
-            `证据语义匹配较早阶段 "${phase.name}"，但该阶段仍缺少其他关键工具证据；已先绑定证据，阶段保持待补证。`,
-            `Evidence semantically matched earlier phase "${phase.name}", but that phase is still missing other required tool evidence; bound this evidence while keeping the phase pending.`,
-          ),
-        };
-      }
-
-      const narration = formatToolCallNarration(toolName, input, outputLanguage, toolNarrationOptions());
-      // The consumer supplies the phase name and verb; keep this to the reason.
-      const summary = localize(
-        outputLanguage,
-        `补记证据（${narration}），当时已在后续阶段「${laterActive.name}」，证据以推断方式绑定。`,
-        `Backfilled evidence (${narration}) while later phase "${laterActive.name}" was active; bound as inferred.`,
-      ).slice(0, 260);
-      phase.status = 'completed';
-      phase.completedAt = Date.now();
-      phase.summary = summary;
-      emitUpdate?.({
-        type: 'plan_phase_updated',
-        content: planPhaseUpdatedContent({ phaseId: phase.id, status: 'completed', summary, phaseName: phase.name, origin: 'auto' }),
-        timestamp: Date.now(),
-      });
-      return {
-        phase,
-        attribution: 'inferred',
-        warning: localize(
-          outputLanguage,
-          `证据语义匹配较早阶段 "${phase.name}"，但当前已在后续阶段 "${laterActive.name}"；已按补记阶段绑定，需要核对顺序。`,
-          `Evidence semantically matched earlier phase "${phase.name}" while later phase "${laterActive.name}" was active; bound as a backfilled phase and should be checked for ordering.`,
-        ),
-      };
+      // Dispatch can bind a backfill, but only the completed result recorder
+      // may close it. The query has not run yet at this point.
+      return {phase, attribution: 'inferred'};
     }
 
     autoStartPhaseForEvidence(phase, toolName, input);
@@ -3040,310 +2384,14 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     input: Record<string, unknown>,
   ): { phase?: PlanPhase; attribution: PlanPhaseAttribution; warning?: string } {
     const plan = analysisPlanRef?.current;
-    if (!plan) return { attribution: 'none' };
-
-    const expectedGapPhase = findBestPhaseForExpectedCallGap(
-      plan,
-      toolInputToPlanCallRecord(toolName, input),
-      'structured_only',
-    );
-    if (expectedGapPhase) {
-      if (expectedGapPhase.status === 'pending') {
-        return bindPendingPhaseForEvidence(expectedGapPhase, toolName, input);
-      }
-      if (expectedGapPhase.status === 'in_progress') {
-        return { phase: expectedGapPhase, attribution: 'active' };
-      }
-      return {
-        phase: expectedGapPhase,
-        attribution: 'inferred',
-        warning: localize(
-          outputLanguage,
-          `工具调用补齐了较早阶段 "${expectedGapPhase.name}" 的关键证据缺口；已按补证绑定到该阶段。`,
-          `Tool call filled a required evidence gap for earlier phase "${expectedGapPhase.name}"; bound it to that phase as backfilled evidence.`,
-        ),
-      };
+    if (!plan) return {attribution: 'none'};
+    const resolution = resolvePlanPhaseForCall(plan, toolInputToPlanCallRecord(toolName, input),
+      typeof input.planPhaseId === 'string' ? input.planPhaseId : undefined);
+    if (!resolution.phase) {
+      return {attribution: resolution.attribution === 'ambiguous' ? 'ambiguous' : 'unexpected_tool'};
     }
-
-    const active = plan.phases.filter(p => p.status === 'in_progress');
-    if (active.length === 0) {
-      const isRawSqlTool = toolName === 'execute_sql' || toolName === 'execute_sql_on';
-      if (isRawSqlTool) {
-        const semanticPending = inferSemanticPhase(
-          plan.phases.filter(p => p.status === 'pending'),
-          toolName,
-          input,
-        );
-        if (semanticPending) {
-          return bindPendingPhaseForEvidence(semanticPending, toolName, input);
-        }
-        const semanticRecentCompleted = inferSemanticPhase(
-          plan.phases
-            .filter(p =>
-              p.status === 'completed' &&
-              typeof p.completedAt === 'number' &&
-              Date.now() - p.completedAt <= RECENT_COMPLETED_PHASE_ATTRIBUTION_WINDOW_MS
-            )
-            .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0)),
-          toolName,
-          input,
-        );
-        if (semanticRecentCompleted) {
-          return {
-            phase: semanticRecentCompleted,
-            attribution: 'inferred',
-            warning: localize(
-              outputLanguage,
-              `当前没有明确进行中的 plan 阶段；已按 SQL 内容绑定到最近完成的阶段 "${semanticRecentCompleted.name}"，需要核对。`,
-              `No plan phase is explicitly in progress; bound to the recently completed phase "${semanticRecentCompleted.name}" by SQL content and should be verified.`,
-            ),
-          };
-        }
-      }
-
-      const matchingPending = plan.phases.filter(p =>
-        p.status === 'pending' &&
-        phaseHasToolExpectation(p) &&
-        phaseMatchesToolInput(p, toolName, input)
-      );
-      if (matchingPending.length === 1) {
-        const phase = matchingPending[0];
-        return bindPendingPhaseForEvidence(phase, toolName, input);
-      }
-      if (matchingPending.length > 1) {
-        const phase = inferSemanticPhase(matchingPending, toolName, input);
-        if (phase) {
-          return bindPendingPhaseForEvidence(phase, toolName, input);
-        }
-        return {
-          attribution: 'ambiguous',
-          warning: localize(
-            outputLanguage,
-            `当前没有明确进行中的 plan 阶段，且 ${matchingPending.length} 个待执行阶段都匹配 ${toolName}；此数据未绑定具体阶段。`,
-            `No plan phase is explicitly in progress and ${matchingPending.length} pending phases match ${toolName}; this data is not bound to a concrete phase.`,
-          ),
-        };
-      }
-      const recentCompleted = plan.phases
-        .filter(p =>
-          p.status === 'completed' &&
-          typeof p.completedAt === 'number' &&
-          Date.now() - p.completedAt <= RECENT_COMPLETED_PHASE_ATTRIBUTION_WINDOW_MS &&
-          phaseHasToolExpectation(p) &&
-          phaseMatchesToolInput(p, toolName, input)
-        )
-        .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
-      if (recentCompleted.length > 0) {
-        const phase = inferSemanticPhase(recentCompleted, toolName, input) || recentCompleted[0];
-        return {
-          phase,
-          attribution: 'inferred',
-          warning: localize(
-            outputLanguage,
-            `当前没有明确进行中的 plan 阶段；已绑定到最近完成且匹配工具的阶段 "${phase.name}"，需要核对。`,
-            `No plan phase is explicitly in progress; bound to the most recently completed matching phase "${phase.name}" and should be verified.`,
-          ),
-        };
-      }
-      const semanticRecentCompleted = inferSemanticPhase(
-        plan.phases
-          .filter(p =>
-            p.status === 'completed' &&
-            typeof p.completedAt === 'number' &&
-            Date.now() - p.completedAt <= RECENT_COMPLETED_PHASE_ATTRIBUTION_WINDOW_MS
-          )
-          .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0)),
-        toolName,
-        input,
-      );
-      if (semanticRecentCompleted &&
-        phaseSemanticScore(semanticRecentCompleted, toolName, input) >= 50) {
-        return {
-          phase: semanticRecentCompleted,
-          attribution: 'inferred',
-          warning: localize(
-            outputLanguage,
-            `当前没有明确进行中的 plan 阶段；已按证据语义绑定到最近完成的阶段 "${semanticRecentCompleted.name}"，需要核对。`,
-            `No plan phase is explicitly in progress; bound to the recently completed phase "${semanticRecentCompleted.name}" by evidence semantics and should be verified.`,
-          ),
-        };
-      }
-      const semanticPending = inferSemanticPhase(
-        plan.phases.filter(p => p.status === 'pending' && phaseHasToolExpectation(p)),
-        toolName,
-        input,
-      );
-      if (semanticPending) {
-        return bindPendingPhaseForEvidence(semanticPending, toolName, input);
-      }
-      return {
-        attribution: 'missing',
-        warning: localize(
-          outputLanguage,
-          '当前没有明确进行中的 plan 阶段；此数据未绑定具体阶段。',
-          'No plan phase is explicitly in progress; this data is not bound to a concrete phase.',
-        ),
-      };
-    }
-    if (active.length > 1) {
-      return {
-        attribution: 'ambiguous',
-        warning: localize(
-          outputLanguage,
-          `当前有 ${active.length} 个 plan 阶段同时进行；此数据未绑定具体阶段。`,
-          `${active.length} plan phases are in progress at the same time; this data is not bound to a concrete phase.`,
-        ),
-      };
-    }
-
-    const phase = active[0];
-    const skillId = typeof input.skillId === 'string' ? input.skillId : undefined;
-    if (phaseHasToolExpectation(phase) && !phaseMatchesToolInput(phase, toolName, input)) {
-      const activeSemanticScore = phaseSemanticScore(phase, toolName, input);
-      const matchingPending = plan.phases.filter(p =>
-        p.status === 'pending' &&
-        phaseHasToolExpectation(p) &&
-        phaseMatchesToolInput(p, toolName, input)
-      );
-      const inferredPhase = matchingPending.length === 1
-        ? matchingPending[0]
-        : inferSemanticPhase(matchingPending, toolName, input);
-      const recentCompleted = plan.phases
-        .filter(p =>
-          p.status === 'completed' &&
-          typeof p.completedAt === 'number' &&
-          Date.now() - p.completedAt <= RECENT_COMPLETED_PHASE_ATTRIBUTION_WINDOW_MS &&
-          phaseHasToolExpectation(p) &&
-          phaseMatchesToolInput(p, toolName, input)
-        )
-        .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0));
-      const recentCompletedPhase = recentCompleted.length === 1
-        ? recentCompleted[0]
-        : inferSemanticPhase(recentCompleted, toolName, input);
-      const recentCompletedScore = recentCompletedPhase
-        ? phaseSemanticScore(recentCompletedPhase, toolName, input)
-        : 0;
-      const inferredSemanticScore = inferredPhase
-        ? phaseSemanticScore(inferredPhase, toolName, input)
-        : 0;
-      if (recentCompletedPhase &&
-        recentCompletedScore >= 50 &&
-        (!inferredPhase || recentCompletedScore >= inferredSemanticScore + 30)) {
-        return {
-          phase: recentCompletedPhase,
-          attribution: 'inferred',
-          warning: localize(
-            outputLanguage,
-            `工具结果语义匹配刚完成的阶段 "${recentCompletedPhase.name}"，但当前已进入阶段 "${phase.name}"；已按并发工具回填绑定。`,
-            `Tool result semantically matched recently completed phase "${recentCompletedPhase.name}" while phase "${phase.name}" is now active; bound as concurrent-tool backfill.`,
-          ),
-        };
-      }
-      if (inferredPhase) {
-        if (activeSemanticScore >= 50 && inferredSemanticScore < activeSemanticScore + 30) {
-          return { phase, attribution: 'active' };
-        }
-        return bindPendingPhaseForEvidence(inferredPhase, toolName, input);
-      }
-      const semanticPending = inferSemanticPhase(
-        plan.phases.filter(p => p.status === 'pending' && phaseHasToolExpectation(p)),
-        toolName,
-        input,
-      );
-      if (semanticPending && phaseSemanticScore(semanticPending, toolName, input) >= 50) {
-        return bindPendingPhaseForEvidence(semanticPending, toolName, input);
-      }
-      if (recentCompletedPhase) {
-        const recentSemanticScore = recentCompletedScore;
-        if (recentSemanticScore >= 50 && recentSemanticScore >= activeSemanticScore + 30) {
-          return {
-            phase: recentCompletedPhase,
-            attribution: 'inferred',
-            warning: localize(
-              outputLanguage,
-              `工具结果语义匹配刚完成的阶段 "${recentCompletedPhase.name}"，但当前已进入阶段 "${phase.name}"；已按并发工具回填绑定。`,
-              `Tool result semantically matched recently completed phase "${recentCompletedPhase.name}" while phase "${phase.name}" is now active; bound as concurrent-tool backfill.`,
-            ),
-          };
-        }
-      }
-      if (activeSemanticScore >= 50) {
-        return { phase, attribution: 'active' };
-      }
-      return {
-        phase,
-        attribution: 'unexpected_tool',
-        warning: localize(
-          outputLanguage,
-          `当前阶段 "${phase.name}" 未声明会调用 ${toolName}${skillId ? `(${skillId})` : ''}；此阶段归因需要人工核对。`,
-          `Active phase "${phase.name}" did not declare ${toolName}${skillId ? `(${skillId})` : ''}; verify this phase attribution.`,
-        ),
-      };
-    }
-
-    const activeSemanticScore = phaseSemanticScore(phase, toolName, input);
-    const semanticPending = inferSemanticPhase(
-      plan.phases.filter(p => p.status === 'pending' && phaseHasToolExpectation(p)),
-      toolName,
-      input,
-    );
-    if (semanticPending) {
-      const pendingSemanticScore = phaseSemanticScore(semanticPending, toolName, input);
-      if (pendingSemanticScore >= 50 && pendingSemanticScore >= activeSemanticScore + 30) {
-        return bindPendingPhaseForEvidence(semanticPending, toolName, input);
-      }
-    }
-
-    return { phase, attribution: 'active' };
-  }
-
-  function consumePhaseToolCallBudget(
-    toolName: string,
-    input: Record<string, unknown>,
-  ): Record<string, unknown> | undefined {
-    const plan = analysisPlanRef?.current;
-    if (!plan || !options.sceneType) return undefined;
-    const activePhases = plan.phases.filter(phase => phase.status === 'in_progress');
-    const phase = activePhases.length === 1
-      ? activePhases[0]
-      : activePlanPhaseForEvidence(toolName, input).phase;
-    if (!phase) return undefined;
-    const hint = matchPhaseHintForNextPhase({
-      hints: getPhaseHints(options.sceneType),
-      nextPhase: {name: phase.name, goal: phase.goal},
-      finishedPhases: plan.phases.map(candidate => ({
-        name: candidate.name,
-        goal: candidate.goal,
-        summary: candidate.summary,
-        status: candidate.status,
-      })),
-    });
-    const maxCalls = hint?.maxToolCalls?.[toolName];
-    if (maxCalls === undefined) return undefined;
-
-    const phaseCounts = phaseToolCallCounts.get(phase.id) ?? new Map<string, number>();
-    phaseToolCallCounts.set(phase.id, phaseCounts);
-    const usedCalls = phaseCounts.get(toolName) ?? 0;
-    if (usedCalls >= maxCalls) {
-      return {
-        success: false,
-        error: 'phase_tool_budget_exhausted',
-        phaseId: phase.id,
-        phaseName: phase.name,
-        phaseHintId: hint?.id,
-        toolName,
-        maxCalls,
-        usedCalls,
-        action_required: 'close_phase_or_revise_plan',
-        hint: localize(
-          outputLanguage,
-          '当前阶段的定向工具预算已用完。请用已有证据收口；只有新证据确实改变分析方向时才 revise_plan。',
-          'The targeted tool budget for this phase is exhausted. Close with existing evidence; revise the plan only if new evidence changes the analysis direction.',
-        ),
-      };
-    }
-    phaseCounts.set(toolName, usedCalls + 1);
-    return undefined;
+    if (resolution.phase.status === 'pending') return bindPendingPhaseForEvidence(resolution.phase, toolName, input);
+    return {phase: resolution.phase, attribution: resolution.phase.status === 'in_progress' ? 'active' : 'inferred'};
   }
 
   function createEvidenceProducerContext(
@@ -3351,37 +2399,22 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     input: Record<string, unknown>,
     producerReason: string,
     suffix?: string,
-    phaseOverride?: EvidencePhaseOverride,
   ): EvidenceProducerContext {
-    const summary = summarizeToolCallInput(toolName, input);
-    const phaseResolution = phaseOverride?.phaseId
-      ? undefined
-      : activePlanPhaseForEvidence(toolName, input);
-    const phase = phaseResolution?.phase;
-    const lightweightPhase = !phaseOverride?.phaseId && !phase?.id && options.lightweight
-      ? {
-          id: 'quick',
-          name: localize(outputLanguage, '快速回答', 'Quick answer'),
-          goal: localize(outputLanguage, '用轻量工具链快速回答当前问题', 'Answer the current question with the lightweight tool chain.'),
-        }
-      : undefined;
-    const paramsHash = summary.paramsHash || evidenceHash(input);
+    const {planPhaseId: _requestedPhaseId, ...evidenceInput} = input;
+    const summary = summarizeToolCallInput(toolName, evidenceInput);
+    const phaseResolution = activePlanPhaseForEvidence(toolName, input);
+    const phase = phaseResolution.phase;
+    const paramsHash = summary.paramsHash || evidenceHash(evidenceInput);
     const ordinal = ++evidenceProducerOrdinal;
-    const sourceToolCallId = [
-      toolName,
-      ordinal,
-      paramsHash,
-      suffix,
-    ].filter(Boolean).join(':');
+    const sourceToolCallId = [toolName, ordinal, paramsHash, suffix].filter(Boolean).join(':');
     return {
-      sourceToolCallId,
-      paramsHash,
-      planPhaseId: phaseOverride?.phaseId ?? phase?.id ?? lightweightPhase?.id,
-      planPhaseTitle: phaseOverride?.phaseTitle ?? phase?.name ?? lightweightPhase?.name,
-      planPhaseGoal: phaseOverride?.phaseGoal ?? phase?.goal ?? lightweightPhase?.goal,
-      planPhaseAttribution: phaseOverride?.attribution ?? (lightweightPhase ? 'active' : phaseResolution?.attribution),
-      planPhaseWarning: phaseOverride?.warning ?? phaseResolution?.warning,
-      toolNarration: formatToolCallNarration(toolName, input, outputLanguage, toolNarrationOptions()),
+      sourceToolCallId, paramsHash,
+      planPhaseId: phase?.id,
+      planPhaseTitle: phase?.name,
+      planPhaseGoal: phase?.goal,
+      planPhaseAttribution: phaseResolution.attribution,
+      planPhaseWarning: phaseResolution.warning,
+      toolNarration: formatToolCallNarration(toolName, evidenceInput, outputLanguage, toolNarrationOptions()),
       producerReason,
     };
   }
@@ -3471,6 +2504,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     '2. CPU frequency overview: sql="SELECT cpu, MIN(value) as min_freq, MAX(value) as max_freq, AVG(value) as avg_freq FROM counter JOIN counter_track ON counter.track_id=counter_track.id WHERE counter_track.name GLOB \'cpu*freq\' GROUP BY cpu", summary=true\n' +
     '3. Thread state in time range: sql="SELECT state, SUM(dur)/1e6 as total_ms FROM thread_state WHERE utid=123 AND ts BETWEEN 1000 AND 2000 GROUP BY state", summary=false',
     {
+      planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.'),
       sql: z.string().describe(
         'The SQL query to execute. Use Perfetto stdlib tables/functions (e.g. android_jank_cuj, slice, thread, process).'
       ),
@@ -3478,14 +2512,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         'When true, returns column statistics (min/max/avg/percentiles) + 10 most interesting sample rows instead of full results. Use for large result sets where you need aggregate understanding, not row-level data. Default: false.'
       ),
     },
-    async ({ sql, summary }, extra) => {
+    async ({ sql, summary, planPhaseId }, extra) => {
       const signal = getRuntimeToolSignal(extra);
       throwIfTraceProcessorQueryCancelled(signal);
-      // P0-G10: Block analysis tools until plan is submitted
-      const planError = requirePlan('execute_sql');
-      if (planError) {
-        return { content: [{ type: 'text' as const, text: planError }] };
-      }
       const artifactSqlHint = artifactSqlMisuseHint(sql, outputLanguage);
       if (artifactSqlHint) {
         return {
@@ -3493,16 +2522,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const phaseBudgetError = consumePhaseToolCallBudget('execute_sql', {sql, summary});
-      if (phaseBudgetError) {
-        return {
-          content: [{type: 'text' as const, text: JSON.stringify(phaseBudgetError)}],
-          isError: true,
-        };
-      }
+
       const producer = createEvidenceProducerContext(
         'execute_sql',
-        { sql, summary },
+        {sql, summary, planPhaseId},
         localize(outputLanguage, '执行当前 Trace SQL，验证本阶段的具体数据点。', 'Run SQL on the current trace to verify this phase of evidence.'),
       );
       try {
@@ -3517,9 +2540,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const truncated = result.rows.length > 200;
         const rows = truncated ? result.rows.slice(0, 200) : result.rows;
         const success = !result.error;
+        const executionWitness = success ? captureEvidenceTable({columns: result.columns, rows: result.rows}) : undefined;
         const sqlArtifact = success && result.columns.length > 0 && result.rows.length > SQL_RAW_INLINE_ROW_LIMIT
           ? storeSqlResultArtifact(artifactStore, {
               toolName: 'execute_sql',
+              executionWitness,
               columns: result.columns,
               rows: result.rows,
               sql: finalSql,
@@ -3620,6 +2645,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               {
                 durationMs: result.durationMs,
                 truncated: false,
+                captureStore: artifactStore, executionWitness,
                 sqlRewrites,
                 toolName: 'execute_sql',
                 outputLanguage,
@@ -3627,40 +2653,37 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             );
             updateSqlArtifactQueryReview(artifactStore, sqlArtifact, emittedEvidence.queryReview);
           }
-          return {
-            content: [{
-              type: 'text' as const,
-              text: consumeWatchdogWarning(JSON.stringify({
-                success: true,
-                mode: 'summary',
-                autoSummarized: !summary && !!sqlArtifact,
-                totalRows: summaryResult.totalRows,
-                columns: summaryResult.columns,
-                columnStats: summaryResult.columnStats,
-                sampleRows: summaryResult.sampleRows,
-                ...(sqlArtifact ? {
-                  artifactId: sqlArtifact.artifactId,
-                  artifact: sqlArtifact.artifactSummary,
-                  rowsAvailableViaArtifact: true,
-                  pageSize: SQL_ARTIFACT_PAGE_SIZE,
-                  hint: `Use the current summary first. Fetch detail="rows" from artifactId="${sqlArtifact.artifactId}" only when a required field or representative sample is missing, or the user explicitly requests row-level data; read the minimum rows needed.`,
-                } : {}),
-                durationMs: result.durationMs,
-                traceSide: traceProvenance.traceSide,
-                traceId: traceProvenance.traceId,
-                traceProvenance,
-                evidenceRefId: emittedEvidence?.evidenceRefId,
-                ...(emittedEvidence?.queryReview ? { queryReview: compactQueryReviewForToolResponse(emittedEvidence.queryReview) } : {}),
-                sourceToolCallId: producer.sourceToolCallId,
-                paramsHash: producer.paramsHash,
-                planPhaseId: producer.planPhaseId,
-                executableSql: finalSql,
-                ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
-                stdlibInjectedModules: injected,
-                ...(processIdentityWarning ? { processIdentityWarning } : {}),
-              })) + getReasoningNudge(),
-            }],
-          };
+          return createRuntimeToolResult({
+            success: true,
+            mode: 'summary',
+            autoSummarized: !summary && !!sqlArtifact,
+            totalRows: summaryResult.totalRows,
+            columns: summaryResult.columns,
+            columnStats: summaryResult.columnStats,
+            sampleRows: summaryResult.sampleRows,
+            ...(sqlArtifact ? {
+              artifactId: sqlArtifact.artifactId,
+              artifact: sqlArtifact.artifactSummary,
+              rowsAvailableViaArtifact: true,
+              pageSize: SQL_ARTIFACT_PAGE_SIZE,
+              hint: `Use the current summary first. Fetch detail="rows" from artifactId="${sqlArtifact.artifactId}" only when a required field or representative sample is missing, or the user explicitly requests row-level data; read the minimum rows needed.`,
+            } : {}),
+            durationMs: result.durationMs,
+            traceSide: traceProvenance.traceSide,
+            traceId: traceProvenance.traceId,
+            traceProvenance,
+            evidenceRefId: emittedEvidence?.evidenceRefId,
+            ...(emittedEvidence?.queryReview ? { queryReview: compactQueryReviewForToolResponse(emittedEvidence.queryReview) } : {}),
+            sourceToolCallId: producer.sourceToolCallId,
+            paramsHash: producer.paramsHash,
+            planPhaseId: producer.planPhaseId,
+            executableSql: finalSql,
+            ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
+            stdlibInjectedModules: injected,
+            ...(processIdentityWarning ? { processIdentityWarning } : {}),
+          }, {
+            decorate: text => consumeWatchdogWarning(text) + getReasoningNudge(),
+          });
         }
 
         if (emitUpdate && success && result.columns.length > 0) {
@@ -3677,6 +2700,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             {
               durationMs: result.durationMs,
               truncated,
+              captureStore: artifactStore, executionWitness,
               sqlRewrites,
               toolName: 'execute_sql',
               rowCount: result.rows.length,
@@ -3685,45 +2709,42 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           );
         }
 
-        return {
-          content: [{
-            type: 'text' as const,
-            text: consumeWatchdogWarning(JSON.stringify(success ? {
-              success,
-              columns: result.columns,
-              rows,
-              totalRows: result.rows.length,
-              truncated,
-              durationMs: result.durationMs,
-              traceSide: traceProvenance.traceSide,
-              traceId: traceProvenance.traceId,
-              traceProvenance,
-              evidenceRefId: emittedEvidence?.evidenceRefId,
-              ...(emittedEvidence?.queryReview ? { queryReview: compactQueryReviewForToolResponse(emittedEvidence.queryReview) } : {}),
-              sourceToolCallId: producer.sourceToolCallId,
-              paramsHash: producer.paramsHash,
-              planPhaseId: producer.planPhaseId,
-              executableSql: finalSql,
-              ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
-              stdlibInjectedModules: injected,
-              ...(processIdentityWarning ? { processIdentityWarning } : {}),
-            } : buildSqlFailureToolPayload({
-              error: result.error || localize(outputLanguage, 'SQL 执行失败', 'SQL execution failed'),
-              traceSide: traceProvenance.traceSide,
-              traceId: traceProvenance.traceId,
-              traceProvenance,
-              sourceToolCallId: producer.sourceToolCallId,
-              paramsHash: producer.paramsHash,
-              planPhaseId: producer.planPhaseId,
-              executableSql: finalSql,
-              sqlRewrites,
-              stdlibInjectedModules: injected,
-              processIdentityWarning,
-              durationMs: result.durationMs,
-              outputLanguage,
-            })) + (success ? getReasoningNudge() : '')),
-          }],
-        };
+        return createRuntimeToolResult(success ? {
+          success,
+          columns: result.columns,
+          rows,
+          totalRows: result.rows.length,
+          truncated,
+          durationMs: result.durationMs,
+          traceSide: traceProvenance.traceSide,
+          traceId: traceProvenance.traceId,
+          traceProvenance,
+          evidenceRefId: emittedEvidence?.evidenceRefId,
+          ...(emittedEvidence?.queryReview ? { queryReview: compactQueryReviewForToolResponse(emittedEvidence.queryReview) } : {}),
+          sourceToolCallId: producer.sourceToolCallId,
+          paramsHash: producer.paramsHash,
+          planPhaseId: producer.planPhaseId,
+          executableSql: finalSql,
+          ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
+          stdlibInjectedModules: injected,
+          ...(processIdentityWarning ? { processIdentityWarning } : {}),
+        } : buildSqlFailureToolPayload({
+          error: result.error || localize(outputLanguage, 'SQL 执行失败', 'SQL execution failed'),
+          traceSide: traceProvenance.traceSide,
+          traceId: traceProvenance.traceId,
+          traceProvenance,
+          sourceToolCallId: producer.sourceToolCallId,
+          paramsHash: producer.paramsHash,
+          planPhaseId: producer.planPhaseId,
+          executableSql: finalSql,
+          sqlRewrites,
+          stdlibInjectedModules: injected,
+          processIdentityWarning,
+          durationMs: result.durationMs,
+          outputLanguage,
+        }), {
+          decorate: text => consumeWatchdogWarning(text + (success ? getReasoningNudge() : '')),
+        });
       } catch (err) {
         rethrowIfTraceProcessorQueryCancelled(err);
         const errMsg = (err as Error).message;
@@ -3772,25 +2793,24 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     '3. Startup analysis: skillId="startup_analysis", params={process_name: "com.example.app"}\n' +
     '4. Selected range CPU scheduling/frequency: skillId="selection_range_cpu_sched_summary", params={start_ts: 123, end_ts: 456}',
     {
+      planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.'),
       skillId: z.string().describe('Skill identifier (e.g. "scrolling_analysis", "jank_frame_detail", "cpu_analysis")'),
       params: z.record(z.string(), z.any()).optional().describe(
         'Optional parameters to pass to the skill. Common: { process_name, start_ts, end_ts, max_frames_per_session }'
       ),
     },
-    async ({ skillId, params }, extra) => {
+    async ({ skillId, params, planPhaseId }, extra) => {
       const signal = getRuntimeToolSignal(extra);
       throwIfTraceProcessorQueryCancelled(signal);
-      // P0-G10: Block analysis tools until plan is submitted
-      const skillPlanError = requirePlan('invoke_skill');
-      if (skillPlanError) {
-        return { content: [{ type: 'text' as const, text: skillPlanError }] };
-      }
 
       if (skillId === 'detect_architecture') {
+        if (params?.upid != null || params?.pid != null) return createRuntimeToolResult({ success: false, skillId,
+          error: 'The detect_architecture delegation does not accept trace-local UPID/PID selectors.',
+          action_required: 'choose_a_skill_with_declared_exact_process_support' });
         const effectiveParams = normalizeSkillParams(params, packageName);
         const producer = createEvidenceProducerContext(
           'invoke_skill',
-          { skillId, params: effectiveParams },
+          {skillId, params: effectiveParams, planPhaseId},
           localize(outputLanguage, '调用 Skill detect_architecture，确认渲染架构并决定后续分析链路。', 'Run Skill detect_architecture to identify the rendering pipeline for later analysis.'),
         );
         try {
@@ -3803,7 +2823,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             timestamp: Date.now(),
           });
           const payload = await detectArchitecturePayload(signal);
-          const planGate = recordArchitecturePlanGate(payload as Partial<ArchitectureInfo>);
           emitUpdate?.({
             type: 'progress',
             content: {
@@ -3816,21 +2835,17 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             },
             timestamp: Date.now(),
           });
-          return {
-            content: [{
-              type: 'text' as const,
-              text: consumeWatchdogWarning(JSON.stringify({
-                success: true,
-                skillId: 'detect_architecture',
-                delegatedTool: 'detect_architecture',
-                sourceToolCallId: producer.sourceToolCallId,
-                paramsHash: producer.paramsHash,
-                planPhaseId: producer.planPhaseId,
-                ...payload,
-                ...planGate,
-              })) + getReasoningNudge(),
-            }],
-          };
+          return createRuntimeToolResult({
+            success: true,
+            skillId: 'detect_architecture',
+            delegatedTool: 'detect_architecture',
+            sourceToolCallId: producer.sourceToolCallId,
+            paramsHash: producer.paramsHash,
+            planPhaseId: producer.planPhaseId,
+            ...payload,
+          }, {
+            decorate: text => consumeWatchdogWarning(text) + getReasoningNudge(),
+          });
         } catch (err) {
           rethrowIfTraceProcessorQueryCancelled(err);
           const errMsg = (err as Error).message;
@@ -3867,10 +2882,19 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           };
         }
 
-        const normalizedParams = normalizeSkillParams(params, packageName, skillDef.inputs);
+        const normalizedParams = normalizeSkillParams(params, packageName, skillDef);
+        const explicitInvalidParams = undeclaredModelSkillParams(skillDef, params, true);
+        if (explicitInvalidParams.length) return createRuntimeToolResult({ success: false, skillId,
+          invalidParams: explicitInvalidParams, error: `Undeclared Skill parameters: ${explicitInvalidParams.join(', ')}`,
+          action_required: 'retry_invoke_skill_with_declared_params' });
+        const prepared = await skillExecutor.prepareInvocation(skillId, traceId, normalizedParams,
+          { __traceSide: 'current', __outputLanguage: outputLanguage, signal });
+        if (!prepared.allowed) return createRuntimeToolResult({ success: false, skillId,
+          error: prepared.error, action_required: 'choose_supported_exact_skill_or_correct_process_selector' });
         const paramResolution = await resolveRegisteredDrillDownSkillParams({
           skillId,
-          params: normalizedParams,
+          params: prepared.params,
+          processScope: prepared.processScope,
           traceId,
           traceProcessorService,
           signal,
@@ -3896,7 +2920,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const producer = createEvidenceProducerContext(
           'invoke_skill',
           {
-            skillId,
+            skillId, planPhaseId,
             params: effectiveParams,
             ...(paramResolution.audit ? {drillDownResolution: paramResolution.audit} : {}),
           },
@@ -3919,11 +2943,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
 
         const skillStart = Date.now();
         const currentPaneSide = paneSideForTraceSide('current');
-        const result = await skillExecutor.execute(skillId, traceId, effectiveParams, {
+        const executionContext = {
           ...(currentPaneSide ? { __paneSide: currentPaneSide } : {}),
-          __outputLanguage: outputLanguage,
-          signal,
-        });
+          __outputLanguage: outputLanguage, __traceSide: 'current', signal,
+        };
+        const result = prepared.processScope
+          ? await skillExecutor.execute(skillId, traceId, effectiveParams, executionContext, prepared.processScope)
+          : await skillExecutor.execute(skillId, traceId, effectiveParams, executionContext);
         const skillDuration = Date.now() - skillStart;
 
         emitUpdate?.({
@@ -3976,6 +3002,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               dr.data,
               skillTraceProvenance,
               producer,
+              dr.scopeProvenance,
             );
             const artId = artifactStore.store({
               skillId: result.skillId || skillId,
@@ -3992,8 +3019,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               planPhaseGoal: producer.planPhaseGoal,
               sourceToolCallId: producer.sourceToolCallId,
               paramsHash: producer.paramsHash,
-              identityResolution: result.identityResolution,
+              identityResolution: identityForScopeEvidence(dr.scopeProvenance, result.identityResolution),
+              scopeProvenance: dr.scopeProvenance,
+              traceProvenance: skillTraceProvenance,
             });
+            const witness = evidenceTableFor(dr) || captureEvidenceTable(undefined, {}, 'display_transformation_unmapped');
+            artifactStore.registerEvidenceCapture?.(artId, witness, {evidenceRefId,
+              ...(dr.sql ? {queryHash: evidenceHash(dr.sql)} : {})});
             const queryReview = buildSkillQueryReview({
               skillId: result.skillId || skillId,
               displayResult: dr as SkillDisplayResult,
@@ -4039,7 +3071,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             planPhaseGoal: producer.planPhaseGoal,
             sourceToolCallId: producer.sourceToolCallId,
             paramsHash: producer.paramsHash,
-            identityResolution: result.identityResolution,
+            identityResolution: identityForScopeEvidence(mergeScopeProvenance(result.diagnostics.map(diagnostic => diagnostic.scopeProvenance)), result.identityResolution),
+            scopeProvenance: mergeScopeProvenance(result.diagnostics.map(diagnostic => diagnostic.scopeProvenance)),
+            traceProvenance: skillTraceProvenance,
           });
         }
 
@@ -4061,8 +3095,22 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
                 planPhaseGoal: producer.planPhaseGoal,
                 sourceToolCallId: producer.sourceToolCallId,
                 paramsHash: producer.paramsHash,
-                identityResolution: result.identityResolution,
+                identityResolution: identityForScopeEvidence(sd.scopeProvenance, result.identityResolution),
+                scopeProvenance: sd.scopeProvenance,
+                traceProvenance: skillTraceProvenance,
               });
+              // A display and synthesize artifact may expose the same SQL step.
+              // Keep their locators distinct without changing existing display IDs.
+              const evidenceRefId = `${stableSkillEvidenceRefId(result.skillId || skillId, sd.stepId,
+                sd.stepName || sd.stepId, normalizedData, skillTraceProvenance, producer, sd.scopeProvenance)}:artifact:${artId}`;
+              // The normalizer flattens iterator-shaped rows and rewrites empty
+              // arrays. Only its plain object-row branch preserves this table.
+              const firstRow = Array.isArray(sd.data) ? sd.data[0] : undefined;
+              const directRows = firstRow && typeof firstRow === 'object' &&
+                !('itemIndex' in firstRow && 'result' in firstRow);
+              const witness = (directRows && evidenceTableFor(sd)) ||
+                captureEvidenceTable(undefined, {}, 'synthesize_transformation_unmapped');
+              artifactStore.registerEvidenceCapture?.(artId, witness, {evidenceRefId});
               return {
                 artifactId: artId,
                 stepId: sd.stepId,
@@ -4121,6 +3169,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             queryReviewsByDisplayIndex,
             result.displayResults as SkillDisplayResult[],
             outputLanguage,
+            artifactStore,
           );
         }
 
@@ -4168,84 +3217,87 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         // artifact was created.
         if (artifactStore && (artifacts?.length || diagnosticsArtifactId || synthesizeArtifacts?.length)) {
           const lightweightArtifacts = options.lightweight
-            ? artifacts?.filter(summary => summary.rowCount > 0 || summary.preview).slice(0, 10)
+            ? artifacts?.filter(summary => summary.rowCount > 0 || summary.preview || summary.executionStatus === 'unavailable').slice(0, 10)
             : artifacts;
-          return {
-            content: [{
-              type: 'text' as const,
-              text: skillNotesPrefix + consumeWatchdogWarning(JSON.stringify({
-                success: result.success,
-                skillId: result.skillId,
-                skillName: localizedSkillName,
-                ...(result.error ? { error: result.error } : {}),
-                ...(paramResolution.audit ? {drillDownResolution: paramResolution.audit} : {}),
-                ...(options.lightweight
-                  ? {
-                      quickMode: {
-                        answerNow: true,
-                        guidance: artifactAccessPolicy.forbidRows
-                          ? 'Answer from row-free artifact metadata and evidence references. Raw artifact rows are unavailable for this request.'
-                          : buildQuickArtifactGuidance(),
-                      },
-                    }
-                  : {}),
-                ...(result.identityResolution
-                  ? options.lightweight
-                    ? {
-                        identity: {
-                          identityRefId: result.identityResolution.identityRefId,
-                          status: result.identityResolution.status,
-                          packageName: result.identityResolution.target?.packageName,
-                          processName: result.identityResolution.target?.processName,
-                          warnings: result.identityResolution.warnings,
-                        },
-                      }
-                    : { identityResolution: result.identityResolution }
-                  : {}),
-                artifacts: lightweightArtifacts,
-                ...(diagnosticsArtifactId ? { diagnosticsArtifactId } : {}),
-                ...((!options.lightweight || !artifacts?.length) && synthesizeArtifacts && synthesizeArtifacts.length > 0
-                  ? { synthesizeArtifacts }
-                  : {}),
-                ...(vendorOverrideHint ? { vendorOverride: vendorOverrideHint } : {}),
-                hint: artifactAccessPolicy.forbidRows
-                  ? 'The user forbids raw artifact rows for this request. Use row-free summaries and aggregates only; fetch_artifact rows/full are blocked.'
-                  : artifactAccessPolicy.requireSummaryBeforeRows
-                    ? 'Fetch detail="summary" for each artifact first. Read rows/full only when that artifact summary is incomplete and the missing evidence requires it.'
-                    : options.lightweight
-                      ? 'Quick mode: answer from previews/evidenceRefId now; fetch artifacts only for explicit row-level follow-up.'
-                      : 'Use fetch_artifact(artifactId=<id>, detail="summary") first. If the summary lacks a required field or representative sample, fetch only the minimum rows needed with a concrete purpose; do not paginate mechanically.',
-              })) + (result.success ? getReasoningNudge() : ''),
-            }],
-          };
+          return createRuntimeToolResult({
+            success: result.success,
+            skillId: result.skillId,
+            partial: result.partial,
+            scopeLimitations: result.scopeLimitations,
+            scopeProvenance: result.scopeProvenance,
+            skillName: localizedSkillName,
+            ...(result.error ? { error: result.error } : {}),
+            ...(paramResolution.audit ? {drillDownResolution: paramResolution.audit} : {}),
+            ...(options.lightweight
+              ? {
+                  quickMode: {
+                    answerNow: true,
+                    guidance: artifactAccessPolicy.forbidRows
+                      ? 'Answer from row-free artifact metadata and evidence references. Raw artifact rows are unavailable for this request.'
+                      : buildQuickArtifactGuidance(),
+                  },
+                }
+              : {}),
+            ...(result.identityResolution
+              ? options.lightweight
+                ? {
+                    identity: {
+                      identityRefId: result.identityResolution.identityRefId,
+                      status: result.identityResolution.status,
+                      packageName: result.identityResolution.target?.packageName,
+                      processName: result.identityResolution.target?.processName,
+                      warnings: result.identityResolution.warnings,
+                    },
+                  }
+                : { identityResolution: result.identityResolution }
+              : {}),
+            artifacts: lightweightArtifacts,
+            ...(diagnosticsArtifactId ? { diagnosticsArtifactId } : {}),
+            ...((!options.lightweight || !artifacts?.length) && synthesizeArtifacts && synthesizeArtifacts.length > 0
+              ? { synthesizeArtifacts }
+              : {}),
+            ...(vendorOverrideHint ? { vendorOverride: vendorOverrideHint } : {}),
+            hint: artifactAccessPolicy.forbidRows
+              ? 'The user forbids raw artifact rows for this request. Use row-free summaries and aggregates only; fetch_artifact rows/full are blocked.'
+              : artifactAccessPolicy.requireSummaryBeforeRows
+                ? 'Fetch detail="summary" for each artifact first. Read rows/full only when that artifact summary is incomplete and the missing evidence requires it.'
+                : options.lightweight
+                  ? 'Quick mode: answer from previews/evidenceRefId now; fetch artifacts only for explicit row-level follow-up.'
+                  : 'Use fetch_artifact(artifactId=<id>, detail="summary") first. If the summary lacks a required field or representative sample, fetch only the minimum rows needed with a concrete purpose; do not paginate mechanically.',
+          }, {
+            facts: {success: result.success, planPhaseId: producer.planPhaseId},
+            decorate: text => skillNotesPrefix + consumeWatchdogWarning(text) + (result.success ? getReasoningNudge() : ''),
+          });
         }
 
         // Default: return full displayResults (backward compatible)
-        return {
-          content: [{
-            type: 'text' as const,
-            text: skillNotesPrefix + consumeWatchdogWarning(JSON.stringify({
-              success: result.success,
-              skillId: result.skillId,
-              skillName: localizedSkillName,
-              ...(result.error ? { error: result.error } : {}),
-              ...(paramResolution.audit ? {drillDownResolution: paramResolution.audit} : {}),
-              ...(result.identityResolution ? { identityResolution: result.identityResolution } : {}),
-              ...(vendorOverrideHint ? { vendorOverride: vendorOverrideHint } : {}),
-              displayResults: localizedDisplayResults.map(dr => ({
-                stepId: dr.stepId,
-                title: dr.title,
-                layer: dr.layer,
-                data: dr.data,
-                executionStatus: dr.executionStatus,
-                executionMessage: dr.executionMessage,
-                executionError: dr.executionError,
-              })),
-              diagnostics: localizedDiagnostics,
-              synthesizeData: result.synthesizeData,
-            })) + (result.success ? getReasoningNudge() : ''),
-          }],
-        };
+        return createRuntimeToolResult({
+          success: result.success,
+          skillId: result.skillId,
+          partial: result.partial,
+          scopeLimitations: result.scopeLimitations,
+          scopeProvenance: result.scopeProvenance,
+          skillName: localizedSkillName,
+          ...(result.error ? { error: result.error } : {}),
+          ...(paramResolution.audit ? {drillDownResolution: paramResolution.audit} : {}),
+          ...(result.identityResolution ? { identityResolution: result.identityResolution } : {}),
+          ...(vendorOverrideHint ? { vendorOverride: vendorOverrideHint } : {}),
+          displayResults: localizedDisplayResults.map(dr => ({
+            stepId: dr.stepId,
+            title: dr.title,
+            layer: dr.layer,
+            data: dr.data,
+            executionStatus: dr.executionStatus,
+            executionMessage: dr.executionMessage,
+            executionError: dr.executionError,
+            ...scopeMetadata(dr.scopeProvenance),
+          })),
+          diagnostics: localizedDiagnostics,
+          synthesizeData: result.synthesizeData,
+        }, {
+          facts: {success: result.success, planPhaseId: producer.planPhaseId},
+          decorate: text => skillNotesPrefix + consumeWatchdogWarning(text) + (result.success ? getReasoningNudge() : ''),
+        });
       } catch (err) {
         rethrowIfTraceProcessorQueryCancelled(err);
         const errMsg = (err as Error).message;
@@ -4295,7 +3347,14 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     },
     async ({ category }) => {
       try {
-        await bindSkillRuntimeRegistry();
+        const capabilityRegistry = await bindSkillRuntimeRegistry();
+        const definitions = new Map(capabilityRegistry.getAllSkills().map(skill => [skill.name, skill]));
+        const fragments = capabilityRegistry.getFragmentCache?.() || new Map<string, string>();
+        const scopeCapability = (id: string) => {
+          const definition = definitions.get(id);
+          return definition ? getExactProcessScopeSupport(definition, definitions, fragments)
+            : { supported: false, reason: 'Skill definition is unavailable' };
+        };
         const allSkills = await skillAdapter.listSkills(outputLanguage);
         const filtered = category
           ? allSkills.filter(s =>
@@ -4311,6 +3370,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           const described = filtered.slice(0, QUICK_SKILL_DESCRIBED_MATCHES);
           const remainingIds = filtered.slice(QUICK_SKILL_DESCRIBED_MATCHES).map(s => s.id);
           return {
+            _meta: runtimeToolReceiptMetadata({success: true}),
             content: [{
               type: 'text' as const,
               text: JSON.stringify({
@@ -4319,10 +3379,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
                   id: s.id,
                   displayName: s.displayName,
                   description: firstSentence(s.description, QUICK_SKILL_DESCRIPTION_CHARS),
+                  exactProcessScope: scopeCapability(s.id),
                 })),
                 ...(remainingIds.length > 0
                   ? {
                       otherMatchedIds: remainingIds,
+                      otherScopeCapabilities: Object.fromEntries(remainingIds.map(id => [id, scopeCapability(id)])),
                       hint: 'Every matched id is listed; pass a narrower `category` for their descriptions.',
                     }
                   : {}),
@@ -4331,6 +3393,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           };
         }
         return {
+          _meta: runtimeToolReceiptMetadata({success: true}),
           content: [{
             type: 'text' as const,
             text: JSON.stringify(
@@ -4342,6 +3405,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
                 keywords: s.keywords.slice(0, 5),
                 origin: s.origin,
                 localizationStatus: s.localizationStatus,
+                exactProcessScope: scopeCapability(s.id),
               }))
             ),
           }],
@@ -4361,27 +3425,26 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     'Detect the rendering architecture of the app in the current trace. ' +
     'Returns architecture type (STANDARD/FLUTTER/COMPOSE/WEBVIEW/etc.), confidence, and evidence. ' +
     'Call this early to understand which analysis approach to use.',
-    {},
-    async (_args, extra) => {
+    {planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.')},
+    async ({planPhaseId}, extra) => {
       const signal = getRuntimeToolSignal(extra);
       throwIfTraceProcessorQueryCancelled(signal);
       const producer = createEvidenceProducerContext(
         'detect_architecture',
-        {},
+        {planPhaseId},
         localize(outputLanguage, '检测渲染架构，确定后续分析路径。', 'Detect rendering architecture to choose the later analysis path.'),
       );
       try {
         const payload = await detectArchitecturePayload(signal);
-        const planGate = recordArchitecturePlanGate(payload as Partial<ArchitectureInfo>);
         return {
           content: [{
             type: 'text' as const,
             text: JSON.stringify({
               ...payload,
+              success: true,
               sourceToolCallId: producer.sourceToolCallId,
               paramsHash: producer.paramsHash,
               planPhaseId: producer.planPhaseId,
-              ...planGate,
             }),
           }],
         };
@@ -4486,6 +3549,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         .map(item => ({ ...item.entry, source: item.source }));
 
       return {
+        _meta: runtimeToolReceiptMetadata({success: true}),
         content: [{
           type: 'text' as const,
           text: JSON.stringify({
@@ -4568,6 +3632,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     '2. Read a few representative jank frames missing from the summary: artifactId="art-2", detail="rows", offset=0, limit=5\n' +
     '3. Read another targeted page only if the first page lacks required evidence or the user requested complete rows: artifactId="art-2", detail="rows", offset=5, limit=5',
     {
+      planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.'),
       artifactId: z.string().describe('Artifact ID (e.g. "art-1") from a previous invoke_skill response'),
       detail: z.enum(['summary', 'rows', 'full']).optional().describe(
         'Detail level: summary (default, compact stats), rows (paginated data rows), full (complete original structure — use with caution on large artifacts)'
@@ -4582,11 +3647,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         'One short sentence explaining why this artifact is needed for the current plan phase. Used in the user-visible timeline.'
       ),
     },
-    async ({ artifactId, detail, offset, limit, purpose }) => {
-      const planRevisionError = requireNoPendingPlanRevision('fetch_artifact');
-      if (planRevisionError) {
-        return { content: [{ type: 'text' as const, text: planRevisionError }], isError: true };
-      }
+    async ({ artifactId, detail, offset, limit, purpose, planPhaseId }) => {
       const effectiveDetail = detail || 'summary';
       if (effectiveDetail === 'rows' || effectiveDetail === 'full') {
         const summaryState = artifactSummaryState.get(artifactId);
@@ -4629,7 +3690,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       if (paginationErrors.length > 0) {
         const producer = createEvidenceProducerContext(
           'fetch_artifact',
-          { artifactId, detail: effectiveDetail, offset, limit, purpose },
+          {artifactId, detail: effectiveDetail, offset, limit, purpose, planPhaseId},
           producerReason,
         );
         return {
@@ -4648,18 +3709,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           : undefined;
         artifactSummaryState.set(artifactId, {complete});
       }
-      const originPhase = result?.planPhaseId
-        ? {
-            phaseId: result.planPhaseId,
-            phaseTitle: result.planPhaseTitle,
-            phaseGoal: result.planPhaseGoal,
-            attribution: 'inferred' as const,
-          }
-        : undefined;
       const producer = createEvidenceProducerContext(
         'fetch_artifact',
         {
-          artifactId,
+          artifactId, planPhaseId,
           detail: effectiveDetail,
           offset,
           limit,
@@ -4670,8 +3723,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           artifactStepId: result?.stepId,
         },
         producerReason,
-        undefined,
-        originPhase,
       );
       if (!result) {
         return {
@@ -4691,17 +3742,20 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       // away from the active phase's constraints. Summary mode skips the
       // reminder (compact responses already keep the agent on-track).
       const reminder = (effectiveDetail === 'full' || effectiveDetail === 'rows')
-        ? buildActivePhaseReminder(analysisPlanRef?.current, options.sceneType)
+        ? buildActivePhaseReminder(analysisPlanRef?.current, options.sceneType, strategyRegistry)
         : '';
       const responseResult = result && effectiveDetail === 'summary' && artifactAccessPolicy.forbidRows
         ? (({sampleRow: _sampleRow, preview: _preview, ...rowFreeResult}) => rowFreeResult)(result)
         : result;
-      const payload = JSON.stringify({
+      const payload = {
         success: true,
         detail: effectiveDetail,
         ...responseResult,
         sourceToolCallId: result?.sourceToolCallId || producer.sourceToolCallId,
         fetchedByToolCallId: producer.sourceToolCallId,
+        artifactPlanPhaseId: result?.planPhaseId,
+        artifactPlanPhaseTitle: result?.planPhaseTitle,
+        artifactPlanPhaseGoal: result?.planPhaseGoal,
         paramsHash: producer.paramsHash,
         planPhaseId: producer.planPhaseId,
         planPhaseTitle: producer.planPhaseTitle,
@@ -4709,13 +3763,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         planPhaseAttribution: producer.planPhaseAttribution,
         sourceArtifactId: artifactId,
         ...(purpose ? { purpose } : {}),
-      });
-      return {
-        content: [{
-          type: 'text' as const,
-          text: reminder ? payload + reminder : payload,
-        }],
       };
+      return createRuntimeToolResult(payload, {
+        decorate: text => reminder ? text + reminder : text,
+      });
     },
     { annotations: { readOnlyHint: true } },
   ) : null;
@@ -4750,6 +3801,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       }
 
       return {
+        _meta: runtimeToolReceiptMetadata({success: true}),
         content: [{
           type: 'text' as const,
           text: JSON.stringify({
@@ -4849,6 +3901,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         contentHash,
       );
       return {
+        _meta: runtimeToolReceiptMetadata({success: true}),
         content: [{ type: 'text' as const, text: content }],
       };
     },
@@ -4907,12 +3960,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           throw new Error('analysis_context_changed_restart_required');
         }
         const evaluated = filterAndRecordKnowledgeDocuments(filtered);
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(retrievedData({success: true, result: evaluated})),
-          }],
-        };
+        return ragToolResult(evaluated, 'nested');
       }
       if (source === 'android_internals_wiki') {
         assertPrivateAnalysisContextCurrent();
@@ -4971,12 +4019,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         await codeLookupLedger?.flush();
         assertPrivateAnalysisContextCurrent();
         const evaluated = filterAndRecordKnowledgeDocuments(filtered);
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(retrievedData({success: true, result: evaluated})),
-          }],
-        };
+        return ragToolResult(evaluated, 'nested');
       }
       const raw = ragStore.search(query, {
         topK: top_k ?? 5,
@@ -4992,12 +4035,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       });
       await codeLookupLedger?.flush();
       const evaluated = filterAndRecordKnowledgeDocuments(filtered);
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify(retrievedData({...evaluated})),
-        }],
-      };
+      return ragToolResult(evaluated, 'inline');
     },
     { annotations: { readOnlyHint: true } },
   );
@@ -5194,18 +4232,14 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         );
         await codeLookupLedger?.flush();
         assertPrivateAnalysisContextCurrent();
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(retrievedData({success: true, result: filtered})) }],
-        };
+        return ragToolResult(filtered, 'nested');
       }
       observeSourceLookup({
         toolName: 'lookup_aosp_source',
         codebaseIds: effectiveCodebaseIds,
-        success: true,
+        success: result.unsupportedReason === undefined,
       });
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(retrievedData({...result})) }],
-      };
+      return ragToolResult(result, 'inline');
     },
     { annotations: { readOnlyHint: true } },
   );
@@ -5273,18 +4307,14 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         );
         await codeLookupLedger?.flush();
         assertPrivateAnalysisContextCurrent();
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify(retrievedData({success: true, result: filtered})) }],
-        };
+        return ragToolResult(filtered, 'nested');
       }
       observeSourceLookup({
         toolName: 'lookup_oem_sdk',
         codebaseIds: effectiveCodebaseIds,
-        success: true,
+        success: result.unsupportedReason === undefined,
       });
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(retrievedData({...result})) }],
-      };
+      return ragToolResult(result, 'inline');
     },
     { annotations: { readOnlyHint: true } },
   );
@@ -5913,9 +4943,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       observeIndexedSourceLookup('lookup_app_source', filtered, allowed);
       await codeLookupLedger?.flush();
       assertPrivateAnalysisContextCurrent();
-      return {
-        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({success: true, result: filtered}))}],
-      };
+      return ragToolResult(filtered, 'nested');
     },
     {annotations: {readOnlyHint: true}},
   );
@@ -5988,9 +5016,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       );
       await codeLookupLedger?.flush();
       assertPrivateAnalysisContextCurrent();
-      return {
-        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({success: true, result: filtered}))}],
-      };
+      return ragToolResult(filtered, 'nested');
     },
     {annotations: {readOnlyHint: true}},
   );
@@ -6473,10 +5499,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   // analysisPlanRef is declared above (P0-G10) and shared with planning tools
   const submitPlan = analysisPlanRef ? tool(
     'submit_plan',
-    'Submit your structured analysis plan BEFORE starting any analysis. ' +
+    'Optionally submit a structured analysis plan. ' +
     'Define phases with goals and expected tools. The system tracks plan adherence and warns on deviation. ' +
-    'You MUST call this tool as your first action in every analysis.\n\n' +
-    'Use when: starting any new analysis — this is mandatory before execute_sql or invoke_skill.\n' +
+    'Use when: an explicit multi-phase plan helps organize the analysis.\n' +
     'Don\'t use when: plan already submitted (use revise_plan to modify, update_plan_phase to track progress).\n' +
     'expectedCalls skillId is only valid for invoke_skill/compare_skill; scope every other tool as {tool:"fetch_artifact"} or {tool:"execute_sql"} with no skillId.\n\n' +
     'Examples:\n' +
@@ -6490,6 +5515,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       waivers: PLAN_WAIVERS_ARG_SCHEMA.optional().describe('Optional opt-outs for scene-template aspects when the trace genuinely cannot support them.'),
     },
     async (args: any, extra?: unknown) => {
+      if (analysisPlanRef.current) return createRuntimeToolResult({
+        success: false, error: 'plan_already_submitted', action_required: 'revise_plan',
+      }, {isError: true});
       const signal = getRuntimeToolSignal(extra);
       throwIfTraceProcessorQueryCancelled(signal);
       const phaseInputs = parseToolArrayInput<PlanPhaseToolInput>(
@@ -6575,9 +5603,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      let normalizedPhases = moveConclusionPhasesLast(
-        phaseInputs.map(normalizePlanPhaseToolInput),
-      );
+      const normalizedPhases = phaseInputs.map(normalizePlanPhaseToolInput);
       const phaseShapeErrors = collectPlanPhaseShapeErrors(normalizedPhases);
       if (phaseShapeErrors.length > 0) {
         return {
@@ -6596,13 +5622,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-
-      const initialValidation = validatePhasesAgainstSceneTemplate(normalizedPhases, waiverInputs);
-      const materializedPlanCalls = materializeMentionedRequiredSkillCalls(
-        normalizedPhases,
-        initialValidation.missingAspectRequirements ?? [],
-      );
-      normalizedPhases = materializedPlanCalls.phases;
 
       const expectedSkillRegistry = await bindSkillRuntimeRegistry();
       throwIfTraceProcessorQueryCancelled(signal);
@@ -6635,60 +5654,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      // P1-G11: Validate against the scene template, honouring agent waivers.
-      const validation = materializedPlanCalls.additions.length > 0
-        ? validatePhasesAgainstSceneTemplate(normalizedPhases, waiverInputs)
-        : initialValidation;
-      if ((validation.incompatibleExpectedCalls?.length ?? 0) > 0) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(buildIncompatiblePlanCallsRejectPayload(
-              'submit_plan',
-              validation.incompatibleExpectedCalls!,
-            )),
-          }],
-          isError: true,
-        };
-      }
-      const { warnings: planWarnings, missingAspectIds } = validation;
-      const nonWaivableMissingAspectIds = validation.nonWaivableMissingAspectIds ?? [];
-
-      // Track only waivers whose reason met the minimum threshold; the rest
-      // are reported back so the agent knows they didn't count.
-      const acceptedWaivers = waiverInputs.filter(
-        w => typeof w.reason === 'string' && w.reason.trim().length >= MIN_WAIVER_REASON_CHARS,
-      );
-      const tooShortWaivers = waiverInputs.filter(
-        w => !acceptedWaivers.some(a => a.aspectId === w.aspectId),
-      );
-
-      planSubmitAttempts++;
-
-      // Phase 2.3: 真硬拦截 — keep rejecting until plan covers all aspects
-      // or supplies a substantial waiver. Strategy-owned non-waivable aspects
-      // cannot be force-accepted because they encode execution-time quality gates.
-      if (planWarnings.length > 0 &&
-        (planSubmitAttempts < MAX_PLAN_ATTEMPTS || nonWaivableMissingAspectIds.length > 0)) {
-        console.log(`[MCP] Plan rejected (attempt ${planSubmitAttempts}/${MAX_PLAN_ATTEMPTS}): missing ${missingAspectIds.length} aspects for ${options.sceneType ?? 'unknown scene'}`);
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(buildPlanGateRejectPayload({
-              missingAspectIds,
-              nonWaivableMissingAspectIds,
-              planWarnings,
-              missingAspectRequirements: validation.missingAspectRequirements ?? [],
-              attempt: planSubmitAttempts,
-              tooShortWaivers,
-              mode: 'submit_plan',
-            })),
-          }],
-          isError: true,
-        };
-      }
-
-      const forcedAccept = planWarnings.length > 0; // hit the attempt cap
       const plan: AnalysisPlanV3 = {
         phases: normalizedPhases.map((p): PlanPhase => ({
           ...p,
@@ -6700,19 +5665,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         ...(sourceUseDecision
           ? {sourceUseDecisionStatus: sourceUseDecision.status}
           : {}),
-        ...(acceptedWaivers.length > 0 ? { waivers: acceptedWaivers } : {}),
-        ...(forcedAccept ? { unresolvedAspects: missingAspectIds } : {}),
+        ...(waiverInputs.length > 0 ? {waivers: waiverInputs} : {}),
       };
       analysisPlanRef.current = plan;
       replayPrePlanToolCalls(analysisPlanRef);
-      clearPendingPlanRevisionGate(plan);
-      planReviseAttempts = 0;
-      if (!forcedAccept) planSubmitAttempts = 0;
-
-      if (forcedAccept) {
-        console.warn(`[MCP] Plan force-accepted at attempt ${planSubmitAttempts} with ${missingAspectIds.length} unresolved aspects: ${missingAspectIds.join(', ')}`);
-      }
-
       emitUpdate?.({
         type: 'plan_submitted',
         content: {
@@ -6722,34 +5678,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         timestamp: Date.now(),
       });
 
-      const response: Record<string, any> = { success: true };
-      if (materializedPlanCalls.additions.length > 0) {
-        response.materializedExpectedCalls = materializedPlanCalls.additions;
-      }
-      if (acceptedWaivers.length > 0) {
-        response.acceptedWaivers = acceptedWaivers.map(w => w.aspectId);
-      }
-      if (tooShortWaivers.length > 0) {
-        response.tooShortWaivers = tooShortWaivers;
-        response.waiverHint = localize(
-          outputLanguage,
-          `已忽略 ${tooShortWaivers.length} 条理由不足 ${MIN_WAIVER_REASON_CHARS} 字符的 waiver。`,
-          `Ignored ${tooShortWaivers.length} waiver(s) whose reason is shorter than ${MIN_WAIVER_REASON_CHARS} characters.`,
-        );
-      }
-      if (forcedAccept) {
-        response.unresolvedAspects = missingAspectIds;
-        response.warning = localize(
-          outputLanguage,
-          `已强制接受 plan（达到第 ${MAX_PLAN_ATTEMPTS} 次尝试上限），但未覆盖的 aspect 会在最终 verifier 中报错。`,
-          `Plan force-accepted after reaching the ${MAX_PLAN_ATTEMPTS}-attempt limit, but uncovered aspects will be reported by the final verifier.`,
-        );
-      }
-      const firstExecutionPhase = plan.phases.find(p => !isConclusionLikePlanPhase(p)) || plan.phases[0];
-      const firstPhaseDetail = buildStrategyDetailDelivery(firstExecutionPhase, 'first_phase');
-      if (firstPhaseDetail) {
-        response.first_phase_detail = firstPhaseDetail;
-      }
+      const response = {success: true};
       return {
         content: [{
           type: 'text' as const,
@@ -6761,310 +5690,74 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
 
   const updatePlanPhase = analysisPlanRef ? tool(
     'update_plan_phase',
-    'Update the status of a plan phase. Ordinary transitions start automatically from the next phase first evidence call; do NOT call this to open or announce a phase. ' +
-    'Call it to close a phase with its evidence summary, or to skip/block one. ' +
-    'Completing REQUIRES a summary with key evidence (e.g. "发现 5 帧卡顿，主因是 RenderThread 阻塞，最长耗时 45ms"). ' +
-    'When skipping, explain why (e.g. "trace 中无启动数据，跳过启动分析").',
+    'Update an explicitly identified plan phase. Ordinary transitions start automatically from attributed evidence calls; do NOT call this merely to announce a transition. ' +
+    'Completion requires successful receipts for every declared call. Skipping requires a typed disposition and preserves unresolved calls. ' +
+    'summary is optional display text; it cannot prove completion or unavailability.',
     {
-      phaseId: z.string().describe('Phase ID to update (e.g. "p1")'),
-      status: z.enum(['in_progress', 'completed', 'skipped', 'active']).optional().describe('New phase status. "active" is accepted as an alias for "in_progress".'),
-      phaseStatus: z.enum(['in_progress', 'completed', 'skipped', 'active']).optional().describe('Compatibility alias for status. If both are present, they must resolve to the same status.'),
-      summary: z.string().optional().describe('REQUIRED for completed/skipped: key evidence or reason. Must include specific data (numbers, names, findings).'),
+      phaseId: z.string(),
+      status: z.enum(['in_progress', 'completed', 'skipped', 'active']).optional(),
+      phaseStatus: z.enum(['in_progress', 'completed', 'skipped', 'active']).optional(),
+      summary: z.string().optional(),
+      skipDisposition: z.object({
+        kind: z.enum(['not_applicable', 'evidence_unavailable', 'deferred']),
+        failureToolCallIds: z.array(z.string()).optional(),
+      }).strict().optional(),
     },
-    async ({ phaseId, status, phaseStatus, summary }) => {
-      const statusResolution = resolvePlanPhaseUpdateStatus(status, phaseStatus);
-      if ('error' in statusResolution) {
-        const error = statusResolution.error === 'missing'
-          ? localize(outputLanguage, '必须提供 status 或 phaseStatus。', 'Provide status or phaseStatus.')
-          : statusResolution.error === 'conflict'
-            ? localize(outputLanguage, 'status 与 phaseStatus 冲突。', 'status and phaseStatus conflict.')
-            : localize(outputLanguage, 'status/phaseStatus 不是支持的阶段状态。', 'status/phaseStatus is not a supported phase status.');
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error,
-              action_required: 'retry_update_plan_phase_with_valid_status',
-            }),
-          }],
-          isError: true,
-        };
-      }
-      const normalizedStatus = statusResolution.status;
+    async ({phaseId, status, phaseStatus, summary, skipDisposition}) => {
+      const resolution = resolvePlanPhaseUpdateStatus(status, phaseStatus);
+      if ('error' in resolution) return createRuntimeToolResult({
+        success: false, error: 'invalid_phase_status', reason: resolution.error,
+      }, {isError: true});
       const plan = analysisPlanRef.current;
-      if (!plan) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error: localize(outputLanguage, '还没有提交 plan，请先调用 submit_plan。', 'No plan submitted yet. Call submit_plan first.'),
-            }),
-          }],
-          isError: true,
-        };
+      const phase = plan?.phases.find(candidate => candidate.id === phaseId);
+      if (!plan || !phase) return createRuntimeToolResult({
+        success: false, error: 'unknown_plan_phase', phaseId,
+      }, {isError: true});
+      const nextStatus = resolution.status;
+      if (phase.status === 'completed' || phase.status === 'skipped') {
+        return nextStatus === phase.status
+          ? createRuntimeToolResult({success: true, unchanged: true, phaseId, status: phase.status})
+          : createRuntimeToolResult({success: false, error: 'closed_phase_immutable', phaseId}, {isError: true});
       }
-
-      const phase = plan.phases.find(p => p.id === phaseId);
-      if (!phase) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error: localize(outputLanguage, `plan 中没有找到阶段 "${phaseId}"`, `Phase "${phaseId}" not found in plan`),
-            }),
-          }],
-          isError: true,
-        };
+      const evidence = getPhaseToolEvidenceStatus(plan, phase);
+      if (nextStatus === 'completed' && !evidence.satisfied) return createRuntimeToolResult({
+        success: false, error: 'missing_phase_evidence', action_required: evidence.missingExpectedTools.length > 0
+          ? 'run_expected_tools_before_completing_phase' : 'run_expected_calls_before_completing_phase',
+        phaseId, missingExpectedCalls: evidence.missingExpectedCalls, missingExpectedTools: evidence.missingExpectedTools,
+        ...(evidence.missingExpectedTools.length ? {expectedTools: evidence.missingExpectedTools} : {}),
+      }, {isError: true});
+      if (nextStatus === 'skipped' && !hasValidPlanSkipDisposition(plan, {...phase, skipDisposition})) {
+        return createRuntimeToolResult({success: false, error: 'invalid_skip_disposition', phaseId}, {isError: true});
       }
-
-      const trimmedSummary = summary?.trim();
-      if ((normalizedStatus === 'completed' || normalizedStatus === 'skipped') && pendingPlanRevisionGate) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(buildPendingPlanRevisionResponse('update_plan_phase')),
-          }],
-          isError: true,
-        };
-      }
-      if ((normalizedStatus === 'completed' || normalizedStatus === 'skipped') &&
-        (!trimmedSummary || trimmedSummary.length < MIN_PHASE_SUMMARY_CHARS)) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error: localize(
-                outputLanguage,
-                `阶段 ${phaseId} 的 summary 太短。完成/跳过阶段时必须给出具体证据、数据或原因，至少 ${MIN_PHASE_SUMMARY_CHARS} 个字符。`,
-                `Phase ${phaseId} summary is too brief. Completed/skipped phases require concrete evidence, data, or reason with at least ${MIN_PHASE_SUMMARY_CHARS} characters.`,
-              ),
-              action_required: 'retry_update_plan_phase_with_evidence',
-            }),
-          }],
-          isError: true,
-        };
-      }
-
-      if (normalizedStatus === 'skipped' && isConclusionLikePlanPhase(phase)) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error: localize(
-                outputLanguage,
-                `阶段 ${phaseId} 是最终结论阶段，不能标记为 skipped。请先补齐必要证据，然后将该阶段标记为 completed，并输出最终结论。`,
-                `Phase ${phaseId} is the final conclusion phase and cannot be skipped. Collect the required evidence first, then mark it completed and produce the final conclusion.`,
-              ),
-              action_required: 'complete_final_conclusion_phase',
-              currentPhaseId: phase.id,
-              currentPhaseName: phase.name,
-            }),
-          }],
-          isError: true,
-        };
-      }
-
-      if (normalizedStatus === 'skipped' && (phase.expectedCalls ?? []).length > 0) {
-        const missingExpectedCalls = findMissingExpectedCallsForPhase(
-          phase,
-          Array.isArray(plan.toolCallLog) ? plan.toolCallLog : [],
-        );
-        if (missingExpectedCalls.length > 0 && !skipSummaryExplainsEvidenceBoundary(trimmedSummary!)) {
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: localize(
-                  outputLanguage,
-                  `阶段 ${phaseId} 声明了关键证据调用，不能仅因已有初步根因或认为不再重要而跳过。请先执行缺失调用；只有条件未触发或 Trace/参数确实不可用时，才能以具体证据边界标记 skipped。`,
-                  `Phase ${phaseId} declares critical evidence calls and cannot be skipped merely because a preliminary root cause already looks likely. Run the missing calls first; only an unmet condition or genuinely unavailable trace data/parameters can justify skipped.`,
-                ),
-                action_required: 'run_expected_calls_or_explain_unavailability',
-                currentPhaseId: phase.id,
-                currentPhaseName: phase.name,
-                missingExpectedCalls,
-              }),
-            }],
-            isError: true,
-          };
-        }
-      }
-
-      const semanticMismatch = findPhaseSemanticMismatch(plan, phase, trimmedSummary);
-      if (normalizedStatus === 'completed' && !semanticMismatch) {
-        const prospectivePlan: AnalysisPlanV3 = {
-          ...plan,
-          phases: plan.phases.map(p =>
-            p.id === phase.id
-              ? {
-                  ...p,
-                  status: 'completed' as const,
-                  summary: trimmedSummary,
-                  completedAt: Date.now(),
-                }
-              : p,
-          ),
-        };
-        const evidenceGap = findCompletedPhaseEvidenceGaps(prospectivePlan)
-          .find(gap => gap.phase.id === phase.id);
-        if (evidenceGap) {
-          const message = formatPlanEvidenceGap(evidenceGap, outputLanguage);
-          const missingGenericToolEvidence = Boolean(evidenceGap.missingGenericToolEvidence);
-          return {
-            content: [{
-              type: 'text' as const,
-              text: JSON.stringify({
-                success: false,
-                error: localize(
-                  outputLanguage,
-                  `${message}。请先调用缺失的关键工具，或如果数据确实不可用则将阶段标记为 skipped 并说明原因。`,
-                  `${message}. Call the missing required tool first, or mark the phase skipped with a concrete reason if the data is genuinely unavailable.`,
-                ),
-                action_required: missingGenericToolEvidence
-                  ? 'run_expected_tools_before_completing_phase'
-                  : 'run_expected_calls_before_completing_phase',
-                currentPhaseId: phase.id,
-                currentPhaseName: phase.name,
-                missingExpectedCalls: evidenceGap.missingExpectedCalls,
-                ...(missingGenericToolEvidence
-                  ? {expectedTools: phase.expectedTools}
-                  : {}),
-              }),
-            }],
-            isError: true,
-          };
-        }
-      }
-
-      if (semanticMismatch) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error: localize(
-                outputLanguage,
-                `阶段 ${phaseId} 是「${phase.name}」，但 summary 更像「${PHASE_SEMANTIC_LABELS[semanticMismatch.summaryKind]}」。请改用阶段 ${semanticMismatch.suggestedPhase.id}（${semanticMismatch.suggestedPhase.name}）或重写 summary。`,
-                `Phase ${phaseId} is "${phase.name}", but the summary looks like "${PHASE_SEMANTIC_LABELS[semanticMismatch.summaryKind]}". Use phase ${semanticMismatch.suggestedPhase.id} (${semanticMismatch.suggestedPhase.name}) or rewrite the summary.`,
-              ),
-              action_required: 'retry_update_plan_phase_with_correct_phase',
-              currentPhaseId: phase.id,
-              currentPhaseName: phase.name,
-              suggestedPhaseId: semanticMismatch.suggestedPhase.id,
-              suggestedPhaseName: semanticMismatch.suggestedPhase.name,
-              detectedSummaryKind: semanticMismatch.summaryKind,
-            }),
-          }],
-          isError: true,
-        };
-      }
-
-      if (normalizedStatus === 'in_progress') {
-        closeSupersededInProgressPhases(plan, phase);
-        phase.completedAt = undefined;
-        phase.summary = undefined;
-      }
-
-      phase.status = normalizedStatus;
-      if (normalizedStatus === 'completed' || normalizedStatus === 'skipped') {
+      if (nextStatus === 'in_progress') closeSupersededInProgressPhases(plan, phase);
+      phase.status = nextStatus;
+      delete phase.completionSource;
+      if (nextStatus === 'in_progress') {
+        delete phase.completedAt;
+        delete phase.skipDisposition;
+      } else {
         phase.completedAt = Date.now();
-        phase.summary = trimmedSummary;
+        if (nextStatus === 'skipped') phase.skipDisposition = structuredClone(skipDisposition!);
       }
-
+      phase.summary = typeof summary === 'string' ? summary.trim() : undefined;
       emitUpdate?.({
         type: 'plan_phase_updated',
-        content: planPhaseUpdatedContent({ phaseId, status: normalizedStatus, summary: trimmedSummary || '', phaseName: phase.name, origin: 'model' }),
+        content: planPhaseUpdatedContent({phaseId, status: nextStatus, summary: phase.summary ?? '', phaseName: phase.name, origin: 'model'}),
         timestamp: Date.now(),
       });
-
-      // Report overall plan progress
-      const allPhasesClosed =
-        plan.phases.every(p => p.status === 'completed' || p.status === 'skipped') &&
-        findCompletedPhaseEvidenceGaps(plan).length === 0;
-      const nextPhase = plan.phases.find(p => p.status === 'pending');
-
-      // Compact return: only include feedback when needed (normal path = minimal ACK)
-      const response: Record<string, any> = { success: true };
-      if (allPhasesClosed) response.allPhasesComplete = true;
-
-      // Restatement injection: leverage tool response's high-attention position
-      // to re-state next-phase constraints from strategy frontmatter phase_hints.
-      // Match logic lives in `phaseHintMatcher` so it can be unit tested.
-      const shouldReportNextPhase = normalizedStatus === 'completed' || normalizedStatus === 'skipped';
-      if (shouldReportNextPhase && nextPhase && options.sceneType) {
-        const hints = getPhaseHints(options.sceneType);
-        const matchedHint = matchPhaseHintForNextPhase({
-          hints,
-          nextPhase: { name: nextPhase.name, goal: nextPhase.goal },
-          finishedPhases: plan.phases.map(p => ({
-            name: p.name,
-            goal: p.goal,
-            summary: p.summary,
-            status: p.status,
+      const completion = getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 0});
+      return createRuntimeToolResult({
+        success: true, allPhasesComplete: completion.complete,
+        ...(completion.unresolvedExpectations?.length ? {
+          unresolvedExpectations: completion.unresolvedExpectations.map(gap => ({
+            phaseId: gap.phase.id, disposition: gap.phase.skipDisposition,
+            missingExpectedCalls: gap.missingExpectedCalls, missingExpectedTools: gap.missingExpectedTools,
           })),
-        });
-
-        if (matchedHint) {
-          const contentHash =
-            evaluationPhaseHintInjectionContentHash(matchedHint);
-          const decision = registerEvaluationInjection({
-            category: 'phaseHints',
-            id: matchedHint.id,
-            contentHash,
-            placement: 'mcp:update_plan_phase',
-          });
-          if (decision.allowed) {
-            runManifestAttributionSink?.recordInjection(
-              'phaseHints',
-              matchedHint.id,
-              contentHash,
-            );
-            response.next_phase_reminder = {
-              phaseId: nextPhase.id,
-              name: nextPhase.name,
-              constraints: matchedHint.constraints,
-              criticalTools: matchedHint.criticalTools,
-              ...(matchedHint.maxToolCalls ? {maxToolCalls: matchedHint.maxToolCalls} : {}),
-            };
-            console.log(`[MCP] Phase hint injected: ${matchedHint.id} for ${options.sceneType}`);
-          }
-        } else if (hints.length > 0) {
-          console.log(
-            `[MCP] Phase hint not found for ${options.sceneType}: ` +
-            diagnosticLogIdentity(nextPhase.name),
-          );
-        }
-
-        // Always include basic next phase info for non-hint scenarios
-        if (!response.next_phase_reminder) {
-          response.next = {
-            phaseId: nextPhase.id,
-            name: nextPhase.name,
-            expectedTools: nextPhase.expectedTools,
-          };
-        }
-        const nextPhaseDetail = buildStrategyDetailDelivery(nextPhase, 'next_phase');
-        if (nextPhaseDetail) {
-          response.next_phase_detail = nextPhaseDetail;
-        }
-      }
-
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify(response),
-        }],
-      };
-    }
+        } : {}),
+      });
+    },
   ) : null;
 
-  // P1-3: Dynamic replan — allows Claude to revise the plan mid-analysis when new information emerges
   const revisePlan = analysisPlanRef ? tool(
     'revise_plan',
     'Revise your analysis plan mid-execution when new information changes priorities. ' +
@@ -7160,12 +5853,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      const normalizedUpdatedPhases = moveConclusionPhasesLast(
-        updatedPhaseInputs.map((p): NormalizedPlanPhaseToolInput => ({
-          ...normalizePlanPhaseToolInput(p),
-          status: normalizePlanPhaseStatus(readAliasedField(p, ['status'])),
-        })),
-      );
+      const normalizedUpdatedPhases = updatedPhaseInputs.map((p): NormalizedPlanPhaseToolInput => ({
+        ...normalizePlanPhaseToolInput(p),
+        status: normalizePlanPhaseStatus(readAliasedField(p, ['status'])),
+      }));
       const phaseShapeErrors = collectPlanPhaseShapeErrors(normalizedUpdatedPhases);
       if (phaseShapeErrors.length > 0) {
         return {
@@ -7274,11 +5965,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      let candidatePhases = normalizedUpdatedPhases.map((up): PlanPhase => {
+      const candidatePhases = normalizedUpdatedPhases.map((up): PlanPhase => {
         const original = plan.phases.find(p => p.id === up.id);
         if (original && (original.status === 'completed' || original.status === 'skipped')) {
           // Preserve completed phase data
-          return { ...original };
+          return structuredClone(original);
         }
         return {
           id: up.id,
@@ -7290,84 +5981,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       });
 
-      const initialValidation = validatePhasesAgainstSceneTemplate(candidatePhases, waiverInputs);
-      const materializedPlanCalls = materializeMentionedRequiredSkillCalls(
-        candidatePhases,
-        initialValidation.missingAspectRequirements ?? [],
-      );
-      candidatePhases = materializedPlanCalls.phases;
-      const unavailableMaterializedSkills = collectUnavailableExpectedSkillErrors(
-        candidatePhases,
-        expectedSkillRegistry,
-        new Set(registry.listForRequest(toolRequestScope).map(toolDefinition => toolDefinition.name)),
-      );
-      if (unavailableMaterializedSkills.length > 0) {
-        const suggestedSkillIds = suggestRegisteredSkillIds(unavailableMaterializedSkills, expectedSkillRegistry);
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify({
-              success: false,
-              error: localize(
-                outputLanguage,
-                'revise_plan 物化出的 expectedCalls 引用了当前会话不可用的 Skill。',
-                'revise_plan materialized expectedCalls that reference Skills unavailable in this session.',
-              ),
-              unavailableExpectedSkills: unavailableMaterializedSkills,
-              ...(suggestedSkillIds.length > 0 ? {suggestedSkillIds} : {}),
-              action_required: 'revise_plan',
-            }),
-          }],
-          isError: true,
-        };
-      }
-      const validation = materializedPlanCalls.additions.length > 0
-        ? validatePhasesAgainstSceneTemplate(candidatePhases, waiverInputs)
-        : initialValidation;
-      if ((validation.incompatibleExpectedCalls?.length ?? 0) > 0) {
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(buildIncompatiblePlanCallsRejectPayload(
-              'revise_plan',
-              validation.incompatibleExpectedCalls!,
-            )),
-          }],
-          isError: true,
-        };
-      }
-      const revisedPlanWarnings = validation.warnings;
-      const missingAspectIds = validation.missingAspectIds;
-      const nonWaivableMissingAspectIds = validation.nonWaivableMissingAspectIds ?? [];
-      const acceptedWaivers = waiverInputs.filter(
-        w => typeof w.reason === 'string' && w.reason.trim().length >= MIN_WAIVER_REASON_CHARS,
-      );
-      const tooShortWaivers = waiverInputs.filter(
-        w => !acceptedWaivers.some(a => a.aspectId === w.aspectId),
-      );
-
-      planReviseAttempts++;
-      if (revisedPlanWarnings.length > 0 &&
-        (planReviseAttempts < MAX_PLAN_ATTEMPTS || nonWaivableMissingAspectIds.length > 0)) {
-        console.log(`[MCP] Revised plan rejected (attempt ${planReviseAttempts}/${MAX_PLAN_ATTEMPTS}): missing ${missingAspectIds.length} aspects for ${options.sceneType ?? 'unknown scene'}`);
-        return {
-          content: [{
-            type: 'text' as const,
-            text: JSON.stringify(buildPlanGateRejectPayload({
-              missingAspectIds,
-              nonWaivableMissingAspectIds,
-              planWarnings: revisedPlanWarnings,
-              missingAspectRequirements: validation.missingAspectRequirements ?? [],
-              attempt: planReviseAttempts,
-              tooShortWaivers,
-              mode: 'revise_plan',
-            })),
-          }],
-          isError: true,
-        };
-      }
-      const forcedAccept = revisedPlanWarnings.length > 0;
-
       const expectedCallKey = (call: NonNullable<PlanPhase['expectedCalls']>[number]): string =>
         `${shortExpectedToolName(call.tool)}:${call.skillId ? shortExpectedToolName(call.skillId) : ''}`;
       const updatedPhaseById = new Map(candidatePhases.map(phase => [phase.id, phase]));
@@ -7377,12 +5990,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const updatedCallKeys = new Set((updated?.expectedCalls ?? []).map(expectedCallKey));
         const removedExpectedCalls = (original.expectedCalls ?? [])
           .filter(call => !updatedCallKeys.has(expectedCallKey(call)));
-        return removedExpectedCalls.length > 0
-          ? [{ phaseId: original.id, removedExpectedCalls }]
+        const updatedTools = new Set((updated?.expectedTools ?? []).map(shortExpectedToolName));
+        const removedExpectedTools = (original.expectedTools ?? []).filter(tool => !updatedTools.has(shortExpectedToolName(tool)));
+        return removedExpectedCalls.length > 0 || removedExpectedTools.length > 0
+          ? [{phaseId: original.id, removedExpectedCalls, removedExpectedTools}]
           : [];
       });
       if (weakenedPhases.length > 0) {
-        planReviseAttempts = 0;
         return {
           content: [{
             type: 'text' as const,
@@ -7405,14 +6019,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       const revision: PlanRevision = {
         revisedAt: Date.now(),
         reason: normalizedReason,
-        previousPhases: plan.phases.map(p => ({ ...p })),
+        previousPhases: structuredClone(plan.phases),
       };
       if (!plan.revisionHistory) plan.revisionHistory = [];
       plan.revisionHistory.push(revision);
 
       // Apply revision: merge completed phase data (summary, completedAt) with updated structure
       plan.phases = candidatePhases;
-      clearPendingPlanRevisionGate(plan);
 
       const normalizedUpdatedSuccessCriteria = coercePlanString(
         readAliasedField(args, ['updatedSuccessCriteria', 'updated_success_criteria']),
@@ -7420,19 +6033,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       if (normalizedUpdatedSuccessCriteria) {
         plan.successCriteria = normalizedUpdatedSuccessCriteria;
       }
-      if (acceptedWaivers.length > 0) {
-        plan.waivers = acceptedWaivers;
-      }
-      if (forcedAccept) {
-        plan.unresolvedAspects = Array.from(new Set([
-          ...(plan.unresolvedAspects ?? []),
-          ...missingAspectIds,
-        ]));
-      } else if (plan.unresolvedAspects) {
-        plan.unresolvedAspects = plan.unresolvedAspects.filter(id => missingAspectIds.includes(id));
-        if (plan.unresolvedAspects.length === 0) delete plan.unresolvedAspects;
-      }
-      planReviseAttempts = 0;
+      if (waiverInputs.length > 0) plan.waivers = waiverInputs;
+      delete plan.unresolvedAspects;
 
       emitUpdate?.({
         type: 'plan_revised',
@@ -7456,20 +6058,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         pendingPhases: pending.length,
         nextPhase: pending[0]?.id,
       };
-      if (acceptedWaivers.length > 0) {
-        reviseResponse.acceptedWaivers = acceptedWaivers.map(w => w.aspectId);
-      }
-      if (materializedPlanCalls.additions.length > 0) {
-        reviseResponse.materializedExpectedCalls = materializedPlanCalls.additions;
-      }
-      if (tooShortWaivers.length > 0) {
-        reviseResponse.tooShortWaivers = tooShortWaivers;
-      }
-      if (forcedAccept) {
-        reviseResponse.unresolvedAspects = missingAspectIds;
-        reviseResponse.sceneWarnings = revisedPlanWarnings;
-        console.log(`[MCP] Revised plan force-accepted with ${revisedPlanWarnings.length} unmet aspects for ${options.sceneType ?? 'unknown scene'}`);
-      }
       return {
         content: [{
           type: 'text' as const,
@@ -7495,10 +6083,19 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         || (detailId?.trim()
           ? (effectiveScene ? `${effectiveScene}:${detailId.trim()}` : detailId.trim())
           : '');
-      const detail = requestedRef ? getStrategyDetailByRef(requestedRef, effectiveScene) : undefined;
+      if (!requestedRef) {
+        const details = effectiveScene ? getStrategyDetails(effectiveScene, strategyRegistry) :
+          strategyRegistry.getAllStrategies().filter(def => def.strategyKind !== 'contract_only').flatMap(def => def.detailSections ?? []);
+        const catalog = details.slice(0, 24).map(detail => ({
+          detailRef: detail.ref, title: detail.title.slice(0, 160), description: detail.content.slice(0, 240),
+        }));
+        return createRuntimeToolResult({success: true, informational: true, catalog, truncated: details.length > catalog.length});
+      }
+      const candidate = getStrategyDetailByRef(requestedRef, effectiveScene, strategyRegistry);
+      const detail = candidate?.ref === requestedRef ? candidate : undefined;
       if (!detail) {
         const availableDetails = effectiveScene
-          ? getStrategyDetails(effectiveScene).map(d => ({ detailRef: d.ref, title: d.title }))
+          ? getStrategyDetails(effectiveScene, strategyRegistry).map(d => ({ detailRef: d.ref, title: d.title }))
           : [];
         return {
           content: [{
@@ -7927,6 +6524,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     '1. Check reference trace jank: trace="reference", sql="SELECT COUNT(*) FROM actual_frame_timeline_slice WHERE jank_type != \'None\'"\n' +
     '2. Compare CPU freq: trace="current", sql="SELECT cpu, AVG(value) as avg_freq FROM counter JOIN counter_track ON counter.track_id=counter_track.id WHERE counter_track.name GLOB \'cpu*freq\' GROUP BY cpu"',
     {
+      planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.'),
       trace: z.enum(['current', 'reference']).describe(
         'Which trace to query: "current" = primary trace loaded in Perfetto, "reference" = comparison trace.'
       ),
@@ -7935,13 +6533,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         'When true, returns column statistics + sample rows instead of full results. Default: false.'
       ),
     },
-    async ({ trace, sql, summary }, extra) => {
+    async ({ trace, sql, summary, planPhaseId }, extra) => {
       const signal = getRuntimeToolSignal(extra);
       throwIfTraceProcessorQueryCancelled(signal);
-      const planError = requirePlan('execute_sql_on');
-      if (planError) {
-        return { content: [{ type: 'text' as const, text: planError }] };
-      }
       const artifactSqlHint = artifactSqlMisuseHint(sql, outputLanguage);
       if (artifactSqlHint) {
         return {
@@ -7949,18 +6543,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const phaseBudgetError = consumePhaseToolCallBudget('execute_sql_on', {trace, sql, summary});
-      if (phaseBudgetError) {
-        return {
-          content: [{type: 'text' as const, text: JSON.stringify(phaseBudgetError)}],
-          isError: true,
-        };
-      }
+
       const targetTraceId = trace === 'reference' ? referenceTraceId : traceId;
       const traceLabel = `[${traceLocationDisplayLabel(trace)}]`;
       const producer = createEvidenceProducerContext(
         'execute_sql_on',
-        { trace, sql, summary },
+        {trace, sql, summary, planPhaseId},
         comparisonSqlProducerReason(trace),
         trace,
       );
@@ -7976,9 +6564,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const truncated = result.rows.length > 200;
         const rows = truncated ? result.rows.slice(0, 200) : result.rows;
         const success = !result.error;
+        const executionWitness = success ? captureEvidenceTable({columns: result.columns, rows: result.rows}) : undefined;
         const sqlArtifact = success && result.columns.length > 0 && result.rows.length > SQL_RAW_INLINE_ROW_LIMIT
           ? storeSqlResultArtifact(artifactStore, {
               toolName: 'execute_sql_on',
+              executionWitness,
               columns: result.columns,
               rows: result.rows,
               sql: finalSql,
@@ -8006,6 +6596,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
               {
                 durationMs,
                 truncated: false,
+                captureStore: artifactStore, executionWitness,
                 sqlRewrites,
                 toolName: 'execute_sql_on',
                 outputLanguage,
@@ -8013,7 +6604,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             );
             updateSqlArtifactQueryReview(artifactStore, sqlArtifact, emittedEvidence.queryReview);
           }
-          const text = JSON.stringify({
+          const text = {
             success: true,
             trace: traceLabel,
             traceSide: trace,
@@ -8040,8 +6631,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             ...(sqlRewrites.length > 0 ? { sqlRewrites } : {}),
             stdlibInjectedModules: injected,
             ...(processIdentityWarning ? { processIdentityWarning } : {}),
+          };
+          return createRuntimeToolResult(text, {
+            decorate: text => consumeWatchdogWarning(text + getReasoningNudge()),
           });
-          return { content: [{ type: 'text' as const, text: consumeWatchdogWarning(text + getReasoningNudge()) }] };
         }
 
         const durationMs = Date.now() - sqlStart;
@@ -8059,6 +6652,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             {
               durationMs,
               truncated,
+              captureStore: artifactStore, executionWitness,
               sqlRewrites,
               toolName: 'execute_sql_on',
               rowCount: result.rows.length,
@@ -8067,7 +6661,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           );
         }
 
-        const text = JSON.stringify(success ? {
+        const text = success ? {
           success,
           trace: traceLabel,
           traceSide: trace,
@@ -8102,8 +6696,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           processIdentityWarning,
           durationMs,
           outputLanguage,
-        }));
-        return { content: [{ type: 'text' as const, text: consumeWatchdogWarning(success ? text + getReasoningNudge() : text) }] };
+        });
+        return createRuntimeToolResult(text, {
+          decorate: text => consumeWatchdogWarning(success ? text + getReasoningNudge() : text),
+        });
       } catch (e: any) {
         rethrowIfTraceProcessorQueryCancelled(e);
         const traceProvenance = buildScopedTraceProvenance(targetTraceId, trace);
@@ -8140,6 +6736,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     '2. Compare startup detail with different windows: skillId="startup_detail", currentParams={startup_id:1,start_ts:100,end_ts:200}, referenceParams={startup_id:1,start_ts:500,end_ts:650}\n' +
     '3. Compare CPU: skillId="cpu_analysis"',
     {
+      planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.'),
       skillId: z.string().describe('Skill identifier to run on both traces'),
       params: z.record(z.string(), z.any()).optional().describe(
         'Shared parameters passed to both skill executions. Common: { process_name, start_ts, end_ts }'
@@ -8157,13 +6754,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         'Alias for referenceParams for OpenAI-compatible callers.'
       ),
     },
-    async ({ skillId, params, currentParams, referenceParams, current_params, reference_params }, extra) => {
+    async ({ skillId, params, currentParams, referenceParams, current_params, reference_params, planPhaseId }, extra) => {
       const signal = getRuntimeToolSignal(extra);
       throwIfTraceProcessorQueryCancelled(signal);
-      const planError = requirePlan('compare_skill');
-      if (planError) {
-        return { content: [{ type: 'text' as const, text: planError }] };
-      }
       try {
         const comparisonRegistry = await bindSkillRuntimeRegistry();
         const comparisonSkillDef = comparisonRegistry.getSkill(skillId);
@@ -8188,33 +6781,58 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         }
         const currentSideParams = currentParams ?? current_params;
         const referenceSideParams = referenceParams ?? reference_params;
+        const explicitInvalidParamsBySide = {
+          current: undeclaredModelSkillParams(comparisonSkillDef, {...params, ...currentSideParams}, true),
+          reference: undeclaredModelSkillParams(comparisonSkillDef, {...params, ...referenceSideParams}, true),
+        };
+        if (explicitInvalidParamsBySide.current.length || explicitInvalidParamsBySide.reference.length) {
+          return createRuntimeToolResult({success: false, skillId,
+            invalidParamsBySide: explicitInvalidParamsBySide,
+            action_required: 'retry_compare_skill_with_declared_side_params'});
+        }
+        const sharedNumericSelectors = ['upid', 'pid'].filter(key => params?.[key] != null);
+        if (sharedNumericSelectors.some(key => currentSideParams?.[key] == null || referenceSideParams?.[key] == null)) {
+          return createRuntimeToolResult({ success: false, skillId,
+            error: 'Trace-local UPID/PID selectors require explicit currentParams and referenceParams; they cannot be shared across traces.',
+            action_required: 'provide_per_trace_process_selectors' });
+        }
         const referenceSharedParams = referenceSharedParamsForComparison(
-          params,
+          {...params, ...referenceSideParams},
           packageName,
           comparisonContext?.referencePackageName,
-          comparisonSkillDef.inputs,
+          comparisonSkillDef,
         );
         const normalizedCurrentParams = normalizeSkillParams(
           { ...(params ?? {}), ...(currentSideParams ?? {}) },
           packageName,
-          comparisonSkillDef.inputs,
+          comparisonSkillDef,
         );
         const normalizedReferenceParams = normalizeSkillParams(
           { ...referenceSharedParams.params, ...(referenceSideParams ?? {}) },
           comparisonContext?.referencePackageName,
-          comparisonSkillDef.inputs,
+          comparisonSkillDef,
         );
+        const [preparedCurrent, preparedReference] = await Promise.all([
+          skillExecutor.prepareInvocation(skillId, traceId, normalizedCurrentParams, { __traceSide: 'current', signal }),
+          skillExecutor.prepareInvocation(skillId, referenceTraceId, normalizedReferenceParams, { __traceSide: 'reference', signal }),
+        ]);
+        if (!preparedCurrent.allowed || !preparedReference.allowed) return createRuntimeToolResult({ success: false, skillId,
+          error: 'Process scope admission failed for comparison.',
+          sideErrors: { current: preparedCurrent.error, reference: preparedReference.error },
+          action_required: 'provide_per_trace_process_selectors' });
         const [currentParamResolution, referenceParamResolution] = await Promise.allSettled([
           resolveRegisteredDrillDownSkillParams({
             skillId,
-            params: normalizedCurrentParams,
+            params: preparedCurrent.params,
+            processScope: preparedCurrent.processScope,
             traceId,
             traceProcessorService,
             signal,
           }),
           resolveRegisteredDrillDownSkillParams({
             skillId,
-            params: normalizedReferenceParams,
+            params: preparedReference.params,
+            processScope: preparedReference.processScope,
             traceId: referenceTraceId,
             traceProcessorService,
             signal,
@@ -8301,7 +6919,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
         const baseProducer = createEvidenceProducerContext(
           'compare_skill',
-          producerInput,
+          {...producerInput, planPhaseId},
           localize(
             outputLanguage,
             `对比 Skill ${skillId}，在${traceLocationDisplayLabel('current')}和${traceLocationDisplayLabel('reference')}上收集同构证据。`,
@@ -8326,18 +6944,18 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const currentTraceProvenance = buildScopedTraceProvenance(traceId, 'current');
         const referenceTraceProvenance = buildScopedTraceProvenance(referenceTraceId, 'reference');
         const [currentSettled, referenceSettled] = await Promise.allSettled([
-          skillExecutor.execute(skillId, traceId, effectiveParams, {
+          executePreparedSkill(skillId, traceId, effectiveParams, {
             __traceSide: 'current',
             __outputLanguage: outputLanguage,
             ...(currentTraceProvenance.paneSide ? { __paneSide: currentTraceProvenance.paneSide } : {}),
             signal,
-          }),
-          skillExecutor.execute(skillId, referenceTraceId, refParams, {
+          }, preparedCurrent.processScope),
+          executePreparedSkill(skillId, referenceTraceId, refParams, {
             __traceSide: 'reference',
             __outputLanguage: outputLanguage,
             ...(referenceTraceProvenance.paneSide ? { __paneSide: referenceTraceProvenance.paneSide } : {}),
             signal,
-          }),
+          }, preparedReference.processScope),
         ]);
         if (currentSettled.status === 'rejected') {
           rethrowIfTraceProcessorQueryCancelled(currentSettled.reason);
@@ -8418,6 +7036,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             undefined,
             currentResult.displayResults as SkillDisplayResult[],
             outputLanguage,
+            artifactStore,
           );
         }
         if (emitUpdate && localizedReferenceDisplayResults.length) {
@@ -8440,6 +7059,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             undefined,
             refResult.displayResults as SkillDisplayResult[],
             outputLanguage,
+            artifactStore,
           );
         }
 
@@ -8450,9 +7070,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             title: r.title,
             rowCount: r.data?.rows?.length || 0,
             columns: r.data?.columns || [],
+            ...scopeMetadata(r.scopeProvenance),
+            executionStatus: r.executionStatus,
+            executionMessage: r.executionMessage,
           }));
 
-        const text = JSON.stringify({
+        const text = {
           success,
           ...(!success ? {
             partial: currentSuccess !== referenceSuccess,
@@ -8482,6 +7105,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             steps: buildStepSummary(localizedCurrentDisplayResults),
             diagnosticCount: currentResult.diagnostics?.length || 0,
             identityResolution: currentResult.identityResolution,
+            scopeProvenance: currentResult.scopeProvenance,
+            scopeLimitations: currentResult.scopeLimitations,
+            partial: currentResult.partial,
             error: currentResult.error,
           },
           reference: {
@@ -8496,6 +7122,9 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             steps: buildStepSummary(localizedReferenceDisplayResults),
             diagnosticCount: refResult.diagnostics?.length || 0,
             identityResolution: refResult.identityResolution,
+            scopeProvenance: refResult.scopeProvenance,
+            scopeLimitations: refResult.scopeLimitations,
+            partial: refResult.partial,
             error: refResult.error,
           },
           alignment: {
@@ -8513,12 +7142,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
                 '修正失败侧的参数后重试 compare_skill；如果两侧分析窗口不同，请同时提供 currentParams 和 referenceParams。',
                 'Fix the failed-side parameters and retry compare_skill; provide both currentParams and referenceParams when the analysis windows differ.',
               ),
-        });
-
-        return {
-          content: [{ type: 'text' as const, text: consumeWatchdogWarning(text + getReasoningNudge()) }],
-          ...(!success ? { isError: true } : {}),
         };
+
+        return createRuntimeToolResult(text, {
+          decorate: text => consumeWatchdogWarning(text + getReasoningNudge()),
+          isError: !success,
+        });
       } catch (e: any) {
         rethrowIfTraceProcessorQueryCancelled(e);
         return {
@@ -8586,101 +7215,75 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   // re-deciding policy. Registration order is preserved exactly to
   // keep SDK behavior identical to the pre-refactor toolEntries
   // array — trace regression validates that.
-  const registry = new McpToolRegistry({runManifestAttributionSink});
+  const registry = new McpToolRegistry({
+    runManifestAttributionSink,
+    toolObserver: options.toolObserver,
+    requestScope: toolRequestScope,
+  });
   const sourceOnlyPhase = sourceUsePolicy?.phase === 'automatic_enrichment' ||
     sourceUsePolicy?.phase === 'deep_enrichment';
 
-  if (options.lightweight) {
-    // Lightweight mode: core data-access tools only — no planning,
-    // hypothesis, notes, or advanced tools. Plan gate is automatically
-    // disabled because analysisPlan is not passed in lightweight mode.
-    // `invoke_skill` returns artifact references, so `fetch_artifact` must
-    // stay available or lightweight models try to query artifact IDs as SQL.
-    const isConversation = options.conversationTraceAttached !== undefined;
-    if ((!isConversation || options.conversationTraceAttached) && !sourceOnlyPhase) {
-      registry.registerSdk(executeSql, 'execute_sql', 'public');
-      registry.registerSdk(invokeSkill, 'invoke_skill', 'public');
-      // Without this, `invoke_skill` is reachable but undiscoverable: the quick
-      // prompt names exactly one skill, so every other question degrades into
-      // hand-written exploratory SQL. The quick projection is capped.
-      registry.registerSdk(listSkills, 'list_skills', 'public');
-      registry.registerSdk(lookupSqlSchema, 'lookup_sql_schema', 'public', {
-        concurrency: {mode: 'commutative_read'},
-      });
-      if (fetchArtifact) registry.registerSdk(fetchArtifact, 'fetch_artifact', 'public');
-    }
-    if (isConversation || sourceUsePolicy) {
-      if (knowledgeSourceIds.length > 0 && !sourceOnlyPhase) {
-        registry.registerSdk(lookupBlogKnowledge, 'lookup_blog_knowledge', 'public');
-      }
-      registry.registerSdk(listCodebases, 'list_codebases', 'requires_codebase_permission');
-      registry.registerSdk(searchCodebase, 'search_codebase', 'requires_codebase_permission');
-      registry.registerSdk(readCodebaseFile, 'read_codebase_file', 'requires_codebase_permission');
-      if (!sourceUsePolicy) {
-        registry.registerSdk(queryCodeGraph, 'query_code_graph', 'requires_codebase_permission');
-        registry.registerSdk(inspectCodeSymbol, 'inspect_code_symbol', 'requires_codebase_permission');
-        registry.registerSdk(lookupAppSource, 'lookup_app_source', 'requires_codebase_permission');
-        registry.registerSdk(lookupKernelSource, 'lookup_kernel_source', 'requires_codebase_permission');
-        registry.registerSdk(resolveSymbol, 'resolve_symbol', 'requires_codebase_permission');
-      }
-    }
-  } else if (sourceOnlyPhase) {
-    registry.registerSdk(listCodebases, 'list_codebases', 'requires_codebase_permission');
-    registry.registerSdk(searchCodebase, 'search_codebase', 'requires_codebase_permission');
-    registry.registerSdk(readCodebaseFile, 'read_codebase_file', 'requires_codebase_permission');
+  if (sourceOnlyPhase) {
+    registry.registerSdk(listCodebases, 'list_codebases', 'requires_codebase_permission', {evidenceEffect: 'none'});
+    registry.registerSdk(searchCodebase, 'search_codebase', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+    registry.registerSdk(readCodebaseFile, 'read_codebase_file', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
   } else {
-    // Full mode: all always-on tools + conditional tools.
-    registry.registerSdk(executeSql, 'execute_sql', 'public');
-    registry.registerSdk(invokeSkill, 'invoke_skill', 'public');
-    registry.registerSdk(listSkills, 'list_skills', 'public');
-    registry.registerSdk(detectArchitecture, 'detect_architecture', 'public');
+    // Budget mode does not change the authorized capability set.
+    if (options.conversationTraceAttached !== false) {
+      registry.registerSdk(executeSql, 'execute_sql', 'public', {evidenceEffect: 'acquire'});
+      registry.registerSdk(invokeSkill, 'invoke_skill', 'public', {evidenceEffect: 'acquire'});
+      registry.registerSdk(detectArchitecture, 'detect_architecture', 'public', {evidenceEffect: 'acquire'});
+    }
+    registry.registerSdk(listSkills, 'list_skills', 'public', {evidenceEffect: 'none'});
     registry.registerSdk(lookupSqlSchema, 'lookup_sql_schema', 'public', {
+      evidenceEffect: 'none',
       concurrency: {mode: 'commutative_read'},
     });
     registry.registerSdk(listStdlibModules, 'list_stdlib_modules', 'public', {
+      evidenceEffect: 'none',
       concurrency: {mode: 'commutative_read'},
     });
-    registry.registerSdk(lookupKnowledge, 'lookup_knowledge', 'public');
-    registry.registerSdk(lookupBlogKnowledge, 'lookup_blog_knowledge', 'public');
-    registry.registerSdk(listCodebases, 'list_codebases', 'requires_codebase_permission');
-    registry.registerSdk(searchCodebase, 'search_codebase', 'requires_codebase_permission');
-    registry.registerSdk(readCodebaseFile, 'read_codebase_file', 'requires_codebase_permission');
+    registry.registerSdk(lookupKnowledge, 'lookup_knowledge', 'public', {evidenceEffect: 'none'});
+    registry.registerSdk(lookupBlogKnowledge, 'lookup_blog_knowledge', 'public', {evidenceEffect: 'acquire'});
+    registry.registerSdk(listCodebases, 'list_codebases', 'requires_codebase_permission', {evidenceEffect: 'none'});
+    registry.registerSdk(searchCodebase, 'search_codebase', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+    registry.registerSdk(readCodebaseFile, 'read_codebase_file', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
     if (!sourceUsePolicy) {
-      registry.registerSdk(queryPerfettoSource, 'query_perfetto_source', 'public');
-      registry.registerSdk(lookupAospSource, 'lookup_aosp_source', 'public');
-      registry.registerSdk(lookupOemSdk, 'lookup_oem_sdk', 'public');
-      registry.registerSdk(queryCodeGraph, 'query_code_graph', 'requires_codebase_permission');
-      registry.registerSdk(inspectCodeSymbol, 'inspect_code_symbol', 'requires_codebase_permission');
-      registry.registerSdk(lookupAppSource, 'lookup_app_source', 'requires_codebase_permission');
-      registry.registerSdk(lookupKernelSource, 'lookup_kernel_source', 'requires_codebase_permission');
-      registry.registerSdk(resolveSymbol, 'resolve_symbol', 'requires_codebase_permission');
-      registry.registerSdk(proposePatch, 'propose_patch', 'requires_codebase_permission');
+      registry.registerSdk(queryPerfettoSource, 'query_perfetto_source', 'public', {evidenceEffect: 'acquire'});
+      registry.registerSdk(lookupAospSource, 'lookup_aosp_source', 'public', {evidenceEffect: 'acquire'});
+      registry.registerSdk(lookupOemSdk, 'lookup_oem_sdk', 'public', {evidenceEffect: 'acquire'});
+      registry.registerSdk(queryCodeGraph, 'query_code_graph', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+      registry.registerSdk(inspectCodeSymbol, 'inspect_code_symbol', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+      registry.registerSdk(lookupAppSource, 'lookup_app_source', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+      registry.registerSdk(lookupKernelSource, 'lookup_kernel_source', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+      registry.registerSdk(resolveSymbol, 'resolve_symbol', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+      registry.registerSdk(proposePatch, 'propose_patch', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
     }
-    registry.registerSdk(lookupBaseline, 'lookup_baseline', 'public');
-    registry.registerSdk(compareBaselines, 'compare_baselines', 'public');
-    registry.registerSdk(recallProjectMemory, 'recall_project_memory', 'public');
-    registry.registerSdk(recallSimilarCase, 'recall_similar_case', 'public');
-    registry.registerSdk(recallSimilarResult, 'recall_similar_result', 'public');
-    if (writeAnalysisNote) registry.registerSdk(writeAnalysisNote, 'write_analysis_note', 'internal');
-    if (fetchArtifact) registry.registerSdk(fetchArtifact, 'fetch_artifact', 'public');
-    if (submitPlan) registry.registerSdk(submitPlan, 'submit_plan', 'internal');
-    if (updatePlanPhase) registry.registerSdk(updatePlanPhase, 'update_plan_phase', 'internal');
-    if (revisePlan) registry.registerSdk(revisePlan, 'revise_plan', 'internal');
-    registry.registerSdk(lookupStrategyDetail, 'lookup_strategy_detail', 'internal');
-    if (submitHypothesis) registry.registerSdk(submitHypothesis, 'submit_hypothesis', 'internal');
-    if (resolveHypothesis) registry.registerSdk(resolveHypothesis, 'resolve_hypothesis', 'internal');
-    if (flagUncertainty) registry.registerSdk(flagUncertainty, 'flag_uncertainty', 'internal');
+    registry.registerSdk(lookupBaseline, 'lookup_baseline', 'public', {evidenceEffect: 'read_existing'});
+    registry.registerSdk(compareBaselines, 'compare_baselines', 'public', {evidenceEffect: 'read_existing'});
+    registry.registerSdk(recallProjectMemory, 'recall_project_memory', 'public', {evidenceEffect: 'read_existing'});
+    registry.registerSdk(recallSimilarCase, 'recall_similar_case', 'public', {evidenceEffect: 'acquire'});
+    registry.registerSdk(recallSimilarResult, 'recall_similar_result', 'public', {evidenceEffect: 'acquire'});
+    if (writeAnalysisNote) registry.registerSdk(writeAnalysisNote, 'write_analysis_note', 'internal', {evidenceEffect: 'none'});
+    if (fetchArtifact) registry.registerSdk(fetchArtifact, 'fetch_artifact', 'public', {evidenceEffect: 'read_existing'});
+    if (submitPlan) registry.registerSdk(submitPlan, 'submit_plan', 'internal', {evidenceEffect: 'none'});
+    if (updatePlanPhase) registry.registerSdk(updatePlanPhase, 'update_plan_phase', 'internal', {evidenceEffect: 'none'});
+    if (revisePlan) registry.registerSdk(revisePlan, 'revise_plan', 'internal', {evidenceEffect: 'none'});
+    registry.registerSdk(lookupStrategyDetail, 'lookup_strategy_detail', 'internal', {evidenceEffect: 'none'});
+    if (submitHypothesis) registry.registerSdk(submitHypothesis, 'submit_hypothesis', 'internal', {evidenceEffect: 'none'});
+    if (resolveHypothesis) registry.registerSdk(resolveHypothesis, 'resolve_hypothesis', 'internal', {evidenceEffect: 'none'});
+    if (flagUncertainty) registry.registerSdk(flagUncertainty, 'flag_uncertainty', 'internal', {evidenceEffect: 'none'});
     // recall_patterns stays 'internal' for one more commit. Plan 41 M1b
     // routes the recall path through openSupersedeStoreReadOnly so it no
     // longer mkdir's or migrates the supersede DB on first call. The
     // public-readonly exposure flip is gated on the M1b invariant test
     // soaking for one release cycle to catch any hidden writable code
     // path; that flip is the M1b commit 2 follow-up.
-    registry.registerSdk(recallPatterns, 'recall_patterns', 'internal');
+    registry.registerSdk(recallPatterns, 'recall_patterns', 'internal', {evidenceEffect: 'read_existing'});
     // Comparison mode tools — only when referenceTraceId is provided.
-    if (compareSkill) registry.registerSdk(compareSkill, 'compare_skill', 'internal');
-    if (executeSqlOn) registry.registerSdk(executeSqlOn, 'execute_sql_on', 'internal');
-    if (getComparisonContext) registry.registerSdk(getComparisonContext, 'get_comparison_context', 'internal');
+    if (options.conversationTraceAttached !== false && compareSkill) registry.registerSdk(compareSkill, 'compare_skill', 'internal', {evidenceEffect: 'acquire'});
+    if (options.conversationTraceAttached !== false && executeSqlOn) registry.registerSdk(executeSqlOn, 'execute_sql_on', 'internal', {evidenceEffect: 'acquire'});
+    if (getComparisonContext) registry.registerSdk(getComparisonContext, 'get_comparison_context', 'internal', {evidenceEffect: 'read_existing'});
   }
 
   if (!sourceUsePolicy) {
@@ -8688,6 +7291,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       recordSourceUseDecision,
       'record_source_use_decision',
       'requires_codebase_permission',
+      {evidenceEffect: 'none'},
     );
   }
 
@@ -8746,6 +7350,7 @@ function storeSqlResultArtifact(
   artifactStore: ArtifactStore | undefined,
   input: {
     toolName: 'execute_sql' | 'execute_sql_on';
+    executionWitness?: EvidenceTableWitness;
     columns: string[];
     rows: any[][];
     sql: string;
@@ -8773,6 +7378,8 @@ function storeSqlResultArtifact(
     paramsHash: input.producer.paramsHash,
     traceProvenance: input.traceProvenance,
   });
+  if (input.executionWitness) artifactStore.registerEvidenceCapture?.(artifactId, input.executionWitness,
+    stableSqlEvidenceRefId(input.sql, input.columns, input.rows, input.traceProvenance, input.producer));
   return {
     artifactId,
     artifactSummary: artifactStore.generateCompactSummary(artifactId),
@@ -8812,10 +7419,12 @@ function stableSkillEvidenceRefId(
   data: unknown,
   traceProvenance?: TraceProcessorQueryProvenance,
   producer?: EvidenceProducerContext,
+  scopeProvenance?: EvidenceScopeProvenanceV1,
 ): string {
   const dataHash = evidenceHash({
     title,
     data,
+    scopeProvenance,
   });
   const toolPart = evidencePart(producer?.paramsHash || 'tool', 'tool');
   return `data:skill:${evidencePart(skillId, 'skill')}:${evidencePart(stepId || title, 'step')}:${evidenceTracePart(traceProvenance)}:${dataHash}:${toolPart}`;
@@ -8889,6 +7498,8 @@ function emitSqlDataEnvelope(
   processIdentityWarning?: string,
   artifactId?: string,
   options?: {
+    captureStore?: ArtifactStore;
+    executionWitness?: EvidenceTableWitness;
     durationMs?: number;
     truncated?: boolean;
     sqlRewrites?: string[];
@@ -8942,6 +7553,10 @@ function emitSqlDataEnvelope(
     },
   );
 
+  if (options?.executionWitness && options.captureStore) {
+    if (artifactId) options.captureStore.registerEvidenceCapture?.(artifactId, options.executionWitness, {evidenceRefId, queryHash});
+    else options.captureStore.registerStandaloneEvidenceCapture?.(options.executionWitness, {meta: envelope.meta, display: envelope.display});
+  }
   emit({
     type: 'data',
     content: [{
@@ -8971,6 +7586,8 @@ function emitSqlSummaryDataEnvelope(
   processIdentityWarning?: string,
   artifactId?: string,
   options?: {
+    captureStore?: ArtifactStore;
+    executionWitness?: EvidenceTableWitness;
     durationMs?: number;
     truncated?: boolean;
     sqlRewrites?: string[];
@@ -9033,6 +7650,10 @@ function emitSqlSummaryDataEnvelope(
     },
   );
 
+  if (options?.executionWitness && options.captureStore) {
+    if (artifactId) options.captureStore.registerEvidenceCapture?.(artifactId, options.executionWitness, {evidenceRefId, queryHash});
+    else options.captureStore.registerStandaloneEvidenceCapture?.(options.executionWitness, {meta: envelope.meta, display: envelope.display});
+  }
   emit({
     type: 'data',
     content: [{
@@ -9152,6 +7773,7 @@ function emitSkillDataEnvelopes(
   queryReviewsByDisplayIndex?: ReadonlyArray<QueryReviewV1 | undefined>,
   evidenceSourceDisplayResults?: SkillDisplayResult[],
   outputLanguage: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+  captureStore?: ArtifactStore,
 ): void {
   const envelopes = displayResults
     .map((dr, index) => ({
@@ -9176,6 +7798,7 @@ function emitSkillDataEnvelopes(
         evidenceSource.data,
         traceProvenance,
         producer,
+        evidenceSource.scopeProvenance,
       );
       const artifactId = artifactIdsByDisplayIndex?.[displayIndex];
       const queryReview = envelope.meta.stepId
@@ -9189,26 +7812,34 @@ function emitSkillDataEnvelopes(
             outputLanguage,
           })
         : undefined;
+      const evidenceIdentity = identityForScopeEvidence(evidenceSource.scopeProvenance, identityResolution);
       const withEvidence = {
         ...envelope,
         meta: {
           ...envelope.meta,
           evidenceRefId,
+          ...scopeMetadata(evidenceSource.scopeProvenance),
           traceSide: traceProvenance?.traceSide,
           paneSide: traceProvenance?.paneSide,
           traceId: traceProvenance?.traceId,
           ...(artifactId ? { artifactId, sourceArtifactId: artifactId } : {}),
           ...(queryReview ? { queryReview } : {}),
-          ...(identityResolution ? {
-            identityRefId: identityResolution.identityRefId,
-            identityStatus: identityResolution.status,
-            identityWarnings: identityResolution.warnings,
-            identityResolution,
+          ...(evidenceIdentity ? {
+            identityRefId: evidenceIdentity.identityRefId,
+            identityStatus: evidenceIdentity.status,
+            identityWarnings: evidenceIdentity.warnings,
+            identityResolution: evidenceIdentity,
           } : {}),
           ...producerEnvelopeOptions(producer),
           intent: 'skill_structured_result',
         },
       };
+      const witness = evidenceTableFor(evidenceSource) || captureEvidenceTable(undefined, {}, 'display_transformation_unmapped');
+      if (captureStore) {
+        if (artifactId) captureStore.registerEvidenceCapture?.(artifactId, witness, {evidenceRefId,
+          ...(evidenceSource.sql ? {queryHash: evidenceHash(evidenceSource.sql)} : {})});
+        else captureStore.registerStandaloneEvidenceCapture?.(witness, {meta: withEvidence.meta, display: withEvidence.display});
+      }
       return traceProvenance
         ? {
           ...withEvidence,

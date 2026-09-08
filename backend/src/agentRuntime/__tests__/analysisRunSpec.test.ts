@@ -141,6 +141,7 @@ describe('AnalysisRunSpec shadow mode', () => {
       selectionContext: options.selectionContext,
       hasReferenceTrace: true,
       previousTurns,
+      requestedMode: 'auto',
     }));
     expect(spec.mode).not.toHaveProperty('classifierPolicy');
     expect(spec).not.toHaveProperty('continuationPolicy');

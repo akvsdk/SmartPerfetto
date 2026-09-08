@@ -3,8 +3,11 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import type { SkillDefinition, SkillStep } from '../skillEngine/types';
+import type { IdentityTraceSide } from '../../types/identityContract';
+import { assertEffectiveProcessScope, createEffectiveProcessScope, verifiedIdentityForScope, type EffectiveProcessScope } from './effectiveProcessScope';
 import {
   DEFAULT_PROCESS_IDENTITY_ALIASES,
+  PROCESS_IDENTITY_SELECTORS,
   type ProcessIdentityResolution,
   type ProcessIdentityTarget,
   type SkillIdentityConfig,
@@ -12,6 +15,8 @@ import {
 
 export interface IdentityGateInput {
   traceId: string;
+  traceSide?: IdentityTraceSide;
+  processScope?: EffectiveProcessScope;
   skill: SkillDefinition;
   params: Record<string, any>;
   inherited?: Record<string, any>;
@@ -25,6 +30,7 @@ export interface IdentityGateResult {
   config: SkillIdentityConfig;
   target?: ProcessIdentityTarget;
   resolution?: ProcessIdentityResolution;
+  processScope?: EffectiveProcessScope;
   error?: string;
 }
 
@@ -163,6 +169,26 @@ export function getEffectiveIdentityConfig(skill: SkillDefinition): SkillIdentit
   return { policy: 'none' };
 }
 
+/** Selectors require either a declared input or an actual process-gate consumer. */
+export function getConsumableProcessIdentitySelectors(skill: SkillDefinition): Set<string> {
+  const declared = new Set(skill.inputs?.map(input => input.name) || []);
+  const allowed = new Set(PROCESS_IDENTITY_SELECTORS.filter(key => declared.has(key)));
+  const config = getEffectiveIdentityConfig(skill);
+  const targetBinding = skill.process_scope?.role === 'target' && Boolean(skill.process_scope.binding);
+  const hasProcessGate = config.scope === 'process' &&
+    (config.policy === 'required' || config.policy === 'verify_if_present') &&
+    (!skill.process_scope || skill.process_scope.role === 'target');
+  if (hasProcessGate) {
+    for (const key of [...DEFAULT_PROCESS_IDENTITY_ALIASES, ...(config.aliases || []), 'upid', 'pid']) allowed.add(key);
+  } else if (targetBinding) {
+    allowed.add('upid');
+    allowed.add('pid');
+  }
+  // Resolving a thread's process does not make the Skill's SQL thread-scoped.
+  for (const key of ['thread_name', 'threadName']) if (!declared.has(key)) allowed.delete(key);
+  return allowed;
+}
+
 function firstValue(source: Record<string, any>, keys: string[]): any {
   for (const key of keys) {
     const value = source[key];
@@ -174,7 +200,7 @@ function firstValue(source: Record<string, any>, keys: string[]): any {
 function coerceInteger(value: any): number | undefined {
   if (value === undefined || value === null || String(value).trim() === '') return undefined;
   const n = Number(value);
-  if (!Number.isInteger(n)) return undefined;
+  if (!Number.isSafeInteger(n) || n <= 0) return undefined;
   return n;
 }
 
@@ -184,10 +210,12 @@ export function extractProcessIdentityTarget(
   config: SkillIdentityConfig,
 ): ProcessIdentityTarget {
   const aliases = config.aliases?.length ? config.aliases : DEFAULT_PROCESS_IDENTITY_ALIASES;
-  const requestedName = firstValue(params, aliases) ?? firstValue(inherited, aliases);
+  const hasExplicitSelector = firstValue(params, [...DEFAULT_PROCESS_IDENTITY_ALIASES, ...aliases, 'upid', 'pid']) !== undefined;
+  const requestedName = firstValue(params, [...aliases, ...DEFAULT_PROCESS_IDENTITY_ALIASES]) ??
+    (hasExplicitSelector ? undefined : firstValue(inherited, aliases));
   const threadName = firstValue(params, ['thread_name', 'threadName']) ?? firstValue(inherited, ['thread_name', 'threadName']);
-  const upid = coerceInteger(firstValue(params, ['upid']) ?? firstValue(inherited, ['upid']));
-  const pid = coerceInteger(firstValue(params, ['pid']) ?? firstValue(inherited, ['pid']));
+  const upid = coerceInteger(firstValue(params, ['upid']) ?? (hasExplicitSelector ? undefined : firstValue(inherited, ['upid'])));
+  const pid = coerceInteger(firstValue(params, ['pid']) ?? (hasExplicitSelector ? undefined : firstValue(inherited, ['pid'])));
   const startTs = firstValue(params, ['start_ts', 'startTs']) ?? firstValue(inherited, ['start_ts', 'startTs']);
   const endTs = firstValue(params, ['end_ts', 'endTs']) ?? firstValue(inherited, ['end_ts', 'endTs']);
 
@@ -224,38 +252,36 @@ function rewriteParams(
   const declaredInputs = new Set((skill.inputs || []).map(input => input.name));
   const hasInputDeclarations = Array.isArray(skill.inputs) && skill.inputs.length > 0;
 
-  if (config.rewriteTo === 'upid' && resolution.upids.length > 0) {
+  if (config.rewriteTo === 'upid' && resolution.upids.length === 1 && target.upid === undefined) {
     rewritten.upid = resolution.upids[0];
     return rewritten;
   }
 
   const recommended = resolution.recommendedProcessNameParam;
-  if (!recommended) return rewritten;
+  if (!recommended && target.upid === undefined) return rewritten;
 
   const aliases = config.aliases?.length ? config.aliases : DEFAULT_PROCESS_IDENTITY_ALIASES;
-  let rewroteExisting = false;
   for (const alias of aliases) {
     if (rewritten[alias] !== undefined && rewritten[alias] !== null && String(rewritten[alias]).trim() !== '') {
       rewritten[alias] = recommended;
-      rewroteExisting = true;
     }
   }
 
-  if (target.requestedName) {
+  if (target.requestedName || target.upid !== undefined) {
     // Keep legacy YAML skills safe: most process filters read either package or
     // process_name regardless of which alias the caller originally supplied.
     if (hasInputDeclarations) {
       for (const alias of aliases) {
         if (declaredInputs.has(alias) && rewritten[alias] === undefined) {
-          rewritten[alias] = recommended;
+          rewritten[alias] = recommended || '';
         }
       }
     }
     if (rewritten.package !== undefined || declaredInputs.has('package') || !hasInputDeclarations) {
-      rewritten.package = recommended;
+      rewritten.package = recommended || '';
     }
     if (rewritten.process_name !== undefined || declaredInputs.has('process_name') || !hasInputDeclarations) {
-      rewritten.process_name = recommended;
+      rewritten.process_name = recommended || '';
     }
     if (hasInputDeclarations) {
       for (const alias of aliases) {
@@ -279,14 +305,47 @@ export class IdentityGate {
   async apply(input: IdentityGateInput): Promise<IdentityGateResult> {
     const inherited = input.inherited || {};
     const config = getEffectiveIdentityConfig(input.skill);
-    const skipForInternalResolver = (inherited as any).__skipIdentityGate === true &&
-      input.skill.name === 'process_identity_resolver';
-
-    if (skipForInternalResolver || config.policy === 'none' || config.policy === 'exempt') {
-      return { allowed: true, params: input.params, inherited, config };
+    const traceSide = input.traceSide || 'current';
+    const parentScope = input.processScope;
+    const blocked = (error: string): IdentityGateResult => ({
+      allowed: false, params: input.params, inherited, config, error,
+    });
+    const consumableSelectors = getConsumableProcessIdentitySelectors(input.skill);
+    const unusedThreadSelectors = ['thread_name', 'threadName'].filter(key =>
+      firstValue(input.params, [key]) !== undefined && !consumableSelectors.has(key));
+    if (unusedThreadSelectors.length && input.skill.name !== 'process_identity_resolver') {
+      return blocked(`Skill does not declare a thread filter input: ${unusedThreadSelectors.join(', ')}`);
+    }
+    if (parentScope) {
+      try { assertEffectiveProcessScope(parentScope, input.traceId, traceSide); }
+      catch (error) { return blocked((error as Error).message); }
+    }
+    for (const key of ['upid', 'pid']) {
+      const value = firstValue(input.params, [key]);
+      // Zero is the legacy SQL fallback for an omitted selector. An explicitly
+      // supplied zero must not enter that fallback and widen the target.
+      if (value !== undefined && coerceInteger(value) === undefined) {
+        return blocked(`Invalid explicit ${key}: expected a positive safe integer`);
+      }
     }
 
-    const target = extractProcessIdentityTarget(input.params, inherited, config);
+    // Resolver queries inspect identity metadata; they do not select target evidence.
+    if (input.skill.name === 'process_identity_resolver') {
+      return { allowed: true, params: input.params, inherited, config,
+        processScope: parentScope ?? createEffectiveProcessScope(input.traceId, traceSide) };
+    }
+
+    let target = extractProcessIdentityTarget(input.params, inherited, config);
+    if (parentScope?.mode === 'exact_upid') {
+      if (target.upid !== undefined && target.upid !== parentScope.upid) {
+        return blocked('Child Skill cannot change the inherited exact UPID');
+      }
+      target.upid = parentScope.upid;
+    }
+    if (target.upid === undefined && target.pid === undefined && (config.policy === 'none' || config.policy === 'exempt')) {
+      return { allowed: true, params: input.params, inherited, config,
+        processScope: parentScope ?? createEffectiveProcessScope(input.traceId, traceSide, target) };
+    }
     if (!hasTarget(target)) {
       if (config.policy === 'required') {
         return {
@@ -298,10 +357,73 @@ export class IdentityGate {
           error: `Process identity is required before running skill "${input.skill.name}", but no package/process/upid target was provided.`,
         };
       }
-      return { allowed: true, params: input.params, inherited, config, target };
+      return { allowed: true, params: input.params, inherited, config, target,
+        processScope: parentScope ?? createEffectiveProcessScope(input.traceId, traceSide) };
     }
 
-    const resolution = await input.resolve(target);
+    const storedIdentity = parentScope ? verifiedIdentityForScope(parentScope) : undefined;
+    const prepared = storedIdentity?.resolution.status === 'verified' && !storedIdentity.resolution.resolverError
+      ? storedIdentity : undefined;
+    const newThreadTarget = target.threadName && target.threadName !== prepared?.target.threadName;
+    const sameNamedTarget = parentScope?.mode === 'named' && prepared && target.upid === undefined &&
+      target.pid === undefined &&
+      (!target.requestedName || [prepared.target.requestedName, prepared.resolution.canonicalPackageName,
+        prepared.resolution.recommendedProcessNameParam].includes(target.requestedName));
+    // Identity belongs to this trace instance, independently of the requested
+    // analysis interval. Recheck selectors below; do not re-query on enrichment.
+    let resolution = (parentScope?.mode === 'exact_upid' || sameNamedTarget) && prepared && !newThreadTarget
+      ? prepared.resolution : await input.resolve(target);
+    const explicitSelectors = [...new Set([...DEFAULT_PROCESS_IDENTITY_ALIASES, ...(config.aliases || [])])]
+      .map(key => ({ key, value: firstValue(input.params, [key]) })).filter(item => item.value !== undefined);
+    const explicitNames = explicitSelectors.map(item => String(item.value).trim());
+    const conflict = (error: string): IdentityGateResult => ({
+      ...blocked(error), target,
+      resolution: { ...resolution, status: 'ambiguous', upids: [], warnings: [...resolution.warnings, error] },
+    });
+    if (target.pid !== undefined && target.upid === undefined) {
+      const selected = resolution.candidates.filter(candidate => candidate.pid === target.pid &&
+        candidate.upid !== undefined && resolution.upids.includes(candidate.upid));
+      if (resolution.status !== 'verified' || resolution.upids.length !== 1 ||
+          !selected.some(candidate => candidate.upid === resolution.upids[0])) {
+        return conflict('Explicit PID must resolve to one verified UPID; select the intended UPID when the PID was reused');
+      }
+      target = {...target, upid: resolution.upids[0]};
+    }
+    if (target.upid !== undefined) {
+      const selected = resolution.candidates.filter(candidate => candidate.upid === target.upid);
+      if (resolution.status !== 'verified' || resolution.upids.length !== 1 || resolution.upids[0] !== target.upid) {
+        return conflict('Explicit UPID could not be verified; no other process may replace it');
+      }
+      const names = new Set([
+        ...selected.flatMap(candidate => [candidate.processName, candidate.metadataProcessName,
+          candidate.packageName, candidate.canonicalPackageName, candidate.cmdline, candidate.recommendedProcessNameParam]),
+        resolution.canonicalPackageName, resolution.recommendedProcessNameParam,
+      ].filter(Boolean));
+      const processNames = new Set(selected.flatMap(candidate => [candidate.processName,
+        candidate.metadataProcessName, candidate.cmdline, candidate.recommendedProcessNameParam]));
+      if (selected.length === 0) processNames.add(resolution.recommendedProcessNameParam);
+      if (explicitSelectors.some(({ key, value }) =>
+          !(key === 'process_name' || key === 'processName' ? processNames : names).has(String(value).trim())) ||
+          (target.pid !== undefined && !selected.some(candidate => candidate.pid === target.pid))) {
+        return conflict('Explicit process name/PID conflicts with the selected UPID');
+      }
+      resolution = { ...resolution, upids: [target.upid], candidates: selected };
+      if (parentScope?.mode === 'named' && parentScope.requestedName) {
+        const boundary = parentScope.requestedName;
+        const belongs = selected.some(candidate => [candidate.processName, candidate.metadataProcessName,
+          candidate.packageName, candidate.canonicalPackageName, candidate.cmdline]
+          .some(name => name === boundary || name?.startsWith(`${boundary}:`)));
+        if (!belongs) return conflict('Resolved UPID is outside the inherited named process scope');
+      }
+    } else if (new Set(explicitNames).size > 1) {
+      const knownNames = new Set([resolution.canonicalPackageName, resolution.recommendedProcessNameParam,
+        ...resolution.candidates.filter(candidate => candidate.upid !== undefined && resolution.upids.includes(candidate.upid))
+          .flatMap(candidate => [candidate.processName, candidate.packageName,
+          candidate.metadataProcessName, candidate.canonicalPackageName, candidate.cmdline])]);
+      if (explicitNames.some(name => !knownNames.has(name))) {
+        return conflict('Explicit process selector aliases conflict');
+      }
+    }
     const verified = isVerified(resolution, config);
 
     if (!verified) {
@@ -311,7 +433,7 @@ export class IdentityGate {
         : `${base}: status=${resolution.status}, confidence=${resolution.confidenceScore}`;
 
       // Keep current broad overview flows resilient when the resolver itself is unavailable.
-      if (config.policy === 'verify_if_present' && resolution.status === 'unresolved' && resolution.resolverError) {
+      if (target.upid === undefined && config.policy === 'verify_if_present' && resolution.status === 'unresolved' && resolution.resolverError) {
         return {
           allowed: true,
           params: input.params,
@@ -323,6 +445,7 @@ export class IdentityGate {
           config,
           target,
           resolution,
+          processScope: createEffectiveProcessScope(input.traceId, traceSide, target, resolution),
         };
       }
 
@@ -338,6 +461,8 @@ export class IdentityGate {
     }
 
     const params = rewriteParams(input.params, input.skill, target, resolution, config);
+    if (target.upid !== undefined && input.skill.inputs?.some(item => item.name === 'upid')) params.upid = target.upid;
+    if (target.pid !== undefined && input.skill.inputs?.some(item => item.name === 'pid')) params.pid = target.pid;
     return {
       allowed: true,
       params,
@@ -348,6 +473,8 @@ export class IdentityGate {
       config,
       target,
       resolution,
+      processScope: parentScope?.mode === 'exact_upid' || sameNamedTarget ? parentScope :
+        createEffectiveProcessScope(input.traceId, traceSide, target, resolution),
     };
   }
 }

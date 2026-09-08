@@ -23,33 +23,21 @@ import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import type {OutputLanguage} from '../agentv3/outputLanguage';
 import {
   privateAnalysisQueryMessage,
-  projectPrivateAnalysisReceipt,
-  projectPrivateClaimSupport,
-  projectPrivateClaimVerification,
-  projectPrivateConclusion,
   projectPrivateDataEnvelopes,
-  projectPrivateIdentityResolutions,
-  projectPrivateStructuredValue,
   projectPrivateTerminationMessage,
   projectPrivateTerminationReason,
   projectPrivateUiActionProposals,
+  projectPrivateAnalysisResult,
+  copyAnalysisResultForSnapshot,
 } from './security/privateAnalysisProjection';
-import type {ConclusionContract} from '../agent/core/conclusionContract';
+import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import {
-  sanitizeSourceUseDecision,
-  type SourceUseDecisionV1,
-} from './codebase/sourceUseDecision';
-import {
-  projectSafeSourceProvenance,
-  sanitizeConclusionSourceContract,
-  verifySourceClaimBindings,
-} from './codebase/sourceClaimVerifier';
-import {
-  collectMatchedTraceEvidenceRefIdsByClaimId,
-  collectVerifiedTraceOccurrenceRefIdsByClaimId,
-} from './verifier/claimVerificationRunner';
+  copyAnalysisDeliveryFields,
+  type AnalysisDeliveryFields,
+} from './security/analysisDeliveryProjection';
+import type {SourceUseDecisionV1} from './codebase/sourceUseDecision';
 
-export interface CompletedAnalysisSnapshotInput {
+export interface CompletedAnalysisSnapshotInput extends AnalysisDeliveryFields {
   tenantId?: string;
   workspaceId?: string;
   userId?: string;
@@ -62,6 +50,8 @@ export interface CompletedAnalysisSnapshotInput {
   conclusion?: string;
   conclusionContract?: unknown;
   sourceUseDecision?: SourceUseDecisionV1;
+  sourceClaimVerificationResult?: AnalysisResult['sourceClaimVerificationResult'];
+  success?: boolean;
   claimSupport?: import('../types/evidenceContract').ClaimSupportV1[];
   claimVerificationResult?: import('../types/claimVerification').ClaimVerificationResult;
   identityResolutions?: import('../types/identityContract').IdentityResolutionV1[];
@@ -500,42 +490,19 @@ export function buildCompletedAnalysisResultSnapshot(
       ? input.traceSummary
       : storedAnalysisReceipt?.traceSummary,
   );
-  let conclusionContract = input.conclusionContract;
-  if (
-    conclusionContract &&
-    typeof conclusionContract === 'object' &&
-    !Array.isArray(conclusionContract) &&
-    (conclusionContract as Record<string, unknown>).schemaVersion === 'conclusion_contract_v1'
-  ) {
-    const sanitized = sanitizeConclusionSourceContract(conclusionContract as ConclusionContract, {
-      actualSourceUseDecision: input.sourceUseDecision ?? null,
-    });
-    const verification = verifySourceClaimBindings({
-      conclusionContract: sanitized,
-      actualSourceUseDecision: input.sourceUseDecision,
-      matchedTraceEvidenceRefIdsByClaimId: input.claimVerificationResult
-        ? collectMatchedTraceEvidenceRefIdsByClaimId(input.claimVerificationResult)
-        : {},
-      verifiedTraceOccurrenceRefIdsByClaimId: input.claimVerificationResult
-        ? collectVerifiedTraceOccurrenceRefIdsByClaimId(input.claimVerificationResult)
-        : {},
-    });
-    const verifiedContract = verification.status === 'not_checked'
-      ? sanitized
-      : {...sanitized, sourceClaimBindings: verification.bindings};
-    const sourceProvenance = projectSafeSourceProvenance({
-      conclusionContract: verifiedContract,
-      actualSourceUseDecision: input.sourceUseDecision,
-    });
-    conclusionContract = sourceProvenance
-      ? {
-          ...verifiedContract,
-          sourceUseDecision: sourceProvenance.sourceUseDecision,
-          sourceReferences: sourceProvenance.sourceUseDecision.references,
-          sourceClaimBindings: sourceProvenance.sourceClaimBindings,
-        }
-      : verifiedContract;
-  }
+  // Reuse the session serializer: finalized contracts stay exact; a changed
+  // legacy source projection cannot keep positive bindings for its old inputs.
+  const storedResult = copyAnalysisResultForSnapshot({
+    sessionId: input.sessionId, success: input.success ?? true, findings: [], hypotheses: [],
+    conclusion: input.conclusion ?? '', confidence: input.confidence ?? 0, rounds: 0, totalDurationMs: 0,
+    turnIntent: input.turnIntent, completion: input.completion, outputOrigin: input.outputOrigin,
+    runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, deliveryAssurance: input.deliveryAssurance,
+    conclusionContract: input.conclusionContract as AnalysisResult['conclusionContract'],
+    claimSupport: input.claimSupport, claimVerificationResult: input.claimVerificationResult,
+    sourceUseDecision: input.sourceUseDecision, sourceClaimVerificationResult: input.sourceClaimVerificationResult,
+    identityResolutions: input.identityResolutions, analysisReceipt,
+  });
+  const conclusionContract = storedResult.conclusionContract;
 
   return {
     id: `analysis-result-${crypto.randomUUID()}`,
@@ -554,20 +521,24 @@ export function buildCompletedAnalysisResultSnapshot(
     traceMetadata: {},
     summary: {
       headline,
+      ...(input.conclusion !== undefined ? {conclusion: input.conclusion} : {}),
+      ...copyAnalysisDeliveryFields(storedResult),
+      ...(storedResult.sourceUseDecision ? {sourceUseDecision: storedResult.sourceUseDecision} : {}),
+      ...(storedResult.sourceClaimVerificationResult ? {sourceClaimVerificationResult: storedResult.sourceClaimVerificationResult} : {}),
       ...(input.confidence !== undefined ? { confidence: input.confidence } : {}),
       ...(partialReasons.length > 0 ? { partialReasons } : {}),
-      ...(analysisReceipt ? { analysisReceipt } : {}),
+      ...(storedResult.analysisReceipt ? {analysisReceipt: storedResult.analysisReceipt} : {}),
       ...(traceSummary ? {traceSummary} : {}),
       ...(input.uiActionProposals && input.uiActionProposals.length > 0 ? { uiActionProposals: input.uiActionProposals } : {}),
     },
     ...(conclusionContract ? { conclusionContract } : {}),
-    ...(input.claimSupport ? { claimSupport: input.claimSupport } : {}),
-    ...(input.claimVerificationResult ? { claimVerificationResult: input.claimVerificationResult } : {}),
+    ...(storedResult.claimSupport ? {claimSupport: storedResult.claimSupport} : {}),
+    ...(storedResult.claimVerificationResult ? {claimVerificationResult: storedResult.claimVerificationResult} : {}),
     ...(input.identityResolutions ? { identityResolutions: input.identityResolutions } : {}),
     ...(capabilityManifest ? {capabilityManifest} : {}),
     metrics,
     evidenceRefs: evidenceRefsFromInput(input),
-    status: input.partial || metrics.length === 0 ? 'partial' : 'ready',
+    status: input.success === false ? 'failed' : input.partial || metrics.length === 0 ? 'partial' : 'ready',
     schemaVersion: ANALYSIS_RESULT_SNAPSHOT_SCHEMA_VERSION,
     createdAt,
   };
@@ -663,37 +634,36 @@ export function persistCompletedAnalysisResultSnapshot(
 ): AnalysisResultSnapshot | null {
   const outputLanguage = input.outputLanguage
     ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
+  const privateResult = input.privateKnowledge ? projectPrivateAnalysisResult(input.sessionId, {
+    sessionId: input.sessionId, success: input.success ?? true,
+    findings: [], hypotheses: [], conclusion: input.conclusion ?? '',
+    confidence: input.confidence ?? 0, rounds: 0, totalDurationMs: 0,
+    turnIntent: input.turnIntent, completion: input.completion, outputOrigin: input.outputOrigin,
+    runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, deliveryAssurance: input.deliveryAssurance,
+    conclusionContract: input.conclusionContract as AnalysisResult['conclusionContract'],
+    claimSupport: input.claimSupport, claimVerificationResult: input.claimVerificationResult,
+    sourceUseDecision: input.sourceUseDecision, sourceClaimVerificationResult: input.sourceClaimVerificationResult,
+    identityResolutions: input.identityResolutions,
+    analysisReceipt: input.analysisReceipt,
+  }, outputLanguage) : undefined;
+  const {turnIntent: _intent, completion: _completion, outputOrigin: _origin, runtimeAppendix: _appendix,
+    reportAssessment: _assessment, deliveryAssurance: _assurance, ...inputWithoutDelivery} = input;
   const durableInput: CompletedAnalysisSnapshotInput = input.privateKnowledge
     ? {
-        ...input,
+        ...inputWithoutDelivery,
         query: privateAnalysisQueryMessage(outputLanguage),
         traceLabel: input.traceId,
-        conclusion: projectPrivateConclusion({
-          sessionId: input.sessionId,
-          conclusion: input.conclusion,
-          success: true,
-          language: outputLanguage,
-        }),
-        conclusionContract: input.conclusionContract
-          ? projectPrivateStructuredValue(input.sessionId, input.conclusionContract)
-          : undefined,
-        sourceUseDecision: input.sourceUseDecision
-          ? sanitizeSourceUseDecision(
-              projectPrivateStructuredValue(input.sessionId, input.sourceUseDecision),
-            )
-          : undefined,
-        claimSupport: projectPrivateClaimSupport(input.sessionId, input.claimSupport),
-        claimVerificationResult: projectPrivateClaimVerification(
-          input.sessionId,
-          input.claimVerificationResult,
-        ),
-        identityResolutions: projectPrivateIdentityResolutions(
-          input.sessionId,
-          input.identityResolutions,
-        ),
+        ...copyAnalysisDeliveryFields(privateResult ?? {}),
+        conclusion: privateResult?.conclusion,
+        conclusionContract: privateResult?.conclusionContract,
+        sourceUseDecision: privateResult?.sourceUseDecision,
+        sourceClaimVerificationResult: privateResult?.sourceClaimVerificationResult,
+        claimSupport: privateResult?.claimSupport,
+        claimVerificationResult: privateResult?.claimVerificationResult,
+        identityResolutions: privateResult?.identityResolutions,
         terminationReason: projectPrivateTerminationReason(input.terminationReason),
         terminationMessage: projectPrivateTerminationMessage(input.terminationMessage, outputLanguage),
-        analysisReceipt: projectPrivateAnalysisReceipt(input.analysisReceipt),
+        analysisReceipt: privateResult?.analysisReceipt,
         uiActionProposals: projectPrivateUiActionProposals(
           input.sessionId,
           input.uiActionProposals,

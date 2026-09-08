@@ -3,6 +3,7 @@
 
 ---
 scene: anr
+classification_description: "Application unresponsiveness, ANR triggers, deadlocks and timeout-related blocking."
 priority: 1
 effort: medium
 required_capabilities:
@@ -35,10 +36,9 @@ final_report_contract:
     - id: anr_diagnostic_api_boundary
       label: ANR 诊断 API/外部聚合边界
       description: '当用户主动提到 ApplicationExitInfo、ProfilingTrigger、Play/Android Vitals 或客户端 watchdog 时，区分系统确认 ANR、客户端预警、Profiling artifact、Play 聚合和当前 trace 根因证据。'
-      trigger_patterns:
-        - 'ApplicationExitInfo|getHistoricalProcessExitReasons|getAnrInfo|REASON_ANR'
-        - 'ProfilingManager|ProfilingTrigger|TRIGGER_TYPE_ANR'
-        - 'Play Vitals|Android Vitals|user-perceived ANR|client watchdog|SDK watchdog'
+      condition:
+        kind: semantic
+        description: '当问题要求解释、比较或使用系统 ANR 诊断记录、剖析产物、外部聚合指标或客户端 watchdog 告警时适用。'
       pattern_groups:
         - ['ANR 诊断 API/外部聚合边界', 'ANR diagnostic API', 'system-confirmed', 'client watchdog', 'Play Vitals', 'ProfilingTrigger', 'ApplicationExitInfo']
         - ['diagnostic_api', 'profiling_artifact', 'external_aggregate', 'ApplicationExitInfo', 'getAnrInfo', 'REASON_ANR', 'ProfilingManager', 'ProfilingTrigger', 'TRIGGER_TYPE_ANR', 'Play Vitals', 'Android Vitals', 'watchdog']

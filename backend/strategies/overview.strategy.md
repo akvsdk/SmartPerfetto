@@ -3,6 +3,7 @@
 
 ---
 scene: overview
+classification_description: "Reconstructing what happened across a trace and identifying which broad performance issues warrant investigation."
 priority: 5
 effort: high
 required_capabilities:

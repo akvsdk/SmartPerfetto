@@ -49,6 +49,8 @@ steps:
   # Step 2: 限频检测（复用 _cpu_topology 视图）
   - id: throttle_detection
     type: atomic
+    process_scope:
+      role: global_context
     name: "热控限频检测"
     display:
       level: detail

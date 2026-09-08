@@ -14,6 +14,7 @@ import { SkillExecutor, createSkillExecutor, LayeredResult } from '../../src/ser
 import { SkillDefinition, StepResult, SkillExecutionResult, SkillExecutionContext } from '../../src/services/skillEngine/types';
 import { validateSkillInputs } from '../../src/services/skillEngine/skillValidator';
 import { normalizeSkillDefinition } from '../../src/services/skillEngine/skillLoader';
+import { assertEffectiveProcessScope } from '../../src/services/processIdentity/effectiveProcessScope';
 import yaml from 'js-yaml';
 import fs from 'fs';
 
@@ -203,10 +204,9 @@ export class SkillEvaluator {
 
     const skillsDir = path.join(process.cwd(), 'skills');
     const visited = new Set<string>([this.skill.name]);
-    const queue = [...this.collectReferencedSkills(this.skill.steps || [])];
-    if (this.requiresProcessIdentityResolver(this.skill)) {
-      queue.push('process_identity_resolver');
-    }
+    // Explicit UPID/PID selectors invoke the identity gate even without an
+    // identity block. Root and nested Skills share this executor dependency.
+    const queue = [...this.collectReferencedSkills(this.skill.steps || []), 'process_identity_resolver'];
 
     while (queue.length > 0) {
       const skillName = queue.shift();
@@ -228,13 +228,6 @@ export class SkillEvaluator {
         console.warn(`[SkillEvaluator] Dependent skill not found: ${skillName}`);
       }
     }
-  }
-
-  private requiresProcessIdentityResolver(skill: SkillDefinition): boolean {
-    const identityPolicy = skill.identity?.policy;
-    return identityPolicy !== undefined
-      && identityPolicy !== 'none'
-      && identityPolicy !== 'exempt';
   }
 
   private collectReferencedSkills(steps: any[]): string[] {
@@ -350,7 +343,11 @@ export class SkillEvaluator {
       throw new Error('SkillEvaluator not initialized. Call loadTrace() first.');
     }
 
-    const validation = validateSkillInputs(this.skill.name, this.skill.inputs, params);
+    const gate = await this.executor.prepareInvocation(this.skill.name, this.traceId, params);
+    if (!gate.allowed) throw new Error(gate.error ?? 'Skill identity admission failed');
+    if (!gate.processScope) throw new Error('Skill identity admission did not issue a process scope');
+    assertEffectiveProcessScope(gate.processScope, this.traceId, 'current');
+    const validation = validateSkillInputs(this.skill.name, this.skill.inputs, gate.params);
     if (validation.errors.length > 0) {
       const msg = validation.errors.map(error => `${error.paramName}: ${error.message}`).join('; ');
       throw new Error(`Input validation failed: ${msg}`);
@@ -370,7 +367,8 @@ export class SkillEvaluator {
     const context: SkillExecutionContext = {
       traceId: this.traceId,
       params: validation.params,
-      inherited: {},
+      inherited: gate.inherited,
+      processScope: gate.processScope,
       results: {},
       variables: {},
       moduleIncludes,

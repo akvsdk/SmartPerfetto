@@ -3,6 +3,7 @@
 
 ---
 scene: pipeline
+classification_description: "Identifying the application rendering architecture and the path from frame production to composition and presentation."
 priority: 4
 effort: medium
 required_capabilities:
@@ -62,9 +63,9 @@ final_report_contract:
     - id: buffer_fence_boundary
       label: BufferQueue/Fence 边界
       description: '区分 producer queue/dequeue、SF acquire/latch、BLAST transaction、acquire/present/release fence，避免把 queueBuffer 等同上屏。'
-      trigger_patterns:
-        - 'BufferQueue|BLAST|queueBuffer|dequeueBuffer'
-        - 'acquire\s+fence|present\s+fence|release\s+fence|\bfence\b|背压|槽位'
+      condition:
+        kind: semantic
+        description: '当问题要求分析图形缓冲区的生产、交接、消费、背压或同步 fence，或判断缓冲区提交与实际显示的关系时适用。'
       pattern_groups:
         - ['BufferQueue/Fence', 'BufferQueue', 'BLAST', 'queueBuffer', 'dequeueBuffer', 'latch']
         - ['acquire', 'present', 'release', 'fence', 'Fence', 'Transaction', 'backpressure', '背压', '槽位']
@@ -72,11 +73,9 @@ final_report_contract:
     - id: graphics_memory_policy_boundary
       label: 图形内存/刷新策略边界
       description: '当问题涉及 GraphicBuffer/dma-buf、图形内存、refresh-rate/ARR/VRR 或 HWC/SF policy 时，说明证据来源、缺口和版本/设备边界。'
-      trigger_patterns:
-        - 'GraphicBuffer|dma[-_ ]?buf|graphics\s+memory|图形内存|GPU memory'
-        - 'refresh[-\s]?rate|刷新率|ARR|VRR|setFrameRate|View\.setRequestedFrameRate'
-        - '(?:SurfaceFlinger|SF|HWC).*(?:policy|策略|refresh|刷新率|overlay|composition|composite|合成)'
-        - '(?:overlay|composition|composite|合成).*(?:SurfaceFlinger|SF|HWC)'
+      condition:
+        kind: semantic
+        description: '当问题涉及图形缓冲区或 GPU 内存、刷新率选择、自适应刷新，或系统显示合成策略及其设备差异时适用。'
       pattern_groups:
         - ['GraphicBuffer', 'dma[-_ ]?buf', 'graphics\s+memory', '图形内存', '刷新率', 'refresh[-\s]?rate', 'ARR', 'VRR', 'SurfaceFlinger', '\bSF\b', '\bHWC\b', 'overlay', 'composition', 'composite', '合成']
         - ['图形内存/刷新策略边界', 'graphics\s+memory\s+boundary', 'refresh\s+policy\s+boundary', 'policy', '策略', '缺失', 'missing', '边界', 'confidence', '置信度']

@@ -36,6 +36,12 @@ import {
   SynthesizeConfig,
 } from './types';
 import { validateSkillInputs } from './skillValidator';
+import { EXACT_UPID_TOKEN, getExactProcessScopeSupport, sqlScopeDeclarationError, selectProcessScopeSql, type ScopedSqlSource } from './processScopeSql';
+import { assertEffectiveProcessScope, type EffectiveProcessScope } from '../processIdentity/effectiveProcessScope';
+import { sqlScopeEvidence, resultScopeProvenance, resultScopeLimitations } from './scopeEvidence';
+import {attachEvidenceTable, captureEvidenceTable, capturedEvidenceTable, evidenceTableFor, evidenceCaptureHash,
+  type CapturedFieldSemantics} from '../evidence/evidenceCapture';
+import { scopeMetadata, mergeScopeProvenance, identityForScopeEvidence, scopeProvenanceForFields, type EvidenceScopeMetadata, type EvidenceScopeProvenanceV1 } from '../../types/identityContract';
 import logger from '../../utils/logger';
 import { parseLlmJson } from '../../utils/llmJson';
 import { redactObjectForLLM, redactTextForLLM } from '../../utils/llmPrivacy';
@@ -106,7 +112,7 @@ import { DisplayLayer } from './types';
  * Synthesize Data - 标记为 synthesize 的步骤数据
  * 用于最终总结时的数据聚合
  */
-export interface SynthesizeData {
+export interface SynthesizeData extends EvidenceScopeMetadata {
   /** 步骤 ID */
   stepId: string;
   /** 步骤名称 */
@@ -154,6 +160,9 @@ export interface LayeredResult {
   };
   /** Raw step results, including hidden/no-layer steps. */
   stepResults?: StepResult[];
+  scopeProvenance?: EvidenceScopeProvenanceV1;
+  scopeLimitations?: string[];
+  partial?: boolean;
   /** YAML 中标记为 synthesize: true 的步骤数据，用于最终总结 */
   synthesizeData?: SynthesizeData[];
 }
@@ -644,6 +653,13 @@ function substituteVariables(sql: string, context: SkillExecutionContext): strin
     const actualPath = pipeIndex >= 0 ? rawPath.substring(0, pipeIndex).trim() : rawPath;
     const explicitDefault = pipeIndex >= 0 ? rawPath.substring(pipeIndex + 1).trim() : undefined;
 
+    if (actualPath === '__process_scope' || actualPath.startsWith('__process_scope.')) {
+      if (match !== EXACT_UPID_TOKEN) throw new Error('Unsupported reserved process scope binding');
+      const scope = context.processScope;
+      if (!scope) throw new Error('Reserved process scope binding requires an issued process scope');
+      assertEffectiveProcessScope(scope, context.traceId, scope.traceSide);
+      return scope.mode === 'exact_upid' ? String(scope.upid) : 'NULL';
+    }
     const value = ExpressionEvaluator.resolvePath(actualPath, context);
 
     // 缺省值优先级：
@@ -998,6 +1014,7 @@ function organizeByLayer(steps: StepResult[]): LayeredResult['layers'] {
               const transformedData = transformDeepFrameAnalysis(displayResults);
 
               const frameStepResult: StepResult = {
+                ...scopeMetadata(resultScopeProvenance(iterItem.result)),
                 stepId: frameId,
                 stepType: 'atomic',
                 success: iterItem.result?.success ?? false,
@@ -1037,6 +1054,8 @@ function organizeByLayer(steps: StepResult[]): LayeredResult['layers'] {
                 }
 
                 const frameStepResult: StepResult = {
+                  ...scopeMetadata(resultScopeProvenance(normalizedStep)),
+                  sql: normalizedStep.sql,
                   stepId: frameId,
                   stepType: 'atomic',
                   success: normalizedStep.success,
@@ -1198,13 +1217,13 @@ export class SkillExecutor {
 
     // Strip leading SQL single-line comments (-- ...) before WITH detection,
     // since steps like root_cause_summary prefix SQL with comment lines.
-    const noLeadingComments = trimmed.replace(/^(--[^\n]*\n\s*)*/g, '');
-    const withMatch = noLeadingComments.match(/^WITH\s+/i);
+    const noLeadingComments = trimmed.replace(/^(?:(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)\s*)*/, '');
+    const withMatch = noLeadingComments.match(/^WITH(?:\s+RECURSIVE)?\s+/i);
     if (withMatch) {
       // Preserve original comments, insert fragments after WITH
       const commentPrefix = trimmed.slice(0, trimmed.length - noLeadingComments.length);
       const afterWith = noLeadingComments.slice(withMatch[0].length);
-      return `${commentPrefix}WITH\n${fragmentBlock}\n,\n${afterWith}`;
+      return `${commentPrefix}${withMatch[0].trim()}\n${fragmentBlock}\n,\n${afterWith}`;
     }
 
     // Wrap the entire SQL in a WITH clause
@@ -1337,7 +1356,7 @@ export class SkillExecutor {
   ): boolean {
     if (!candidate) return false;
     const sources = new Set(this.splitSources(candidate.targetMatchSources));
-    return Boolean(target.upid !== undefined && sources.has('upid'));
+    return Boolean(target.upid !== undefined && candidate.upid === target.upid && sources.has('upid'));
   }
 
   private hasExactProcessNameTarget(
@@ -1443,6 +1462,32 @@ export class SkillExecutor {
 
     let resolution: ProcessIdentityResolution;
     try {
+      let verifiedTarget = target;
+      if (target.pid !== undefined && target.upid === undefined) {
+        if (!Number.isSafeInteger(target.pid) || target.pid <= 0) throw new Error('Invalid PID selector');
+        // Check the entire trace's process table before the ranked resolver can
+        // truncate candidates or let activity choose between reused OS PIDs.
+        const lookup = await this.queryTraceProcessor(traceId,
+          `SELECT COUNT(DISTINCT upid) AS process_count, MIN(upid) AS unique_upid FROM process WHERE pid = ${target.pid}`,
+          {}, inherited.signal);
+        if (lookup.error) throw new Error(lookup.error);
+        if (!Array.isArray(lookup.rows) || lookup.rows.length !== 1) throw new Error('PID uniqueness query returned incomplete facts');
+        const row = lookup.rows[0];
+        const facts = Array.isArray(row)
+          ? Object.fromEntries((lookup.columns || []).map((column: string, index: number) => [column, row[index]]))
+          : row;
+        const count = this.toNumber(facts?.process_count);
+        const upid = this.toNumber(facts?.unique_upid);
+        if (count === undefined || !Number.isSafeInteger(count) || count < 0) throw new Error('PID uniqueness count is unavailable');
+        if (count !== 1) {
+          return {status: count === 0 ? 'not_found' : 'ambiguous', requestedName: target.requestedName,
+            upids: [], confidenceScore: 0, candidates: [], evidenceSources: ['process.pid'],
+            warnings: [`PID ${target.pid} maps to ${count} UPIDs in this trace; select an explicit UPID.`]};
+        }
+        if (upid === undefined || !Number.isSafeInteger(upid) || upid <= 0) throw new Error('PID uniqueness query returned an invalid UPID');
+        verifiedTarget = {...target, upid};
+        params.upid = upid;
+      }
       const result = await this.execute(
         'process_identity_resolver',
         traceId,
@@ -1465,18 +1510,22 @@ export class SkillExecutor {
         const rows = Array.isArray(result.rawResults?.root?.data)
           ? result.rawResults.root.data as Record<string, any>[]
           : [];
-        const candidates = rows.map(row => this.rowToIdentityCandidate(row));
+        const candidates = rows.map(row => this.rowToIdentityCandidate(row))
+          .filter(candidate => verifiedTarget.upid === undefined || candidate.upid === verifiedTarget.upid);
         const top = candidates[0];
-        const qualityWarnings = this.identityQualityWarnings(top, candidates, target);
+        const qualityWarnings = this.identityQualityWarnings(top, candidates, verifiedTarget);
+        const status = this.normalizeIdentityStatus(top, candidates, verifiedTarget);
         resolution = {
-          status: this.normalizeIdentityStatus(top, candidates, target),
+          status,
           requestedName: target.requestedName,
           canonicalPackageName: top?.canonicalPackageName,
           recommendedProcessNameParam: top?.recommendedProcessNameParam,
-          upids: candidates.map(c => c.upid).filter((upid): upid is number => upid !== undefined),
+          upids: top?.upid !== undefined && status === 'verified'
+            ? [top.upid] : [],
           confidenceScore: top?.confidenceScore ?? 0,
           rawStatus: top?.rawStatus,
-          evidenceSources: this.splitSources(top?.targetMatchSources, top?.supportingSources),
+          evidenceSources: this.splitSources(top?.targetMatchSources, top?.supportingSources,
+            verifiedTarget !== target ? 'process.pid_unique_upid' : undefined),
           warnings: qualityWarnings,
           candidates,
         };
@@ -1506,9 +1555,12 @@ export class SkillExecutor {
     traceId: string,
     params: Record<string, any>,
     inherited: Record<string, any>,
+    processScope?: EffectiveProcessScope,
   ): Promise<IdentityGateResult> {
     return this.identityGate.apply({
       traceId,
+      traceSide: processScope?.traceSide ?? this.resolveTraceSide(inherited),
+      processScope,
       skill,
       params,
       inherited,
@@ -1649,6 +1701,52 @@ export class SkillExecutor {
     return `${prefix}\n${sql}`;
   }
 
+  private exactScopeAdmissionError(skill: SkillDefinition): string | undefined {
+    const support = getExactProcessScopeSupport(skill, this.skillRegistry, this.fragmentRegistry);
+    if (support.supported) return undefined;
+    const alternatives = [...this.skillRegistry.values()]
+      .filter(candidate => candidate.type === 'atomic' && candidate.name !== 'process_identity_resolver' &&
+        (candidate.process_scope?.role === 'target' || candidate.steps?.some(step =>
+          'process_scope' in step && step.process_scope?.role === 'target')) &&
+        getExactProcessScopeSupport(candidate, this.skillRegistry, this.fragmentRegistry).supported)
+      .map(candidate => candidate.name).sort();
+    return `Exact UPID scope is unsupported: ${support.reason}. ` +
+      (alternatives.length ? `Use a supported exact Skill: ${alternatives.join(', ')}.` :
+        'Use execute_sql with an explicit verified process.upid equality on the target relation.');
+  }
+
+  async prepareInvocation(
+    skillId: string, traceId: string, params: Record<string, any> = {},
+    inherited: Record<string, any> = {}, processScope?: EffectiveProcessScope,
+  ): Promise<IdentityGateResult> {
+    const skill = this.skillRegistry.get(skillId);
+    if (!skill) return { allowed: false, params, inherited, config: { policy: 'none' }, error: `Skill not found: ${skillId}` };
+    const gate = await this.applyIdentityGate(skill, traceId, params, inherited, processScope);
+    if (gate.allowed && gate.processScope?.mode === 'exact_upid') {
+      const scopeError = this.exactScopeAdmissionError(skill);
+      if (scopeError) { gate.allowed = false; gate.error = scopeError; }
+    }
+    return gate;
+  }
+
+  /** Root atomic SQL and nested SQL use the same scope and fragment checks. */
+  private prepareSql(source: ScopedSqlSource, context: SkillExecutionContext): string {
+    const usesRuntimeScope = [source.sql || '', ...(source.sql_fragments || []).map(path => this.fragmentRegistry.get(path) || '')]
+      .some(sql => /\$\{\s*__process_scope\b/.test(sql));
+    if (usesRuntimeScope) {
+      if (!context.processScope) throw new Error('Reserved process scope binding requires an issued process scope');
+      assertEffectiveProcessScope(context.processScope, context.traceId, context.processScope.traceSide);
+    }
+    if (context.processScope?.mode === 'exact_upid' || usesRuntimeScope) {
+      const reason = sqlScopeDeclarationError(source, this.fragmentRegistry);
+      if (reason) throw new Error(`Exact UPID scope is unsupported: ${reason}`);
+    }
+    let sql = substituteVariables(source.sql || '', context);
+    if (source.sql_fragments?.length) sql = this.injectSqlFragments(sql, source.sql_fragments, context);
+    return this.buildSqlWithModuleIncludes(sql, context);
+  }
+
+
   /**
    * 执行 skill
    */
@@ -1656,7 +1754,8 @@ export class SkillExecutor {
     skillId: string,
     traceId: string,
     params: Record<string, any> = {},
-    inherited: Record<string, any> = {}
+    inherited: Record<string, any> = {},
+    processScope?: EffectiveProcessScope,
   ): Promise<SkillExecutionResult> {
     const inheritedSink = inherited.__runManifestAttributionSink as
       | RunManifestAttributionSink
@@ -1669,7 +1768,7 @@ export class SkillExecutor {
     const skill = this.skillRegistry.get(skillId);
     if (!skill) {
       sink?.recordUnknownSkillInvocation(skillId);
-      return this.executeInternal(skillId, traceId, params, inherited);
+      return this.executeInternal(skillId, traceId, params, inherited, processScope);
     }
     const invocationId = sink?.startSkillInvocation({
       skillId,
@@ -1685,6 +1784,7 @@ export class SkillExecutor {
         traceId,
         params,
         inherited,
+        processScope,
       );
       if (sink && invocationId) {
         sink.finishSkillInvocation(invocationId, {
@@ -1724,11 +1824,12 @@ export class SkillExecutor {
     traceId: string,
     params: Record<string, any>,
     inherited: Record<string, any>,
+    processScope?: EffectiveProcessScope,
   ): Promise<SkillExecutionResult> {
     const startTime = Date.now();
     const signal = getSkillExecutionSignal(inherited);
     throwIfTraceProcessorQueryCancelled(signal);
-    const traceSide = this.resolveTraceSide(inherited);
+    const traceSide = processScope?.traceSide ?? this.resolveTraceSide(inherited);
 
     const skill = this.skillRegistry.get(skillId);
     if (!skill) {
@@ -1749,7 +1850,7 @@ export class SkillExecutor {
       data: { skillName: skill.meta.display_name },
     });
 
-    const gate = await this.applyIdentityGate(skill, traceId, params, inherited);
+    const gate = await this.prepareInvocation(skillId, traceId, params, inherited, processScope);
     if (!gate.allowed) {
       this.emit({
         type: 'skill_error',
@@ -1764,6 +1865,7 @@ export class SkillExecutor {
       target: gate.target,
       resolution: gate.resolution,
     });
+    if (identityResolution && gate.processScope?.identityRefId) identityResolution.identityRefId = gate.processScope.identityRefId;
 
     // Validate and coerce input parameters against skill.inputs declarations
     const validated = validateSkillInputs(skillId, skill.inputs, gate.params);
@@ -1799,8 +1901,10 @@ export class SkillExecutor {
       signal,
       params: validated.params,
       inherited: gate.inherited,
+      processScope: gate.processScope,
       results: {},
       variables: {},
+      variableScopes: {},
       moduleIncludes,
     }
 
@@ -1849,6 +1953,10 @@ export class SkillExecutor {
                 ...(identityResolution ? { identityResolution } : {}),
                 executionTimeMs: Date.now() - startTime,
                 error: atomicResult.error,
+                rawResults: { root: atomicResult },
+                scopeProvenance: atomicResult.scopeProvenance,
+                scopeLimitations: resultScopeLimitations(atomicResult),
+                partial: atomicResult.code === 'exact_scope_unavailable',
               };
             }
             // Keep parity with step-based execution so referenced atomic skills
@@ -1931,6 +2039,9 @@ export class SkillExecutor {
           displayResults,
           diagnostics,
           rawResults: context.results,
+          scopeProvenance: mergeScopeProvenance(Object.values(context.results).map(resultScopeProvenance)),
+          scopeLimitations: resultScopeLimitations({ rawResults: context.results }),
+          partial: resultScopeLimitations({ rawResults: context.results }).length > 0,
           ...(identityResolution ? { identityResolution } : {}),
           executionTimeMs: Date.now() - startTime,
           error: stepExecutionError,
@@ -1965,6 +2076,9 @@ export class SkillExecutor {
         aiSummary,
         synthesizeData: synthesizeData.length > 0 ? synthesizeData : undefined,
         rawResults: context.results,
+        scopeProvenance: mergeScopeProvenance(Object.values(context.results).map(resultScopeProvenance)),
+        scopeLimitations: resultScopeLimitations({ rawResults: context.results }),
+        partial: resultScopeLimitations({ rawResults: context.results }).length > 0,
         ...(identityResolution ? { identityResolution } : {}),
         executionTimeMs: Date.now() - startTime,
       };
@@ -2008,19 +2122,23 @@ export class SkillExecutor {
   }
 
   private extractSaveAsValue(stepResult: StepResult): any {
+    return this.extractSelectedStepResult(stepResult).data;
+  }
+
+  private extractSelectedStepResult(stepResult: StepResult): StepResult {
     // Most steps already store direct row arrays/objects in stepResult.data.
     if (stepResult.stepType !== 'skill') {
-      return stepResult.data;
+      return stepResult;
     }
 
     const nested = stepResult.data as any;
     if (!nested || typeof nested !== 'object') {
-      return stepResult.data;
+      return stepResult;
     }
 
     // Future-proof: if nested result already exposes .data directly, use it.
     if (Object.prototype.hasOwnProperty.call(nested, 'data')) {
-      return nested.data;
+      return { ...stepResult, data: nested.data, ...scopeMetadata(resultScopeProvenance(nested)) };
     }
 
     // SkillExecutionResult currently exposes payloads via rawResults.
@@ -2031,7 +2149,7 @@ export class SkillExecutor {
     const rawResults = nested.rawResults;
     if (rawResults && typeof rawResults === 'object') {
       if ((rawResults as any).root?.data !== undefined) {
-        return (rawResults as any).root.data;
+        return (rawResults as any).root;
       }
       const dataSteps = Object.values(rawResults as Record<string, any>)
         .filter((step) => step && typeof step === 'object' && Object.prototype.hasOwnProperty.call(step, 'data'));
@@ -2051,24 +2169,24 @@ export class SkillExecutor {
           Object.prototype.hasOwnProperty.call(displayedStep, 'data') &&
           this.hasMeaningfulData(displayedStep.data)
         ) {
-          return displayedStep.data;
+          return displayedStep;
         }
       }
       const meaningfulStep = dataSteps.find((step) => this.hasMeaningfulData((step as any).data));
       if (meaningfulStep) {
-        return (meaningfulStep as any).data;
+        return meaningfulStep as StepResult;
       }
       if (dataSteps.length > 0) {
-        return (dataSteps[dataSteps.length - 1] as any).data;
+        return dataSteps[dataSteps.length - 1] as StepResult;
       }
       for (const step of Object.values(rawResults as Record<string, any>)) {
         if (step && typeof step === 'object' && Object.prototype.hasOwnProperty.call(step, 'data')) {
-          return (step as any).data;
+          return step as StepResult;
         }
       }
     }
 
-    return stepResult.data;
+    return stepResult;
   }
 
   private async executeStepBasedSkill(
@@ -2102,15 +2220,7 @@ export class SkillExecutor {
           config = synthesizeValue as SynthesizeConfig;
         }
 
-        synthesizeData.push({
-          stepId: step.id,
-          stepName: ('name' in step ? step.name : step.id) || step.id,
-          stepType: typeof (step as any).type === 'string' ? (step as any).type : 'skill',
-          layer: (displayConfig as DisplayConfig).layer,
-          data: stepResult.data,
-          success: stepResult.success,
-          config,
-        });
+        synthesizeData.push(this.createSynthesizeData(step, stepResult, displayConfig, config));
       }
 
       if (stepResult.success) {
@@ -2120,6 +2230,7 @@ export class SkillExecutor {
         // 如果有 save_as，保存到变量
         if ('save_as' in step && step.save_as) {
           context.variables[step.save_as] = this.extractSaveAsValue(stepResult);
+          if (context.variableScopes) context.variableScopes[step.save_as] = resultScopeProvenance(this.extractSelectedStepResult(stepResult));
         }
 
         // 收集需要展示的结果
@@ -2162,6 +2273,12 @@ export class SkillExecutor {
           aiSummary = stepResult.data.summary;
         }
       } else {
+        if (stepResult.code === 'exact_scope_unavailable') {
+          context.results[step.id] = stepResult;
+          displayResults.push(this.createDisplayResult(step.id, ('name' in step ? step.name : undefined) || step.id,
+            { ...stepResult, data: { text: stepResult.error } }, this.getDisplayConfig(step)));
+          continue;
+        }
         if (stepResult.code === 'condition_not_met') {
           context.results[step.id] = stepResult;
           continue;
@@ -2211,7 +2328,8 @@ export class SkillExecutor {
       targetDisplayResult.data.expandableData = this.buildExpandableFromBatch(
         targetDisplayResult.data.rows,
         targetDisplayResult.data.columns,
-        sourceData
+        sourceData, undefined,
+        resultScopeProvenance(context.results[steps.find(candidate => 'save_as' in candidate && candidate.save_as === bindSource)?.id || ''])
       );
     }
   }
@@ -2230,7 +2348,8 @@ export class SkillExecutor {
     targetRows: any[][] | null,
     targetColumns: string[] | null,
     sourceData: Record<string, any>[],
-    targetObjects?: Record<string, any>[]
+    targetObjects?: Record<string, any>[],
+    sourceProvenance?: EvidenceScopeProvenanceV1,
   ): NonNullable<DisplayResult['data']['expandableData']> {
     const isColumnar = targetRows != null && targetColumns != null;
     const rowCount = isColumnar ? targetRows.length : (targetObjects?.length ?? 0);
@@ -2305,7 +2424,7 @@ export class SkillExecutor {
       if (!matched && sourceByStartTs && startTsVal != null) {
         matched = sourceByStartTs.get(String(startTsVal));
       }
-      if (!matched && i < sourceData.length) {
+      if (!matched && !sourceByFrameIndex && !sourceBySessionKey && !sourceByStartTs && i < sourceData.length) {
         matched = sourceData[i];
       }
 
@@ -2328,7 +2447,8 @@ export class SkillExecutor {
 
       expandableData.push({
         item,
-        result: { success: true, sections: this.groupBatchRowIntoSections(matched) },
+        result: { success: true, sections: this.groupBatchRowIntoSections(matched, sourceProvenance),
+          scopeProvenance: sourceProvenance },
       });
     }
 
@@ -2339,7 +2459,7 @@ export class SkillExecutor {
    * Group a batch row into named sections for the expandable UI.
    * Uses a declarative registry for JSON columns + imperative handlers for scalar fields.
    */
-  private groupBatchRowIntoSections(row: Record<string, any>): Record<string, any> {
+  private groupBatchRowIntoSections(row: Record<string, any>, provenance?: EvidenceScopeProvenanceV1): Record<string, any> {
     const sections: Record<string, any> = {};
 
     // ── Declarative JSON column registry ─────────────────────────────────
@@ -2606,10 +2726,15 @@ export class SkillExecutor {
     for (const entry of jsonSectionRegistry) {
       const items = this.parseJsonColumn(row, entry.column);
       if (items.length > 0) {
-        sections[entry.key] = { title: entry.title, data: entry.transform(items) };
+        sections[entry.key] = { title: entry.title, data: entry.transform(items),
+          ...scopeMetadata(scopeProvenanceForFields(provenance, [entry.column])) };
       }
     }
 
+    for (const section of Object.values(sections)) {
+      if (!section.scopeProvenance) Object.assign(section, scopeMetadata(scopeProvenanceForFields(provenance,
+        Object.keys(section.data?.[0] || {})) || provenance));
+    }
     return sections;
   }
 
@@ -2632,7 +2757,8 @@ export class SkillExecutor {
   async executeCompositeSkill(
     skill: SkillDefinition,
     inputs: Record<string, any>,
-    context: Partial<SkillExecutionContext>
+    context: Partial<SkillExecutionContext>,
+    processScope?: EffectiveProcessScope,
   ): Promise<LayeredResult> {
     const startTime = Date.now();
     const signal = context.signal || getSkillExecutionSignal(context.inherited);
@@ -2659,7 +2785,11 @@ export class SkillExecutor {
     }
 
     const traceId = context.traceId || '';
-    const gate = await this.applyIdentityGate(skill, traceId, inputs, context.inherited || {});
+    const gate = await this.applyIdentityGate(skill, traceId, inputs, context.inherited || {}, processScope);
+    if (gate.allowed && gate.processScope?.mode === 'exact_upid') {
+      const scopeError = this.exactScopeAdmissionError(skill);
+      if (scopeError) { gate.allowed = false; gate.error = scopeError; }
+    }
     if (!gate.allowed) {
       throw new Error(gate.error || `Process identity gate blocked skill: ${skill.name}`);
     }
@@ -2681,8 +2811,10 @@ export class SkillExecutor {
       signal,
       params: validated.params,
       inherited: gate.inherited,
+      processScope: gate.processScope,
       results: {},
       variables: {},
+      variableScopes: {},
       moduleIncludes: prerequisiteModules,
     };
 
@@ -2704,7 +2836,7 @@ export class SkillExecutor {
         const step = skill.steps[i];
         const stepResult = await this.executeStep(step, execContext, skill.name);
         const layerStepResult = stepResult.stepType === 'skill'
-          ? { ...stepResult, data: this.extractSaveAsValue(stepResult) }
+          ? { ...stepResult, ...this.extractSelectedStepResult(stepResult), stepId: step.id, stepType: stepResult.stepType }
           : stepResult;
 
         // Save result to context
@@ -2714,6 +2846,7 @@ export class SkillExecutor {
           // Save to variables if save_as is specified
           if ('save_as' in step && step.save_as) {
             execContext.variables[step.save_as] = this.extractSaveAsValue(stepResult);
+            if (execContext.variableScopes) execContext.variableScopes[step.save_as] = resultScopeProvenance(this.extractSelectedStepResult(stepResult));
           }
         }
 
@@ -2740,15 +2873,7 @@ export class SkillExecutor {
           }
           // 旧格式 (synthesize: true) 不设置 config，由 analysisWorker 使用默认处理
 
-          synthesizeData.push({
-            stepId: step.id,
-            stepName: ('name' in step ? step.name : step.id) || step.id,
-            stepType: typeof (step as any).type === 'string' ? (step as any).type : 'skill',
-            layer: (displayConfig as DisplayConfig).layer,
-            data: stepResult.data,
-            success: stepResult.success,
-            config,  // 包含 YAML 中定义的配置（如果有）
-          });
+          synthesizeData.push(this.createSynthesizeData(step, stepResult, displayConfig, config));
         }
 
         stepResults.push(layerStepResult);
@@ -2777,6 +2902,7 @@ export class SkillExecutor {
               result: {
                 success: iterItem.result?.success ?? false,
                 sections: this.convertDisplayResultsToSections(iterItem.result?.displayResults || []),
+                scopeProvenance: resultScopeProvenance(iterItem.result),
                 error: iterItem.result?.error,
               },
             }));
@@ -2801,7 +2927,9 @@ export class SkillExecutor {
         if (!targetResult?.data || !Array.isArray(targetResult.data) || targetResult.data.length === 0) continue;
         if (typeof targetResult.data[0] !== 'object' || targetResult.data[0] === null) continue;
 
-        const expandableData = this.buildExpandableFromBatch(null, null, sourceData, targetResult.data);
+        const sourceStepId = skill.steps.find(candidate => 'save_as' in candidate && candidate.save_as === bindSource)?.id;
+        const expandableData = this.buildExpandableFromBatch(null, null, sourceData, targetResult.data,
+          sourceStepId ? resultScopeProvenance(execContext.results[sourceStepId]) : undefined);
         (targetResult.data as any).expandableData = expandableData;
       }
     }
@@ -2819,6 +2947,9 @@ export class SkillExecutor {
           executedAt: new Date().toISOString()
         },
         stepResults,
+        scopeProvenance: mergeScopeProvenance(stepResults.map(resultScopeProvenance)),
+        scopeLimitations: stepResults.flatMap(resultScopeLimitations),
+        partial: stepResults.some(step => resultScopeLimitations(step).length > 0),
         // 添加收集的 synthesize 数据
         synthesizeData: synthesizeData.length > 0 ? synthesizeData : undefined,
       };
@@ -2835,6 +2966,22 @@ export class SkillExecutor {
   /**
    * 执行原子 skill（单个 SQL）
    */
+  private sqlEvidenceFields(
+    skill: SkillDefinition | undefined, stepId: string, display: DisplayConfig | undefined, sql: string): Record<string, CapturedFieldSemantics> {
+    const fields: Record<string, CapturedFieldSemantics> = Object.create(null);
+    if (skill) {
+      const origin: CapturedFieldSemantics['origin'] = {kind: 'skill_literal', skillId: skill.name, stepId,
+        definitionFingerprint: fingerprintSkillDefinition(skill, this.fragmentRegistry), selectedSqlHash: evidenceCaptureHash(sql)};
+      for (const column of display?.columns || []) {
+        if (column && typeof column === 'object' && typeof column.name === 'string' &&
+            typeof column.unit === 'string' && ['ns', 'us', 'ms', 's'].includes(column.unit)) {
+          fields[column.name] = {origin, unit: column.unit};
+        }
+      }
+    }
+    return fields;
+  }
+
   private async executeAtomicSkill(
     skill: SkillDefinition,
     context: SkillExecutionContext
@@ -2852,10 +2999,14 @@ export class SkillExecutor {
       };
     }
 
-    const sql = this.buildSqlWithModuleIncludes(
-      substituteVariables(skill.sql, context),
-      context
-    );
+    const source = selectProcessScopeSql(skill, context.processScope?.mode === 'exact_upid');
+    if (context.processScope?.mode === 'exact_upid' && source.process_scope?.exact_unavailable) {
+      return { stepId: 'root', stepType: 'atomic', success: false, code: 'exact_scope_unavailable',
+        error: source.process_scope.exact_unavailable, executionTimeMs: 0,
+        ...sqlScopeEvidence(source, context, 'root', undefined, true) };
+    }
+    const sql = this.prepareSql(source, context);
+    const evidenceFields = this.sqlEvidenceFields(skill, 'root', skill.output?.display, sql);
 
     try {
       const result = await this.queryTraceProcessor(context.traceId, sql, {}, context.signal);
@@ -2870,14 +3021,17 @@ export class SkillExecutor {
         };
       }
 
-      return {
+      const stepResult: StepResult = {
         stepId: 'root',
         stepType: 'atomic',
         success: true,
         data: this.rowsToObjects(result.columns, result.rows),
         executionTimeMs: Date.now() - startTime,
         display: skill.output?.display ? processDisplayConfig(skill.output.display, context) : undefined,
+        sql, ...sqlScopeEvidence(source, context, 'root', this.rowsToObjects(result.columns, result.rows)),
       };
+      attachEvidenceTable(stepResult, captureEvidenceTable(result, evidenceFields));
+      return stepResult;
 
     } catch (error: any) {
       rethrowIfTraceProcessorQueryCancelled(error);
@@ -2938,7 +3092,7 @@ export class SkillExecutor {
     try {
       switch (step.type) {
         case 'atomic':
-          result = await this.executeAtomicStep(step, context);
+          result = await this.executeAtomicStep(step, context, parentSkillId);
           break;
 
         case 'iterator':
@@ -3001,6 +3155,14 @@ export class SkillExecutor {
       };
     }
 
+    if (!result.scopeProvenance && ['diagnostic', 'ai_decision', 'ai_summary'].includes(step.type || '')) {
+      const inputNames = 'inputs' in step && Array.isArray(step.inputs) ? step.inputs : [];
+      const provenance = mergeScopeProvenance(inputNames.map(name =>
+        resultScopeProvenance(context.results[name]) || context.variableScopes?.[name]));
+      Object.assign(result, scopeMetadata(provenance));
+      if (Array.isArray(result.data?.diagnostics)) result.data.diagnostics = result.data.diagnostics.map((diagnostic: any) =>
+        ({ ...diagnostic, ...scopeMetadata(provenance) }));
+    }
     this.emit({
       type: 'step_completed',
       skillId: parentSkillId,
@@ -3016,21 +3178,20 @@ export class SkillExecutor {
    */
   private async executeAtomicStep(
     step: AtomicStep,
-    context: SkillExecutionContext
+    context: SkillExecutionContext,
+    parentSkillId?: string,
   ): Promise<StepResult> {
     const startTime = Date.now();
     throwIfTraceProcessorQueryCancelled(context.signal);
-    let substitutedSql = substituteVariables(step.sql, context);
-
-    // Inject SQL fragments if declared on this step
-    if (step.sql_fragments?.length) {
-      substitutedSql = this.injectSqlFragments(substitutedSql, step.sql_fragments, context);
+    const source = selectProcessScopeSql(step, context.processScope?.mode === 'exact_upid');
+    if (context.processScope?.mode === 'exact_upid' && source.process_scope?.exact_unavailable) {
+      return { stepId: step.id, stepType: 'atomic', success: false, code: 'exact_scope_unavailable',
+        error: source.process_scope.exact_unavailable, executionTimeMs: 0,
+        ...sqlScopeEvidence(source, context, step.id, undefined, true) };
     }
-
-    const sql = this.buildSqlWithModuleIncludes(
-      substitutedSql,
-      context
-    );
+    const sql = this.prepareSql(source, context);
+    const evidenceFields = this.sqlEvidenceFields(parentSkillId ? this.skillRegistry.get(parentSkillId) : undefined,
+      step.id, this.getDisplayConfig(step), sql);
 
     try {
       const result = await this.queryTraceProcessor(context.traceId, sql, {}, context.signal);
@@ -3043,6 +3204,7 @@ export class SkillExecutor {
             success: true,
             data: [],
             error: result.error,
+            sql, ...sqlScopeEvidence({ ...source, process_scope: source.process_scope && { ...source.process_scope, exact_unavailable: result.error } }, context, step.id, undefined, true),
             code: 'optional_query_error',
             executionTimeMs: Date.now() - startTime,
           };
@@ -3059,11 +3221,12 @@ export class SkillExecutor {
 
       const data = this.rowsToObjects(result.columns, result.rows);
 
-      return {
+      const stepResult: StepResult = {
         stepId: step.id,
         stepType: 'atomic',
         success: true,
         data,
+        sql, ...sqlScopeEvidence(source, context, step.id, data),
         ...(
           data.length === 0 && step.on_empty
             ? { emptyMessage: step.on_empty }
@@ -3071,6 +3234,8 @@ export class SkillExecutor {
         ),
         executionTimeMs: Date.now() - startTime,
       };
+      attachEvidenceTable(stepResult, captureEvidenceTable(result, evidenceFields));
+      return stepResult;
 
     } catch (error: any) {
       rethrowIfTraceProcessorQueryCancelled(error);
@@ -3081,6 +3246,7 @@ export class SkillExecutor {
           success: true,
           data: [],
           error: error.message,
+          sql, ...sqlScopeEvidence({ ...source, process_scope: source.process_scope && { ...source.process_scope, exact_unavailable: error.message } }, context, step.id, undefined, true),
           code: 'optional_query_error',
           executionTimeMs: Date.now() - startTime,
         };
@@ -3200,7 +3366,8 @@ export class SkillExecutor {
       mergeInheritedWithSignal(
         { ...context.inherited, ...context.variables },
         context.signal,
-      )
+      ),
+      context.processScope,
     );
 
     return {
@@ -3208,6 +3375,8 @@ export class SkillExecutor {
       stepType: 'skill',
       success: result.success,
       data: result,
+      ...scopeMetadata(resultScopeProvenance(result)),
+      scopeLimitations: resultScopeLimitations(result),
       error: result.error,
       executionTimeMs: Date.now() - startTime,
     };
@@ -3304,7 +3473,8 @@ export class SkillExecutor {
         itemSkillName,
         context.traceId,
         params,
-        { ...context.inherited, ...context.variables, item }
+        mergeInheritedWithSignal({ ...context.inherited, ...context.variables, item }, context.signal),
+        context.processScope,
       );
 
       // Always record the per-item result, even if it failed (so UI/Agents can see errors).
@@ -3319,6 +3489,8 @@ export class SkillExecutor {
       stepId: step.id,
       stepType: 'iterator',
       success: true,
+      ...scopeMetadata(mergeScopeProvenance(results.map(item => resultScopeProvenance(item.result)))),
+      scopeLimitations: results.flatMap(item => resultScopeLimitations(item.result)),
       data: results,
       executionTimeMs: Date.now() - startTime,
     };
@@ -3352,6 +3524,8 @@ export class SkillExecutor {
     return {
       stepId: step.id,
       stepType: 'parallel',
+      ...scopeMetadata(mergeScopeProvenance(results.map(resultScopeProvenance))),
+      scopeLimitations: results.flatMap(resultScopeLimitations),
       success: allSuccess,
       data,
       executionTimeMs: Date.now() - startTime,
@@ -4171,20 +4345,21 @@ export class SkillExecutor {
       displayData = { text: String(data) };
     }
 
-    return {
+    const displayResult: DisplayResult = {
       stepId,
       title: config.title || title,
       level: config.level || 'summary',
       layer: config.layer,         // 分层展示层级
       format: config.format || 'table',
       data: displayData,
-      executionStatus: stepResult.code === 'optional_query_error'
+      ...scopeMetadata(resultScopeProvenance(this.extractSelectedStepResult(stepResult))),
+      executionStatus: stepResult.code === 'exact_scope_unavailable' ? 'unavailable' : stepResult.code === 'optional_query_error'
         ? 'optional_error'
         : (Array.isArray(data) && data.length === 0 ? 'empty' : 'observed'),
-      executionMessage: stepResult.emptyMessage,
-      executionError: stepResult.error,
+      executionMessage: stepResult.code === 'exact_scope_unavailable' ? stepResult.error : stepResult.emptyMessage,
+      executionError: stepResult.code === 'exact_scope_unavailable' ? undefined : stepResult.error,
       highlight: config.highlight,
-      sql,  // 保存原始 SQL
+      sql: this.extractSelectedStepResult(stepResult).sql || sql,
       expandable: config.expandable,           // 是否支持展开查看详细分析
       metadataFields: config.metadataFields,   // 提取到元数据的字段
       hidden_columns: config.hidden_columns,   // 隐藏的列
@@ -4192,6 +4367,35 @@ export class SkillExecutor {
       collapsible: config.collapsible,         // 是否可折叠
       defaultCollapsed: config.defaultCollapsed, // 是否默认折叠
     };
+    const selected = this.extractSelectedStepResult(stepResult);
+    const witness = evidenceTableFor(selected);
+    const table = witness && capturedEvidenceTable(witness);
+    const directMapping = Array.isArray(data) && selected.data === data && table &&
+      Array.isArray(displayData.rows) && displayData.rows.length === table.rows.length &&
+      Array.isArray(displayData.columns) && displayData.columns.every((column: string) => table.columns.includes(column));
+    attachEvidenceTable(displayResult, directMapping && witness ? witness :
+      captureEvidenceTable(undefined, {}, 'display_transformation_unmapped'));
+    return displayResult;
+  }
+
+  /** Carry a raw atomic table to its synthesize view without serializing authority. */
+  private createSynthesizeData(step: SkillStep, stepResult: StepResult, display: DisplayConfig,
+    config: SynthesizeConfig | undefined): SynthesizeData {
+    const entry: SynthesizeData = {
+      stepId: step.id,
+      stepName: ('name' in step ? step.name : step.id) || step.id,
+      stepType: typeof step.type === 'string' ? step.type : 'skill',
+      layer: display.layer,
+      data: stepResult.data,
+      ...scopeMetadata(resultScopeProvenance(stepResult)),
+      success: stepResult.success,
+      config,
+    };
+    // Only this atomic execution object can identify its original table. Nested
+    // skill wrappers, iterator flattening and summaries have no such mapping.
+    const witness = evidenceTableFor(stepResult);
+    if (stepResult.success && stepResult.stepType === 'atomic' && witness) attachEvidenceTable(entry, witness);
+    return entry;
   }
 
   /**
@@ -4625,6 +4829,7 @@ export class SkillExecutor {
       : '（无显式洞见，见指标）';
 
     return {
+      ...scopeMetadata(mergeScopeProvenance(synthesizeData.filter(item => item.success).map(resultScopeProvenance))),
       stepId: '__synthesize_summary__',
       title: '洞见摘要',
       level: 'key',
@@ -4718,6 +4923,7 @@ export class SkillExecutor {
     envelope: DataEnvelope,
     identityResolution?: IdentityResolutionV1,
   ): DataEnvelope {
+    identityResolution = identityForScopeEvidence(envelope.meta.scopeProvenance, identityResolution);
     if (!identityResolution) return envelope;
     const traceSide = identityResolution.target.traceSide === 'current' || identityResolution.target.traceSide === 'reference'
       ? identityResolution.target.traceSide
@@ -4818,6 +5024,7 @@ export class SkillExecutor {
         result: {
           success: iterItem.result?.success ?? false,
           sections: this.convertDisplayResultsToSections(iterItem.result?.displayResults || []),
+          scopeProvenance: resultScopeProvenance(iterItem.result),
           error: iterItem.result?.error,
         },
       }));
@@ -5045,6 +5252,7 @@ export class SkillExecutor {
     stepId: string;
     title: string;
     data: any;
+    scopeProvenance?: EvidenceScopeProvenanceV1;
   }>): Record<string, any> {
     const sections: Record<string, any> = {};
     for (const dr of displayResults) {
@@ -5063,6 +5271,7 @@ export class SkillExecutor {
       });
 
       sections[dr.stepId] = {
+        ...scopeMetadata(dr.scopeProvenance),
         title: dr.title,
         data: objects,
       };

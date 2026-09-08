@@ -8,13 +8,8 @@ export const MULTI_TRACE_COMPARISON_RUN_SCHEMA_VERSION = 'multi_trace_comparison
 
 export type AnalysisResultVisibility = 'private' | 'workspace';
 
-export type AnalysisResultSceneType =
-  | 'startup'
-  | 'scrolling'
-  | 'interaction'
-  | 'memory'
-  | 'cpu'
-  | 'general';
+/** A strategy registry scene ID, including IDs retained in historical snapshots. */
+export type AnalysisResultSceneType = string;
 
 export type AnalysisResultSnapshotStatus = 'ready' | 'partial' | 'failed';
 
@@ -125,6 +120,16 @@ export interface TraceComparisonMetadata {
 
 export interface AnalysisSummary {
   headline: string;
+  /** Full accepted body, kept separately from the one-line comparison headline. */
+  conclusion?: string;
+  turnIntent?: import('../agent/core/orchestratorTypes').AnalysisResult['turnIntent'];
+  completion?: import('./analysisDelivery').AnalysisCompletion;
+  outputOrigin?: import('./analysisDelivery').AnalysisOutputOrigin;
+  runtimeAppendix?: import('./analysisDelivery').AnalysisRuntimeAppendix;
+  reportAssessment?: import('./analysisDelivery').FinalReportAssessment;
+  deliveryAssurance?: import('./analysisDelivery').AnalysisDeliveryAssurance;
+  sourceUseDecision?: import('../services/codebase/sourceUseDecision').SourceUseDecisionV1;
+  sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;
   details?: string[];
   risks?: string[];
   recommendations?: string[];

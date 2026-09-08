@@ -33,6 +33,11 @@ prerequisites:
   modules:
     - android.frames.timeline
 
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package, process_name]
+
 inputs:
   - name: package
     type: string
@@ -85,32 +90,45 @@ steps:
           label: "最大帧耗时"
           type: duration
           format: duration_ms
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     sql: |
       WITH
-      time_bounds AS (
+      matched_frames AS (
         SELECT
-          COALESCE(${start_ts}, MIN(ts)) as start_ts,
-          COALESCE(${end_ts}, MAX(ts + dur)) as end_ts
-        FROM actual_frame_timeline_slice
-      ),
-      app_frames AS (
-        SELECT
+          a.upid,
           e.ts as expected_ts,
           e.dur as expected_dur,
           a.ts as actual_ts,
           a.dur as actual_dur,
           a.jank_type,
-          p.name as process_name,
-          LAG(e.ts) OVER (PARTITION BY a.upid ORDER BY e.ts) as prev_expected_ts,
-          LAG(a.ts) OVER (PARTITION BY a.upid ORDER BY a.ts) as prev_actual_ts
+          p.name as process_name
         FROM expected_frame_timeline_slice e
         JOIN actual_frame_timeline_slice a
           ON e.display_frame_token = a.display_frame_token
           AND e.upid = a.upid
-        JOIN process p ON e.upid = p.upid
-        WHERE (('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
-          AND e.ts >= (SELECT start_ts FROM time_bounds)
-          AND e.ts <= (SELECT end_ts FROM time_bounds)
+        JOIN effective_target_processes p ON e.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
+      ),
+      -- The authored window selects expected frame starts. Derive automatic
+      -- bounds from the same clock so a late actual start cannot drop frame 1.
+      time_bounds AS (
+        SELECT
+          COALESCE(${start_ts}, MIN(expected_ts)) as start_ts,
+          COALESCE(${end_ts}, MAX(expected_ts + expected_dur)) as end_ts
+        FROM matched_frames
+      ),
+      app_frames AS (
+        SELECT
+          *,
+          LAG(expected_ts) OVER (PARTITION BY upid ORDER BY expected_ts) as prev_expected_ts,
+          LAG(actual_ts) OVER (PARTITION BY upid ORDER BY actual_ts) as prev_actual_ts
+        FROM matched_frames
+        WHERE expected_ts >= (SELECT start_ts FROM time_bounds)
+          AND expected_ts <= (SELECT end_ts FROM time_bounds)
       ),
       production_intervals AS (
         SELECT
@@ -123,14 +141,14 @@ steps:
       ),
       production_stats AS (
         SELECT
-          COUNT(*) + 1 as total_produced_frames,
+          COUNT(*) as total_produced_frames,
           (SELECT end_ts - start_ts FROM time_bounds) as total_duration_ns,
           COUNT(CASE WHEN jank_type = 'None' THEN 1 END) as on_time_frames,
           COUNT(CASE WHEN jank_type != 'None' THEN 1 END) as janky_frames,
-          AVG(expected_interval_ns) as avg_expected_interval_ns,
+          (SELECT AVG(expected_interval_ns) FROM production_intervals) as avg_expected_interval_ns,
           AVG(actual_dur) as avg_actual_dur_ns,
           MAX(actual_dur) as max_actual_dur_ns
-        FROM production_intervals
+        FROM app_frames
       )
       SELECT
         total_produced_frames,

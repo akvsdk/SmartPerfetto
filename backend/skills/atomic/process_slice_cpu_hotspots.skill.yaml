@@ -145,13 +145,17 @@ display:
       label: "最后出现"
       type: timestamp
 
+process_scope:
+  role: target
+  binding: native_upid
+
 sql: |
   WITH
   raw_input AS (
     SELECT
       COALESCE(${start_ts}, trace_start()) AS raw_start_ts,
       COALESCE(${end_ts}, trace_end()) AS raw_end_ts,
-      ${upid} AS target_upid,
+      COALESCE(${__process_scope.upid}, ${upid}) AS target_upid,
       NULLIF(COALESCE(NULLIF('${process_name|}', ''), NULLIF('${package|}', '')), '') AS target_process,
       NULLIF('${slice_name|}', '') AS target_slice,
       CASE

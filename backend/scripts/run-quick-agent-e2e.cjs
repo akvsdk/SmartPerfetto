@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const {frameFactExpectation} = require('./run-deepseek-agent-e2e.cjs');
 
 const backendRoot = path.resolve(__dirname, '..');
 const verifierPath = path.join(backendRoot, 'src/scripts/verifyAgentSseScrolling.ts');
@@ -21,38 +22,39 @@ const QUICK_RUNTIME_KINDS = [
 const DEFAULT_TRACE = '../Trace/real/android-scroll-customer/trace.pftrace';
 const DEFAULT_TIMEOUT_MS = '300000';
 const QUICK_FULL_REPORT_FALLBACK = 'quick_full_report_shape';
-const QUICK_REFERENCE_HEADING = '## 逐句数据引用（结构化来源）';
-const QUICK_TRIAGE_HEADING = '## 快速 Triage';
 
 const suites = {
   'mixed-trace-scrolling': quickSuite({
     label: 'quick direct mixed trace fact + scrolling triage gate',
     output: 'test-output/e2e-quick-mixed-trace-scrolling-real.json',
-    query: '总帧数是多少？整体流畅吗？',
+    query: '整个 Trace 的总帧数是多少？FrameTimeline 标记的掉帧数是多少（按 upid 与 frame id 去重）？整体流畅吗？',
     maxChars: 900,
-    requiredText: [QUICK_TRIAGE_HEADING, QUICK_REFERENCE_HEADING],
+    expectation: frameFactExpectation({taskKind: 'investigation', withJank: true}),
   }),
   'trace-fact': quickSuite({
     label: 'quick direct trace fact gate',
     output: 'test-output/e2e-quick-trace-fact-real.json',
     query: '总帧数是多少？',
     maxChars: 900,
-    requiredText: [QUICK_REFERENCE_HEADING],
+    expectation: frameFactExpectation(),
   }),
   'process-identity': quickSuite({
     label: 'quick direct process identity gate',
     output: 'test-output/e2e-quick-process-identity-real.json',
     query: '这个 trace 的应用包名和主要进程是什么？',
     maxChars: 900,
-    requiredText: [QUICK_REFERENCE_HEADING, '包名'],
+    expectation: {schemaVersion: 1, intent: {taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'},
+      facts: [{id: 'main_process_identity', kind: 'identity', columns: ['process_name'], verification: 'reference_only',
+        oracle: {sql: 'SELECT name AS process_name FROM process WHERE name IS NOT NULL', column: 'process_name'}}],
+      uncoveredFacets: ['primary application selection and categorical identity proposition proof']},
   }),
   'scrolling-triage': quickSuite({
     label: 'quick direct scrolling triage gate',
     output: 'test-output/e2e-quick-scrolling-triage-real.json',
     mode: 'fast',
-    query: '快速看一下滑动整体流畅吗？',
+    query: '快速看一下滑动整体流畅吗？给出整个 Trace 的总帧数和 FrameTimeline 标记的掉帧数（按 upid 与 frame id 去重）。',
     maxChars: 900,
-    requiredText: [QUICK_TRIAGE_HEADING, QUICK_REFERENCE_HEADING],
+    expectation: frameFactExpectation({taskKind: 'investigation', withJank: true}),
   }),
 };
 
@@ -86,7 +88,7 @@ function main() {
     }
   }
 
-  const verb = options.dryRun ? 'prepared' : 'passed';
+  const verb = options.dryRun ? 'prepared' : 'observed checks passed (semantic acceptance is recorded separately in each report)';
   console.log(`\nQuick Agent SSE E2E ${verb}: ${runtimeKinds.join(', ')} / ${suiteNames.join(', ')}`);
 }
 
@@ -216,12 +218,12 @@ function quickSuite(input) {
       input.output,
       '--require-quick-run',
       '--require-data-envelope',
-      '--require-conclusion-evidence',
       '--require-claim-verifier-ok',
       '--require-non-partial',
       '--max-analysis-completed-conclusion-chars',
       String(input.maxChars),
-      ...input.requiredText.flatMap(text => ['--require-text', text]),
+      '--expectation-json',
+      JSON.stringify(input.expectation),
       '--forbid-degraded-fallback',
       QUICK_FULL_REPORT_FALLBACK,
     ],

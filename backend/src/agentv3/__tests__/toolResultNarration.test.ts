@@ -5,12 +5,14 @@
 import {
   formatToolResultNarration,
   toolResultIsFailure,
+  isPolicyRefusalResult,
 } from '../toolNarration';
 import {
   formatPlanPhaseTransition,
   planPhaseUpdatedContent,
   readPlanPhaseUpdateOrigin,
 } from '../planPhaseEvents';
+import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
 
 /** MCP results reach the runtimes wrapped in a content-block envelope. */
 function mcpResult(body: unknown) {
@@ -18,6 +20,13 @@ function mcpResult(body: unknown) {
 }
 
 describe('formatToolResultNarration', () => {
+  it.each([true, undefined])('does not overwrite typed success=%s with a legacy failure field', success => {
+    const result = createRuntimeToolResult({success: false, error: 'old failure', action_required: 'retry'}, {
+      facts: success === undefined ? {} : {success},
+    });
+    expect(formatToolResultNarration({toolName: 'invoke_skill', result})).toBe('');
+    expect(isPolicyRefusalResult(result)).toBe(false);
+  });
   it('says nothing for a SQL query that returned rows', () => {
     // The dispatch line already stated what the query is for; a row count does
     // not tell the reader whether it worked out.
@@ -205,14 +214,18 @@ describe('formatToolResultNarration', () => {
   it.each([
     ['a trailing phase reminder', (body: string) => `${body}\n\n**Reminder**: stay on p1.`],
     ['a notes prefix and reasoning nudge', (body: string) => `Notes: prior turn said X.\n${body}\nThink first.`],
-  ])('reads JSON wrapped in %s', (_label, wrap) => {
-    // invoke_skill and fetch_artifact deliberately surround their JSON with
-    // guidance text; a whole-string parse silently dropped those results.
-    const body = JSON.stringify({success: true, detail: 'rows', id: 'art-8', rows: []});
+  ])('reads producer facts before decoration with %s', (_label, wrap) => {
+    const body = {success: true, detail: 'rows', id: 'art-8', rows: []};
     expect(formatToolResultNarration({
       toolName: 'fetch_artifact',
-      result: [{type: 'text', text: wrap(body)}],
+      result: createRuntimeToolResult(body, {decorate: wrap}),
     })).toBe('该 artifact 没有数据行');
+  });
+
+  it('does not narrate a failure from ordinary explanation quoting an earlier JSON result', () => {
+    expect(formatToolResultNarration({
+      toolName: 'invoke_skill', result: 'A previous response used {"success":false}. This explains its format.',
+    })).toBe('');
   });
 
   it('is not confused by braces inside JSON string values', () => {
@@ -371,18 +384,25 @@ describe('failure detection across the projection boundary', () => {
   const {projectToolResultForExternalSurface} =
     require('../../services/rag/toolResultProjectionFilter') as typeof import('../../services/rag/toolResultProjectionFilter');
 
-  /**
-   * A sensitive tool's projection is a rejection envelope with no `success`
-   * field. Deciding failure after projection therefore reported a failed
-   * source lookup as an ordinary success, and the step vanished from the
-   * timeline instead of showing that the lookup did not work.
-   */
-  it('sees a sensitive tool failure that projection erases', () => {
+  it('preserves tool failure after private error text is projected away', () => {
     const rawFailure = [{type: 'text', text: JSON.stringify({success: false, error: 'codebase not registered'})}];
 
     const projected = projectToolResultForExternalSurface('read_codebase_file', rawFailure);
-    expect(toolResultIsFailure({toolName: 'read_codebase_file', result: projected})).toBe(false);
+    expect(toolResultIsFailure({toolName: 'read_codebase_file', result: projected})).toBe(true);
     expect(toolResultIsFailure({toolName: 'read_codebase_file', result: rawFailure})).toBe(true);
+  });
+
+  it.each([true, false, undefined])('projects every raw wrapper away while preserving success=%s', success => {
+    const raw = createRuntimeToolResult({
+      reference: {referenceId: 'ref1', codebaseId: 'cb1', filePath: 'STRUCTURED_PATH_CANARY', text: 'STRUCTURED_TEXT_CANARY'},
+    }, {facts: {planPhaseId: 'p1', ...(success === undefined ? {} : {success})}});
+    raw.content[0].text = 'CONTENT_CANARY';
+    const wrapped = {content: [{type: 'text', text: 'OUTER_CONTENT_CANARY'}], details: raw};
+    for (const input of [raw, wrapped, JSON.stringify(wrapped)]) {
+      const projected = projectToolResultForExternalSurface('mcp__smartperfetto__read_codebase_file', input);
+      expect(JSON.stringify(projected)).not.toMatch(/CANARY/);
+      expect(readRuntimeToolResultFacts(projected)).toEqual({planPhaseId: 'p1', ...(success === undefined ? {} : {success})});
+    }
   });
 
   it('reads a failure flag off the result envelope itself', () => {

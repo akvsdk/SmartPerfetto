@@ -6,8 +6,55 @@ import {describe, expect, it} from '@jest/globals';
 import {buildTraceProcessorQueryProvenance} from '../../services/traceProcessorConnectionModel';
 import {sanitizeQueryReview} from '../../types/queryReviewContract';
 import {ArtifactStore} from '../artifactStore';
+import type {EvidenceScopeProvenanceV1} from '../../types/identityContract';
 
 describe('ArtifactStore', () => {
+  it.each([
+    {fields: 'metric'}, {fields: ['metric', 7]}, {availability: 'maybe'}, {relativeTo: null},
+  ])('preserves invalid scope through store, snapshot and every fetch surface: %j', malformedFields => {
+    const scope = {mode: 'exact_upid' as const, traceId: 'trace', traceSide: 'current' as const, upid: 42};
+    const malformed = {version: 'process_scope_evidence@1', entries: [
+      {role: 'global_context', scope: {mode: 'unscoped', traceId: 'trace', traceSide: 'current'}, fields: ['device_metric']},
+      {role: 'target', scope, ...malformedFields},
+    ]} as unknown as EvidenceScopeProvenanceV1;
+    const store = new ArtifactStore();
+    const id = store.store({skillId: 'invalid_scope', data: {columns: ['metric', 'device_metric'], rows: [[1, 4]]},
+      scopeProvenance: malformed, ...{appliedProcessScope: scope, evidenceRole: 'target'}});
+    const invalid = {version: 'process_scope_evidence@1', entries: [], invalid: true};
+    expect(store.serialize()[0].scopeProvenance).toEqual(invalid);
+    expect(store.serialize()[0].appliedProcessScope).toBeUndefined();
+    const snapshot = JSON.parse(JSON.stringify(store.serialize()));
+    // Also exercise a malformed persisted record that predates strict copying.
+    snapshot[0].scopeProvenance = malformed;
+    snapshot[0].appliedProcessScope = scope;
+    snapshot[0].evidenceRole = 'target';
+    const restored = ArtifactStore.fromSnapshot(snapshot);
+    for (const candidate of [store, restored, ArtifactStore.fromSnapshot(JSON.parse(JSON.stringify(restored.serialize())))]) {
+      for (const projection of [candidate.generateSummary(id), candidate.generateCompactSummary(id),
+        candidate.fetch(id, 'rows'), candidate.fetch(id, 'full')]) {
+        expect(projection.scopeProvenance).toEqual(invalid);
+        expect(projection.appliedProcessScope).toBeUndefined();
+        expect(projection.evidenceRole).toBeUndefined();
+      }
+    }
+  });
+
+  it('derives scope compatibility fields from entries across snapshot and fetch surfaces', () => {
+    const store = new ArtifactStore();
+    const id = store.store({ skillId: 'global', data: { columns: ['frequency'], rows: [[1200]] },
+      scopeProvenance: { version: 'process_scope_evidence@1', entries: [{ role: 'global_context',
+        scope: { mode: 'unscoped', traceId: 'trace', traceSide: 'current' } }] } });
+    const snapshot = JSON.parse(JSON.stringify(store.serialize()));
+    snapshot[0].appliedProcessScope = { mode: 'exact_upid', traceId: 'trace', traceSide: 'current', upid: 999 };
+    snapshot[0].evidenceRole = 'target';
+    const restored = ArtifactStore.fromSnapshot(snapshot);
+    for (const projection of [restored.generateSummary(id), restored.generateCompactSummary(id),
+      restored.fetch(id, 'rows'), restored.fetch(id, 'full')]) {
+      expect(projection.evidenceRole).toBe('global_context');
+      expect(projection.appliedProcessScope).toBeUndefined();
+      expect(projection.scopeProvenance.entries[0].scope.mode).toBe('unscoped');
+    }
+  });
   it('exposes pane-aware trace provenance in summaries and fetch results', () => {
     const store = new ArtifactStore();
     const traceProvenance = buildTraceProcessorQueryProvenance({

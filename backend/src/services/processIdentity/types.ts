@@ -52,6 +52,7 @@ export interface ProcessIdentityResolution {
   requestedName?: string;
   canonicalPackageName?: string;
   recommendedProcessNameParam?: string;
+  /** Verified selected process IDs; alternatives belong only in candidates. */
   upids: number[];
   confidenceScore: number;
   rawStatus?: string;
@@ -70,3 +71,12 @@ export const DEFAULT_PROCESS_IDENTITY_ALIASES = [
   'packageName',
   'processName',
 ];
+
+export const PROCESS_IDENTITY_SELECTORS = [
+  ...DEFAULT_PROCESS_IDENTITY_ALIASES, 'upid', 'pid', 'thread_name', 'threadName',
+];
+
+export function hasProcessIdentitySelector(params: Record<string, unknown> | undefined): boolean {
+  return PROCESS_IDENTITY_SELECTORS.some(key => params?.[key] !== undefined && params[key] !== null &&
+    String(params[key]).trim() !== '');
+}

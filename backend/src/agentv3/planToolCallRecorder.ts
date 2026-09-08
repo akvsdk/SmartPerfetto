@@ -15,10 +15,7 @@ import {
   type PlanPhase,
   type ToolCallRecord,
 } from './types';
-import {
-  isComparisonSynthesisPlanPhase,
-  isConclusionLikePlanPhase,
-} from './planPhaseSemantics';
+import {resolvePlanPhaseForCall} from './planPhaseSemantics';
 import { summarizeToolCallInput } from './toolCallSummary';
 import {
   getSourceLookupCodeReferences,
@@ -28,11 +25,17 @@ import {
   type SourceLookupCodeReference,
 } from '../services/codebase/sourceLookupTools';
 
+import {readRuntimeToolResultFacts, type RuntimeToolResultFacts} from '../agentRuntime/runtimeToolResult';
+
 const MCP_NAME_PREFIX = 'mcp__smartperfetto__';
 const MAX_PLAN_TOOL_CALL_LOG = 100;
 
 export interface PlanToolCallRecorderInput {
   toolName: string;
+  /** Actual SDK/handler invocation ID. Never substitute a parameter hash. */
+  toolCallId?: string;
+  /** Emitted only after recorded success completes an earlier pending phase. */
+  onPhaseAutoCompleted?: (phase: PlanPhase) => void;
   input?: unknown;
   /**
    * Transport form of the result: byte-truncated to
@@ -46,7 +49,7 @@ export interface PlanToolCallRecorderInput {
   /**
    * Facts read from the intact result, before truncation or external-surface
    * projection. Without these, a large result silently degrades plan phase
-   * attribution to semantic inference and leaves tool success unknown.
+   * attribution to an unresolved dispatch and leaves tool success unknown.
    */
   resultFacts?: ToolResultFacts;
   /** Privacy-safe fact extracted from the raw result before any external-surface projection. */
@@ -63,14 +66,17 @@ export interface AnalysisPlanTracker {
    * How many tool calls this run has dispatched, counted once and never
    * revised.
    *
-   * The two logs cannot answer this. They are plan-adherence records, so they
-   * are *allowed* to forget: both are capped and trimmed from the front, and
-   * `replayPrePlanToolCalls` drops pre-plan calls that match no phase and then
-   * clears the pre-plan log outright. A run that ran one query before planning
-   * can therefore end with both logs empty. This counter exists because
-   * "did this run do anything" needs an answer that only ever grows.
+   * The bounded logs can be trimmed or transferred during plan submission.
+   * Their lengths cannot provide a monotone dispatch count.
    */
   dispatchedToolCallCount?: number;
+}
+
+const recordedCallIds = new WeakMap<AnalysisPlanTracker, Set<string>>();
+
+function realToolCallId(value: string | undefined): string | undefined {
+  const id = value?.trim();
+  return id && id !== 'unknown' ? id : undefined;
 }
 
 export function resetPrePlanToolCallsForNewRun(
@@ -79,6 +85,7 @@ export function resetPrePlanToolCallsForNewRun(
   if (!tracker) return;
   tracker.prePlanToolCallLog = [];
   tracker.dispatchedToolCallCount = 0;
+  recordedCallIds.delete(tracker);
 }
 
 export interface PlanEvidenceGap {
@@ -87,6 +94,7 @@ export interface PlanEvidenceGap {
   missingExpectedCalls: ExpectedCall[];
   /** True when a legacy expectedTools-only phase has no valid call attributed to it. */
   missingGenericToolEvidence?: boolean;
+  missingExpectedTools?: string[];
 }
 
 export interface PhaseToolEvidenceStatus {
@@ -94,6 +102,7 @@ export interface PhaseToolEvidenceStatus {
   matchedCalls: ToolCallRecord[];
   missingExpectedCalls: ExpectedCall[];
   missingGenericToolEvidence: boolean;
+  missingExpectedTools: string[];
 }
 
 function shortToolName(toolName: string): string {
@@ -102,8 +111,11 @@ function shortToolName(toolName: string): string {
 
 function buildToolCallRecord(input: PlanToolCallRecorderInput): ToolCallRecord {
   const callSummary = summarizeToolCallInput(shortToolName(input.toolName), input.input);
-  const success = input.resultFacts?.success ?? extractToolCallSuccessFromResult(input.resultText);
+  const success = input.resultFacts !== undefined
+    ? input.resultFacts.success : extractToolCallSuccessFromResult(input.resultText);
   const planCapability = getPlanToolCapability(input.toolName);
+  const requestedPhaseId = input.input && typeof input.input === 'object'
+    ? (input.input as Record<string, unknown>).planPhaseId : undefined;
   const returnedCodeReferences = planCapability === 'evidence' && (
     input.returnedCodeReferences ?? (
       Boolean(input.returnedCodeReferenceHints?.length) ||
@@ -112,9 +124,11 @@ function buildToolCallRecord(input: PlanToolCallRecorderInput): ToolCallRecord {
   );
   return {
     toolName: input.toolName,
+    ...(realToolCallId(input.toolCallId) ? {toolCallId: realToolCallId(input.toolCallId)} : {}),
     timestamp: input.timestamp ?? Date.now(),
     ...(planCapability === 'evidence' ? {} : {planCapability}),
     ...(success === undefined ? {} : { success }),
+    ...(typeof requestedPhaseId === 'string' ? {requestedPhaseId} : {}),
     ...(returnedCodeReferences ? { returnedCodeReferences: true } : {}),
     ...callSummary,
   };
@@ -128,171 +142,18 @@ function findSourceControlPhase(plan: AnalysisPlanV3): PlanPhase | undefined {
   return matches.length === 1 ? matches[0] : undefined;
 }
 
-function parseLeadingJsonObject(text: string): Record<string, unknown> | null {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === '\\') {
-        escaped = true;
-      } else if (char === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-    } else if (char === '{') {
-      depth++;
-    } else if (char === '}') {
-      depth--;
-      if (depth === 0) {
-        try {
-          const parsed = JSON.parse(text.slice(0, i + 1));
-          return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-            ? parsed as Record<string, unknown>
-            : null;
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
-}
+export type ToolResultFacts = RuntimeToolResultFacts;
 
-function collectToolResultCandidates(resultText: string): string[] {
-  const candidates = [resultText];
-  const collect = (value: unknown, depth: number): void => {
-    if (depth > 3 || value == null) return;
-    if (typeof value === 'string') {
-      candidates.push(value);
-      return;
-    }
-    if (Array.isArray(value)) {
-      value.forEach(entry => collect(entry, depth + 1));
-      return;
-    }
-    if (typeof value !== 'object') return;
-    const record = value as Record<string, unknown>;
-    if (typeof record.text === 'string') candidates.push(record.text);
-    if (typeof record.output === 'string') candidates.push(record.output);
-    collect(record.content, depth + 1);
-    collect(record.result, depth + 1);
-  };
-
-  try {
-    collect(JSON.parse(resultText), 0);
-  } catch {
-    // A tool result may append a reasoning nudge after its leading JSON object.
-  }
-  return [...new Set(candidates)];
+export function readToolResultFacts(result: unknown): ToolResultFacts {
+  return readRuntimeToolResultFacts(result);
 }
 
 export function extractToolCallSuccessFromResult(resultText?: string): boolean | undefined {
-  if (!resultText) return undefined;
-  for (const candidate of collectToolResultCandidates(resultText)) {
-    const parsed = parseLeadingJsonObject(candidate.trim());
-    if (!parsed) continue;
-    if (typeof parsed.success === 'boolean') return parsed.success;
-    if (parsed.isError === true) return false;
-    if (parsed.outcome === 'success') return true;
-    if (
-      parsed.outcome === 'rejected' ||
-      parsed.outcome === 'budget_exceeded' ||
-      parsed.outcome === 'consent_blocked' ||
-      parsed.outcome === 'license_blocked' ||
-      parsed.outcome === 'unresolved' ||
-      parsed.outcome === 'sidecar_missing'
-    ) {
-      return false;
-    }
-  }
-  return undefined;
-}
-
-export interface ToolResultFacts {
-  /** Plan phase the tool itself attributed the call to. */
-  planPhaseId?: string;
-  /** Whether the tool reported success. */
-  success?: boolean;
-}
-
-/**
- * Read the plan-relevant facts out of an intact tool result.
- *
- * Runtimes call this while they still hold the result object, before
- * `summarizeExternalToolResult` truncates it for transport. Both fields sit
- * after the result body in the MCP payload, so they are the first casualties of
- * a byte cap.
- */
-export function readToolResultFacts(result: unknown): ToolResultFacts {
-  const body = unwrapToolResultObject(result);
-  if (!body) return {};
-  const planPhaseId = typeof body.planPhaseId === 'string' && body.planPhaseId.trim()
-    ? body.planPhaseId.trim()
-    : undefined;
-  const success = typeof body.success === 'boolean' ? body.success : undefined;
-  return {
-    ...(planPhaseId ? {planPhaseId} : {}),
-    ...(success === undefined ? {} : {success}),
-  };
-}
-
-/** Unwrap the MCP content envelope each runtime happens to use. */
-function unwrapToolResultObject(value: unknown): Record<string, unknown> | undefined {
-  let current: unknown = value;
-  for (let depth = 0; depth < 6; depth += 1) {
-    if (typeof current === 'string') {
-      const text = current.trim();
-      // A serialized content-block array has to keep unwrapping; parsing it as
-      // a leading object would stop at the `{type, text}` wrapper.
-      if (text.startsWith('[')) {
-        try {
-          current = JSON.parse(text);
-          continue;
-        } catch {
-          return undefined;
-        }
-      }
-      // Objects may carry trailing guidance prose, so scan for the leading one.
-      return parseLeadingJsonObject(text) ?? undefined;
-    }
-    if (Array.isArray(current)) {
-      const block = current.find(
-        (entry): entry is {text: string} =>
-          !!entry && typeof entry === 'object' && typeof (entry as {text?: unknown}).text === 'string',
-      );
-      if (!block) return undefined;
-      current = block.text;
-      continue;
-    }
-    if (current && typeof current === 'object') {
-      const record = current as Record<string, unknown>;
-      if (Array.isArray(record.content) || typeof record.content === 'string') {
-        current = record.content;
-        continue;
-      }
-      return record;
-    }
-    return undefined;
-  }
-  return undefined;
+  return readToolResultFacts(resultText).success;
 }
 
 export function extractPlanPhaseIdFromToolResult(resultText?: string): string | undefined {
-  if (!resultText) return undefined;
-  for (const candidate of collectToolResultCandidates(resultText)) {
-    const trimmed = candidate.trim();
-    const parsed = parseLeadingJsonObject(trimmed);
-    const planPhaseId = parsed?.planPhaseId;
-    if (typeof planPhaseId === 'string' && planPhaseId.trim()) return planPhaseId.trim();
-  }
-  return undefined;
+  return readToolResultFacts(resultText).planPhaseId;
 }
 
 export function recordPlanToolCall(
@@ -308,36 +169,14 @@ export function recordPlanToolCall(
   const canControlPlan = isControlCapableToolName(shortName);
   const candidate = buildToolCallRecord(input);
 
-  const expectedGapPhase = canSatisfyEvidence
-    ? findBestPhaseForExpectedCallGap(plan, candidate, 'structured_only')
-    : undefined;
-  const toolReturnedPhaseId =
-    input.resultFacts?.planPhaseId ?? extractPlanPhaseIdFromToolResult(input.resultText);
-  let matchedPhaseId = canControlPlan
-    ? findSourceControlPhase(plan)?.id
-    : expectedGapPhase?.id;
-
-  if (!matchedPhaseId && canSatisfyEvidence) {
-    const returnedPhase = toolReturnedPhaseId
-      ? plan.phases.find(phase => phase.id === toolReturnedPhaseId)
-      : undefined;
-    matchedPhaseId = returnedPhase && phaseMatchesCall(returnedPhase, candidate)
-      ? returnedPhase.id
-      : undefined;
-  }
-
-  if (!matchedPhaseId && canSatisfyEvidence) {
-    const activePhase = plan.phases.find(p => p.status === 'in_progress');
-    if (activePhase && phaseMatchesCall(activePhase, candidate)) {
-      matchedPhaseId = activePhase.id;
-    }
-  }
-  if (!matchedPhaseId && canSatisfyEvidence) {
-    const pendingMatches = plan.phases.filter(p =>
-      p.status === 'pending' && phaseMatchesCall(p, candidate),
-    );
-    matchedPhaseId = pendingMatches.length === 1 ? pendingMatches[0].id : undefined;
-  }
+  const returnedPhaseId = input.resultFacts !== undefined
+    ? input.resultFacts.planPhaseId : extractPlanPhaseIdFromToolResult(input.resultText);
+  const explicitPhaseId = candidate.requestedPhaseId ?? returnedPhaseId;
+  const conflictingPhaseIds = candidate.requestedPhaseId !== undefined && returnedPhaseId !== undefined &&
+    candidate.requestedPhaseId !== returnedPhaseId;
+  const matchedPhaseId = canSatisfyEvidence && !conflictingPhaseIds
+    ? resolvePlanPhaseForCall(plan, candidate, explicitPhaseId).phase?.id
+    : canControlPlan ? findSourceControlPhase(plan)?.id : undefined;
 
   const record = { ...candidate, matchedPhaseId };
   plan.toolCallLog.push(record);
@@ -353,11 +192,20 @@ export function recordPlanOrPrePlanToolCall(
   input: PlanToolCallRecorderInput,
 ): ToolCallRecord | undefined {
   if (!tracker) return undefined;
+  const toolCallId = realToolCallId(input.toolCallId);
+  if (toolCallId) {
+    const seen = recordedCallIds.get(tracker) ?? new Set<string>();
+    if (seen.has(toolCallId)) return undefined;
+    seen.add(toolCallId);
+    recordedCallIds.set(tracker, seen);
+  }
   // Counted before any filtering: the model dispatched this call whether or not
   // the call is one the plan cares to remember.
   tracker.dispatchedToolCallCount = (tracker.dispatchedToolCallCount ?? 0) + 1;
   if (tracker.current) {
-    return recordPlanToolCall(tracker.current, input);
+    const record = recordPlanToolCall(tracker.current, input);
+    if (record) reconcileSuccessfulBackfill(tracker.current, record, input.onPhaseAutoCompleted);
+    return record;
   }
 
   const shortName = shortToolName(input.toolName);
@@ -375,6 +223,24 @@ export function recordPlanOrPrePlanToolCall(
     tracker.prePlanToolCallLog.splice(0, tracker.prePlanToolCallLog.length - MAX_PLAN_TOOL_CALL_LOG);
   }
   return record;
+}
+
+function reconcileSuccessfulBackfill(
+  plan: AnalysisPlanV3,
+  record: ToolCallRecord,
+  notify?: (phase: PlanPhase) => void,
+): void {
+  if (record.success !== true || !record.matchedPhaseId) return;
+  const index = plan.phases.findIndex(phase => phase.id === record.matchedPhaseId);
+  const phase = plan.phases[index];
+  if (!phase || phase.status !== 'pending') return;
+  if (!(phase.expectedCalls?.length || phase.expectedTools?.length)) return;
+  if (!plan.phases.some((candidate, position) => position > index && candidate.status === 'in_progress')) return;
+  if (!getPhaseToolEvidenceStatus(plan, phase).satisfied) return;
+  phase.status = 'completed';
+  phase.completedAt = record.timestamp;
+  phase.completionSource = 'evidence_backfill';
+  try { notify?.(phase); } catch { /* Display observers cannot change a recorded tool outcome. */ }
 }
 
 /**
@@ -412,15 +278,10 @@ export function replayPrePlanToolCalls(tracker: AnalysisPlanTracker | null | und
       }
       continue;
     }
-    const matchedPhase = findBestPhaseForExpectedCallGap(
-      plan,
-      candidate,
-      'structured_or_generic',
-    );
-    if (!matchedPhase) continue;
+    const matchedPhase = resolvePlanPhaseForCall(plan, candidate, candidate.requestedPhaseId).phase;
     plan.toolCallLog.push({
       ...candidate,
-      matchedPhaseId: matchedPhase.id,
+      matchedPhaseId: matchedPhase?.id,
     });
     rememberSourceLookupCodeReferences(plan, getSourceLookupCodeReferences(candidate));
     replayed++;
@@ -439,132 +300,33 @@ export function findMissingExpectedCallsForPhase(
 ): ExpectedCall[] {
   const expectedCalls = phase.expectedCalls ?? [];
   if (expectedCalls.length === 0) return [];
-  const matchedCalls = toolCallLog.filter(call => call.matchedPhaseId === phase.id);
+  const matchedCalls = toolCallLog.filter(call => call.success === true && call.matchedPhaseId === phase.id);
   return expectedCalls
     .filter(call => !matchedCalls.some(record => expectedCallMatchesRecord(call, record)));
 }
 
-function expectedCallWasExecutedAnywhere(
-  toolCallLog: readonly ToolCallRecord[],
-  expectedCall: ExpectedCall,
-): boolean {
-  return toolCallLog.some(record => expectedCallMatchesRecord(expectedCall, record));
-}
-
-function hasNonConclusionPhaseToolEvidence(
-  plan: AnalysisPlanV3,
-  conclusionPhaseId: string,
-  toolCallLog: readonly ToolCallRecord[],
-): boolean {
-  const phaseById = new Map(plan.phases.map(phase => [phase.id, phase]));
-  return toolCallLog.some(record => {
-    if (!record.matchedPhaseId || record.matchedPhaseId === conclusionPhaseId) return false;
-    const matchedPhase = phaseById.get(record.matchedPhaseId);
-    return Boolean(
-      matchedPhase &&
-      !isConclusionLikePlanPhase(matchedPhase) &&
-      phaseMatchesCall(matchedPhase, record),
-    );
-  });
-}
-
-function hasPriorNonConclusionMatchingToolEvidence(
-  plan: AnalysisPlanV3,
-  phase: PlanPhase,
-  toolCallLog: readonly ToolCallRecord[],
-): boolean {
-  const phaseById = new Map(plan.phases.map(entry => [entry.id, entry]));
-  const phaseIndex = plan.phases.findIndex(entry => entry.id === phase.id);
-  return toolCallLog.some(record => {
-    if (!record.matchedPhaseId || record.matchedPhaseId === phase.id) return false;
-    const matchedPhase = phaseById.get(record.matchedPhaseId);
-    if (
-      !matchedPhase ||
-      isConclusionLikePlanPhase(matchedPhase) ||
-      !phaseMatchesCall(matchedPhase, record)
-    ) {
-      return false;
-    }
-    if (phaseIndex >= 0) {
-      const matchedIndex = plan.phases.findIndex(entry => entry.id === matchedPhase.id);
-      if (matchedIndex > phaseIndex) return false;
-    }
-    return phaseMatchesCall(phase, record);
-  });
-}
-
-/**
- * Single source of truth for whether a phase has fulfilled its tool-evidence
- * contract. Structured calls are exact requirements; legacy expectedTools
- * require at least one valid call attributed to the phase. A pure conclusion
- * phase may reuse valid evidence from an earlier non-conclusion phase.
- */
+/** Only successful receipts attributed to this phase satisfy its declared calls. */
 export function getPhaseToolEvidenceStatus(
   plan: AnalysisPlanV3,
   phase: PlanPhase,
   toolCallLog: readonly ToolCallRecord[] = plan.toolCallLog,
 ): PhaseToolEvidenceStatus {
   const matchedCalls = toolCallLog.filter(record =>
-    record.matchedPhaseId === phase.id && phaseMatchesCall(phase, record),
+    record.success === true && record.matchedPhaseId === phase.id && phaseMatchesCall(phase, record),
   );
-  const missingForPhase = findMissingExpectedCallsForPhase(phase, toolCallLog);
-  const conclusionLike = isConclusionLikePlanPhase(phase);
-  const missingExpectedCalls = conclusionLike
-    ? missingForPhase.filter(call => !expectedCallWasExecutedAnywhere(toolCallLog, call))
-    : missingForPhase;
-
-  const hasReusableConclusionEvidence = conclusionLike &&
-    hasNonConclusionPhaseToolEvidence(plan, phase.id, toolCallLog);
-  const hasReusableComparisonEvidence = isComparisonSynthesisPlanPhase(phase) &&
-    hasPriorNonConclusionMatchingToolEvidence(plan, phase, toolCallLog);
-  const missingGenericToolEvidence = missingExpectedCalls.length === 0 &&
-    (phase.expectedTools ?? []).length > 0 &&
-    matchedCalls.length === 0 &&
-    !hasReusableConclusionEvidence &&
-    !hasReusableComparisonEvidence;
+  const missingExpectedCalls = findMissingExpectedCallsForPhase(phase, toolCallLog);
+  const structuredTools = new Set((phase.expectedCalls ?? []).map(call => shortToolName(call.tool)));
+  const missingExpectedTools = [...new Set((phase.expectedTools ?? []).map(shortToolName))]
+    .filter(tool => !structuredTools.has(tool) && !matchedCalls.some(call => shortToolName(call.toolName) === tool));
+  const missingGenericToolEvidence = missingExpectedTools.length > 0;
 
   return {
     satisfied: missingExpectedCalls.length === 0 && !missingGenericToolEvidence,
     matchedCalls,
     missingExpectedCalls,
     missingGenericToolEvidence,
+    missingExpectedTools,
   };
-}
-
-export function findBestPhaseForExpectedCallGap(
-  plan: AnalysisPlanV3,
-  record: ToolCallRecord,
-  mode: 'structured_only' | 'structured_or_generic',
-): PlanPhase | undefined {
-  const toolCallLog = Array.isArray(plan.toolCallLog) ? plan.toolCallLog : [];
-  const phasesWithStructuredGap = plan.phases.filter(phase => {
-    if (phase.status === 'skipped') return false;
-    const missingExpectedCalls = findMissingExpectedCallsForPhase(phase, toolCallLog);
-    return missingExpectedCalls.some(call => expectedCallMatchesRecord(call, record));
-  });
-  const phasesWithMatchingGap = phasesWithStructuredGap.length > 0 || mode === 'structured_only'
-    ? phasesWithStructuredGap
-    : plan.phases.filter(phase => {
-        if (phase.status === 'skipped' || !phaseMatchesCall(phase, record)) return false;
-        return !toolCallLog.some(call =>
-          call.matchedPhaseId === phase.id && phaseMatchesCall(phase, call),
-        );
-      });
-  if (phasesWithMatchingGap.length === 0) return undefined;
-
-  const statusPriority: Record<PlanPhase['status'], number> = {
-    in_progress: 0,
-    completed: 1,
-    pending: 2,
-    skipped: 3,
-  };
-  const highestPriority = Math.min(
-    ...phasesWithMatchingGap.map(phase => statusPriority[phase.status]),
-  );
-  const highestPriorityMatches = phasesWithMatchingGap.filter(
-    phase => statusPriority[phase.status] === highestPriority,
-  );
-  return highestPriorityMatches.length === 1 ? highestPriorityMatches[0] : undefined;
 }
 
 export function findCompletedPhaseEvidenceGaps(plan: AnalysisPlanV3): PlanEvidenceGap[] {
@@ -578,6 +340,7 @@ export function findCompletedPhaseEvidenceGaps(plan: AnalysisPlanV3): PlanEviden
         phase,
         matchedCalls: status.matchedCalls,
         missingExpectedCalls: status.missingExpectedCalls,
+        missingExpectedTools: status.missingExpectedTools,
         ...(status.missingGenericToolEvidence ? {missingGenericToolEvidence: true} : {}),
       });
     }
@@ -588,10 +351,11 @@ export function findCompletedPhaseEvidenceGaps(plan: AnalysisPlanV3): PlanEviden
 export function formatPlanEvidenceGap(gap: PlanEvidenceGap, outputLanguage: string = 'zh-CN'): string {
   const expected = expectedToolNames(gap.phase).join(', ');
   if (gap.missingGenericToolEvidence) {
+    const missing = (gap.missingExpectedTools ?? []).join(', ');
     if (outputLanguage === 'en') {
-      return `Phase "${gap.phase.name}" (${gap.phase.id}) has no matching tool evidence; run one of: ${expected}`;
+      return `Phase "${gap.phase.name}" (${gap.phase.id}) is missing successful calls for every listed tool: ${missing}`;
     }
-    return `阶段 "${gap.phase.name}" (${gap.phase.id}) 没有匹配的工具证据；请至少执行以下工具之一: ${expected}`;
+    return `阶段 "${gap.phase.name}" (${gap.phase.id}) 缺少以下各工具的成功调用: ${missing}`;
   }
   const missing = gap.missingExpectedCalls.map(formatExpectedCall).join(', ');
   if (outputLanguage === 'en') {

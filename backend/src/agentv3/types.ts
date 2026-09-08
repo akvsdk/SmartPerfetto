@@ -10,6 +10,9 @@ import type { OutputLanguage } from './outputLanguage';
 import type { CodeAwareMode } from '../services/codebase/codeAwareFeature';
 import type {SourceUseStatus} from '../services/codebase/sourceUseDecision';
 import type {CapabilityManifestResolutionV1} from '../types/capabilityManifest';
+import type {AnalysisRecoveryKind, AnalysisMissingReportSection} from '../types/analysisDelivery';
+import type {AnalysisTurnIntent} from '../agentRuntime/analysisTurnIntent';
+import type {ReadonlyStrategyRegistrySnapshot} from '../services/selfEvolution/effectiveRuntimeRegistryContext';
 
 // =============================================================================
 // Query Complexity Classification
@@ -21,7 +24,7 @@ export type QueryComplexity = 'quick' | 'full';
 /** Input signals for the complexity classifier. */
 export interface ComplexityClassifierInput {
   query: string;
-  /** Scene type already classified by keyword matcher */
+  /** Legacy scene hint; semantic turn intent uses the registered scene catalog. */
   sceneType: SceneType;
   /** Whether user selected a time range or slice in Perfetto UI */
   hasSelectionContext: boolean;
@@ -37,6 +40,18 @@ export interface ComplexityClassifierInput {
   previousQueries?: string[];
   /** Compact recent finding summaries from the same recent window as previousQueries. */
   previousFindings?: string[];
+  /** Bounded facts from recent turns, including quick answers. No raw tool payloads. */
+  previousFindingDetails?: Array<{
+    turnIndex: number;
+    turnId?: string;
+    id?: string;
+    title: string;
+    description?: string;
+    category?: string;
+  }>;
+  previousEntities?: Array<{turnIndex: number; type: string; id: number | string}>;
+  /** Presentation budget preference, independent of requested content. */
+  requestedMode?: 'auto' | 'fast' | 'full';
 }
 
 export interface SqlSchemaEntry {
@@ -81,6 +96,10 @@ export interface SqlSchemaIndex {
 /** Context assembled before calling Claude, injected into the system prompt. */
 export interface ClaudeAnalysisContext {
   query: string;
+  /** Current run pins, independent of the presentation budget. */
+  strategyRegistry?: ReadonlyStrategyRegistrySnapshot;
+  turnIntent?: AnalysisTurnIntent;
+  onDemandContext?: boolean;
   architecture?: ArchitectureInfo;
   packageName?: string;
   focusApps?: DetectedFocusApp[];
@@ -172,6 +191,8 @@ export interface ComparisonContext {
   referenceArchitecture?: ArchitectureInfo;
   /** Intersection of stdlib capabilities available on both trace processors */
   commonCapabilities: string[];
+  /** Missing on historical contexts means unknown, not a successful empty probe. */
+  capabilityProbeStatus?: 'not_checked' | 'checked' | 'unavailable';
   /** Capabilities available on only one side — informs Claude about analysis limitations */
   capabilityDiff?: { currentOnly: string[]; referenceOnly: string[] };
   /** Alignment anchor for cross-trace time normalization */
@@ -293,6 +314,12 @@ export interface ExpectedCall {
 }
 
 /** A phase in Claude's analysis plan, submitted via submit_plan tool. */
+export interface PlanSkipDisposition {
+  kind: 'not_applicable' | 'evidence_unavailable' | 'deferred';
+  /** Optional references to actual failed invocations; the declaration itself is not proof. */
+  failureToolCallIds?: string[];
+}
+
 export interface PlanPhase {
   id: string;
   name: string;
@@ -308,8 +335,12 @@ export interface PlanPhase {
   expectedCalls?: ExpectedCall[];
   status: 'pending' | 'in_progress' | 'completed' | 'skipped';
   completedAt?: number;
+  /** Backend-owned completion; consumers must still verify the phase's successful call log. */
+  completionSource?: 'evidence_backfill';
   /** Reasoning summary provided when completing/skipping this phase (P2-1) */
   summary?: string;
+  /** Keeps unresolved expectations visible without manufacturing successful evidence. */
+  skipDisposition?: PlanSkipDisposition;
 }
 
 /**
@@ -402,19 +433,12 @@ export function isEvidenceCapableToolName(toolName: string): boolean {
   return getPlanToolCapability(toolName) === 'evidence';
 }
 
-const ATTRIBUTION_SUPPORT_SKILL_IDS = new Set([
-  // Identity resolution supports the current phase after the process gate reports
-  // ambiguous/blocked identity, but it must not satisfy the phase's key skill.
-  'process_identity_resolver',
-]);
-
 export function formatExpectedCall(call: ExpectedCall): string {
   const tool = shortToolName(call.tool);
   return call.skillId ? `${tool}(${call.skillId})` : tool;
 }
 
 export function expectedCallMatchesRecord(call: ExpectedCall, record: ToolCallRecord): boolean {
-  if (record.success === false) return false;
   const shortTool = shortToolName(record.toolName);
   if (!isEvidenceCapableToolName(call.tool) || !isEvidenceCapableToolName(shortTool)) return false;
   if (shortToolName(call.tool) !== shortTool) return false;
@@ -427,19 +451,12 @@ export function phaseMatchesExpectedCall(phase: PlanPhase, record: ToolCallRecor
 }
 
 export function phaseMatchesCall(phase: PlanPhase, record: ToolCallRecord): boolean {
-  if (record.success === false) return false;
   const shortTool = shortToolName(record.toolName);
   if (!isEvidenceCapableToolName(shortTool)) return false;
   const expectedToolSet = new Set((phase.expectedTools ?? []).map(shortToolName));
   const structuredCallsForTool = (phase.expectedCalls ?? [])
     .filter(call => shortToolName(call.tool) === shortTool);
   if (structuredCallsForTool.length > 0) {
-    if (shortTool === 'invoke_skill' &&
-      record.skillId &&
-      ATTRIBUTION_SUPPORT_SKILL_IDS.has(record.skillId) &&
-      expectedToolSet.has(shortTool)) {
-      return true;
-    }
     return structuredCallsForTool.some(call => {
       if (call.skillId && call.skillId !== record.skillId) return false;
       return true;
@@ -462,6 +479,8 @@ export function expectedToolNames(phase: PlanPhase): string[] {
 /** Record of a tool call for plan adherence tracking. */
 export interface ToolCallRecord {
   toolName: string;
+  /** Actual invocation ID, optional for historical records without one. */
+  toolCallId?: string;
   timestamp: number;
   /** Provider-neutral plan role. Optional so older snapshots remain readable. */
   planCapability?: PlanToolCapability;
@@ -471,6 +490,8 @@ export interface ToolCallRecord {
   returnedCodeReferences?: boolean;
   /** Phase ID this tool call was matched to (if any) */
   matchedPhaseId?: string;
+  /** Explicit invocation attribution retained even when it cannot bind to a current phase. */
+  requestedPhaseId?: string;
   /**
    * One-line, human-readable digest of the tool's input. Used by plan
    * adherence checks to confirm the *right* call was made, not just any call
@@ -657,4 +678,6 @@ export interface VerificationIssue {
   type: 'missing_evidence' | 'too_many_criticals' | 'known_misdiagnosis' | 'severity_mismatch' | 'missing_check' | 'plan_deviation' | 'missing_reasoning' | 'unresolved_hypothesis' | 'truncation';
   severity: 'warning' | 'error' | 'info';
   message: string;
+  recoveryKind?: AnalysisRecoveryKind;
+  missingSections?: AnalysisMissingReportSection[];
 }

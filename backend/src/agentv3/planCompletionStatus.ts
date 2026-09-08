@@ -5,65 +5,62 @@
 import type { AnalysisPlanV3, PlanPhase } from './types';
 import {
   findCompletedPhaseEvidenceGaps,
+  getPhaseToolEvidenceStatus,
   type PlanEvidenceGap,
 } from './planToolCallRecorder';
-import {isSourceLookupToolName} from '../services/codebase/sourceLookupTools';
+import {hasValidPlanSkipDisposition} from './planPhaseSemantics';
 
 export interface AnalysisPlanCompletionStatus {
   complete: boolean;
   hasPlan: boolean;
   pendingPhases: PlanPhase[];
   evidenceGaps?: PlanEvidenceGap[];
-  sourceUseDecisionPending?: true;
-}
-
-export function hasAdequateClosedPhaseSummary(
-  phase: PlanPhase,
-  minSummaryChars: number,
-): boolean {
-  if (phase.status !== 'completed' && phase.status !== 'skipped') return false;
-  return typeof phase.summary === 'string' && phase.summary.trim().length >= minSummaryChars;
+  /** Closed skips retain unfulfilled declarations for delivery/coverage review. */
+  unresolvedExpectations?: PlanEvidenceGap[];
 }
 
 export function getAnalysisPlanCompletionStatus(
   plan: AnalysisPlanV3 | null | undefined,
   options: {
     minSummaryChars: number;
+    /** Compatibility input only; budget mode does not change a submitted plan's obligations. */
     quickMode?: boolean;
   },
 ): AnalysisPlanCompletionStatus {
-  if (options.quickMode) {
+  if (plan === null || plan === undefined) {
     return { complete: true, hasPlan: false, pendingPhases: [] };
   }
-  if (!plan || !Array.isArray(plan.phases) || plan.phases.length === 0) {
-    return { complete: false, hasPlan: false, pendingPhases: [] };
+  if (!Array.isArray(plan.phases) || plan.phases.length === 0 ||
+    new Set(plan.phases.map(phase => phase?.id)).size !== plan.phases.length || plan.phases.some(phase =>
+    !phase || typeof phase !== 'object' ||
+    typeof phase.id !== 'string' || !phase.id.trim() ||
+    typeof phase.name !== 'string' || !phase.name.trim() ||
+    typeof phase.goal !== 'string' || !phase.goal.trim() ||
+    (phase.expectedTools !== undefined && (!Array.isArray(phase.expectedTools) ||
+      phase.expectedTools.some(tool => typeof tool !== 'string' || !tool.trim()))) ||
+    (phase.expectedCalls !== undefined && (!Array.isArray(phase.expectedCalls) ||
+      phase.expectedCalls.some(call => !call || typeof call.tool !== 'string' || !call.tool.trim()))),
+  )) {
+    return { complete: false, hasPlan: true, pendingPhases: [] };
   }
 
   const evidenceGaps = findCompletedPhaseEvidenceGaps(plan);
   const evidenceGapPhaseIds = new Set(evidenceGaps.map(gap => gap.phase.id));
-  const pendingPhaseIds = new Set(plan.phases.filter(phase =>
-    !hasAdequateClosedPhaseSummary(phase, options.minSummaryChars) ||
-    evidenceGapPhaseIds.has(phase.id),
-  ).map(phase => phase.id));
-  const sourceUseDecisionPending = plan.sourceUseDecisionStatus === 'pending' ||
-    plan.sourceUseDecisionStatus === 'attempted';
-  if (sourceUseDecisionPending) {
-    const sourcePhases = plan.phases.filter(phase => [
-      ...(phase.expectedTools ?? []),
-      ...(phase.expectedCalls ?? []).map(call => call.tool),
-    ].some(isSourceLookupToolName));
-    if (sourcePhases.length > 0) {
-      sourcePhases.forEach(phase => pendingPhaseIds.add(phase.id));
-    } else if (pendingPhaseIds.size === 0) {
-      pendingPhaseIds.add(plan.phases[0].id);
-    }
-  }
-  const pendingPhases = plan.phases.filter(phase => pendingPhaseIds.has(phase.id));
+  const pendingPhases = plan.phases.filter(phase =>
+    (phase.status !== 'completed' && !(phase.status === 'skipped' && hasValidPlanSkipDisposition(plan, phase))) ||
+    evidenceGapPhaseIds.has(phase.id));
+  const unresolvedExpectations = plan.phases.flatMap(phase => {
+    if (phase.status !== 'skipped') return [];
+    const status = getPhaseToolEvidenceStatus(plan, phase);
+    return status.satisfied ? [] : [{phase, matchedCalls: status.matchedCalls,
+      missingExpectedCalls: status.missingExpectedCalls, missingExpectedTools: status.missingExpectedTools,
+      missingGenericToolEvidence: status.missingGenericToolEvidence}];
+  });
   return {
-    complete: pendingPhases.length === 0 && !sourceUseDecisionPending,
+    complete: pendingPhases.length === 0,
     hasPlan: true,
     pendingPhases,
     ...(evidenceGaps.length > 0 ? { evidenceGaps } : {}),
-    ...(sourceUseDecisionPending ? {sourceUseDecisionPending: true as const} : {}),
+    ...(unresolvedExpectations.length > 0 ? {unresolvedExpectations} : {}),
   };
 }

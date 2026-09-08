@@ -6,6 +6,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { DataEnvelope } from '../../types/dataContract';
+import {createDataEnvelope} from '../../types/dataContract';
+import type {ConclusionContract} from '../../agent/core/conclusionContract';
+import {deriveEvidenceBackedConclusionContractForNarrative} from '../agentResultNormalizer';
+import {runPreparedAnalysisClaimVerification} from '../evidence/analysisRelationPreparation';
 import {
   buildCompletedAnalysisResultSnapshot,
   persistCompletedAnalysisResultSnapshot,
@@ -17,6 +21,11 @@ import type {CapabilityManifestAttributionV1} from '../../types/capabilityManife
 import {createClaudeMcpServer} from '../../agentv3/claudeMcpServer';
 import {finalizeSourceAwareAnalysisResult} from '../codebase/sourceClaimVerifier';
 import {sanitizeSourceReference} from '../codebase/sourceUseDecision';
+import * as sourceClaimVerifier from '../codebase/sourceClaimVerifier';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import {captureEvidenceTable} from '../evidence/evidenceCapture';
+import {prepareClaimEvidence} from '../evidence/claimEvidencePreparation';
 import {
   createRuntimeSourceFinalizationFixture,
   createSourceAuthoredAnalysisResult,
@@ -78,6 +87,148 @@ const receiptCapabilityManifest: CapabilityManifestAttributionV1 = {
 };
 
 describe('analysis result snapshot pipeline', () => {
+  test('stores finalized body and source verdict verbatim without running a verifier again', () => {
+    const verify = jest.spyOn(sourceClaimVerifier, 'verifySourceClaimBindings');
+    const sanitize = jest.spyOn(sourceClaimVerifier, 'sanitizeConclusionSourceContract');
+    const conclusion = 'One narrow answer\n\nkeeps its original ending';
+    const contract: ConclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], claims: [], uncertainties: [], nextSteps: [],
+      sourceClaimBindings: [{claimId: 'claim-a', mechanismStatus: 'unverified', sourceReferenceIds: [], traceEvidenceRefIds: []}]};
+    const completion = {schemaVersion: 1 as const, runtimeKind: 'qoder-agent-sdk' as const, status: 'completed' as const,
+      candidateRef: 'candidate-a', runId: 'run-a', attemptId: 'attempt-a', conclusionFingerprint: analysisDeliveryFingerprint(conclusion)};
+    const sourceVerification = {schemaVersion: 'source_claim_verifier@1' as const, status: 'failed' as const,
+      bindings: contract.sourceClaimBindings!, issues: [{severity: 'error' as const, code: 'source_claim_missing' as const, message: 'No current source proof.'}]};
+    try {
+      const result = buildCompletedAnalysisResultSnapshot({tenantId: 'tenant-a', workspaceId: 'workspace-a',
+        traceId: 'trace-a', sessionId: 'session-a', runId: 'run-a', query: 'a narrow question',
+        conclusion, conclusionContract: contract, completion, outputOrigin: 'sdk_final',
+        sourceClaimVerificationResult: sourceVerification,
+        deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'passed', claims: 'not_checked',
+          source: 'failed', identity: 'not_checked', report: 'not_applicable'}});
+      expect(result?.summary.conclusion).toBe(conclusion);
+      expect(result?.summary.completion).toEqual(completion);
+      expect(result?.summary.sourceClaimVerificationResult).toEqual(sourceVerification);
+      expect(result?.conclusionContract).toBe(contract);
+      expect(verify).not.toHaveBeenCalled();
+      expect(sanitize).not.toHaveBeenCalled();
+    } finally { verify.mockRestore(); sanitize.mockRestore(); }
+  });
+
+  test('private persistence invalidates body bindings and retains failed terminal status', () => {
+    useTempEnterpriseDb();
+    const sessionId = 'snapshot-private-binding';
+    const conclusion = 'PRIVATE_BODY_CANARY';
+    registerCodeAwareCanary(sessionId, conclusion);
+    try {
+      const stored = persistCompletedAnalysisResultSnapshot({tenantId: 'tenant-a', workspaceId: 'workspace-a',
+        traceId: 'trace-a', sessionId, runId: 'run-a', query: 'private query', privateKnowledge: true,
+        conclusion, completion: {schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'failed', reason: 'provider_error',
+          candidateRef: 'candidate-a', runId: 'run-a', attemptId: 'attempt-a', conclusionFingerprint: analysisDeliveryFingerprint(conclusion)},
+        deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'failed', claims: 'passed',
+          source: 'failed', identity: 'not_checked', report: 'passed'}});
+      expect(stored?.summary.conclusion).not.toContain(conclusion);
+      expect(stored?.summary.completion).toMatchObject({status: 'failed', reason: 'provider_error', conclusionFingerprint: ''});
+      expect(stored?.summary.deliveryAssurance).toMatchObject({completion: 'failed', claims: 'not_checked', source: 'failed', report: 'not_checked'});
+      expect(JSON.stringify(stored)).not.toContain(analysisDeliveryFingerprint(conclusion));
+    } finally { clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  test('legacy snapshot safety projection invalidates old claim, source and report positives together', () => {
+    const conclusion = 'An unchanged historical statement';
+    const snapshot = buildCompletedAnalysisResultSnapshot({tenantId: 'tenant-a', workspaceId: 'workspace-a',
+      sessionId: 'session-a', traceId: 'trace-a', runId: 'run-a', query: 'old query', conclusion,
+      conclusionContract: {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [], clusters: [], evidenceChain: [],
+        claims: [{id: 'claim-a', text: conclusion, references: []}], uncertainties: [], nextSteps: [],
+        sourceReferences: [{rootPath: '/private/RAW_LEGACY_CANARY'}]},
+      claimVerificationResult: {schemaVersion: 'claim_verifier@1', status: 'passed', passed: true, policy: 'record_only',
+        checkedClaimCount: 1, unsupportedClaimCount: 0, claimResults: [{claimId: 'claim-a', status: 'verified'}], issues: []},
+      sourceClaimVerificationResult: {schemaVersion: 'source_claim_verifier@1', status: 'passed', bindings: [], issues: []},
+      deliveryAssurance: {schemaVersion: 1, entry: 'historical_restore', completion: 'not_checked', claims: 'passed', source: 'passed', identity: 'not_checked', report: 'passed'},
+    });
+    expect(snapshot?.summary.conclusion).toBe(conclusion);
+    expect(snapshot?.claimVerificationResult).toMatchObject({status: 'not_checked', passed: false});
+    expect(snapshot?.summary.sourceClaimVerificationResult?.status).toBe('not_checked');
+    expect(snapshot?.summary.deliveryAssurance).toMatchObject({claims: 'not_checked', source: 'not_checked', report: 'not_checked'});
+    expect(JSON.stringify(snapshot)).not.toContain('RAW_LEGACY_CANARY');
+  });
+
+  test('a finalized snapshot invalidates coverage changed by metadata copying while preserving the body and contract', () => {
+    const conclusion = 'A current conclusion';
+    const contract = {schemaVersion: 'conclusion_contract_v1' as const, mode: 'focused_answer' as const,
+      conclusions: [], clusters: [], evidenceChain: [], claims: [{id: 'claim/1', text: conclusion, references: []}], uncertainties: [], nextSteps: []};
+    const intent = {schemaVersion: 1 as const, status: 'resolved' as const, source: 'semantic' as const,
+      taskKind: 'fact' as const, sceneId: 'general', scope: 'bounded_question' as const, recommendedComplexity: 'quick' as const,
+      deliverable: 'answer' as const, evidenceAccess: 'existing_only' as const, registryFingerprint: 'registry-a'};
+    const candidate = {candidateRef: 'candidate-a', runId: 'run-a', attemptId: 'attempt-a', conclusionFingerprint: analysisDeliveryFingerprint(conclusion)};
+    const snapshot = buildCompletedAnalysisResultSnapshot({tenantId: 'tenant-a', workspaceId: 'workspace-a',
+      traceId: 'trace-a', sessionId: 'session-a', runId: 'run-a', query: 'current query', conclusion, conclusionContract: contract, turnIntent: intent,
+      completion: {...candidate, schemaVersion: 1, runtimeKind: 'pi-agent-core', status: 'completed'},
+      analysisReceipt: {schemaVersion: 1, runId: 'run-a', sessionId: 'session-a', traceId: 'trace-a', mode: 'fast', resolvedMode: 'quick', providerId: null, generatedAt: 1,
+        traceEvidence: {sqlCount: 1, skillCount: 0, dataEnvelopeCount: 1, artifactCount: 0, evidenceRefCount: 1},
+        nonEvidenceContext: {frontendPrequeryCount: 0, memoryHintCount: 0, conversationContextCount: 0, strategyHintCount: 0},
+        claimAudit: {totalClaims: 1, verifiedClaims: 1, unsupportedClaims: 0, uncertainClaims: 0},
+        qualityGates: {finalReportContract: 'passed', claimVerification: 'passed', identityResolution: 'passed'}, outputs: {}},
+      reportAssessment: {schemaVersion: 1, status: 'checked', binding: {...candidate,
+        conclusionContractFingerprint: analysisDeliveryFingerprint(contract), evidenceFingerprint: analysisDeliveryFingerprint([]),
+        requirementsFingerprint: analysisDeliveryFingerprint([]), registryFingerprint: 'registry-a', intentFingerprint: analysisDeliveryFingerprint(intent)},
+        requirements: [{requirementId: 'requirement-a', applicability: 'applicable', coverage: 'covered', claimIds: ['claim/1']}]},
+      deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'passed', claims: 'passed', source: 'not_checked', identity: 'not_checked', report: 'passed'}});
+    expect(snapshot?.summary.conclusion).toBe(conclusion);
+    expect(snapshot?.conclusionContract).toBe(contract);
+    expect(snapshot?.summary.completion?.conclusionFingerprint).toBe(candidate.conclusionFingerprint);
+    expect(snapshot?.summary.reportAssessment?.status).toBe('coverage_incomplete');
+    expect(snapshot?.summary.deliveryAssurance?.report).toBe('not_checked');
+    expect(snapshot?.summary.analysisReceipt?.qualityGates).toMatchObject({finalReportContract: 'partial', claimVerification: 'passed'});
+    expect(snapshot?.summary.analysisReceipt?.claimAudit.verifiedClaims).toBe(1);
+  });
+
+  test('persists the original contradicted claim and real failed verdict without replacing its value', async () => {
+    useTempEnterpriseDb();
+    const data = createDataEnvelope({columns: ['ttid_ms'], rows: [[1912]]}, {
+      type: 'skill_result', source: 'startup_analysis', title: '启动概览',
+      evidenceRefId: 'data:snapshot-ttid', traceId: 'trace-a', traceSide: 'current',
+    });
+    const contract: ConclusionContract = {
+      schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [{rank: 1, statement: 'TTID=9999ms'}], clusters: [], evidenceChain: [],
+      claims: [{id: 'snapshot-wrong', text: 'TTID=9999ms', kind: 'numeric', references: [
+        {evidenceRefId: 'data:snapshot-ttid', rowIndex: 0, column: 'ttid_ms', value: 9999},
+      ]}], uncertainties: [], nextSteps: [],
+    };
+    const conclusion = 'TTID=9999ms，事件计数1912次。';
+    const normalized = deriveEvidenceBackedConclusionContractForNarrative(conclusion, [data], {existingContract: contract});
+    const store = new ArtifactStore();
+    store.registerStandaloneEvidenceCapture(captureEvidenceTable(data.data, {
+      ttid_ms: {unit: 'ms', origin: {kind: 'native_producer', definitionFingerprint: 'snapshot-ttid-v1'}},
+    }), {meta: data.meta, display: data.display});
+    const preparedEvidence = await prepareClaimEvidence({conclusionContract: normalized, bindingEligibility: 'eligible',
+      evidenceReadView: store.createEvidenceReadView({allowedTraces: [{traceId: 'trace-a', traceSide: 'current'}], ownerKey: 'run-a'})});
+    const verification = runPreparedAnalysisClaimVerification({conclusionContract: normalized, dataEnvelopes: [data],
+      preparedEvidence, bindingEligibility: 'eligible'});
+    expect(verification.claimVerificationResult.claimResults[0].referenceCells).toEqual([
+      expect.objectContaining({status: 'value_mismatch'}),
+    ]);
+    const snapshot = persistCompletedAnalysisResultSnapshot({
+      tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a',
+      traceId: 'trace-a', sessionId: 'session-a', runId: 'run-a', query: '核对 TTID',
+      conclusion, conclusionContract: normalized, dataEnvelopes: [data],
+      claimSupport: verification.claimSupport, claimVerificationResult: verification.claimVerificationResult,
+    });
+    expect(snapshot?.conclusionContract).toEqual(contract);
+    expect(snapshot?.claimVerificationResult).toMatchObject({status: 'failed', passed: false});
+    const db = openEnterpriseDb();
+    try {
+      const row = db.prepare(`
+        SELECT conclusion_contract_json AS contract, claim_verification_json AS verification
+        FROM analysis_result_snapshots WHERE id = ?
+      `).get(snapshot!.id) as {contract: string; verification: string};
+      expect(JSON.parse(row.contract)).toEqual(contract);
+      expect(JSON.parse(row.verification)).toMatchObject({status: 'failed', passed: false});
+    } finally {
+      db.close();
+    }
+  });
+
   test('resolves a canonical scene before private query projection', () => {
     expect(resolveAnalysisResultSceneType('分析点击响应性能')).toBe('interaction');
     expect(resolveAnalysisResultSceneType(
@@ -835,7 +986,8 @@ describe('analysis result snapshot pipeline', () => {
       expect(snapshot?.capabilityManifest).toEqual(receiptCapabilityManifest);
       expect(snapshot?.summary.analysisReceipt?.capabilityManifest).toEqual(receiptCapabilityManifest);
       expect(snapshot?.summary.analysisReceipt?.outputs).toEqual({});
-      const storedSourceDecision = (snapshot?.conclusionContract as any)?.sourceUseDecision;
+      const storedSourceDecision = snapshot?.summary.sourceUseDecision;
+      expect(snapshot?.conclusionContract).not.toHaveProperty('sourceUseDecision');
       expect(storedSourceDecision).toEqual(expect.objectContaining({
         schemaVersion: 'source_use_decision@1',
         selectedCodebaseIds: ['app-safe'],
@@ -847,8 +999,8 @@ describe('analysis result snapshot pipeline', () => {
           referenceId: 'lookup-safe',
         })],
       }));
-      expect(storedSourceDecision.references[0]).not.toHaveProperty('rootPath');
-      expect(storedSourceDecision.references[0]).not.toHaveProperty('snippet');
+      expect(storedSourceDecision?.references[0]).not.toHaveProperty('rootPath');
+      expect(storedSourceDecision?.references[0]).not.toHaveProperty('snippet');
       expect(JSON.stringify(storedSourceDecision)).not.toContain(rawRoot);
       expect(JSON.stringify(storedSourceDecision)).not.toContain(rawSnippet);
 

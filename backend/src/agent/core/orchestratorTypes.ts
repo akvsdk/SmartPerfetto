@@ -40,6 +40,14 @@ import type { IdentityResolutionV1 } from '../../types/identityContract';
 import type { CodeAwareMode } from '../../services/codebase/codeAwareFeature';
 import type { AnalysisReceipt, UiActionProposalV1 } from '../../types/dataContract';
 import type {RunManifestAttributionSink} from '../../types/selfEvolution';
+import type {AnalysisTurnIntent} from '../../agentRuntime/analysisTurnIntent';
+import type {
+  AnalysisCompletion,
+  AnalysisDeliveryAssurance,
+  AnalysisOutputOrigin,
+  AnalysisRuntimeAppendix,
+  FinalReportAssessment,
+} from '../../types/analysisDelivery';
 
 // =============================================================================
 // Agent ID Constants
@@ -223,6 +231,13 @@ export interface AnalysisResult {
   findings: Finding[];
   hypotheses: Hypothesis[];
   conclusion: string;
+  /** Server-owned metadata. Deserializing these fields does not attest a new turn. */
+  turnIntent?: AnalysisTurnIntent;
+  completion?: AnalysisCompletion;
+  outputOrigin?: AnalysisOutputOrigin;
+  runtimeAppendix?: AnalysisRuntimeAppendix;
+  reportAssessment?: FinalReportAssessment;
+  deliveryAssurance?: AnalysisDeliveryAssurance;
   conclusionContract?: ConclusionContract;
   claimSupport?: ClaimSupportV1[];
   claimVerificationResult?: ClaimVerificationResult;

@@ -3,6 +3,7 @@
 
 ---
 scene: multi_trace_result_comparison
+classification_description: "Comparing previously saved analysis results or snapshots, including scope and metric differences between results."
 priority: 0
 effort: medium
 required_capabilities: []

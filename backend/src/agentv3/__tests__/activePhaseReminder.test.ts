@@ -2,108 +2,37 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-/**
- * Phase 3-4 of v2.1 — verify the active-phase reminder string that
- * gets appended to `fetch_artifact(full|rows)` responses.
- *
- * Exercises the real on-disk strategies (no mock) so the reminder
- * stays consistent with the actual phase_hints that ship in production.
- */
+import {describe, expect, it, jest} from '@jest/globals';
+import {buildActivePhaseReminder, REMINDER_PREFIX} from '../activePhaseReminder';
+import type {AnalysisPlanV3} from '../types';
 
-import { describe, it, expect, beforeAll } from '@jest/globals';
-import { buildActivePhaseReminder, REMINDER_PREFIX } from '../activePhaseReminder';
-import { invalidateStrategyCache } from '../strategyLoader';
-import type { AnalysisPlanV3 } from '../types';
+const state = (): AnalysisPlanV3 => ({phases: [{id: 'p1', name: 'Final conclusion', goal: 'Inspect the selected evidence',
+  expectedTools: [], status: 'in_progress'}], successCriteria: 'Resolve', submittedAt: 1, toolCallLog: []});
 
-const planWithInProgress: AnalysisPlanV3 = {
-  phases: [
-    { id: 'p1', name: '概览', goal: '取全帧统计', expectedTools: ['scrolling_analysis'], status: 'completed', summary: '已完成' },
-    // Avoid every keyword that appears on the overview hint (frame,
-    // jank, 帧, 卡顿, overview, 概览, 统计) so the matcher reliably
-    // picks the root_cause_drill hint.
-    { id: 'p2', name: 'drill investigation', goal: 'representative slice diagnos via 深钻', expectedTools: ['jank_frame_detail'], status: 'in_progress' },
-    { id: 'p3', name: '结论', goal: '输出报告', expectedTools: [], status: 'pending' },
-  ],
-  successCriteria: 'identify root cause',
-  submittedAt: 0,
-  toolCallLog: [],
-};
-
-const planAllPending: AnalysisPlanV3 = {
-  phases: [
-    { id: 'p1', name: '概览采集', goal: '取数据', expectedTools: ['scrolling_analysis'], status: 'pending' },
-  ],
-  successCriteria: 'x',
-  submittedAt: 0,
-  toolCallLog: [],
-};
-
-const planAllDone: AnalysisPlanV3 = {
-  phases: [
-    { id: 'p1', name: '概览', goal: 'x', expectedTools: [], status: 'completed' },
-    { id: 'p2', name: '结论', goal: 'y', expectedTools: [], status: 'completed' },
-  ],
-  successCriteria: 'x',
-  submittedAt: 0,
-  toolCallLog: [],
-};
-
-describe('buildActivePhaseReminder', () => {
-  beforeAll(() => invalidateStrategyCache());
-
-  it('returns empty string when plan is missing', () => {
-    expect(buildActivePhaseReminder(null, 'scrolling')).toBe('');
-    expect(buildActivePhaseReminder(undefined, 'scrolling')).toBe('');
+describe('explicit active phase reminder', () => {
+  it('renders the explicit ID and goal without selecting a strategy hint', () => {
+    const getStrategy = jest.fn(() => {throw new Error('Strategy matching must not run');});
+    const pin = {registryFingerprint: 'pin', overlayGeneration: 'pin', getStrategy, getAllStrategies: () => []};
+    const plan = state();
+    expect(buildActivePhaseReminder(plan, 'scrolling', pin)).toBe(`${REMINDER_PREFIX} p1: Inspect the selected evidence`);
+    expect(getStrategy).not.toHaveBeenCalled();
+    plan.phases[0].name = 'architecture root drill synthesis';
+    expect(buildActivePhaseReminder(plan)).toBe(`${REMINDER_PREFIX} p1: Inspect the selected evidence`);
   });
-
-  it('returns empty string when sceneType is missing', () => {
-    expect(buildActivePhaseReminder(planWithInProgress, undefined)).toBe('');
+  it('does not guess an active phase from no plan, pending phases, or multiple active phases', () => {
+    expect(buildActivePhaseReminder(null)).toBe('');
+    const plan = state();
+    plan.phases[0].status = 'pending';
+    expect(buildActivePhaseReminder(plan)).toBe('');
+    plan.phases[0].status = 'in_progress';
+    plan.phases.push({...plan.phases[0], id: 'p2'});
+    expect(buildActivePhaseReminder(plan)).toBe('');
   });
-
-  it('returns empty string when every phase is already done', () => {
-    expect(buildActivePhaseReminder(planAllDone, 'scrolling')).toBe('');
-  });
-
-  it('starts with the canonical reminder prefix', () => {
-    const reminder = buildActivePhaseReminder(planWithInProgress, 'scrolling');
-    expect(reminder.startsWith(REMINDER_PREFIX)).toBe(true);
-  });
-
-  it('mentions the active phase name', () => {
-    const reminder = buildActivePhaseReminder(planWithInProgress, 'scrolling');
-    expect(reminder).toContain('drill investigation');
-  });
-
-  it('includes the matched phase_hint constraint and critical tools (scrolling root_cause)', () => {
-    const reminder = buildActivePhaseReminder(planWithInProgress, 'scrolling');
-    // scrolling root_cause_drill hint → constraint mentions reason_code + workload_heavy
-    expect(reminder).toMatch(/reason_code|workload_heavy/);
-    expect(reminder).toMatch(/jank_frame_detail|blocking_chain_analysis/);
-  });
-
-  it('falls back to a short phase pointer for scenes without phase_hints', () => {
-    const genericPlan: AnalysisPlanV3 = {
-      phases: [
-        { id: 'p1', name: '通用分析', goal: '确认整体表现', expectedTools: ['execute_sql'], status: 'in_progress' },
-      ],
-      successCriteria: 'x',
-      submittedAt: 0,
-      toolCallLog: [],
-    };
-    const reminder = buildActivePhaseReminder(genericPlan, 'general');
-    expect(reminder).toContain('通用分析');
-    expect(reminder).toContain('确认整体表现');
-  });
-
-  it('does not guess the current phase when no phase is in_progress', () => {
-    const reminder = buildActivePhaseReminder(planAllPending, 'scrolling');
-    expect(reminder).toBe('');
-  });
-
-  it('caps the rendered length so a busy fetch_artifact response stays compact', () => {
-    const reminder = buildActivePhaseReminder(planWithInProgress, 'scrolling');
-    // Constraint is trimmed to 140 chars; total stays comfortably below
-    // 350 chars (prefix + phase name + constraint + tool list).
-    expect(reminder.length).toBeLessThanOrEqual(350);
+  it('bounds display text without mutating plan state or creating completion proof', () => {
+    const plan = state();
+    plan.phases[0].goal = 'x'.repeat(1000);
+    expect(buildActivePhaseReminder(plan).length).toBeLessThanOrEqual(200);
+    expect(plan.phases[0].status).toBe('in_progress');
+    expect(plan.phases[0].summary).toBeUndefined();
   });
 });

@@ -2,6 +2,14 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 
 import path from 'path';
+import fs from 'fs';
+import Database from 'better-sqlite3';
+import yaml from 'js-yaml';
+import {SkillEvaluator} from '../skill-eval/runner';
+import {SkillExecutor} from '../../src/services/skillEngine/skillExecutor';
+import {normalizeSkillDefinition} from '../../src/services/skillEngine/skillLoader';
+import type {SkillDefinition} from '../../src/services/skillEngine/types';
+import {assertEffectiveProcessScope} from '../../src/services/processIdentity/effectiveProcessScope';
 
 import {
   assertExpectationRows,
@@ -9,18 +17,132 @@ import {
   resolveParameterTokens,
   runCorpusRegression,
   sqlResultState,
+  validateStrategyExpectationDeclaration,
 } from './corpusRunner';
 
 const repoRoot = path.resolve(__dirname, '../../..');
 
+describe('SkillEvaluator step sequence identity admission', () => {
+  function scopedEvaluator() {
+    const db = new Database(':memory:');
+    db.function('trace_start', () => 0);
+    db.function('trace_end', () => 1000);
+    db.exec(`
+      CREATE TABLE process(upid INTEGER PRIMARY KEY, pid INTEGER, name TEXT, cmdline TEXT,
+        uid INTEGER, android_appid INTEGER, start_ts INTEGER, end_ts INTEGER);
+      CREATE TABLE android_process_metadata(upid INTEGER, process_name TEXT, package_name TEXT,
+        uid INTEGER, shared_uid INTEGER, is_kernel_task INTEGER);
+      CREATE TABLE thread(upid INTEGER, utid INTEGER, tid INTEGER, name TEXT, is_main_thread INTEGER);
+      CREATE TABLE actual_frame_timeline_slice(upid INTEGER, ts INTEGER, dur INTEGER, jank_type TEXT, layer_name TEXT);
+      CREATE TABLE android_oom_adj_intervals(upid INTEGER, ts INTEGER, dur INTEGER, score INTEGER);
+      CREATE TABLE android_battery_stats_event_slices(str_value TEXT, ts INTEGER, safe_dur INTEGER, track_name TEXT);
+      INSERT INTO process VALUES (42,4242,'com.example','com.example',1000,1000,0,1000),
+        (43,4343,'com.example.worker','com.example.worker',1000,1000,0,1000);
+    `);
+    const query = jest.fn(async (_traceId: string, sql: string) => {
+      // SQLite supplies the real relations used by the maintained resolver;
+      // only Perfetto's module-loading syntax is removed in this local fixture.
+      const rendered = sql.replace(/INCLUDE PERFETTO MODULE [^;]+;/g, '').trim();
+      if (!rendered) return {columns: [], rows: []};
+      const statement = db.prepare<[], unknown[]>(rendered);
+      return {columns: statement.columns().map(column => column.name), rows: statement.raw().all()};
+    });
+    const resolverPath = path.join(repoRoot, 'backend/skills/atomic/process_identity_resolver.skill.yaml');
+    const resolver = normalizeSkillDefinition(yaml.load(fs.readFileSync(resolverPath, 'utf8')), resolverPath)!;
+    const definition: SkillDefinition = {name: 'corpus_scoped_steps', version: '1', type: 'composite',
+      meta: {display_name: 'Scoped steps', description: 'Step admission fixture'},
+      identity: {policy: 'required'},
+      inputs: [{name: 'upid', type: 'integer', required: false}, {name: 'package', type: 'string', required: false}],
+      steps: [{id: 'target', type: 'atomic', condition: 'false', save_as: 'selected',
+        process_scope: {role: 'target', binding: 'native_upid'},
+        sql: "SELECT upid AS selected_upid FROM process WHERE upid = ${__process_scope.upid} OR (${__process_scope.upid} IS NULL AND name = '${package}')"},
+      {id: 'context', type: 'atomic', process_scope: {role: 'identity_metadata'},
+        sql: "SELECT '${identity_resolution.status}' AS admitted_status, ${selected.data[0].selected_upid} AS previous_upid, '${package}' AS admitted_name"}],
+    };
+    const executor = new SkillExecutor({query});
+    executor.registerSkills([resolver, definition]);
+    // Load an in-memory test trace without starting a TP process. The sequence,
+    // gate, resolver SQL, parameter rewrite, and step executor remain real.
+    const evaluator = Object.assign(Object.create(SkillEvaluator.prototype), {
+      executor, skill: definition, traceId: 'scope-trace', availablePrerequisiteModules: [],
+    }) as SkillEvaluator;
+    return {db, executor, evaluator, query, definition};
+  }
+
+  it('prepares the real exact identity before forced SQL and preserves gate parameters and context', async () => {
+    const {db, executor, evaluator, query} = scopedEvaluator();
+    const prepare = jest.spyOn(executor, 'prepareInvocation');
+    try {
+      const results = await evaluator.executeStepSequence(['target', 'context'], {upid: 43}, {forceSqlStepIds: ['target']});
+      expect(prepare.mock.calls[0]).toEqual(['corpus_scoped_steps', 'scope-trace', {upid: 43}]);
+      const gate = await prepare.mock.results[0].value;
+      expect(gate.processScope).toMatchObject({mode: 'exact_upid', traceId: 'scope-trace', upid: 43});
+      expect(() => assertEffectiveProcessScope(gate.processScope!, 'scope-trace', 'current')).not.toThrow();
+      expect(gate.resolution?.upids).toEqual([43]);
+      expect(results.map(result => result.success)).toEqual([true, true]);
+      expect(results[0].data).toEqual([{selected_upid: 43}]);
+      expect(results[1].data).toEqual([{admitted_status: 'verified', previous_upid: 43, admitted_name: 'com.example.worker'}]);
+      const targetSql = query.mock.calls.find(([, sql]) => sql.includes('AS selected_upid'))?.[1];
+      expect(targetSql).toContain('upid = 43');
+      expect(targetSql).not.toContain('upid = NULL');
+    } finally {prepare.mockRestore(); db.close();}
+  });
+
+  it.each([{upid: 0}, {upid: 999999}])('refuses an invalid or unresolved selector before target SQL: %j', async params => {
+    const {db, evaluator, query} = scopedEvaluator();
+    try {
+      await expect(evaluator.executeStepSequence(['target', 'context'], params, {forceSqlStepIds: ['target']}))
+        .rejects.toThrow(params.upid === 0 ? 'positive safe integer' : 'Explicit UPID could not be verified');
+      expect(query.mock.calls.some(([, sql]) => sql.includes('AS selected_upid') || sql.includes('AS admitted_status'))).toBe(false);
+      if (params.upid === 0) expect(query).not.toHaveBeenCalled();
+    } finally {db.close();}
+  });
+
+  it('preserves unverified named filtering when the optional resolver is unavailable', async () => {
+    const {db, executor, evaluator, definition, query} = scopedEvaluator();
+    const optional = {...definition, identity: {policy: 'verify_if_present' as const}};
+    executor.replaceRegisteredSkills([optional]);
+    Object.assign(evaluator, {skill: optional});
+    const prepare = jest.spyOn(executor, 'prepareInvocation');
+    try {
+      const results = await evaluator.executeStepSequence(['target', 'context'], {package: 'com.example.worker'},
+        {forceSqlStepIds: ['target']});
+      const gate = await prepare.mock.results[0].value;
+      expect(gate.processScope).toMatchObject({mode: 'named', requestedName: 'com.example.worker'});
+      expect(gate.resolution?.status).toBe('unresolved');
+      expect(gate.inherited.identity_gate_warning).toContain('resolver failed');
+      expect(results[0].data).toEqual([{selected_upid: 43}]);
+      expect(results[1].data).toEqual([{admitted_status: 'unresolved', previous_upid: 43, admitted_name: 'com.example.worker'}]);
+      expect(query.mock.calls.find(([, sql]) => sql.includes('AS selected_upid'))?.[1])
+        .toContain("name = 'com.example.worker'");
+    } finally {prepare.mockRestore(); db.close();}
+  });
+});
+
 describe('Trace corpus regression runner', () => {
   it('loads the generated catalog and exact current coverage inventory', () => {
     const corpus = loadCorpus(repoRoot);
-
-    expect(corpus.cases).toHaveLength(18);
+    const manifestTools = require(path.join(repoRoot, 'Trace/tools/lib/catalog.cjs')) as {
+      loadCatalog: (root: string) => {cases: Array<{id: string; coverage: unknown}>};
+      discoverCoverageTargets: (root: string) => {skills: string[]; strategies: string[]};
+    };
+    const manifestCases = manifestTools.loadCatalog(repoRoot).cases;
+    const coverageTargets = manifestTools.discoverCoverageTargets(repoRoot);
+    expect(corpus.cases.map(entry => ({id: entry.id, coverage: entry.coverage})))
+      .toEqual(manifestCases.map(entry => ({id: entry.id, coverage: entry.coverage})));
     expect(corpus.coverage.missing).toEqual({skills: [], strategies: []});
-    expect(corpus.coverage.covered.skills.length).toBeGreaterThan(200);
-    expect(corpus.coverage.covered.strategies.length).toBeGreaterThan(20);
+    expect(corpus.coverage.covered).toEqual(coverageTargets);
+  });
+
+  it('validates declared strategy identity without treating query wording as routing evidence', () => {
+    for (const query of ['启动很慢', '不要分析启动，只分析滑动卡顿', 'No startup analysis, only the selected row.']) {
+      expect(() => validateStrategyExpectationDeclaration({target: 'startup', expected_strategy: 'startup', query}))
+        .not.toThrow();
+    }
+    expect(() => validateStrategyExpectationDeclaration({target: 'startup', expected_strategy: 'scrolling'}))
+      .toThrow('does not match registered target');
+    expect(() => validateStrategyExpectationDeclaration({target: 'unknown-corpus-strategy'}))
+      .toThrow('Strategy loader cannot resolve');
   });
 
   it('requires declared value-level semantic evidence', () => {
@@ -111,7 +233,7 @@ describe('Trace corpus regression runner', () => {
     expect(sqlResultState({success: true})).toBe('executed');
   });
 
-  it('executes startup_analysis and startup Strategy against the constructed startup case', async () => {
+  it('executes startup_analysis and checks the startup declaration with a real trace marker', async () => {
     const result = await runCorpusRegression(repoRoot, {
       caseIds: ['startup-lifecycle'],
       targetIds: ['startup_analysis', 'startup'],
@@ -119,6 +241,9 @@ describe('Trace corpus regression runner', () => {
     });
 
     expect(result.failures).toEqual([]);
+    expect(result.strategy).toEqual({declaration_checked: ['startup-lifecycle:strategy:startup'],
+      semantic_routing: 'not_evaluated'});
+    expect(result.correctness.positive).not.toContain('startup-lifecycle:strategy:startup');
     expect(result.executed).toEqual(expect.arrayContaining([
       'startup-lifecycle:skill:startup_analysis',
       'startup-lifecycle:strategy:startup',

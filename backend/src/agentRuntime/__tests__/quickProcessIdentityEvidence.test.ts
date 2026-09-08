@@ -266,8 +266,10 @@ describe('shouldUseEvidenceOnlyQuickAnalysis', () => {
 });
 
 describe('buildQuickProcessIdentityDirectAnswer', () => {
-  it('builds a verifier-backed direct answer for confirmed process identity evidence', async () => {
-    const execute = jest.fn<ExecuteSkill>(async () => resolverResult());
+  it('renders confirmed legacy identity rows without certifying uncaptured claims', async () => {
+    const resolverOutput = resolverResult();
+    const beforeResolver = structuredClone(resolverOutput);
+    const execute = jest.fn<ExecuteSkill>(async () => resolverOutput);
     const evidence = await buildQuickProcessIdentityEvidence({
       skillExecutor: { execute },
       traceId: 'trace-1',
@@ -283,11 +285,13 @@ describe('buildQuickProcessIdentityDirectAnswer', () => {
       outputLanguage: 'zh-CN',
     });
 
+    const beforeEvidence = structuredClone(evidence);
     const direct = buildQuickProcessIdentityDirectAnswer({
       evidence,
       outputLanguage: 'zh-CN',
     });
 
+    expect(direct).toBeDefined();
     expect(direct?.conclusion).toContain('com.example.app');
     expect(direct?.conclusion).toContain('UPID=42');
     expect(direct?.conclusion).toContain('PID=4242');
@@ -298,17 +302,45 @@ describe('buildQuickProcessIdentityDirectAnswer', () => {
       expect.objectContaining({ column: 'upid', value: 42 }),
       expect.objectContaining({ column: 'pid', value: 4242 }),
     ]));
+    expect(execute).toHaveBeenCalledWith('process_identity_resolver', 'trace-1',
+      {package: 'com.example.app', process_name: 'com.example.app', max_rows: 5}, {__skipIdentityGate: true});
+    expect(evidence.envelopes[0].meta).toMatchObject({traceId: 'trace-1', traceSide: 'current'});
+    const claims = direct!.conclusionContract.claims!;
+    expect(claims).toHaveLength(1);
+    expect(claims[0].references.map(({column, value, evidenceRefId, rowIndex}) => ({column, value, evidenceRefId, rowIndex})))
+      .toEqual(Object.entries({canonical_package_name: 'com.example.app', recommended_process_name_param: 'com.example.app',
+        process_name: 'com.example.app', upid: 42, pid: 4242, identity_status: 'confirmed', confidence_score: 95})
+        .map(([column, value]) => ({column, value, evidenceRefId: evidence.envelopes[0].meta.evidenceRefId, rowIndex: 0})));
+    const beforeAnswer = structuredClone(direct);
     const verified = runClaimVerification({
       conclusionContract: direct?.conclusionContract,
       dataEnvelopes: evidence.envelopes,
       policy: 'record_only',
     });
     expect(verified.claimVerificationResult).toEqual(expect.objectContaining({
-      status: 'passed',
-      passed: true,
+      schemaVersion: 'claim_verifier@2',
+      status: 'not_checked',
+      passed: false,
       checkedClaimCount: 1,
       unsupportedClaimCount: 0,
     }));
+    expect(verified.claimVerificationResult.claimResults).toHaveLength(claims.length);
+    verified.claimVerificationResult.claimResults.forEach((checked, index) => {
+      expect(claims[index].semantics).toBeUndefined();
+      expect(claims[index].references.length).toBeGreaterThan(0);
+      expect(checked).toMatchObject({claimId: claims[index].id, status: 'not_checked',
+        deterministicProof: {status: 'not_checked', reason: 'semantics_not_declared'}});
+      expect(checked.referenceResults).toHaveLength(claims[index].references.length);
+      checked.referenceResults!.forEach((reference, refIndex) => {
+        expect(reference).toMatchObject({status: 'not_checked',
+          evidenceRefId: claims[index].references[refIndex].evidenceRefId,
+          sourceToolCallId: claims[index].references[refIndex].sourceToolCallId});
+      });
+      expect(checked.referenceCells).toEqual(checked.referenceResults);
+    });
+    expect(resolverOutput).toEqual(beforeResolver);
+    expect(evidence).toEqual(beforeEvidence);
+    expect(direct).toEqual(beforeAnswer);
   });
 
   it('does not build a direct answer when process identity evidence is incomplete', () => {

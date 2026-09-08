@@ -151,6 +151,8 @@ function collectStepSql(steps) {
         id: step.id,
         sql: step.sql,
         condition: typeof step.condition === 'string' ? step.condition : null,
+        process_scope: step.process_scope,
+        sql_fragments: step.sql_fragments,
         topLevelIndex,
         requiredColumns: resultColumns(step.sql, step.display),
       });
@@ -169,9 +171,31 @@ function collectStepSql(steps) {
 function referencedSqlVariables(sql) {
   return [...String(sql).matchAll(/\$\{([^}]+)\}/g)].map((match) => {
     const expression = match[1].trim();
-    return expression.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:(?:\.|\[|\?)|(?:\|[^}]*$)|$)/)?.[1]
-      ?? null;
+    return {token: match[0], name: expression.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:(?:\.|\[|\?)|(?:\|[^}]*$)|$)/)?.[1]
+      ?? null};
   });
+}
+
+function hasRuntimeProcessScopeBinding(step) {
+  const scope = step.process_scope;
+  if (!scope || typeof scope !== 'object' || Array.isArray(scope) ||
+      Object.keys(scope).some(key => !['role', 'binding', 'context_fields', 'exact_unavailable', 'limitations'].includes(key)) ||
+      !['target', 'global_context', 'peer_context', 'identity_metadata'].includes(scope.role)) return false;
+  if (scope.exact_unavailable !== undefined) {
+    return typeof scope.exact_unavailable === 'string' && scope.exact_unavailable.trim().length > 0;
+  }
+  if (scope.context_fields !== undefined && (!scope.context_fields || typeof scope.context_fields !== 'object' ||
+      Array.isArray(scope.context_fields) || Object.entries(scope.context_fields).some(([role, fields]) =>
+        !['global_context', 'peer_context', 'identity_metadata'].includes(role) || !Array.isArray(fields) ||
+        fields.some(field => typeof field !== 'string' || !field.trim())))) return false;
+  if (scope.limitations !== undefined && (!Array.isArray(scope.limitations) ||
+      scope.limitations.some(reason => typeof reason !== 'string' || !reason.trim()))) return false;
+  if (scope.role !== 'target') return scope.binding === undefined;
+  const executableSql = maskSqlLiteralsAndComments(step.sql);
+  if (scope.binding === 'native_upid') return executableSql.includes('${__process_scope.upid}');
+  return scope.binding === 'effective_target_processes' &&
+    Array.isArray(step.sql_fragments) && step.sql_fragments.includes('fragments/effective_target_processes.sql') &&
+    /\b(?:FROM|JOIN)\s+effective_target_processes\b/i.test(executableSql);
 }
 
 function producedVariablesBefore(steps, topLevelIndex) {
@@ -196,8 +220,10 @@ function skillSqlContract(definition) {
   const canForceProbe = (step) => {
     const availableNames = producedVariablesBefore(steps, step.topLevelIndex);
     return isReadOnlySql(step.sql)
-      && referencedSqlVariables(step.sql).every((name) =>
-        name !== null && (inputNames.has(name) || availableNames.has(name)));
+      && referencedSqlVariables(step.sql).every(({name, token}) =>
+        name === '__process_scope'
+          ? token === '${__process_scope.upid}' && hasRuntimeProcessScopeBinding(step)
+          : name !== null && (inputNames.has(name) || availableNames.has(name)));
   };
   const stepSqlIds = sqlSteps.map((step) => step.id).filter(Boolean);
   const sqlIds = [...(hasRootSql ? ['root'] : []), ...stepSqlIds];

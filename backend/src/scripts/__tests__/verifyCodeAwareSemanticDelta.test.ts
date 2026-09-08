@@ -223,6 +223,8 @@ describe('deterministic code-aware semantic delta', () => {
         schemaVersion: 'code_aware_semantic_delta_summary@2',
         evidenceKind: DETERMINISTIC_EVIDENCE_KIND,
         realProviderAcceptance: false,
+        passedMeaning: 'deterministic_assertions_only',
+        semanticCoverage: {status: 'INCONCLUSIVE'},
         passed: true,
         queryCount: 3,
         surfaceProof: {
@@ -278,8 +280,14 @@ describe('deterministic code-aware semantic delta', () => {
           traceMarkerMapped: true,
           actionableSeam: true,
         });
-        expect(summary.conditions[condition].claimVerification.claimVerificationResult.status)
-          .toBe('passed');
+        expect(summary.conditions[condition].finiteProofPassed).toBe(true);
+        expect(summary.conditions[condition].claimVerification.claimVerificationResult.status).toBe('partial');
+        expect(summary.conditions[condition].semanticCoverage).toBe('INCONCLUSIVE');
+        expect(summary.conditions[condition].wrongNumericVerification.claimVerificationResult.status).toBe('failed');
+        expect(summary.conditions[condition].originalWrongClaim.semantics.numeric.value)
+          .toBe(summary.traceFacts.durationNs + 1);
+        expect(summary.conditions[condition].originalWrongClaim.references[0].value)
+          .toBe(summary.traceFacts.durationNs);
         expect(summary.conditions[condition].sourceClaimVerification.status).toBe('passed');
         expect(summary.conditions[condition].codeRefOnlyOccurrence.status).not.toBe('passed');
       }
@@ -295,7 +303,7 @@ describe('deterministic code-aware semantic delta', () => {
       });
       expect(summary.queries.find((query: any) => query.kind === 'quantitative-only')).toMatchObject({
         sourceUseDecision: {
-          status: 'not_needed',
+          status: 'pending',
           attemptedTools: [],
           references: [],
         },
@@ -375,9 +383,10 @@ describe('real-provider semantic delta wrapper contract', () => {
       'StartupHooks.kt',
       'StartupHooks.initializeOnMainThread',
       'Application.onCreate',
-      'avoid synchronous disk I/O before first frame',
       '[Code:',
     ]));
+    expect(forbidden).not.toContain('avoid synchronous disk I/O before first frame');
+    expect(args).toContain('--expectation-json');
 
     const evaluated = wrapper.evaluateSemanticConditionReport?.({
       query,
@@ -468,5 +477,65 @@ describe('real-provider semantic delta wrapper contract', () => {
       reason:
         'DEEPSEEK_API_KEY_OR_OPENAI_API_KEY_MISSING;QODER_PERSONAL_ACCESS_TOKEN_OR_QODERCLI_PATH_MISSING',
     });
+  });
+});
+
+describe('real-provider task fact configuration', () => {
+  const wrapper = require('../../../scripts/run-deepseek-agent-e2e.cjs');
+
+  it('allows scrolling to choose its tools while declaring independently queried frame facts', () => {
+    const args: string[] = wrapper.suites.scrolling.args;
+    expect(args).not.toContain('--require-skill');
+    expect(args).not.toContain('--require-tool');
+    const expectation = parseAgentSseArgs(args).expectation;
+    expect(expectation?.facts.map(fact => fact.id)).toEqual(['total_frames', 'jank_frames']);
+    expect(expectation?.facts.every(fact => fact.verification === 'proved' && fact.oracle?.sql)).toBe(true);
+  });
+
+  it('keeps explicit connector invocation checks and removes startup sentence polarity traps', () => {
+    expect(wrapper.suites['external-issue'].args).toContain('anr_analysis');
+    expect(wrapper.suites.startup.args).not.toContain('--require-text');
+    expect(wrapper.suites.startup.args).not.toContain('--forbid-text');
+    const expectation = parseAgentSseArgs(wrapper.suites.startup.args).expectation;
+    expect(expectation?.facts.find(fact => fact.id === 'startup_type')?.verification).toBe('reference_only');
+  });
+
+  it('reports source action semantics as uncovered instead of requiring an English sentence', () => {
+    const query = wrapper.semanticDeltaQueries()[0];
+    const args = wrapper.semanticConditionArgs(query, 'A3', 'a3.json', 1000);
+    expect(args).not.toContain('avoid synchronous disk I/O before first frame');
+    const expectation = parseAgentSseArgs(args).expectation;
+    expect(expectation?.uncoveredFacets).toContain('source recommendation action semantics');
+    expect(expectation?.facts[0]).toMatchObject({id: 'source_marker_duration', value: 42_000_000, unit: 'ns'});
+  });
+
+  it('keeps successful observed facts separate from incomplete aggregate semantic acceptance', () => {
+    const result = wrapper.summarizeSemanticRuntimeRecords([{hardPassed: true, sourceUpliftPassed: true,
+      uncoveredFacets: ['source recommendation action semantics']}], 1);
+    expect(result).toMatchObject({status: 'REAL PROVIDER INCONCLUSIVE', observedChecksPassed: true,
+      semanticAcceptance: 'INCONCLUSIVE', completeAcceptance: false, hardPassCount: 1, sourceUpliftPassCount: 1});
+  });
+
+  it.each(['pending', 'attempted', 'not_needed'])('accepts trace-only output independently of optional source audit state %s', status => {
+    const query = wrapper.semanticDeltaQueries().find((item: any) => item.kind === 'quantitative-only');
+    const report = {taskVerification: {checks: {originalClaimsVerified: true},
+      facts: {source_marker_duration: {matched: true, proposition: 'proved'}}, uncoveredFacets: []},
+      summary: {analysisCompletedSourceUseStatus: status, toolCallCounts: {lookup_app_source: 1},
+        terminalAnalysis: {conclusionContract: {claims: [{kind: 'numeric', semantics: {scope: {population: 'cited_rows'}}}]}}}};
+    expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}).sourceSemanticPassed).toBe(true);
+    report.summary.terminalAnalysis.conclusionContract.claims[0].kind = 'recommendation';
+    expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}).sourceSemanticPassed).toBe(false);
+  });
+
+  it('accepts verified source bindings after a located lookup without a corroborated audit ceremony', () => {
+    const query = wrapper.semanticDeltaQueries()[0];
+    const report = {taskVerification: {checks: {originalClaimsVerified: true},
+      facts: {source_marker_duration: {matched: true, proposition: 'proved'}}, uncoveredFacets: []},
+      summary: {analysisCompletedSourceUseStatus: 'located', analysisCompletedSourceReferenceCount: 1,
+        analysisCompletedSourceBindingCount: 1, analysisCompletedSourceClaimVerifierStatus: 'passed',
+        analysisCompletedSourceReferenceMembershipPassed: true, analysisCompletedSourceMechanismStatuses: ['compatible'],
+        terminalAnalysis: {conclusionContract: {sourceUseDecision: {references: [{filePath: 'StartupHooks.kt',
+          symbol: 'StartupHooks.initializeOnMainThread', lineRange: {start: 9, end: 9}}]}}}}};
+    expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}).sourceSemanticPassed).toBe(true);
   });
 });

@@ -10,19 +10,117 @@ import type {
   TraceCompleteness,
 } from '../types';
 import {
+  buildQuickSystemPrompt,
   buildSelectionContextSection,
   buildSystemPromptParts,
   estimatePromptTokens,
-  MAX_PLAN_ARCHITECTURE_REQUIREMENT_TOKENS,
   splitMethodologyTemplate,
   stripTemplateComments,
   MAX_PROMPT_TOKENS,
   MAX_SCENE_CORE_TOKENS,
   type PromptSegment,
 } from '../claudeSystemPrompt';
-import {loadPromptTemplate} from '../strategyLoader';
+import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes, loadPromptTemplate} from '../strategyLoader';
+import {CONCLUSION_CONTRACT_SIDECAR_MARKER, parseConclusionContractSidecar} from '../../agent/core/conclusionContract';
+import {SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../../services/verifier/deterministicClaimVerifier';
 import fs from 'fs';
 import path from 'path';
+
+describe('typed prompt with real strategy assets', () => {
+  it.each(['zh-CN', 'en'] as const)('retains the real declaration example and catalog for %s without enabling report recipes', outputLanguage => {
+    const registry = buildStrategyRegistrySnapshotFromDefinitions({
+      definitions: getRegisteredScenes(), overlayGeneration: 'typed-protocol-test',
+    });
+    const scene = registry.getAllStrategies().find(item => item.strategyKind !== 'contract_only')!;
+    for (const taskKind of ['acknowledgement', 'fact'] as const) {
+      const context: ClaudeAnalysisContext = {
+        query: taskKind === 'acknowledgement' ? 'Thanks.' : 'What value is already available?',
+        outputLanguage, strategyRegistry: registry,
+        turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', taskKind,
+          sceneId: scene.scene, scope: 'bounded_question', recommendedComplexity: 'quick', deliverable: 'answer',
+          evidenceAccess: 'existing_only', registryFingerprint: registry.registryFingerprint},
+      };
+      const parts = buildSystemPromptParts(context);
+      const declaration = parts.segments.find(segment => segment.label === 'conclusion_declaration')!;
+      expect(declaration).toMatchObject({tier: 1, droppable: false, truncatable: false});
+      const start = declaration.content.indexOf(CONCLUSION_CONTRACT_SIDECAR_MARKER);
+      const end = declaration.content.indexOf('\n-->', start);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(end).toBeGreaterThan(start);
+      const parsed = parseConclusionContractSidecar(declaration.content.slice(start, end + '\n-->'.length));
+      expect(parsed).toMatchObject({status: 'valid', bindingEligibility: 'eligible', narrative: '',
+        contract: {schemaVersion: 'conclusion_contract_v1', relationProposals: []}});
+      expect(parsed.contract?.conclusions).toEqual([{rank: expect.any(Number), statement: expect.any(String)}]);
+      expect(parsed.contract?.clusters).toEqual([{cluster: expect.any(String)}]);
+      expect(parsed.contract?.evidenceChain).toEqual([{conclusionId: expect.any(String), text: expect.any(String)}]);
+      expect(parsed.contract?.uncertainties).toEqual([expect.any(String)]);
+      expect(parsed.contract?.nextSteps).toEqual([expect.any(String)]);
+      expect(parsed.contract?.claims).toEqual([{id: expect.any(String), text: expect.any(String), kind: 'inference', references: []}]);
+      const jsonBlocks = [...declaration.content.matchAll(/^```json\n([\s\S]*?)\n```$/gm)]
+        .map(match => JSON.parse(match[1]));
+      expect(jsonBlocks.filter(Array.isArray)).toEqual([SUPPORTED_DETERMINISTIC_CLAIM_RULES]);
+      expect(declaration.content).not.toMatch(/\{\{\w+\}\}/);
+      expect(declaration.content).not.toContain('SPDX-License-Identifier');
+      expect(declaration.content).not.toContain('Copyright (C)');
+      expect(parts.segments.some(segment => ['report_requirements', 'scene_strategy_core',
+        'plan_architecture_requirements', 'base_methodology'].includes(segment.label))).toBe(false);
+      expect(parts.droppedLabels).toEqual([]);
+      expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(MAX_PROMPT_TOKENS);
+      expect(buildQuickSystemPrompt(context)).toBe(parts.fullPrompt);
+    }
+  });
+
+  it('keeps budget and presentation independent across every registered analysis scene', () => {
+    const registry = buildStrategyRegistrySnapshotFromDefinitions({
+      definitions: getRegisteredScenes(), overlayGeneration: 'typed-prompt-test',
+    });
+    for (const scene of registry.getAllStrategies().filter(item => item.strategyKind !== 'contract_only')) {
+      for (const deliverable of ['answer', 'report'] as const) {
+        const context: ClaudeAnalysisContext = {
+          query: 'Explain the selected evidence.', strategyRegistry: registry,
+          turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', taskKind: 'investigation',
+            sceneId: scene.scene, scope: 'bounded_question', recommendedComplexity: 'full', deliverable,
+            evidenceAccess: 'existing_only', registryFingerprint: registry.registryFingerprint},
+          selectionContext: {kind: 'area', startNs: 10, endNs: 20, tracks: [{uri: 'track-1', upid: 42}]},
+        };
+        const parts = buildSystemPromptParts(context);
+        expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(MAX_PROMPT_TOKENS);
+        expect(buildQuickSystemPrompt(context)).toBe(parts.fullPrompt);
+        const required = parts.segments.find(segment => segment.label === 'report_requirements');
+        if (deliverable === 'report') {
+          expect(JSON.parse(required!.content).data.requirements.map((item: {id: string}) => item.id))
+            .toEqual((scene.finalReportContract?.requiredSections ?? []).map(item => item.id));
+        } else expect(required).toBeUndefined();
+        expect(parts.segments.some(segment => segment.label === 'scene_strategy_core')).toBe(false);
+        expect(parts.segments.some(segment => segment.label === 'plan_architecture_requirements')).toBe(false);
+      }
+    }
+  });
+
+  it('retains both trace identities with the real protocol and oversized comparison detail', () => {
+    const registry = buildStrategyRegistrySnapshotFromDefinitions({
+      definitions: getRegisteredScenes(), overlayGeneration: 'typed-prompt-test',
+    });
+    const scene = registry.getAllStrategies().find(item => item.strategyKind !== 'contract_only')!;
+    const context: ClaudeAnalysisContext = {
+      query: 'Use the available comparison evidence.', strategyRegistry: registry,
+      turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', taskKind: 'comparison',
+        sceneId: scene.scene, scope: 'bounded_question', recommendedComplexity: 'quick', deliverable: 'answer',
+        evidenceAccess: 'existing_only', registryFingerprint: registry.registryFingerprint},
+      comparison: {referenceTraceId: 'ref-2', commonCapabilities: [], capabilityProbeStatus: 'not_checked',
+        tracePairContext: {schemaVersion: 1, layout: 'horizontal', primarySide: 'left', referenceSide: 'right',
+          panes: [{side: 'left', traceSide: 'current', traceId: 'trace-1', traceName: 'Description '.repeat(10_000)},
+            {side: 'right', traceSide: 'reference', traceId: 'ref-2'}]}},
+    };
+    const parts = buildSystemPromptParts(context, 4_000);
+    const identity = JSON.parse(parts.segments.find(segment => segment.label === 'comparison_identity')!.content).data;
+    expect(identity.referenceTraceId).toBe('ref-2');
+    expect(identity.tracePairContext.panes.map((pane: {traceId: string}) => pane.traceId)).toEqual(['trace-1', 'ref-2']);
+    expect(identity.capabilityProbeStatus).toBe('not_checked');
+    expect(parts.droppedLabels).toContain('comparison_details');
+    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(4_000);
+  });
+});
 
 function loadStrategy(scene: string): string {
   return fs.readFileSync(
@@ -428,61 +526,6 @@ describe('system prompt token regression with real strategy files', () => {
     expect(prompt).toContain('com.example.smartperfetto.demo');
     expect(prompt).toContain('com.example.reference');
     expect(prompt).toContain(rule);
-  });
-});
-
-describe('architecture-conditional plan requirements survive the prompt budget', () => {
-  it('keeps the requirement section in the worst-case scrolling prompt', () => {
-    // The whole point is to stop the first submit_plan from being rejected by
-    // construction; a section the budget can drop would silently restore that.
-    const parts = buildSystemPromptParts(makeWorstCaseContext('scrolling'));
-    const segment = parts.segments.find(
-      item => item.label === 'plan_architecture_requirements',
-    );
-
-    expect(segment).toBeDefined();
-    expect(segment?.droppable).not.toBe(true);
-    expect(segment?.truncatable).not.toBe(true);
-    expect(parts.droppedLabels).not.toContain('plan_architecture_requirements');
-    expect(parts.truncatedLabels).not.toContain('plan_architecture_requirements');
-    expect(parts.fullPrompt).toContain('计划强制项（当前架构）');
-    // The concrete skill the gate will demand must be named, not just described.
-    expect(parts.fullPrompt).toContain('flutter_scrolling_analysis');
-    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(MAX_PROMPT_TOKENS);
-  });
-
-  it('stays inside a tight token budget so it cannot crowd out other context', () => {
-    // The section is non-droppable by design, so its cost is paid on every
-    // full-mode run of this scene. Keep it small enough that it does not
-    // compete with the droppable context sections.
-    const unbudgeted = buildSystemPromptParts(makeWorstCaseContext('scrolling'), 1_000_000);
-    const section = unbudgeted.segments.find(
-      item => item.label === 'plan_architecture_requirements',
-    );
-
-    expect(section?.estimatedTokens).toBeGreaterThan(0);
-    expect(section?.estimatedTokens).toBeLessThanOrEqual(
-      MAX_PLAN_ARCHITECTURE_REQUIREMENT_TOKENS,
-    );
-  });
-
-  it('omits the section entirely when no conditional branch is active', () => {
-    const context = makeWorstCaseContext('scrolling');
-    const parts = buildSystemPromptParts({
-      ...context,
-      // Neither the query nor the architecture names a conditional branch.
-      query: '分析这个应用滑动掉帧的根因，并给出优化建议',
-      architecture: {
-        type: 'STANDARD',
-        confidence: 0.9,
-        evidence: [],
-      },
-    });
-
-    expect(parts.segments.find(
-      item => item.label === 'plan_architecture_requirements',
-    )).toBeUndefined();
-    expect(parts.fullPrompt).not.toContain('计划强制项（当前架构）');
   });
 });
 

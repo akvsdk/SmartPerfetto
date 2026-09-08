@@ -4,6 +4,7 @@
 
 import { loadPromptTemplate, renderTemplate } from './strategyLoader';
 import type { ComplexityClassifierInput } from './types';
+import type {ReadonlyStrategyRegistrySnapshot} from '../services/selfEvolution/effectiveRuntimeRegistryContext';
 
 type ComplexityPromptInput = string | ComplexityClassifierInput;
 const MAX_PREVIOUS_QUERY_CHARS = 240;
@@ -65,4 +66,35 @@ export function buildComplexityClassifierPrompt(input: ComplexityPromptInput): s
         `Query: ${query}`,
         'Output JSON: {"complexity": "quick" or "full", "reason": "..."}',
       ].join('\n');
+}
+
+/** Rendering only: semantic policy lives in the external template. */
+export function buildAnalysisTurnIntentPrompt(input: {
+  context: ComplexityClassifierInput;
+  strategyRegistry: ReadonlyStrategyRegistrySnapshot;
+  template: string;
+  decisionSchema: Readonly<Record<string, unknown>>;
+}): string {
+  const context = input.context;
+  const sceneCatalog = input.strategyRegistry.getAllStrategies()
+    .filter(strategy => strategy.strategyKind !== 'contract_only')
+    .map(strategy => ({
+      id: strategy.scene,
+      ...(strategy.classificationDescription ? {description: strategy.classificationDescription} : {}),
+      capabilities: strategy.requiredCapabilities,
+    }));
+  const requestContext = {
+    query: context.query,
+    requestedMode: context.requestedMode ?? 'auto',
+    selection: context.selectionContext ?? null,
+    hasReferenceTrace: context.hasReferenceTrace,
+    previousQueries: context.previousQueries?.slice(-3).map(query => query.slice(0, 800)) ?? [],
+    previousFindings: context.previousFindingDetails ?? context.previousFindings?.slice(-5) ?? [],
+    previousEntities: context.previousEntities ?? [],
+  };
+  return renderTemplate(input.template, {
+    decisionSchema: JSON.stringify(input.decisionSchema),
+    sceneCatalog: JSON.stringify(sceneCatalog),
+    requestContext: JSON.stringify(requestContext),
+  });
 }

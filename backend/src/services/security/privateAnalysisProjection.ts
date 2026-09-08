@@ -13,13 +13,26 @@ import type {ClaimVerificationResult} from '../../types/claimVerification';
 import type {IdentityResolutionV1} from '../../types/identityContract';
 import {sanitizeCodeAwareText} from './codeAwareOutputRegistry';
 import type {CodeLookupSummary} from '../codebase/codeLookupLedger';
-import {sanitizeSourceUseDecision} from '../codebase/sourceUseDecision';
+import {sanitizeSourceUseDecision, type SourceUseDecisionV1, type SourceReferenceV1} from '../codebase/sourceUseDecision';
 import {isCodebaseKind} from '../codebase/codebaseRegistry';
 import {sanitizeStoredCapabilityManifestAttribution} from '../capabilityManifest';
 import {sanitizeStoredTraceSummaryAttribution} from '../traceSummaryAttribution';
+import {
+  analysisProjectionChanged,
+  copyAnalysisDeliveryFields,
+  projectPrivateAnalysisDelivery,
+  projectStoredConclusionSourceMetadata,
+  preserveProjectedFieldOrder,
+} from './analysisDeliveryProjection';
+import {sanitizeSourceClaimBindings, sanitizeSourceReferences} from '../codebase/sourceUseDecision';
+import {isPlainJsonObject} from '../../utils/isPlainJsonObject';
 
 type PrivateFinding = AnalysisResult['findings'][number];
 type PrivateHypothesis = AnalysisResult['hypotheses'][number];
+
+function privateControl<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof value === 'string' && allowed.includes(value as T) ? value as T : fallback;
+}
 
 export interface PrivateAnalysisSessionSelection {
   sessionId: string;
@@ -70,7 +83,39 @@ function boundedDisplayName(value: unknown): string | undefined {
   return trimmed.slice(0, MAX_PRIVATE_DISPLAY_NAME);
 }
 
+function privateSourceTextUnchanged(sessionId: string, value: string): boolean {
+  return sanitizeCodeAwareText(sessionId, value) === value;
+}
+
+/** Drop a changed locator instead of inventing a replacement source identity. */
+function projectPrivateSourceReferences(sessionId: string, value: unknown): SourceReferenceV1[] {
+  return sanitizeSourceReferences(value).filter(reference => Object.entries(reference).every(([key, entry]) =>
+    key === 'lookupKind' || typeof entry !== 'string' || privateSourceTextUnchanged(sessionId, entry)));
+}
+
+function projectPrivateSourceUseDecision(
+  sessionId: string,
+  value: unknown,
+  selectedCodebaseIds?: readonly string[],
+): SourceUseDecisionV1 | undefined {
+  const originalSafe = sanitizeSourceUseDecision(value);
+  if (!originalSafe) return undefined;
+  const safe = sanitizeSourceUseDecision(originalSafe, selectedCodebaseIds)!;
+  const unchanged = (entry: string) => privateSourceTextUnchanged(sessionId, entry);
+  const projected = sanitizeSourceUseDecision({...safe,
+    selectedCodebaseIds: safe.selectedCodebaseIds.filter(unchanged),
+    queriedCodebaseIds: safe.queriedCodebaseIds.filter(unchanged),
+    usedCodebaseIds: safe.usedCodebaseIds.filter(unchanged),
+    attemptedTools: safe.attemptedTools.filter(unchanged),
+    ...(safe.incompleteReasons ? {incompleteReasons: safe.incompleteReasons.filter(unchanged)} : {}),
+    references: projectPrivateSourceReferences(sessionId, safe.references),
+  })!;
+  if (analysisProjectionChanged(originalSafe, projected) && originalSafe.coverageComplete === true) projected.coverageComplete = false;
+  return preserveProjectedFieldOrder(safe, projected);
+}
+
 function projectPrivateCodeLookupSummary(
+  sessionId: string,
   summary: CodeLookupSummary | undefined,
   currentSelectedCodebaseIds: readonly string[],
 ): CodeLookupSummary | undefined {
@@ -78,26 +123,30 @@ function projectPrivateCodeLookupSummary(
   const referencedCodebaseIds = summary.referencedCodebaseIds
     .map(strictBoundedIdentifier)
     .filter((value): value is string => Boolean(value))
+    .filter(value => privateSourceTextUnchanged(sessionId, value))
     .slice(0, MAX_PRIVATE_PROVENANCE_IDS);
   const usedCodebaseIds = summary.usedCodebaseIds
     ?.map(strictBoundedIdentifier)
     .filter((value): value is string => Boolean(value))
+    .filter(value => privateSourceTextUnchanged(sessionId, value))
     .slice(0, MAX_PRIVATE_PROVENANCE_IDS);
   const usedKnowledgeSources = summary.usedKnowledgeSources
     ?.map(source => {
       const knowledgeSourceId = boundedIdentifier(source.knowledgeSourceId);
-      if (!knowledgeSourceId) return undefined;
+      if (!knowledgeSourceId || !privateSourceTextUnchanged(sessionId, knowledgeSourceId)) return undefined;
       return {
         knowledgeSourceId,
         sourceGenerations: source.sourceGenerations
           .map(boundedIdentifier)
           .filter((value): value is string => Boolean(value))
+          .filter(value => privateSourceTextUnchanged(sessionId, value))
           .slice(0, MAX_PRIVATE_SOURCE_GENERATIONS),
       };
     })
     .filter((value): value is NonNullable<typeof value> => Boolean(value))
     .slice(0, MAX_PRIVATE_PROVENANCE_IDS);
-  const sourceUseDecision = sanitizeSourceUseDecision(
+  const sourceUseDecision = projectPrivateSourceUseDecision(
+    sessionId,
     summary.sourceUseDecision,
     currentSelectedCodebaseIds,
   );
@@ -203,7 +252,7 @@ export function projectPrivateTerminationMessage(
 export function projectPrivateAnalysisReceipt(
   receipt: AnalysisReceipt | undefined,
 ): AnalysisReceipt | undefined {
-  if (!receipt) return undefined;
+  if (!isCompleteAnalysisReceipt(receipt)) return undefined;
   const {
     capabilityManifest: storedCapabilityManifest,
     traceSummary: storedTraceSummary,
@@ -227,6 +276,21 @@ export function projectPrivateAnalysisReceipt(
   };
 }
 
+/** Historical JSON may be incomplete; it cannot supply missing audit counts. */
+function isCompleteAnalysisReceipt(value: unknown): value is AnalysisReceipt {
+  if (!isPlainJsonObject(value) || (value.schemaVersion !== 1 && value.schemaVersion !== 2)) return false;
+  if (value.schemaVersion === 2 && typeof value.runManifestId !== 'string') return false;
+  if (['runId', 'sessionId', 'traceId'].some(key => typeof value[key] !== 'string')) return false;
+  if (!isPlainJsonObject(value.outputs) || !isPlainJsonObject(value.qualityGates)) return false;
+  const counts = [
+    [value.claimAudit, ['totalClaims', 'verifiedClaims', 'unsupportedClaims', 'uncertainClaims']],
+    [value.traceEvidence, ['sqlCount', 'skillCount', 'dataEnvelopeCount', 'artifactCount', 'evidenceRefCount']],
+    [value.nonEvidenceContext, ['frontendPrequeryCount', 'memoryHintCount', 'conversationContextCount', 'strategyHintCount']],
+  ] as const;
+  return counts.every(([section, keys]) => isPlainJsonObject(section) && keys.every(key =>
+    typeof section[key] === 'number' && Number.isSafeInteger(section[key]) && section[key] >= 0));
+}
+
 const PRIVATE_ENVELOPE_FORBIDDEN_KEYS = new Set([
   'sql',
   'rawsql',
@@ -236,6 +300,12 @@ const PRIVATE_ENVELOPE_FORBIDDEN_KEYS = new Set([
   'prompt',
   'arguments',
   'toolarguments',
+  'rawdeclaration',
+  'rawclaims',
+  'rawbody',
+  'rawbodyfingerprint',
+  'sourcebodyfingerprint',
+  'parserdiagnostics',
 ]);
 
 function projectPrivateEnvelopeValue(
@@ -304,7 +374,112 @@ export function projectPrivateClaimVerification(
   sessionId: string,
   verification: ClaimVerificationResult | undefined,
 ): ClaimVerificationResult | undefined {
-  return verification ? projectPrivateStructuredValue(sessionId, verification) : undefined;
+  if (!verification || !['claim_verifier@1', 'claim_verifier@2'].includes(verification.schemaVersion)) return undefined;
+  const text = (value: string) => sanitizeCodeAwareText(sessionId, value);
+  const references = (values: NonNullable<ClaimVerificationResult['claimResults'][number]['referenceResults']>) =>
+    values.map(reference => ({
+      ...(reference.evidenceRefId !== undefined ? {evidenceRefId: text(reference.evidenceRefId)} : {}),
+      ...(reference.sourceRef !== undefined ? {sourceRef: text(reference.sourceRef)} : {}),
+      ...(reference.artifactId !== undefined ? {artifactId: text(reference.artifactId)} : {}),
+      ...(reference.sourceToolCallId !== undefined ? {sourceToolCallId: text(reference.sourceToolCallId)} : {}),
+      ...(reference.anchorId !== undefined ? {anchorId: text(reference.anchorId)} : {}),
+      ...(reference.column !== undefined ? {column: text(reference.column)} : {}),
+      status: privateControl(reference.status, ['matched', 'missing', 'ambiguous', 'value_mismatch', 'ineligible', 'not_checked'], 'not_checked'),
+      ...(reference.message !== undefined ? {message: text(reference.message)} : {}),
+    }));
+  const projected: ClaimVerificationResult = {
+    schemaVersion: verification.schemaVersion,
+    status: privateControl(verification.status, ['passed', 'failed', 'partial', 'not_checked'], 'not_checked'),
+    policy: privateControl(verification.policy, ['block', 'retry', 'warn_only', 'record_only'], 'record_only'),
+    ...(verification.notCheckedReason !== undefined ? {notCheckedReason: text(verification.notCheckedReason)} : {}),
+    passed: verification.status === 'passed' && verification.passed === true,
+    checkedClaimCount: verification.checkedClaimCount,
+    unsupportedClaimCount: verification.unsupportedClaimCount,
+    claimResults: (verification.claimResults ?? []).map(claim => ({
+      claimId: text(claim.claimId), status: privateControl(claim.status,
+        ['verified', 'partial', 'inference', 'unsupported', 'not_checked'], 'not_checked'),
+      ...(claim.referenceResults ? {referenceResults: references(claim.referenceResults)} : {}),
+      ...(claim.referenceCells ? {referenceCells: references(claim.referenceCells)} : {}),
+      ...(claim.deterministicProof ? {deterministicProof: {
+        kind: privateControl(claim.deterministicProof.kind, ['numeric_cell', 'interval_overlap', 'comparison_delta', 'none'], 'none'),
+        status: privateControl(claim.deterministicProof.status, ['proved', 'candidate', 'rejected', 'not_checked'], 'not_checked'),
+        reason: text(claim.deterministicProof.reason),
+        anchorIds: claim.deterministicProof.anchorIds.map(text),
+        evidenceRefIds: claim.deterministicProof.evidenceRefIds.map(text),
+      }} : {}),
+      ...(claim.propositionCoverage ? {propositionCoverage: {
+        status: privateControl(claim.propositionCoverage.status, ['complete', 'partial', 'none'], 'none'),
+        covered: claim.propositionCoverage.covered.map(text),
+        uncovered: claim.propositionCoverage.uncovered.map(text),
+        reason: text(claim.propositionCoverage.reason),
+      }} : {}),
+    })),
+    issues: (verification.issues ?? []).map(issue => ({
+      claimId: text(issue.claimId), severity: privateControl(issue.severity, ['error', 'warning'], 'warning'),
+      code: text(issue.code), message: text(issue.message),
+      ...(issue.evidenceRefId !== undefined ? {evidenceRefId: text(issue.evidenceRefId)} : {}),
+    })),
+  };
+  if (projected.status === 'passed' && !projected.passed) projected.status = 'not_checked';
+  return preserveProjectedFieldOrder(verification, projected);
+}
+
+function invalidatePrivateClaimVerification(verification: ClaimVerificationResult): ClaimVerificationResult {
+  const claimResults = verification.claimResults.map(claim => {
+    const references = (values: typeof claim.referenceResults) => values?.map(reference => ({...reference,
+      status: reference.status === 'matched' ? 'not_checked' as const : reference.status}));
+    return {...claim,
+      status: claim.status === 'verified' || claim.status === 'inference' || claim.status === 'partial'
+        ? 'not_checked' as const : claim.status,
+      ...(claim.referenceResults ? {referenceResults: references(claim.referenceResults)} : {}),
+      ...(claim.referenceCells ? {referenceCells: references(claim.referenceCells)} : {}),
+      ...(claim.deterministicProof ? {deterministicProof: {...claim.deterministicProof,
+        status: claim.deterministicProof.status === 'proved' || claim.deterministicProof.status === 'candidate'
+          ? 'not_checked' as const : claim.deterministicProof.status}} : {}),
+      ...(claim.propositionCoverage ? {propositionCoverage: {...claim.propositionCoverage,
+        status: 'none' as const,
+        covered: [], uncovered: [...claim.propositionCoverage.covered, ...claim.propositionCoverage.uncovered]}} : {}),
+    };
+  });
+  const onlyUnchecked = claimResults.every(claim => claim.status === 'not_checked' &&
+    claim.deterministicProof?.status !== 'rejected' &&
+    [...(claim.referenceResults ?? []), ...(claim.referenceCells ?? [])].every(reference => reference.status === 'not_checked')) &&
+    verification.issues.every(issue => issue.severity !== 'error');
+  return {...verification,
+    status: verification.status === 'passed' || (verification.status === 'partial' && onlyUnchecked)
+      ? 'not_checked' : verification.status,
+    passed: false, claimResults,
+    checkedClaimCount: claimResults.filter(claim => claim.status !== 'not_checked').length,
+    unsupportedClaimCount: claimResults.filter(claim => claim.status === 'unsupported').length,
+  };
+}
+
+/** A known source-verifier failure remains a failure after diagnostic redaction. */
+function projectPrivateSourceVerification(
+  sessionId: string,
+  verification: AnalysisResult['sourceClaimVerificationResult'],
+  invalidate: boolean,
+): AnalysisResult['sourceClaimVerificationResult'] {
+  if (!verification || verification.schemaVersion !== 'source_claim_verifier@1') return undefined;
+  const text = (value: string) => sanitizeCodeAwareText(sessionId, value);
+  const projected: NonNullable<AnalysisResult['sourceClaimVerificationResult']> = {
+    schemaVersion: verification.schemaVersion,
+    status: invalidate && verification.status === 'passed' ? 'not_checked' :
+      privateControl(verification.status, ['passed', 'failed', 'partial', 'not_checked'], 'not_checked'),
+    bindings: sanitizeSourceClaimBindings(verification.bindings).map(binding => ({...binding,
+      claimId: text(binding.claimId), sourceReferenceIds: binding.sourceReferenceIds.map(text),
+      traceEvidenceRefIds: binding.traceEvidenceRefIds.map(text),
+      mechanismStatus: invalidate && (binding.mechanismStatus === 'corroborated' || binding.mechanismStatus === 'compatible')
+        ? 'unverified' : binding.mechanismStatus,
+    })),
+    issues: verification.issues.map(issue => ({
+      ...(issue.claimId !== undefined ? {claimId: text(issue.claimId)} : {}),
+      severity: privateControl(issue.severity, ['error', 'warning'], 'warning'), code: issue.code, message: text(issue.message),
+      ...(issue.sourceReferenceId !== undefined ? {sourceReferenceId: text(issue.sourceReferenceId)} : {}),
+      ...(issue.traceEvidenceRefId !== undefined ? {traceEvidenceRefId: text(issue.traceEvidenceRefId)} : {}),
+    })),
+  };
+  return preserveProjectedFieldOrder(verification, projected);
 }
 
 export function projectPrivateIdentityResolutions(
@@ -312,7 +487,14 @@ export function projectPrivateIdentityResolutions(
   resolutions: readonly IdentityResolutionV1[] | undefined,
 ): IdentityResolutionV1[] | undefined {
   return resolutions
-    ? resolutions.map(resolution => projectPrivateStructuredValue(sessionId, resolution))
+    ? resolutions.filter(resolution => resolution.version === 'identity_contract@1').map<IdentityResolutionV1>(resolution => {
+      const projected = projectPrivateStructuredValue(sessionId, resolution);
+      const status = ['verified', 'ambiguous', 'weak', 'missing', 'not_required', 'error'].includes(resolution.status)
+        ? resolution.status : 'error';
+      const unchanged = !analysisProjectionChanged({...resolution, status: undefined}, {...projected, status: undefined});
+      return {...projected, version: 'identity_contract@1',
+        status: !unchanged && (status === 'verified' || status === 'not_required') ? 'weak' : status};
+    })
     : undefined;
 }
 
@@ -375,17 +557,73 @@ export function projectPrivateAnalysisResult(
   result: AnalysisResult,
   language: OutputLanguage,
 ): AnalysisResult {
+  const conclusion = projectPrivateConclusion({sessionId, conclusion: result.conclusion, success: result.success, language});
+  const sourceUseDecision = projectPrivateSourceUseDecision(sessionId, result.sourceUseDecision);
+  const sourceReferences = result.sourceReferences ? projectPrivateSourceReferences(sessionId, result.sourceReferences) : undefined;
+  const storedContract = projectStoredConclusionSourceMetadata(result.conclusionContract, sourceUseDecision);
+  let conclusionContract = projectPrivateConclusionContract(sessionId, storedContract);
+  if (conclusionContract && storedContract?.sourceUseDecision) {
+    conclusionContract = {...conclusionContract,
+      sourceUseDecision: projectPrivateSourceUseDecision(sessionId, storedContract.sourceUseDecision),
+      sourceReferences: projectPrivateSourceReferences(sessionId, storedContract.sourceReferences)};
+  }
+  if (conclusionContract?.sourceClaimBindings && storedContract?.sourceClaimBindings) {
+    conclusionContract = {...conclusionContract, sourceClaimBindings: conclusionContract.sourceClaimBindings.map((binding, index) => ({
+      ...binding, mechanismStatus: storedContract.sourceClaimBindings![index].mechanismStatus,
+    }))};
+  }
+  let claimSupport = projectPrivateClaimSupport(sessionId, result.claimSupport)?.map((support, index) => {
+    const status = result.claimSupport?.[index].supportLevel;
+    return {...support, supportLevel: status && ['verified', 'partial', 'inference', 'unsupported'].includes(status)
+      ? status : 'partial' as const};
+  });
+  let claimVerificationResult = projectPrivateClaimVerification(sessionId, result.claimVerificationResult);
+  const identityResolutions = projectPrivateIdentityResolutions(sessionId, result.identityResolutions);
+  const claimsChanged = conclusion !== result.conclusion ||
+    analysisProjectionChanged(result.conclusionContract, conclusionContract) ||
+    analysisProjectionChanged(result.claimSupport, claimSupport) ||
+    analysisProjectionChanged(result.claimVerificationResult, claimVerificationResult);
+  if (claimsChanged) {
+    if (claimVerificationResult) claimVerificationResult = invalidatePrivateClaimVerification(claimVerificationResult);
+    claimSupport = claimSupport?.map(support => ({...support,
+      supportLevel: support.supportLevel === 'verified' || support.supportLevel === 'inference' ? 'partial' : support.supportLevel,
+      bindingEligibility: 'ineligible'}));
+  }
+  const sourceProjection = projectPrivateSourceVerification(sessionId, result.sourceClaimVerificationResult, false);
+  const sourceChanged = analysisProjectionChanged(result.sourceUseDecision, sourceUseDecision) ||
+    analysisProjectionChanged(result.sourceReferences, sourceReferences) ||
+    analysisProjectionChanged(result.sourceClaimVerificationResult, sourceProjection);
+  if ((claimsChanged || sourceChanged) && conclusionContract?.sourceClaimBindings) {
+    conclusionContract = {...conclusionContract,
+      sourceClaimBindings: sanitizeSourceClaimBindings(conclusionContract.sourceClaimBindings).map(binding => ({...binding,
+        mechanismStatus: binding.mechanismStatus === 'corroborated' || binding.mechanismStatus === 'compatible'
+          ? 'unverified' : binding.mechanismStatus}))};
+  }
+  const sourceClaimVerificationResult = claimsChanged || sourceChanged
+    ? projectPrivateSourceVerification(sessionId, result.sourceClaimVerificationResult, true) : sourceProjection;
+  const identityChanged = analysisProjectionChanged(result.identityResolutions, identityResolutions);
+  const delivery = projectPrivateAnalysisDelivery(result, {conclusion, conclusionContract, claimsChanged,
+    sourceChanged, identityChanged,
+  }, text => sanitizeCodeAwareText(sessionId, text));
+  let analysisReceipt = projectPrivateAnalysisReceipt(result.analysisReceipt);
+  if (analysisReceipt && (claimsChanged || identityChanged ||
+      delivery.deliveryAssurance?.report === 'not_checked' || delivery.deliveryAssurance?.report === 'coverage_incomplete')) {
+    analysisReceipt = {...analysisReceipt,
+      claimAudit: claimsChanged ? {...analysisReceipt.claimAudit, verifiedClaims: 0,
+        uncertainClaims: analysisReceipt.claimAudit.uncertainClaims + analysisReceipt.claimAudit.verifiedClaims} : analysisReceipt.claimAudit,
+      qualityGates: {...analysisReceipt.qualityGates,
+        ...(claimsChanged ? {claimVerification: 'partial' as const} : {}),
+        ...(identityChanged ? {identityResolution: 'partial' as const} : {}),
+        ...(claimsChanged || delivery.deliveryAssurance?.report === 'not_checked' || delivery.deliveryAssurance?.report === 'coverage_incomplete'
+          ? {finalReportContract: 'partial' as const} : {})}};
+  }
   return {
     sessionId: result.sessionId,
     success: result.success,
     findings: projectPrivateFindings(sessionId, result.findings),
     hypotheses: projectPrivateHypotheses(sessionId, result.hypotheses),
-    conclusion: projectPrivateConclusion({
-      sessionId,
-      conclusion: result.conclusion,
-      success: result.success,
-      language,
-    }),
+    conclusion,
+    ...delivery,
     confidence: result.confidence,
     rounds: result.rounds,
     totalDurationMs: result.totalDurationMs,
@@ -397,23 +635,85 @@ export function projectPrivateAnalysisResult(
       ? {terminationMessage: projectPrivateTerminationMessage(result.terminationMessage, language)}
       : {}),
     ...(result.quickRun ? {quickRun: result.quickRun} : {}),
-    ...(projectPrivateConclusionContract(sessionId, result.conclusionContract)
-      ? {conclusionContract: projectPrivateConclusionContract(sessionId, result.conclusionContract)}
-      : {}),
-    ...(projectPrivateClaimSupport(sessionId, result.claimSupport)
-      ? {claimSupport: projectPrivateClaimSupport(sessionId, result.claimSupport)}
-      : {}),
-    ...(projectPrivateClaimVerification(sessionId, result.claimVerificationResult)
-      ? {claimVerificationResult: projectPrivateClaimVerification(sessionId, result.claimVerificationResult)}
-      : {}),
-    ...(projectPrivateIdentityResolutions(sessionId, result.identityResolutions)
-      ? {identityResolutions: projectPrivateIdentityResolutions(sessionId, result.identityResolutions)}
-      : {}),
-    ...(projectPrivateAnalysisReceipt(result.analysisReceipt)
-      ? {analysisReceipt: projectPrivateAnalysisReceipt(result.analysisReceipt)}
-      : {}),
+    ...(conclusionContract ? {conclusionContract} : {}),
+    ...(claimSupport ? {claimSupport} : {}),
+    ...(claimVerificationResult ? {claimVerificationResult} : {}),
+    ...(identityResolutions ? {identityResolutions} : {}),
+    ...(sourceUseDecision ? {sourceUseDecision} : {}),
+    ...(sourceReferences ? {sourceReferences} : {}),
+    ...(sourceClaimVerificationResult ? {sourceClaimVerificationResult} : {}),
+    ...(analysisReceipt ? {analysisReceipt} : {}),
     uiActionProposals: projectPrivateUiActionProposals(sessionId, result.uiActionProposals),
   };
+}
+
+/** Copy only public result fields; private runtime callbacks and parser diagnostics cannot leak. */
+export function copyAnalysisResultForSnapshot(result: AnalysisResult): AnalysisResult {
+  const finalized = result.deliveryAssurance?.entry === 'new_finalization';
+  const conclusionContract = finalized ? result.conclusionContract
+    : projectStoredConclusionSourceMetadata(result.conclusionContract, result.sourceUseDecision);
+  const sourceUseDecision = finalized ? result.sourceUseDecision : sanitizeSourceUseDecision(result.sourceUseDecision);
+  const sourceReferences = finalized ? result.sourceReferences
+    : result.sourceReferences ? sanitizeSourceReferences(result.sourceReferences) : undefined;
+  const sourceProjection = finalized ? result.sourceClaimVerificationResult
+    : projectPrivateSourceVerification('', result.sourceClaimVerificationResult, false);
+  const claimVerificationResult = finalized ? result.claimVerificationResult
+    : projectPrivateClaimVerification('', result.claimVerificationResult);
+  const claimsChanged = analysisProjectionChanged(result.conclusionContract, conclusionContract) ||
+    analysisProjectionChanged(result.claimVerificationResult, claimVerificationResult);
+  const sourceChanged = analysisProjectionChanged(result.sourceUseDecision, sourceUseDecision) ||
+    analysisProjectionChanged(result.sourceReferences, sourceReferences) ||
+    analysisProjectionChanged(result.sourceClaimVerificationResult, sourceProjection);
+  const sourceClaimVerificationResult = !finalized && (claimsChanged || sourceChanged)
+    ? projectPrivateSourceVerification('', result.sourceClaimVerificationResult, true) : sourceProjection;
+  const stored: AnalysisResult = {
+    sessionId: result.sessionId, success: result.success, conclusion: result.conclusion,
+    findings: result.findings, hypotheses: result.hypotheses, confidence: result.confidence,
+    rounds: result.rounds, totalDurationMs: result.totalDurationMs,
+    ...copyAnalysisDeliveryFields(result),
+    ...(conclusionContract !== undefined ? {conclusionContract} : {}),
+    ...(result.claimSupport !== undefined ? {claimSupport: result.claimSupport} : {}),
+    ...(claimVerificationResult !== undefined ? {claimVerificationResult} : {}),
+    ...(sourceUseDecision !== undefined ? {sourceUseDecision} : {}),
+    ...(sourceReferences !== undefined ? {sourceReferences} : {}),
+    ...(sourceClaimVerificationResult !== undefined ? {sourceClaimVerificationResult} : {}),
+    ...(result.identityResolutions !== undefined ? {identityResolutions: result.identityResolutions} : {}),
+    ...(result.partial !== undefined ? {partial: result.partial} : {}),
+    ...(result.terminationReason !== undefined ? {terminationReason: result.terminationReason} : {}),
+    ...(result.terminationMessage !== undefined ? {terminationMessage: result.terminationMessage} : {}),
+    ...(result.analysisReceipt !== undefined ? {analysisReceipt: result.analysisReceipt} : {}),
+    ...(result.uiActionProposals !== undefined ? {uiActionProposals: result.uiActionProposals} : {}),
+    ...(result.quickRun !== undefined ? {quickRun: result.quickRun} : {}),
+    ...(result.smartScenePreview !== undefined ? {smartScenePreview: result.smartScenePreview} : {}),
+  };
+  if (claimsChanged && stored.claimVerificationResult) {
+    stored.claimVerificationResult = invalidatePrivateClaimVerification(stored.claimVerificationResult);
+  }
+  if (claimsChanged && stored.claimSupport) {
+    stored.claimSupport = stored.claimSupport.map(support => ({...support,
+      supportLevel: support.supportLevel === 'verified' || support.supportLevel === 'inference' ? 'partial' : support.supportLevel,
+      bindingEligibility: 'ineligible'}));
+  }
+  if ((claimsChanged || sourceChanged) && stored.conclusionContract?.sourceClaimBindings) {
+    stored.conclusionContract = {...stored.conclusionContract,
+      sourceClaimBindings: stored.conclusionContract.sourceClaimBindings.map(binding => ({...binding,
+        mechanismStatus: binding.mechanismStatus === 'corroborated' || binding.mechanismStatus === 'compatible'
+          ? 'unverified' : binding.mechanismStatus}))};
+  }
+  const delivery = projectPrivateAnalysisDelivery(result, {conclusion: result.conclusion,
+    conclusionContract: stored.conclusionContract, claimsChanged, sourceChanged}, text => text, {privateMetadata: false});
+  const reportInvalidated = (result.reportAssessment?.status === 'checked' && delivery.reportAssessment?.status !== 'checked') ||
+    ((result.deliveryAssurance?.report === 'passed' || result.deliveryAssurance?.report === 'not_applicable') &&
+      delivery.deliveryAssurance?.report !== 'passed' && delivery.deliveryAssurance?.report !== 'not_applicable');
+  if (stored.analysisReceipt && !isCompleteAnalysisReceipt(stored.analysisReceipt)) delete stored.analysisReceipt;
+  if (stored.analysisReceipt && (claimsChanged || sourceChanged || reportInvalidated)) {
+    stored.analysisReceipt = {...stored.analysisReceipt,
+      claimAudit: claimsChanged ? {...stored.analysisReceipt.claimAudit, verifiedClaims: 0,
+        uncertainClaims: stored.analysisReceipt.claimAudit.uncertainClaims + stored.analysisReceipt.claimAudit.verifiedClaims} : stored.analysisReceipt.claimAudit,
+      qualityGates: {...stored.analysisReceipt.qualityGates, finalReportContract: 'partial',
+        ...(claimsChanged ? {claimVerification: 'partial' as const} : {})}};
+  }
+  return {...stored, ...delivery};
 }
 
 /**
@@ -424,13 +724,15 @@ export function projectPrivateAnalysisResult(
 export function projectPrivateSessionStateSnapshot(
   snapshot: SessionStateSnapshot,
 ): SessionStateSnapshot {
-  const codebaseIds = projectPrivateIdList(snapshot.codebaseIds);
+  const codebaseIds = projectPrivateIdList(snapshot.codebaseIds)?.filter(id => privateSourceTextUnchanged(snapshot.sessionId, id));
   const currentSelectedCodebaseIds = codebaseIds ?? [];
   const projectedCodeLookupSummary = projectPrivateCodeLookupSummary(
+    snapshot.sessionId,
     snapshot.codeLookupSummary,
     currentSelectedCodebaseIds,
   );
-  const sourceUseDecision = sanitizeSourceUseDecision(
+  const sourceUseDecision = projectPrivateSourceUseDecision(
+    snapshot.sessionId,
     snapshot.sourceUseDecision,
     currentSelectedCodebaseIds,
   ) ??
@@ -441,10 +743,15 @@ export function projectPrivateSessionStateSnapshot(
         ...(sourceUseDecision ? {sourceUseDecision} : {}),
       }
     : undefined;
-  const codebaseSnapshot = projectPrivateCodebaseSnapshot(snapshot.codebaseSnapshot);
-  const knowledgeSourceIds = projectPrivateIdList(snapshot.knowledgeSourceIds);
-  const analysisReceipt = projectPrivateAnalysisReceipt(snapshot.analysisReceipt);
+  const codebaseSnapshot = projectPrivateCodebaseSnapshot(snapshot.codebaseSnapshot)?.filter(item =>
+    Object.entries(item).every(([key, value]) => key === 'kind' || key === 'commitProvenance' ||
+      typeof value !== 'string' || privateSourceTextUnchanged(snapshot.sessionId, value)));
+  const knowledgeSourceIds = projectPrivateIdList(snapshot.knowledgeSourceIds)?.filter(id => privateSourceTextUnchanged(snapshot.sessionId, id));
   const traceSummary = sanitizeStoredTraceSummaryAttribution(snapshot.traceSummary);
+  const finalResult = snapshot.finalResult?.sessionId === snapshot.sessionId
+    ? projectPrivateAnalysisResult(snapshot.sessionId, snapshot.finalResult, snapshot.outputLanguage ?? 'zh-CN')
+    : undefined;
+  const analysisReceipt = finalResult ? finalResult.analysisReceipt : projectPrivateAnalysisReceipt(snapshot.analysisReceipt);
   return {
     version: snapshot.version,
     snapshotTimestamp: snapshot.snapshotTimestamp,
@@ -455,6 +762,10 @@ export function projectPrivateSessionStateSnapshot(
     ...(snapshot.comparisonSource ? {comparisonSource: snapshot.comparisonSource} : {}),
     ...(analysisReceipt ? {analysisReceipt} : {}),
     ...(traceSummary ? {traceSummary} : {}),
+    ...(finalResult ? {finalResult, claimSupport: finalResult.claimSupport,
+      claimVerificationResult: finalResult.claimVerificationResult,
+      sourceClaimVerificationResult: finalResult.sourceClaimVerificationResult,
+      identityResolutions: finalResult.identityResolutions} : {}),
     conversationSteps: [],
     queryHistory: [],
     conclusionHistory: [],
@@ -487,10 +798,12 @@ export function projectPrivateSessionStateSnapshot(
       : {}),
     ...(knowledgeSourceIds ? {knowledgeSourceIds} : {}),
     ...(snapshot.knowledgeSourceSnapshot
-      ? {knowledgeSourceSnapshot: snapshot.knowledgeSourceSnapshot.map(item => ({...item}))}
+      ? {knowledgeSourceSnapshot: snapshot.knowledgeSourceSnapshot.filter(item => Object.values(item).every(value =>
+          typeof value !== 'string' || privateSourceTextUnchanged(snapshot.sessionId, value))).map(item => ({...item}))}
       : {}),
     ...(codeLookupSummary ? {codeLookupSummary} : {}),
-    ...(sourceUseDecision ? {sourceUseDecision} : {}),
+    ...(finalResult ? {sourceUseDecision: finalResult.sourceUseDecision}
+      : sourceUseDecision ? {sourceUseDecision} : {}),
     runSequence: snapshot.runSequence,
     conversationOrdinal: snapshot.conversationOrdinal,
   };

@@ -3,6 +3,8 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {describe, expect, it, jest} from '@jest/globals';
+import * as authorization from '../../../services/resolvedAnalysisContext';
+import type {AnalysisResult} from '../../../agent/core/orchestratorTypes';
 
 import {
   ConversationSessionService,
@@ -500,4 +502,153 @@ describe('ConversationSessionService', () => {
     expect(adapter.dispose).toHaveBeenCalled();
     expect(service.getSession(receipt.sessionId)).toBeUndefined();
   });
+  it('withdraws delivery permission synchronously when cancellation wins after runtime return but before commit', async () => {
+    let runtimeInput!: ConversationRuntimeInput;
+    const settled = jest.fn();
+    const adapter: ConversationRuntimeAdapter = {
+      run: jest.fn<ConversationRuntimeAdapter['run']>(input => {runtimeInput = input; return Promise.resolve({kind: 'answered', message: 'STALE_ANSWER'});}),
+      cancel: jest.fn(async () => {runtimeInput.onUpdate?.({message: 'STALE_UPDATE'});}),
+    };
+    const service = new ConversationSessionService({createRuntime: () => adapter, onRunSettled: settled});
+    const receipt = service.startTurn({query: 'question'});
+    await service.cancelRun(receipt.sessionId, receipt.runId);
+    await expect(receipt.completion).resolves.toEqual({kind: 'cancelled', message: ''});
+    const session = service.getSession(receipt.sessionId)!;
+    expect(session.status).toBe('cancelled');
+    expect(session.history.some(message => message.content === 'STALE_ANSWER')).toBe(false);
+    expect(session.runs[0].events.filter(event => event.type === 'run_completed')).toHaveLength(1);
+    expect(JSON.stringify(session.runs[0].events)).not.toContain('STALE_UPDATE');
+    expect(settled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['success', 'error'] as const)('isolates late %s and updates after cancellation timeout from the next active run', async terminal => {
+    jest.useFakeTimers();
+    let resolveOld!: (outcome: ConversationRuntimeOutcome) => void;
+    let rejectOld!: (error: Error) => void;
+    const old = new Promise<ConversationRuntimeOutcome>((resolve, reject) => {resolveOld = resolve; rejectOld = reject;});
+    const next = deferred<ConversationRuntimeOutcome>();
+    const inputs: ConversationRuntimeInput[] = [];
+    const settled = jest.fn();
+    const adapter: ConversationRuntimeAdapter = {
+      run: jest.fn<ConversationRuntimeAdapter['run']>(input => {inputs.push(input); return inputs.length === 1 ? old : next.promise;}),
+      cancel: jest.fn(() => new Promise<void>(() => {})),
+    };
+    const service = new ConversationSessionService({createRuntime: () => adapter, cancelSettleTimeoutMs: 5, onRunSettled: settled});
+    try {
+      const first = service.startTurn({query: 'old question'});
+      const cancellation = expect(service.cancelRun(first.sessionId, first.runId)).rejects.toThrow('did not settle');
+      await jest.advanceTimersByTimeAsync(6);
+      await cancellation;
+      const session = service.getSession(first.sessionId)!;
+      expect(session.status).toBe('cancelled');
+      expect(session.activeRun).toBeUndefined();
+      const priorEvents = session.runs[0].events.length;
+      const second = service.startTurn({sessionId: first.sessionId, query: 'new question'});
+      const active = session.activeRun;
+      if (terminal === 'success') resolveOld({kind: 'answered', message: 'LATE_OLD_ANSWER'});
+      else rejectOld(new Error('LATE_OLD_ERROR'));
+      inputs[0].onUpdate?.({message: 'LATE_OLD_UPDATE'});
+      await expect(first.completion).resolves.toEqual({kind: 'cancelled', message: ''});
+      expect(session.activeRun).toBe(active);
+      expect(session.status).toBe('running');
+      expect(session.error).toBeUndefined();
+      expect(session.runs[0].outcome).toEqual({kind: 'cancelled', message: ''});
+      expect(session.runs[0].events).toHaveLength(priorEvents);
+      expect(JSON.stringify(session.history)).not.toContain('LATE_OLD');
+      next.resolve({kind: 'answered', message: 'new answer'});
+      await second.completion;
+      expect(settled).toHaveBeenCalledTimes(2);
+    } finally {jest.useRealTimers();}
+  });
+
+  it('does not start runtime work after a reservation hook removes the session', async () => {
+    const adapter: ConversationRuntimeAdapter = {run: jest.fn<ConversationRuntimeAdapter['run']>(async () => ({kind: 'answered', message: 'unexpected'})),
+      cancel: jest.fn(async () => undefined), dispose: jest.fn(async () => undefined)};
+    const settled = jest.fn();
+    let service!: ConversationSessionService;
+    service = new ConversationSessionService({createRuntime: () => adapter, now: () => 100,
+      onRunStarted: () => {service.cleanupIdleSessions({terminalMaxIdleMs: 1, nonTerminalMaxIdleMs: 1, now: 1000});},
+      onRunSettled: settled});
+    const receipt = service.startTurn({query: 'question'});
+    await expect(receipt.completion).resolves.toEqual({kind: 'cancelled', message: ''});
+    expect(service.getSession(receipt.sessionId)).toBeUndefined();
+    expect(adapter.run).not.toHaveBeenCalled();
+    expect(settled).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not dispatch a new runtime after a run_started listener cancels it', async () => {
+    const adapter: ConversationRuntimeAdapter = {run: jest.fn<ConversationRuntimeAdapter['run']>(async () => ({kind: 'answered', message: 'answer'})),
+      cancel: jest.fn(async () => undefined)};
+    const service = createService(adapter);
+    const first = service.startTurn({query: 'first'});
+    await first.completion;
+    service.subscribe(first.sessionId, event => {
+      if (event.type === 'run_started') void service.cancelRun(event.sessionId, event.runId).catch(() => undefined);
+    });
+    const next = service.startTurn({sessionId: first.sessionId, query: 'cancel before execution'});
+    await expect(next.completion).resolves.toEqual({kind: 'cancelled', message: ''});
+    expect(adapter.run).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish old completion or start enrichment after a settlement hook starts the next run', async () => {
+    const next = deferred<ConversationRuntimeOutcome>();
+    let calls = 0;
+    const adapter: ConversationRuntimeAdapter = {
+      run: jest.fn<ConversationRuntimeAdapter['run']>(() => ++calls === 1 ? Promise.resolve({kind: 'answered', message: 'first answer'}) : next.promise),
+      shouldStartSourceEnrichment: jest.fn(() => true),
+      runSourceEnrichment: jest.fn(async () => ({message: 'unexpected', evidence: [], metrics: {searchCalls: 0, readCalls: 0, durationMs: 0}})),
+      cancel: jest.fn(async () => undefined),
+    };
+    let service!: ConversationSessionService;
+    let replacement: ReturnType<ConversationSessionService['startTurn']> | undefined;
+    service = new ConversationSessionService({createRuntime: () => adapter,
+      onRunSettled: session => {if (!replacement) replacement = service.startTurn({sessionId: session.sessionId, query: 'next'});}});
+    const first = service.startTurn({query: 'first'});
+    await first.completion;
+    const session = service.getSession(first.sessionId)!;
+    expect(session.activeRun?.runId).toBe(replacement?.runId);
+    expect(session.runs[0].events.some(event => event.type === 'run_completed')).toBe(false);
+    expect(adapter.runSourceEnrichment).not.toHaveBeenCalled();
+    next.resolve({kind: 'answered', message: 'next answer'});
+    await replacement!.completion;
+  });
+
+  it('preserves finalResult through actual session state and the completed event', async () => {
+    const finalResult: AnalysisResult = {sessionId: 'runtime', success: true, partial: true, findings: [], hypotheses: [],
+      conclusion: '  Final body.\r\n', confidence: 0.5, rounds: 1, totalDurationMs: 1,
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2', status: 'partial', policy: 'record_only', passed: false,
+        checkedClaimCount: 0, unsupportedClaimCount: 0, claimResults: [], issues: []}};
+    const adapter: ConversationRuntimeAdapter = {run: jest.fn<ConversationRuntimeAdapter['run']>(async () => ({kind: 'answered', message: finalResult.conclusion, finalResult})),
+      cancel: jest.fn(async () => undefined)};
+    const service = createService(adapter);
+    const receipt = service.startTurn({query: 'question'});
+    const outcome = await receipt.completion;
+    const session = service.getSession(receipt.sessionId)!;
+    expect(outcome.finalResult).toBe(finalResult);
+    expect(session.runs[0].outcome?.finalResult).toBe(finalResult);
+    expect(session.history[session.history.length - 1]?.content).toBe(finalResult.conclusion);
+    expect(session.runs[0].events).toContainEqual(expect.objectContaining({type: 'run_completed', outcome: {kind: 'answered',
+      message: finalResult.conclusion, finalResult}}));
+  });
+
+  it('rechecks authorization at the application commit boundary', async () => {
+    let revoked = false;
+    const authorizationCheck = jest.spyOn(authorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
+      if (revoked) throw new authorization.AnalysisContextAuthorizationChangedError();
+    });
+    try {
+      const adapter: ConversationRuntimeAdapter = {run: jest.fn<ConversationRuntimeAdapter['run']>(async () => {
+        revoked = true;
+        return {kind: 'answered', message: 'REVOKED_ANSWER'};
+      }), cancel: jest.fn(async () => undefined)};
+      const service = createService(adapter);
+      const receipt = service.startTurn({query: 'question'});
+      await expect(receipt.completion).rejects.toThrow('analysis_context_changed_restart_required');
+      const session = service.getSession(receipt.sessionId)!;
+      expect(session.history.some(message => message.content === 'REVOKED_ANSWER')).toBe(false);
+      expect(session.runs[0].outcome).toBeUndefined();
+      expect(session.runs[0].events.some(event => event.type === 'run_completed')).toBe(false);
+    } finally {authorizationCheck.mockRestore();}
+  });
+
 });

@@ -26,6 +26,7 @@ import {
   getStrategyContent,
   getVerifierMisdiagnosisPatterns,
   getPhaseHints,
+  parseFinalReportContract,
   invalidateStrategyCache,
   loadPromptTemplate,
 } from '../strategyLoader';
@@ -35,8 +36,52 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     invalidateStrategyCache();
   });
 
+  it('loads semantic ID and description requirements without regex patterns', () => {
+    const contract = parseFinalReportContract({required_sections: [{
+      id: 'startup_metrics', description: 'Explain measured TTID and TTFD and the evidence boundary.',
+    }]});
+    expect(contract?.requiredSections).toEqual([{
+      id: 'startup_metrics', label: 'startup_metrics',
+      description: 'Explain measured TTID and TTFD and the evidence boundary.',
+      required: true, triggerPatterns: [], patterns: [], patternGroups: [],
+      recoveryText: {zh: [], en: []},
+    }]);
+    expect(parseFinalReportContract({required_sections: [null, {description: 'No stable identity'}]})
+      ?.requiredSections).toEqual([]);
+    expect(parseFinalReportContract({required_sections: [{id: 'case_ref',
+      condition: {kind: 'strong_case_retrieval'}}]})?.requiredSections[0].condition)
+      .toEqual({kind: 'strong_case_retrieval'});
+    expect(parseFinalReportContract({required_sections: [{id: 'optional_scope',
+      condition: {kind: 'semantic', description: 'Only when the requested scope includes launch.'}}]})
+      ?.requiredSections[0].condition).toEqual({kind: 'semantic', description: 'Only when the requested scope includes launch.'});
+  });
+
   it('loads at least 12 scenes from disk', () => {
     expect(getRegisteredScenes().length).toBeGreaterThanOrEqual(12);
+  });
+
+  it('keeps legacy or invalid conditions unresolved instead of requiring them unconditionally', () => {
+    for (const declaration of [{trigger_patterns: ['case']}, {condition: null},
+      {condition: {kind: 'semantic', description: ''}}, {condition: {kind: 'unknown'}}]) {
+      const condition = parseFinalReportContract({required_sections: [{id: 'conditional', ...declaration}]})
+        ?.requiredSections[0].condition;
+      expect(condition).toEqual({kind: 'unresolved',
+        reason: 'trigger_patterns' in declaration ? 'legacy_trigger_patterns' : 'invalid_condition'});
+    }
+  });
+
+  it('ships semantic or typed conditions instead of unresolved lexical report triggers', () => {
+    for (const definition of getRegisteredScenes()) {
+      const sections = getFinalReportContract(definition.scene)?.requiredSections ?? [];
+      expect(new Set(sections.map(section => section.id)).size).toBe(sections.length);
+      for (const section of sections) {
+        expect(section.triggerPatterns).toEqual([]);
+        expect(section.condition?.kind).not.toBe('unresolved');
+        if (section.condition?.kind === 'semantic') expect(section.condition.description.trim().length).toBeGreaterThan(0);
+      }
+    }
+    expect(getFinalReportContract('scrolling')?.requiredSections.find(section => section.id === 'case_recommendations')
+      ?.condition).toEqual({kind: 'strong_case_retrieval'});
   });
 
   it('returns non-empty content for known scenes', () => {
@@ -82,9 +127,7 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     ]));
     expect(getFinalReportContract('startup')?.requiredSections.find(section =>
       section.id === 'startup_diagnostic_api_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'ApplicationStartInfo|getHistoricalProcessStartReasons|STARTUP_STATE|START_TIMESTAMP|START_REASON|START_COMPONENT',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
 
     expect(getFinalReportContract('memory')?.requiredSections.map(section => section.id)).toEqual(expect.arrayContaining([
       'memory_evidence_scope',
@@ -94,9 +137,7 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     ]));
     expect(getFinalReportContract('memory')?.requiredSections.find(section =>
       section.id === 'memory_diagnostic_api_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'ApplicationExitInfo|getHistoricalProcessExitReasons|REASON_LOW_MEMORY|REASON_FREEZER|REASON_EXCESSIVE_RESOURCE_USAGE',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
 
     const anrContract = getFinalReportContract('anr');
     expect(anrContract?.requiredSections.map(section => section.id)).toEqual(expect.arrayContaining([
@@ -104,10 +145,7 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     ]));
     expect(anrContract?.requiredSections.find(section =>
       section.id === 'anr_diagnostic_api_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'ApplicationExitInfo|getHistoricalProcessExitReasons|getAnrInfo|REASON_ANR',
-      'ProfilingManager|ProfilingTrigger|TRIGGER_TYPE_ANR',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
 
     expect(getFinalReportContract('io')?.requiredSections.map(section => section.id)).toEqual(expect.arrayContaining([
       'io_evidence_class',
@@ -135,14 +173,10 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     ]));
     expect(pipelineContract?.requiredSections.find(section =>
       section.id === 'graphics_memory_policy_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'GraphicBuffer|dma[-_ ]?buf|graphics\\s+memory|图形内存|GPU memory',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
     expect(pipelineContract?.requiredSections.find(section =>
       section.id === 'buffer_fence_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'BufferQueue|BLAST|queueBuffer|dequeueBuffer',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
 
     const networkContract = getFinalReportContract('network');
     expect(networkContract?.requiredSections.map(section => section.id)).toEqual(expect.arrayContaining([
@@ -151,16 +185,10 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     ]));
     expect(networkContract?.requiredSections.find(section =>
       section.id === 'request_stage_evidence_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      '(网络|network).*(慢|延迟|latency|slow|请求慢|request.*slow)|(请求|request).*(慢|耗时|延迟|latency|slow)',
-      'DNS|TTFB|HTTPDNS|OkHttp|Cronet|HttpEngine|EventListener|request[- ]stage|首包|首字节|secureConnect|responseHeadersStart',
-      'TLS|handshake|\\bconnect(?:Start|End)?\\b|request body|response body|body transfer|decode|server log|access[- ]layer|APM',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
     expect(networkContract?.requiredSections.find(section =>
       section.id === 'network_stack_policy_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'NetworkCallback|NetworkCapabilities|validated internet|metered|estimated bandwidth|bandwidth estimate|local network permission|ACCESS_LOCAL_NETWORK|satellite|constrained network',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
 
     const powerContract = getFinalReportContract('power');
     expect(powerContract?.requiredSections.map(section => section.id)).toEqual(expect.arrayContaining([
@@ -169,14 +197,10 @@ describe('strategyLoader tolerates leading SPDX HTML comments', () => {
     ]));
     expect(powerContract?.requiredSections.find(section =>
       section.id === 'job_work_fgs_governance_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'JobScheduler|WorkManager|Foreground Service|\\bFGS\\b|foreground worker|JobParameters|WorkInfo|UIDT|user[- ]initiated data transfer',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
     expect(powerContract?.requiredSections.find(section =>
       section.id === 'alarm_wakeup_vitals_boundary',
-    )?.triggerPatterns).toEqual(expect.arrayContaining([
-      'allow[- ]while[- ]idle|setExactAndAllowWhileIdle|exact alarm|AlarmManager|wakeup alarm|excessive wakeups',
-    ]));
+    )?.condition).toEqual(expect.objectContaining({kind: 'semantic', description: expect.any(String)}));
   });
 
   it('loads verifier misdiagnosis patterns with scene and global scopes', () => {

@@ -10,6 +10,7 @@ import {
   type QueryReviewV1,
 } from '../../../types/queryReviewContract';
 import {buildEvidenceContract} from '../evidenceContractBuilder';
+import type {EvidenceScopeProvenanceV1, IdentityResolutionV1} from '../../../types/identityContract';
 
 const queryReview: QueryReviewV1 = {
   schemaVersion: QUERY_REVIEW_SCHEMA_VERSION,
@@ -28,6 +29,84 @@ const queryReview: QueryReviewV1 = {
 };
 
 describe('evidenceContractBuilder', () => {
+  describe('field scope provenance', () => {
+    const target = {mode: 'exact_upid' as const, upid: 42, traceId: 'trace-a',
+      traceSide: 'current' as const, identityRefId: 'identity:42'};
+    const resolution: IdentityResolutionV1 = {
+      version: 'identity_contract@1', identityRefId: target.identityRefId, status: 'verified',
+      target: {...target, source: 'user_param'}, processes: [{upid: 42, confidence: 1, matchSources: ['upid']}],
+      threads: [], warnings: [],
+    };
+    const mixed: EvidenceScopeProvenanceV1 = {version: 'process_scope_evidence@1', entries: [
+      {role: 'target', scope: target, fields: ['upid', 'metric'], availability: 'available'},
+      {role: 'global_context', scope: {mode: 'unscoped', traceId: 'trace-a', traceSide: 'current'},
+        fields: ['vsync'], relativeTo: target},
+      {role: 'peer_context', scope: {mode: 'unscoped', traceId: 'trace-a', traceSide: 'current'},
+        fields: ['peer_duration'], relativeTo: target},
+    ]};
+    function build(column?: string, provenance: EvidenceScopeProvenanceV1 = mixed,
+      rowUpid = 42, identity = resolution) {
+      const envelope = createDataEnvelope({columns: ['upid', 'metric', 'vsync', 'peer_duration', 'undeclared'],
+        rows: [[rowUpid, 0, 16, 5, 99]]}, {
+        type: 'skill_result', source: 'scoped', title: 'Mixed observations', traceId: 'trace-a', traceSide: 'current',
+        evidenceRefId: 'data:mixed', scopeProvenance: provenance,
+        identityRefId: target.identityRefId, identityStatus: 'verified', identityResolution: identity,
+      });
+      return buildEvidenceContract({dataEnvelopes: [envelope], conclusionContract: {
+        schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [],
+        clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+        claims: [{id: 'claim:scoped', kind: 'numeric', text: 'An observed value', references: [
+          {evidenceRefId: 'data:mixed', rowIndex: 0, ...(column ? {column} : {})},
+        ]}],
+      }});
+    }
+    it('selects target, global and peer cells independently within one row', () => {
+      expect(build('metric').anchors[0].identity?.status).toBe('verified');
+      for (const [column, role] of [['vsync', 'global_context'], ['peer_duration', 'peer_context']]) {
+        const anchor = build(column).anchors[0];
+        expect(anchor.identity).toBeUndefined();
+        expect(anchor.missing).not.toBe(true);
+        expect(anchor.scopeProvenance?.entries.map(entry => entry.role)).toEqual([role]);
+        expect(anchor.scopeProvenance?.entries[0].relativeTo?.upid).toBe(42);
+      }
+      expect(build().anchors[0].identity).toBeUndefined();
+      expect(build().anchors[0].scopeProvenance?.entries).toHaveLength(3);
+    });
+    it('does not verify a residual zero when that selected scope is unavailable', () => {
+      const unavailable = structuredClone(mixed);
+      unavailable.entries[0].availability = 'unavailable';
+      const result = build('metric', unavailable);
+      expect(result.anchors[0]).toMatchObject({missing: true, confidence: 0});
+      expect(result.claimSupport[0].supportLevel).not.toBe('verified');
+      expect(build('vsync', unavailable).anchors[0].missing).not.toBe(true);
+    });
+    it('rejects undeclared fields and mismatched scope trace or side', () => {
+      expect(build('undeclared').anchors[0].missing).toBe(true);
+      for (const change of [{traceId: 'another'}, {traceSide: 'reference' as const}]) {
+        const wrong = structuredClone(mixed);
+        Object.assign(wrong.entries[0].scope, change);
+        expect(build('metric', wrong).anchors[0].missing).toBe(true);
+      }
+    });
+    it('cannot transfer target identity from a different row instance or root side', () => {
+      expect(build('metric', mixed, 43).anchors[0].identity).toBeUndefined();
+      const otherSide = {...resolution, target: {...resolution.target, traceSide: 'reference' as const}};
+      expect(build('metric', mixed, 42, otherSide).anchors[0].identity).toBeUndefined();
+      const ambiguous = {...resolution, status: 'ambiguous' as const};
+      expect(build('metric', mixed, 42, ambiguous).anchors[0].identity).toBeUndefined();
+      const wrongTarget = {...resolution, target: {...resolution.target, upid: 43}};
+      expect(build('metric', mixed, 42, wrongTarget).anchors[0].identity).toBeUndefined();
+      const wrongProcess = {...resolution, processes: [{...resolution.processes[0], upid: 43}]};
+      expect(build('metric', mixed, 42, wrongProcess).anchors[0].identity).toBeUndefined();
+    });
+    it('preserves pure global context without borrowing a verified target', () => {
+      const global = {version: mixed.version, entries: [mixed.entries[1]]};
+      const anchor = build('vsync', global).anchors[0];
+      expect(anchor.identity).toBeUndefined();
+      expect(anchor.scopeProvenance?.entries[0].role).toBe('global_context');
+    });
+  });
+
   it('preserves canonical legacy ns ranges while precise aliases remain strict', () => {
     const envelope = createDataEnvelope({
       columns: ['start_ts', 'ts', 'end_ts', 'dur', 'ts_str', 'dur_str'],
@@ -58,7 +137,7 @@ describe('evidenceContractBuilder', () => {
     });
 
     expect(built.relations.find(item => item.id === 'relation:legacy-exact')).toEqual(expect.objectContaining({
-      verificationStatus: 'verified', reasonCode: 'overlap_verified',
+      verificationStatus: 'candidate', reasonCode: 'overlap_range_missing',
     }));
     expect(built.anchors.find(anchor => anchor.timeRange?.startTs === '10')?.timeRange).toEqual({
       startTs: '10', endTs: '30', unit: 'ns', source: 'row',
@@ -154,7 +233,7 @@ describe('evidenceContractBuilder', () => {
     expect(subjectRanges.get('anr-7')).toBeUndefined();
   });
 
-  it('builds and deduplicates producer-authored overlap relation anchors', () => {
+  it('builds distinct producer-authored overlap anchors without granting inferred clock authority', () => {
     const envelope = createDataEnvelope(
       {
         columns: ['ts', 'dur', 'name'],
@@ -193,8 +272,8 @@ describe('evidenceContractBuilder', () => {
       expect.objectContaining({
         schemaVersion: 'evidence_relation@1',
         id: 'relation:overlap:1',
-        verificationStatus: 'verified',
-        reasonCode: 'overlap_verified',
+        verificationStatus: 'candidate',
+        reasonCode: 'overlap_range_missing',
       }),
     ]);
     expect(contract.anchors).toHaveLength(2);
@@ -204,7 +283,7 @@ describe('evidenceContractBuilder', () => {
     );
   });
 
-  it('keeps missing overlap ranges as candidates and rejects disjoint ranges', () => {
+  it('retains missing and disjoint legacy ranges as candidates without a captured clock', () => {
     const envelope = createDataEnvelope(
       {
         columns: ['ts', 'dur', 'name'],
@@ -246,8 +325,8 @@ describe('evidenceContractBuilder', () => {
     expect(built.relations).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: 'relation:overlap:disjoint',
-        verificationStatus: 'rejected',
-        reasonCode: 'overlap_disjoint',
+        verificationStatus: 'candidate',
+        reasonCode: 'overlap_range_missing',
       }),
       expect.objectContaining({
         id: 'relation:overlap:missing',
@@ -255,6 +334,13 @@ describe('evidenceContractBuilder', () => {
         reasonCode: 'overlap_range_missing',
       }),
     ]));
+    const disjoint = built.relations.find(relation => relation.id === 'relation:overlap:disjoint')!;
+    expect(built.anchors.find(anchor => anchor.anchorId === disjoint.subjectAnchorId)?.timeRange).toEqual({
+      startTs: '100', endTs: '110', unit: 'ns', source: 'row',
+    });
+    expect(built.anchors.find(anchor => anchor.anchorId === disjoint.objectAnchorId)?.timeRange).toEqual({
+      startTs: '200', endTs: '210', unit: 'ns', source: 'row',
+    });
   });
 
   it('never verifies a relation whose endpoint expected value mismatches the resolved cell', () => {
@@ -292,7 +378,7 @@ describe('evidenceContractBuilder', () => {
     }));
   });
 
-  it('compares canonical nanosecond string ranges without losing integer precision', () => {
+  it('preserves canonical nanosecond strings precisely without granting replay clock authority', () => {
     const envelope = createDataEnvelope(
       {
         columns: ['name', 'ts', 'dur'],
@@ -323,12 +409,16 @@ describe('evidenceContractBuilder', () => {
     } as any);
 
     expect(built.relations[0]).toEqual(expect.objectContaining({
-      verificationStatus: 'verified',
-      reasonCode: 'overlap_verified',
+      verificationStatus: 'candidate',
+      reasonCode: 'overlap_range_missing',
     }));
+    expect(built.anchors.map(anchor => anchor.timeRange)).toEqual([
+      {startTs: '9007199254740993', endTs: '9007199254740994', unit: 'ns', source: 'row'},
+      {startTs: '9007199254740993', endTs: '9007199254740994', unit: 'ns', source: 'row'},
+    ]);
   });
 
-  it('verifies binary causal relations only when one proof row binds both endpoints', () => {
+  it('retains both binary bindings but never treats matching endpoint values as mechanism proof', () => {
     const envelope = createDataEnvelope(
       {
         columns: ['row_kind', 'utid', 'subject_utid', 'object_utid'],
@@ -380,8 +470,8 @@ describe('evidenceContractBuilder', () => {
     expect(built.relations).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: 'relation:blocking:verified',
-        verificationStatus: 'verified',
-        reasonCode: 'binary_proof_verified',
+        verificationStatus: 'candidate',
+        reasonCode: 'proof_binding_missing',
       }),
       expect.objectContaining({
         id: 'relation:blocking:mismatch',
@@ -559,7 +649,7 @@ describe('evidenceContractBuilder', () => {
     }));
   });
 
-  it('allows distinct verified client, server, and proof identities in a binary relation', () => {
+  it('retains distinct client, server, and proof identities without upgrading a binary candidate', () => {
     const makeEnvelope = (
       evidenceRefId: string,
       identityRefId: string,
@@ -598,8 +688,8 @@ describe('evidenceContractBuilder', () => {
     } as any);
 
     expect(built.relations[0]).toEqual(expect.objectContaining({
-      verificationStatus: 'verified',
-      reasonCode: 'binary_proof_verified',
+      verificationStatus: 'candidate',
+      reasonCode: 'proof_binding_missing',
     }));
     expect(built.identityRefIds).toEqual(expect.arrayContaining([
       'identity:binder-client',
@@ -613,7 +703,7 @@ describe('evidenceContractBuilder', () => {
     ['weak', 'candidate', 'identity_evidence_missing'],
     ['missing', 'candidate', 'identity_evidence_missing'],
     ['not_required', 'candidate', 'identity_evidence_missing'],
-    ['error', 'rejected', 'identity_conflict'],
+    ['error', 'candidate', 'relation_anchor_missing'],
     [undefined, 'candidate', 'identity_evidence_missing'],
   ] as const)(
     'maps %s binary identity state to %s',
@@ -665,6 +755,12 @@ describe('evidenceContractBuilder', () => {
         verificationStatus,
         reasonCode,
       }));
+      if (identityStatus === 'error') {
+        expect(built.anchors).toEqual(expect.arrayContaining([
+          expect.objectContaining({missing: true, missingReason: 'captured_identity_conflict',
+            identity: expect.objectContaining({status: 'error'})}),
+        ]));
+      }
     },
   );
 
@@ -713,7 +809,7 @@ describe('evidenceContractBuilder', () => {
     }));
   });
 
-  it('recomputes comparison delta as current minus reference and rejects wrong sides or values', () => {
+  it('retains declared deltas as candidates without metric authority and still rejects wrong sides', () => {
     const makeEnvelope = (evidenceRefId: string, traceSide: 'current' | 'reference', value: number) =>
       createDataEnvelope({columns: ['blocked_ms'], rows: [[value]]}, {
         type: 'sql_result',
@@ -752,8 +848,9 @@ describe('evidenceContractBuilder', () => {
       expect.objectContaining({
         id: 'relation:delta:verified',
         deltaDirection: 'current_minus_reference',
-        verificationStatus: 'verified',
-        reasonCode: 'comparison_delta_verified',
+        verificationStatus: 'candidate',
+        reasonCode: 'comparison_metric_missing',
+        value: 50,
       }),
       expect.objectContaining({
         id: 'relation:delta:wrong-side',
@@ -762,10 +859,16 @@ describe('evidenceContractBuilder', () => {
       }),
       expect.objectContaining({
         id: 'relation:delta:wrong-value',
-        verificationStatus: 'rejected',
-        reasonCode: 'comparison_delta_mismatch',
+        verificationStatus: 'candidate',
+        reasonCode: 'comparison_metric_missing',
+        value: 40,
       }),
     ]));
+    // Keep the conflicting proposal and its actual operands visible. Neither
+    // arithmetic result has a captured unit/population definition in this replay.
+    const wrongValue = built.relations.find(relation => relation.id === 'relation:delta:wrong-value')!;
+    expect(built.anchors.find(anchor => anchor.anchorId === wrongValue.subjectAnchorId)?.cells?.[0].actualValue).toBe(150);
+    expect(built.anchors.find(anchor => anchor.anchorId === wrongValue.objectAnchorId)?.cells?.[0].actualValue).toBe(100);
   });
 
   it('excludes hostile candidates, conflicting duplicate ids, and invalid envelopes defensively', () => {

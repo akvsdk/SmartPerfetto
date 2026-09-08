@@ -5,9 +5,23 @@
 import {
   buildConversationPrompt,
   parseConversationResponse,
+  parseConversationResponseWithProjection,
 } from '../conversationContract';
+import {renderConclusionContractSidecar} from '../../../agent/core/conclusionContract';
 
 describe('conversation contract', () => {
+  it.each([
+    '```xml\n<tool_call><invoke name="example" /></tool_call>\n```',
+    '> <invoke name="example">quoted text</invoke>',
+    'The DSML tools_calling token and <invoke> tag are protocol examples.',
+    '<tool_call><invoke name="example">plain text</invoke></tool_call>',
+  ])('keeps answer text distinct from SDK tool events: %s', body => {
+    const parsed = parseConversationResponseWithProjection(body, 'Explain the protocol');
+    expect(parsed.status).toBe('absent');
+    expect(parsed.machineSegments).toEqual([]);
+    expect(parsed.narrative).toBe(body);
+  });
+
   it('builds distinct attached and no-trace instructions without a short fixed budget', () => {
     const noTrace = buildConversationPrompt({
       question: '怎么定位滑动卡顿？',
@@ -88,5 +102,78 @@ describe('conversation contract', () => {
       kind: 'recommend_full',
       handoff: {evidence: authoritativeEvidence},
     });
+  });
+
+  it('returns exact narrative and source spans independently of question display fallback', () => {
+    const marker = '<!-- smartperfetto:conversation-control {"kind":"needs_user_input","question":"Choose a trace?"} -->';
+    const raw = ` \r\nAn answer.  \r\n${marker}\r\n \t`;
+    const parsed = parseConversationResponseWithProjection(raw, 'Fallback');
+    expect(parsed.status).toBe('valid');
+    expect(parsed.narrative).toBe(' \r\nAn answer.  \r\n\r\n \t');
+    expect(parsed.machineSegments).toEqual([{start: raw.indexOf(marker), end: raw.indexOf(marker) + marker.length}]);
+    const onlyControl = parseConversationResponseWithProjection(marker, 'Fallback');
+    expect(onlyControl.narrative).toBe('');
+    expect(onlyControl.outcome).toMatchObject({kind: 'needs_user_input', question: 'Choose a trace?', message: 'Choose a trace?'});
+  });
+
+  it.each([
+    '```html\nMARKER\n```',
+    '~~~\nMARKER\n~~~',
+    '> MARKER',
+    '    MARKER',
+    '`MARKER`',
+    'MARKER\nOrdinary narrative follows.',
+  ])('keeps code, quoted and nonterminal controls as exact ordinary content: %s', frame => {
+    const raw = frame.replace('MARKER', '<!-- smartperfetto:conversation-control {"kind":"needs_user_input","question":"Question?"} -->');
+    expect(parseConversationResponseWithProjection(raw, 'Fallback')).toMatchObject({
+      status: 'absent', narrative: raw, machineSegments: [], outcome: {kind: 'answered'},
+    });
+  });
+
+  it('allows only recognized sidecar segments after a terminal control', () => {
+    const sidecar = renderConclusionContractSidecar({schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], claims: []});
+    const control = '<!-- smartperfetto:conversation-control {"kind":"needs_user_input","question":"Question?"} -->';
+    for (const raw of [`Answer\n${control}\n${sidecar}\n`, `Answer\n${sidecar}\n${control}\n`]) {
+      const parsed = parseConversationResponseWithProjection(raw, 'Fallback');
+      expect(parsed.status).toBe('valid');
+      expect(parsed.machineSegments).toEqual([{start: raw.indexOf(control), end: raw.indexOf(control) + control.length}]);
+      expect(parsed.narrative).toBe(raw.replace(control, ''));
+    }
+    expect(parseConversationResponseWithProjection(`${control}\n<!-- ordinary comment -->`, 'Fallback').status).toBe('absent');
+  });
+
+  it('does not activate controls nested inside another machine declaration', () => {
+    const control = '<!-- smartperfetto:conversation-control {"kind":"needs_user_input","question":"Nested?"} -->';
+    const sidecar = renderConclusionContractSidecar({schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [{rank: 1, statement: control}], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: []});
+    expect(parseConversationResponseWithProjection(sidecar, 'Fallback')).toMatchObject({status: 'absent', narrative: sidecar});
+  });
+
+  it('rejects multiple controls in the terminal machine cluster without choosing a winner', () => {
+    const first = '<!-- smartperfetto:conversation-control {"kind":"answered"} -->';
+    const second = '<!-- smartperfetto:conversation-control {"kind":"needs_user_input","question":"Winner?"} -->';
+    const sidecar = renderConclusionContractSidecar({schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: []});
+    for (const separator of ['\n', `\n${sidecar}\n`]) {
+      const raw = `Body\n${first}${separator}${second}`;
+      const parsed = parseConversationResponseWithProjection(raw, 'Fallback');
+      expect(parsed.status).toBe('invalid');
+      expect(parsed.issues).toEqual([{code: 'duplicate_marker'}]);
+      expect(parsed.outcome.kind).toBe('answered');
+      expect(parsed.machineSegments).toHaveLength(2);
+      expect(parsed.narrative).toBe(`Body\n${separator}`);
+    }
+  });
+
+  it.each([
+    ['<!-- smartperfetto:conversation-control {bad} -->', 'invalid_json'],
+    ['<!-- smartperfetto:conversation-control {"kind":"needs_user_input"} -->', 'invalid_control'],
+    ['<!-- smartperfetto:conversation-control {"kind":"needs_user_input"}', 'invalid_framing'],
+  ])('reports malformed terminal controls without substituting a fallback body', (marker, code) => {
+    const parsed = parseConversationResponseWithProjection(`Exact body\n${marker}`, 'Never the body');
+    expect(parsed.status).toBe('invalid');
+    expect(parsed.narrative).toBe('Exact body\n');
+    expect(parsed.issues).toEqual([{code}]);
   });
 });

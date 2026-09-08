@@ -38,6 +38,11 @@ prerequisites:
   modules:
     - android.frames.timeline
 
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package, process_name]
+
 inputs:
   - name: package
     type: string
@@ -87,14 +92,20 @@ display:
       label: "抖动等级"
       type: string
 
+process_scope:
+  role: target
+  binding: effective_target_processes
+sql_fragments:
+  - fragments/effective_target_processes.sql
+
 sql: |
   WITH frames AS (
     SELECT
       a.ts,
       a.dur / 1e6 as frame_ms
     FROM actual_frame_timeline_slice a
-    LEFT JOIN process p ON a.upid = p.upid
-    WHERE (('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
+    JOIN effective_target_processes p ON a.upid = p.upid
+    WHERE (${__process_scope.upid} IS NOT NULL OR ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
       AND p.name NOT LIKE '/system/%'
       AND COALESCE(a.display_frame_token, a.surface_frame_token) IS NOT NULL
       AND (${start_ts} IS NULL OR a.ts >= ${start_ts})

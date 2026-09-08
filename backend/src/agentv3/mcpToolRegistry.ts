@@ -33,12 +33,14 @@
  */
 
 import {createSdkMcpServer} from '@anthropic-ai/claude-agent-sdk';
+import {z} from 'zod';
 
 import {
   compactSharedToolSpec,
   createClaudeSdkToolFromSharedSpec,
   sharedToolSpecFromClaudeSdkTool,
   withRuntimeToolConcurrency,
+  withRuntimeToolGuard,
   type SharedToolSpec,
 } from '../agentRuntime/runtimeToolSpec';
 import {
@@ -53,6 +55,8 @@ import {
 } from '../types/sparkContracts';
 import {getPlanToolCapability, type PlanToolCapability} from './types';
 import type {RunManifestAttributionSink} from '../types/selfEvolution';
+import {withRuntimeToolObserver, type RuntimeToolObserver} from '../agentRuntime/runtimeToolObserver';
+import {createRuntimeToolResult} from '../agentRuntime/runtimeToolResult';
 
 /** MCP tool name prefix — derived from the server name `'smartperfetto'`.
  * `claudeMcpServer.ts` exports the same constant; both files agree
@@ -82,6 +86,7 @@ export interface McpToolDefinition {
   requires?: string[];
   /** Provider-neutral planning role derived from the canonical tool name. */
   planCapability?: PlanToolCapability;
+  evidenceEffect?: SharedToolSpec['evidenceEffect'];
 }
 
 export type McpToolRegistration = Omit<McpToolDefinition, 'shared' | 'planCapability'> & {
@@ -95,9 +100,21 @@ export function resolveMcpToolPlanCapability(
 }
 
 export interface ToolRequestScope {
-  sessionId: string;
-  hasCodebaseAccess: boolean;
-  capabilities?: string[];
+  readonly sessionId: string;
+  readonly hasCodebaseAccess: boolean;
+  readonly capabilities?: readonly string[];
+  readonly allowNewEvidence?: boolean;
+}
+
+function isToolAllowedForScope(
+  tool: Pick<McpToolDefinition, 'exposure' | 'evidenceEffect'>,
+  scope: ToolRequestScope | undefined,
+): boolean {
+  if (!scope) return true;
+  if (tool.exposure === 'deprecated') return false;
+  if (tool.exposure === 'requires_codebase_permission' && !scope.hasCodebaseAccess) return false;
+  return scope.allowNewEvidence !== false ||
+    tool.evidenceEffect === 'none' || tool.evidenceEffect === 'read_existing';
 }
 
 /**
@@ -140,14 +157,25 @@ export class McpToolRegistry {
   private readonly entries: McpToolDefinition[] = [];
   private readonly toolConcurrencyCoordinator: RuntimeToolConcurrencyCoordinator;
   private readonly runManifestAttributionSink?: RunManifestAttributionSink;
+  private readonly toolObserver?: RuntimeToolObserver;
+  private readonly requestScope?: ToolRequestScope;
 
   constructor(options: {
     toolConcurrencyCoordinator?: RuntimeToolConcurrencyCoordinator;
     runManifestAttributionSink?: RunManifestAttributionSink;
+    toolObserver?: RuntimeToolObserver;
+    requestScope?: ToolRequestScope;
   } = {}) {
     this.toolConcurrencyCoordinator = options.toolConcurrencyCoordinator
       ?? createRuntimeToolConcurrencyCoordinator();
     this.runManifestAttributionSink = options.runManifestAttributionSink;
+    this.toolObserver = options.toolObserver;
+    this.requestScope = options.requestScope && Object.freeze({
+      ...options.requestScope,
+      ...(options.requestScope.capabilities
+        ? {capabilities: Object.freeze([...options.requestScope.capabilities])}
+        : {}),
+    });
   }
 
   /** Add a tool to the registry. Does NOT prevent duplicates by
@@ -155,26 +183,43 @@ export class McpToolRegistry {
    * existing conditional registration patterns
    * (`if (writeAnalysisNote) registry.register(...)`) keep working. */
   register(def: McpToolRegistration): void {
-    const shared = def.shared ?? sharedToolSpecFromClaudeSdkTool(
+    const base = def.shared ?? sharedToolSpecFromClaudeSdkTool(
       def.name,
       def.tool,
       def.exposure,
-      {summary: def.summary, requires: def.requires},
+      {summary: def.summary, requires: def.requires, evidenceEffect: def.evidenceEffect},
+    );
+    const planCapability = getPlanToolCapability(base.name);
+    const shared = planCapability === 'evidence' && !base.inputSchema.planPhaseId
+      ? {...base, inputSchema: {...base.inputSchema,
+          planPhaseId: z.string().optional().describe('Optional explicit plan phase ID for this invocation.'),
+        }}
+      : base;
+    const access = Object.freeze({exposure: shared.exposure, evidenceEffect: shared.evidenceEffect});
+    const guarded = withRuntimeToolGuard(
+      compactSharedToolSpec(shared),
+      () => isToolAllowedForScope(access, this.requestScope),
+      async () => createRuntimeToolResult({
+        success: false,
+        action_required: 'use_authorized_existing_evidence',
+        unsupportedReason: 'tool_not_allowed_for_request',
+      }, {isError: true}),
     );
     const runtimeShared = withRuntimeToolConcurrency(
-      compactSharedToolSpec(shared),
+      withRuntimeToolObserver(guarded, this.toolObserver),
       this.toolConcurrencyCoordinator,
       {runManifestAttributionSink: this.runManifestAttributionSink},
     );
-    this.entries.push({
+    this.entries.push(Object.freeze({
       name: runtimeShared.name,
       shared: runtimeShared,
       tool: createClaudeSdkToolFromSharedSpec(runtimeShared),
       exposure: runtimeShared.exposure,
       summary: runtimeShared.summary,
       requires: runtimeShared.requires,
-      planCapability: getPlanToolCapability(runtimeShared.name),
-    });
+      planCapability,
+      evidenceEffect: runtimeShared.evidenceEffect,
+    }));
   }
 
   /** Convenience for the existing call sites that pass `(tool,
@@ -184,7 +229,7 @@ export class McpToolRegistry {
     tool: unknown,
     name: string,
     exposure: McpToolExposure,
-    extras?: Pick<McpToolDefinition, 'summary' | 'requires'> & Pick<SharedToolSpec, 'concurrency'>,
+    extras?: Pick<McpToolDefinition, 'summary' | 'requires' | 'evidenceEffect'> & Pick<SharedToolSpec, 'concurrency'>,
   ): void {
     this.register({
       tool,
@@ -205,28 +250,26 @@ export class McpToolRegistry {
       shared: spec,
       summary: spec.summary,
       requires: spec.requires,
+      evidenceEffect: spec.evidenceEffect,
     });
   }
 
-  /** Read-only view of every entry in registration order. */
+  /** Request-authorized entries in registration order. */
   list(): readonly McpToolDefinition[] {
-    return this.entries;
+    return this.listForRequest();
   }
 
-  listForRequest(scope: ToolRequestScope): McpToolDefinition[] {
-    return this.entries.filter(entry => {
-      if (entry.exposure === 'requires_codebase_permission') {
-        return scope.hasCodebaseAccess;
-      }
-      return entry.exposure !== 'deprecated';
-    });
+  listForRequest(scope?: ToolRequestScope): McpToolDefinition[] {
+    return this.entries.filter(entry =>
+      isToolAllowedForScope(entry, this.requestScope) && isToolAllowedForScope(entry, scope),
+    );
   }
 
   /** Build the SDK's in-process MCP server. The SDK names the server
    * `smartperfetto` to align with `MCP_NAME_PREFIX`; that linkage is
    * preserved here. */
   buildSdkServer(opts: {name?: string; version?: string; scope?: ToolRequestScope} = {}) {
-    const entries = opts.scope ? this.listForRequest(opts.scope) : this.entries;
+    const entries = this.listForRequest(opts.scope);
     return createSdkMcpServer({
       name: opts.name ?? 'smartperfetto',
       version: opts.version ?? '1.0.0',
@@ -240,7 +283,7 @@ export class McpToolRegistry {
   /** Allowed-tools array prefixed for the SDK call site. Matches the
    * exact format `claudeMcpServer.ts` returned before the refactor. */
   buildAllowedTools(scope?: ToolRequestScope): string[] {
-    return buildAllowedTools(scope ? this.listForRequest(scope) : this.entries);
+    return buildAllowedTools(this.listForRequest(scope));
   }
 
   /** Snapshot of the registry as `McpToolAci[]` — drives the future
@@ -249,7 +292,7 @@ export class McpToolRegistry {
    * just name + qualified name + exposure; the description / schema
    * fields stay optional so older snapshots remain readable. */
   getAci(scope?: ToolRequestScope): McpToolAci[] {
-    const entries = scope ? this.listForRequest(scope) : this.entries;
+    const entries = this.listForRequest(scope);
     return entries.map(e => ({
       toolName: e.name,
       qualifiedName: `${MCP_NAME_PREFIX}${e.name}`,
@@ -283,9 +326,9 @@ export class McpToolRegistry {
     };
   }
 
-  /** Number of registered tools — useful in tests. */
+  /** Number of request-authorized tools. */
   size(): number {
-    return this.entries.length;
+    return this.listForRequest().length;
   }
 
   probeCapabilities(scope: ToolRequestScope): {
@@ -295,7 +338,7 @@ export class McpToolRegistry {
     if (process.env.SMARTPERFETTO_CODE_AWARE === 'off') {
       return {codeAwareAvailable: false, reason: 'feature_disabled'};
     }
-    if (!scope.hasCodebaseAccess) {
+    if (!scope.hasCodebaseAccess || this.requestScope?.hasCodebaseAccess === false) {
       return {codeAwareAvailable: false, reason: 'no_permission'};
     }
     return {codeAwareAvailable: true};

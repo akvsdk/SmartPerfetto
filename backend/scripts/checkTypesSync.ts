@@ -25,6 +25,9 @@ import {
   externalIssueReportingFragment,
   identityContractFragment,
   verbatimContractFragment,
+  ANALYSIS_COMPLETED_PUBLIC_TYPE_PATHS,
+  analysisCompletedPublicTypeFragment,
+  analysisCompletedContractFragment,
 } from './frontendContractFragments';
 
 // Paths
@@ -189,7 +192,6 @@ interface AnalysisQualitySyncExpectation {
   analysisCompletedHasIdentityResolutions: boolean;
   analysisCompletedHasTerminationReason: boolean;
   analysisCompletedHasTerminationMessage: boolean;
-  analysisCompletedHasTerminalRunStatus: boolean;
   claimReferencesHaveArtifactIds: boolean;
 }
 
@@ -253,7 +255,6 @@ function extractAnalysisQualityExpectations(content: string): AnalysisQualitySyn
     analysisCompletedHasIdentityResolutions: /\bidentityResolutions\s*\?:\s*IdentityResolutionV1\[\]\s*;/.test(analysisCompletedBlock),
     analysisCompletedHasTerminationReason: /\bterminationReason\s*\?:\s*string\s*;/.test(analysisCompletedBlock),
     analysisCompletedHasTerminationMessage: /\bterminationMessage\s*\?:\s*string\s*;/.test(analysisCompletedBlock),
-    analysisCompletedHasTerminalRunStatus: /\bterminalRunStatus\s*\?:\s*'completed'\s*\|\s*'quota_exceeded'\s*;/.test(analysisCompletedBlock),
     claimReferencesHaveArtifactIds:
       /\bartifactId\s*\?:\s*string\s*;/.test(claimRefBlock) &&
       /\bsourceArtifactId\s*\?:\s*string\s*;/.test(claimRefBlock),
@@ -369,6 +370,10 @@ async function checkTypesSync(): Promise<boolean> {
   // private copy here once expected `SourceUseDecisionV1` that the generator
   // deliberately rewrites, so the check could never pass.
   const outOfSyncFragments = findOutOfSyncContractFragments(frontendContent, [
+    {name: 'AnalysisCompletedEvent', content: analysisCompletedContractFragment(backendContent)},
+    {name: 'AnalysisCompletedEvent public dependencies', content: analysisCompletedPublicTypeFragment(backendContent,
+      ANALYSIS_COMPLETED_PUBLIC_TYPE_PATHS.map(sourcePath =>
+        fs.readFileSync(path.join(projectRoot, 'backend/src', sourcePath), 'utf-8')))},
     { name: 'conclusionContract.ts', content: conclusionContractFragment(conclusionContractContent) },
     { name: 'evidenceContract.ts', content: verbatimContractFragment(evidenceContractContent) },
     { name: 'claimVerification.ts', content: verbatimContractFragment(claimVerificationContent) },

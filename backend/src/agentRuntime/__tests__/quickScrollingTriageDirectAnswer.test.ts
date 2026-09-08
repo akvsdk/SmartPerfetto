@@ -134,7 +134,7 @@ describe('selectQuickScrollingTriageEvidenceEnvelopes', () => {
 });
 
 describe('buildQuickScrollingTriageDirectAnswer', () => {
-  it('builds a verifier-backed quick triage answer from scrolling_analysis envelopes', () => {
+  it('renders legacy scrolling envelopes without certifying uncaptured claims', () => {
     const performance = envelope({
       stepId: 'performance_summary',
       title: '滑动性能概览',
@@ -187,11 +187,14 @@ describe('buildQuickScrollingTriageDirectAnswer', () => {
       ],
     });
 
+    const evidence = {envelopes: [performance, inputLatency, rootCause], effectivePackageName: 'com.example.app'};
+    const beforeEvidence = structuredClone(evidence);
     const directAnswer = buildQuickScrollingTriageDirectAnswer({
-      evidence: { envelopes: [performance, inputLatency, rootCause], effectivePackageName: 'com.example.app' },
+      evidence,
       outputLanguage: 'zh-CN',
     });
 
+    expect(directAnswer).toBeDefined();
     expect(directAnswer?.conclusion).toContain('## 快速 Triage');
     expect(directAnswer?.conclusion).toContain('共 347 帧');
     expect(directAnswer?.conclusion).toContain('Input 延迟概览');
@@ -200,6 +203,21 @@ describe('buildQuickScrollingTriageDirectAnswer', () => {
     expect(directAnswer?.conclusion.length ?? 0).toBeLessThanOrEqual(QUICK_TRIAGE_MAX_CHINESE_CHARS);
     expect(directAnswer?.conclusionContract.metadata?.rounds).toBe(0);
     expect(directAnswer?.conclusionContract.claims).toHaveLength(QUICK_TRIAGE_MAX_CLAIMS);
+    const claims = directAnswer!.conclusionContract.claims!;
+    const beforeAnswer = structuredClone(directAnswer);
+    expect(claims.map(claim => ({id: claim.id, references: claim.references.map(({column, value, evidenceRefId, rowIndex}) =>
+      ({column, value, evidenceRefId, rowIndex}))}))).toEqual([
+      {id: 'quick-scrolling-performance', references: Object.entries({total_frames: 347, perceived_jank_frames: 7,
+        jank_rate: 2.02, actual_fps: 78, refresh_rate: 120, rating: '良好'}).map(([column, value]) =>
+        ({column, value, evidenceRefId: performance.meta.evidenceRefId, rowIndex: 0}))},
+      {id: 'quick-scrolling-responsibility', references: Object.entries({app_janky_frames: 6, sf_jank_count: 1,
+        buffer_stuffing_frames: 14, buffer_stuffing_rate: 4.03}).map(([column, value]) =>
+        ({column, value, evidenceRefId: performance.meta.evidenceRefId, rowIndex: 0}))},
+      {id: 'quick-scrolling-input-latency', references: Object.entries({total_input_events: 35, move_events: 29,
+        p95_handling_ms: 0.71, max_handling_ms: 13.61, max_e2e_ms: 98.44, slow_handling_events: 32,
+        input_backlog_frames: 2, input_latency_rating: '需关注'}).map(([column, value]) =>
+        ({column, value, evidenceRefId: inputLatency.meta.evidenceRefId, rowIndex: 0}))},
+    ]);
 
     const verified = runClaimVerification({
       conclusionContract: directAnswer?.conclusionContract,
@@ -207,10 +225,28 @@ describe('buildQuickScrollingTriageDirectAnswer', () => {
       policy: 'record_only',
     });
     expect(verified.claimVerificationResult).toEqual(expect.objectContaining({
-      status: 'passed',
-      passed: true,
+      schemaVersion: 'claim_verifier@2',
+      status: 'not_checked',
+      passed: false,
+      checkedClaimCount: 3,
       unsupportedClaimCount: 0,
     }));
+    expect(verified.claimVerificationResult.claimResults).toHaveLength(claims.length);
+    verified.claimVerificationResult.claimResults.forEach((checked, index) => {
+      expect(claims[index].semantics).toBeUndefined();
+      expect(claims[index].references.length).toBeGreaterThan(0);
+      expect(checked).toMatchObject({claimId: claims[index].id, status: 'not_checked',
+        deterministicProof: {status: 'not_checked', reason: 'semantics_not_declared'}});
+      expect(checked.referenceResults).toHaveLength(claims[index].references.length);
+      checked.referenceResults!.forEach((reference, refIndex) => {
+        expect(reference).toMatchObject({status: 'not_checked',
+          evidenceRefId: claims[index].references[refIndex].evidenceRefId,
+          sourceToolCallId: claims[index].references[refIndex].sourceToolCallId});
+      });
+      expect(checked.referenceCells).toEqual(checked.referenceResults);
+    });
+    expect(evidence).toEqual(beforeEvidence);
+    expect(directAnswer).toEqual(beforeAnswer);
   });
 });
 

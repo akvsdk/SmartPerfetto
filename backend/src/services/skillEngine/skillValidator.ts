@@ -26,6 +26,7 @@ import {
   ValidatedParams,
 } from './types';
 import { extractRootVariables } from './expressionUtils';
+import { sqlScopeDeclarationError } from './processScopeSql';
 
 // =============================================================================
 // Validation Types
@@ -310,31 +311,43 @@ export function validateFragmentReferences(
 ): SkillValidationWarning[] {
   const warnings: SkillValidationWarning[] = [];
 
-  if (!skill.steps) return warnings;
-
-  function checkStepFragments(stepAny: any, stepId: string): void {
-    if (!Array.isArray(stepAny.sql_fragments)) return;
-    for (const fragPath of stepAny.sql_fragments) {
+  const visit = (node: any, path: string): void => {
+    if (!node || typeof node !== 'object') return;
+    for (const fragPath of node.sql_fragments || []) {
       if (!availableFragments.has(fragPath)) {
-        warnings.push({
-          stepId,
-          message: `SQL fragment '${fragPath}' not found in fragments directory`,
-        });
+        warnings.push({ stepId: path, message: `SQL fragment '${fragPath}' not found in fragments directory` });
       }
     }
-  }
+    if (node.exact_sql !== undefined) visit(node.exact_sql, `${path}.exact_sql`);
+    for (const child of node.steps || []) visit(child, child.id || path);
+    for (const branch of node.conditions || []) visit(branch.then, path);
+    visit(node.else, path);
+  };
+  visit(skill, 'root');
+  return warnings;
+}
 
-  for (const step of skill.steps) {
-    const stepAny = step as any;
-    checkStepFragments(stepAny, step.id);
-
-    // Check nested parallel steps
-    if (stepAny.type === 'parallel' && Array.isArray(stepAny.steps)) {
-      for (const nested of stepAny.steps) {
-        checkStepFragments(nested, nested.id || step.id);
-      }
+/** Validate declarations without requiring unmigrated named Skills to opt in. */
+export function validateProcessScopeDeclarations(
+  skill: SkillDefinition,
+  fragments: ReadonlyMap<string, string>,
+): SkillValidationWarning[] {
+  const warnings: SkillValidationWarning[] = [];
+  const visit = (node: any, path: string): void => {
+    if (!node || typeof node !== 'object') return;
+    if (node.process_scope) {
+      const reason = sqlScopeDeclarationError(node, fragments);
+      if (reason) warnings.push({ stepId: path, message: reason });
     }
-  }
-
+    if ([...(node.inputs || []).map((input: SkillInput) => input.name), node.save_as]
+      .some(name => typeof name === 'string' && name.startsWith('__process_scope'))) {
+      warnings.push({ stepId: path, message: '__process_scope is reserved for trusted execution bindings' });
+    }
+    if (node.exact_sql !== undefined) visit(node.exact_sql, `${path}.exact_sql`);
+    for (const child of node.steps || []) visit(child, child.id || path);
+    for (const branch of node.conditions || []) visit(branch.then, path);
+    visit(node.else, path);
+  };
+  visit(skill, 'root');
   return warnings;
 }

@@ -31,6 +31,10 @@ import type {
   ConclusionContractMetadata,
   ConclusionOutputMode,
 } from './conclusionContract';
+import {parseConclusionContractSidecar, parseTypedConclusionContractJson,
+  hasConclusionContractDeclarations,
+  parseDeclaredConclusionClaims, parseDeclaredRelationProposals, renderConclusionContractSidecar,
+} from './conclusionContract';
 import {
   AMPLIFICATION_UNKNOWN_CURRENT_FRAME_TEXT,
   buildTriadStatement,
@@ -67,6 +71,7 @@ export interface ConclusionGenerationOptions {
 
 interface ContractRenderOptions {
   singleFrameDrillDown: boolean;
+  includeMachineSidecar?: boolean;
   scenePromptHints?: ConclusionScenePromptHints;
 }
 
@@ -2310,14 +2315,13 @@ function parseClaimItemsFromUnknown(value: unknown): ConclusionContractClaimItem
           .flatMap(ref => parseClaimReferencesFromRecord(ref))
       : [];
     const artifactRefs = parseClaimArtifactRefs(readValueFromAliases(record, ['artifactRefs', 'artifact_refs']));
-    if (references.length === 0 && (!artifactRefs || artifactRefs.length === 0)) return;
-
     const claimId = String(readValueFromAliases(record, ['id', 'claimId', 'claim_id']) || '').trim();
     const conclusionId = normalizeConclusionId(
       String(readValueFromAliases(record, ['conclusionId', 'conclusion_id', 'conclusion']) || '').trim(),
       idx + 1
     );
-    const text = String(readValueFromAliases(record, ['text', 'statement', 'claim']) || '').trim() || `claim ${idx + 1}`;
+    const text = String(readValueFromAliases(record, ['text', 'statement', 'claim']) || '').trim();
+    if (!text) return;
     const kind = parseClaimKind(readValueFromAliases(record, ['kind', 'claimKind', 'claim_kind']));
     const supportLevel = parseClaimSupportLevel(readValueFromAliases(record, ['supportLevel', 'support_level']));
     const relationRefs = parseStringArray(readValueFromAliases(record, ['relationRefs', 'relation_refs']));
@@ -2409,7 +2413,8 @@ function parseClaimItemsFromMarkdownSection(sectionBody: string): ConclusionCont
   let current: ConclusionContractClaimItem | null = null;
 
   const flush = () => {
-    if (current && current.references.length > 0) claims.push(current);
+    // Missing evidence is a verification result, not a reason to erase a claim.
+    if (current) claims.push(current);
     current = null;
   };
 
@@ -2771,7 +2776,7 @@ function sanitizeConclusionContract(
     .filter(item => item.text)
     .slice(0, 12);
 
-  const claims = (contract.claims || [])
+  const claims = contract.bindingEligibility !== undefined ? (contract.claims ?? []) : (contract.claims || [])
     .map((item, idx) => {
       const references = (item.references || [])
         .map(ref => ({
@@ -2796,7 +2801,7 @@ function sanitizeConclusionContract(
       return {
         ...(item.id ? { id: sanitizeText(item.id) } : {}),
         ...(item.conclusionId ? { conclusionId: normalizeConclusionId(item.conclusionId, idx + 1) } : {}),
-        text: sanitizeText(item.text) || `claim ${idx + 1}`,
+        text: sanitizeText(item.text),
         ...(kind ? { kind } : {}),
         references,
         ...(artifactRefs ? { artifactRefs } : {}),
@@ -2804,8 +2809,9 @@ function sanitizeConclusionContract(
         ...(supportLevel ? { supportLevel } : {}),
       };
     })
-    .filter(item => item.text && (item.references.length > 0 || Boolean(item.artifactRefs?.length)))
-    .slice(0, 50);
+    // Keep the whole explicit claim set. Dropping unreferenced claims or a tail
+    // of claims would let an incomplete verification look like a complete pass.
+    .filter(item => item.text);
 
   const uncertainties = dedupe(contract.uncertainties).slice(0, 6);
   const nextSteps = dedupe(contract.nextSteps).slice(0, 6);
@@ -2832,6 +2838,14 @@ function sanitizeConclusionContract(
     clusters,
     evidenceChain,
     ...(claims.length > 0 ? { claims } : {}),
+    ...(contract.bindingEligibility !== undefined ? {
+      bindingEligibility: contract.bindingEligibility, parseIssues: contract.parseIssues ?? [],
+      ...(Object.prototype.hasOwnProperty.call(contract, 'rawClaims') ? {rawClaims: contract.rawClaims} : {}),
+      ...(Object.prototype.hasOwnProperty.call(contract, 'rawDeclaration') ? {rawDeclaration: contract.rawDeclaration} : {}),
+      ...(Object.prototype.hasOwnProperty.call(contract, 'rawRelationProposals')
+        ? {rawRelationProposals: contract.rawRelationProposals} : {}),
+      ...(contract.relationProposals ? {relationProposals: contract.relationProposals} : {}),
+    } : {}),
     ...(contract.sourceUseDecision ? {sourceUseDecision: contract.sourceUseDecision} : {}),
     ...(contract.sourceReferences ? {sourceReferences: contract.sourceReferences} : {}),
     ...(contract.sourceClaimBindings ? {sourceClaimBindings: contract.sourceClaimBindings} : {}),
@@ -2936,7 +2950,13 @@ function renderConclusionContract(
     }
   }
 
-  return lines.join('\n');
+  const markdown = lines.join('\n');
+  if (options.includeMachineSidecar !== true) return markdown;
+  // Put the protocol before body fences; escape body examples of the reserved
+  // marker so they cannot create a second binding. The decoded claim stays in JSON.
+  const safeNarrative = markdown.replace(/^<!-- smartperfetto:conclusion-contract@/gm,
+    '&lt;!-- smartperfetto:conclusion-contract@');
+  return `${renderConclusionContractSidecar(contract)}\n\n${safeNarrative}`;
 }
 
 function parseMarkdownToConclusionContract(
@@ -2997,22 +3017,30 @@ function parseJsonToConclusionContract(
   rawText: string,
   mode: ConclusionOutputMode,
   options: ContractRenderOptions
-): ConclusionContract | null {
+): {status: 'absent' | 'valid' | 'invalid'; contract?: ConclusionContract} {
+  const typed = parseTypedConclusionContractJson(rawText);
+  if (typed.status !== 'absent') return typed;
   const cleaned = stripJsonCodeFence(rawText);
-  if (!cleaned) return null;
-  if (!cleaned.startsWith('{')) return null;
+  if (!cleaned) return {status: 'absent'};
+  if (!cleaned.startsWith('{')) return {status: 'absent'};
 
   let parsed: unknown = null;
   const candidate = cleaned.endsWith('}') ? cleaned : extractFirstJsonObject(cleaned);
-  if (!candidate) return null;
+  if (!candidate) return {status: 'absent'};
   try {
     parsed = JSON.parse(candidate);
   } catch {
-    return null;
+    return {status: 'absent'};
   }
 
   const root = toRecord(parsed);
-  if (!root) return null;
+  if (!root) return {status: 'absent'};
+  if (root.schemaVersion === 'conclusion_contract_v1' && hasConclusionContractDeclarations(root)) {
+    // The legacy extractor recognized a typed object only after trimming extra
+    // framing or trailing content. It must not repair that protocol implicitly.
+    return {status: 'invalid'};
+  }
+
 
   const conclusionSource = readValueFromAliases(root, ['conclusion', 'conclusions', '结论']);
   const clusterSource = readValueFromAliases(root, ['clusters', 'jank_clusters', '掉帧聚类', 'cluster']);
@@ -3094,7 +3122,12 @@ function parseJsonToConclusionContract(
     }
   }
 
-  const claims = parseClaimItemsFromUnknown(claimsSource);
+  const declarations = hasConclusionContractDeclarations(root) && Array.isArray(claimsSource)
+    ? parseDeclaredConclusionClaims(claimsSource) : undefined;
+  const claims = declarations?.claims ?? parseClaimItemsFromUnknown(claimsSource);
+  const relations = Object.prototype.hasOwnProperty.call(root, 'relationProposals')
+    ? parseDeclaredRelationProposals(root.relationProposals) : undefined;
+  const declarationIssues = [...(declarations?.issues ?? []), ...(relations?.issues ?? [])];
 
   const uncertainties = toStringArray(uncertaintySource).map(normalizeUncertaintyWording);
   const nextSteps = toStringArray(nextStepSource).map(normalizeNextStepWording);
@@ -3135,6 +3168,14 @@ function parseJsonToConclusionContract(
     clusters,
     evidenceChain,
     claims,
+    ...(declarations || relations ? {
+      parseIssues: declarationIssues,
+      bindingEligibility: declarationIssues.length ? 'ineligible' as const : 'eligible' as const,
+      ...(declarations && Object.prototype.hasOwnProperty.call(declarations, 'rawClaims') ? {rawClaims: declarations.rawClaims} : {}),
+      ...(relations ? {relationProposals: relations.relationProposals,
+        ...(Object.prototype.hasOwnProperty.call(relations, 'rawRelationProposals')
+          ? {rawRelationProposals: relations.rawRelationProposals} : {})} : {}),
+    } : {}),
     ...(sourceUseDecision ? {sourceUseDecision: sourceUseDecision as ConclusionContract['sourceUseDecision']} : {}),
     ...(Array.isArray(sourceReferences)
       ? {sourceReferences: sourceReferences as ConclusionContract['sourceReferences']}
@@ -3147,7 +3188,7 @@ function parseJsonToConclusionContract(
     metadata,
   };
 
-  return sanitizeConclusionContract(contract, options);
+  return {status: 'valid', contract: sanitizeConclusionContract(contract, options)};
 }
 
 function toDeterministicConclusionMarkdown(
@@ -3156,13 +3197,15 @@ function toDeterministicConclusionMarkdown(
   options: ContractRenderOptions,
   emitter: ProgressEmitter
 ): string {
+  if (parseConclusionContractSidecar(rawText).status !== 'absent') return rawText;
   const text = String(rawText || '').trim();
   if (!text) return text;
 
   const contractFromJson = parseJsonToConclusionContract(text, mode, options);
-  if (contractFromJson) {
+  if (contractFromJson.status === 'invalid') return rawText;
+  if (contractFromJson.contract) {
     emitter.log('[conclusionGenerator] Rendered conclusion via structured contract JSON');
-    return renderConclusionContract(contractFromJson, options);
+    return renderConclusionContract(contractFromJson.contract, options);
   }
 
   let markdownCandidate = text;
@@ -3188,6 +3231,10 @@ export function deriveConclusionContract(
     sceneId?: string;
   } = {}
 ): ConclusionContract | null {
+  const machine = parseConclusionContractSidecar(rawText);
+  if (machine.status !== 'absent') {
+    return machine.contract ? sanitizeConclusionSourceContract(machine.contract) : null;
+  }
   const mode = options.mode || 'initial_report';
   const renderOptions: ContractRenderOptions = {
     singleFrameDrillDown: Boolean(options.singleFrameDrillDown),
@@ -3208,7 +3255,9 @@ export function deriveConclusionContract(
   };
 
   const contractFromJson = parseJsonToConclusionContract(text, mode, renderOptions);
-  if (contractFromJson) return applySceneIdHint(contractFromJson);
+  if (contractFromJson.status !== 'absent') {
+    return contractFromJson.contract ? applySceneIdHint(sanitizeConclusionSourceContract(contractFromJson.contract)) : null;
+  }
 
   const markdownCandidates: string[] = [text];
   const normalizedJsonLike = convertJsonLikeSectionsToMarkdown(text, renderOptions);
@@ -3231,10 +3280,11 @@ export function deriveConclusionContract(
 
 export function renderConclusionContractMarkdown(
   contract: ConclusionContract,
-  options: { singleFrameDrillDown?: boolean } = {}
+  options: { singleFrameDrillDown?: boolean; includeMachineSidecar?: boolean } = {}
 ): string {
   return renderConclusionContract(contract, {
     singleFrameDrillDown: Boolean(options.singleFrameDrillDown),
+    includeMachineSidecar: options.includeMachineSidecar,
   });
 }
 
@@ -4319,10 +4369,12 @@ export function shouldNormalizeConclusionOutput(text: string): boolean {
 }
 
 export function normalizeConclusionOutput(rawText: string): string {
+  if (parseConclusionContractSidecar(rawText).status !== 'absent') return rawText;
   const contractOptions: ContractRenderOptions = { singleFrameDrillDown: false };
   const directContract = parseJsonToConclusionContract(rawText, 'initial_report', contractOptions);
-  if (directContract) {
-    return renderConclusionContract(directContract, contractOptions);
+  if (directContract.status === 'invalid') return rawText;
+  if (directContract.contract) {
+    return renderConclusionContract(directContract.contract, contractOptions);
   }
 
   const converted = convertJsonToMarkdown(rawText);

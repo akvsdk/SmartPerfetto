@@ -3,6 +3,7 @@
 
 ---
 scene: media
+classification_description: "Audio, video and camera pipelines, decoding, playback or capture behavior and performance."
 priority: 6
 effort: medium
 required_capabilities:

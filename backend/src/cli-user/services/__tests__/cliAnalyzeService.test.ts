@@ -12,7 +12,7 @@ import {
 } from '../cliAnalyzeService';
 
 describe('CliAnalyzeService streaming data collection', () => {
-  it('keeps valid DataEnvelope updates available for deterministic claim verification', () => {
+  it('preserves valid DataEnvelope updates without treating transport data as execution proof', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[120]],
@@ -60,8 +60,12 @@ describe('CliAnalyzeService streaming data collection', () => {
       dataEnvelopes: collected,
     });
 
-    expect(collected).toHaveLength(1);
-    expect(result.claimVerificationResult.status).toBe('passed');
+    expect(collected).toEqual([envelope]);
+    expect(collected[0].data).toEqual({columns: ['blocked_ms'], rows: [[120]]});
+    expect(result.claimVerificationResult).toMatchObject({
+      schemaVersion: 'claim_verifier@2', status: 'not_checked', passed: false, unsupportedClaimCount: 0,
+      claimResults: [{claimId: 'claim-main-thread-blocked', status: 'not_checked'}],
+    });
   });
 
   it('does not expose pre-verifier narrative events to live machine streams', () => {

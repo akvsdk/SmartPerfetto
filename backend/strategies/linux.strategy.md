@@ -3,6 +3,7 @@
 
 ---
 scene: linux
+classification_description: "Linux system behavior, scheduling and workload performance in traces outside an Android-specific workflow."
 priority: 7
 effort: medium
 required_capabilities:

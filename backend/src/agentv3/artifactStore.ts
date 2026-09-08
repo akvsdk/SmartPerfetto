@@ -17,14 +17,19 @@
  */
 
 import type { TraceProcessorQueryProvenance } from '../services/traceProcessorConnectionModel';
-import type { IdentityResolutionV1 } from '../types/identityContract';
+import {randomUUID} from 'crypto';
+import {createDataEnvelope} from '../types/dataContract';
+import {capturedEvidenceTable, freezeEvidenceValue, type EvidenceTableWitness} from '../services/evidence/evidenceCapture';
+import {createEvidenceReadView, type EvidenceReadView, type EvidenceReadViewOptions,
+  type EvidenceReadRecord} from '../services/evidence/evidenceReadView';
+import { scopeMetadata, type IdentityResolutionV1, type EvidenceScopeMetadata, type EvidenceScopeProvenanceV1 } from '../types/identityContract';
 import type { DataEnvelopeMeta } from '../types/dataContract';
 import {
   sanitizeQueryReview,
   type QueryReviewV1,
 } from '../types/queryReviewContract';
 
-export interface StoredArtifact {
+export interface StoredArtifact extends EvidenceScopeMetadata {
   id: string;
   skillId: string;
   stepId?: string;
@@ -52,7 +57,7 @@ export interface StoredArtifact {
   executionError?: string;
 }
 
-export interface ArtifactSummary {
+export interface ArtifactSummary extends EvidenceScopeMetadata {
   id: string;
   skillId: string;
   stepId?: string;
@@ -217,7 +222,7 @@ function queryReviewRefForArtifact(review: QueryReviewV1): ArtifactQueryReviewRe
  * Removes redundant fields (skillId already in parent, layer unused for fetch decisions)
  * and merges columns+sampleRow into a self-describing preview object.
  */
-export interface CompactArtifactSummary {
+export interface CompactArtifactSummary extends EvidenceScopeMetadata {
   id: string;
   stepId?: string;
   title?: string;
@@ -240,6 +245,9 @@ export interface CompactArtifactSummary {
 
 export class ArtifactStore {
   private artifacts: Map<string, StoredArtifact> = new Map();
+  private readonly executionCaptures = new Map<string, EvidenceReadRecord>();
+  private readonly evidenceStoreId = randomUUID();
+  private captureGeneration = 0;
   private counter = 0;
   /** Maximum number of artifacts before LRU eviction. */
   private readonly maxArtifacts: number;
@@ -265,6 +273,7 @@ export class ArtifactStore {
     sourceToolCallId?: string;
     paramsHash?: string;
     identityResolution?: IdentityResolutionV1;
+    scopeProvenance?: EvidenceScopeProvenanceV1;
     traceProvenance?: TraceProcessorQueryProvenance;
     queryReview?: QueryReviewV1;
     executionStatus?: DataEnvelopeMeta['executionStatus'];
@@ -277,6 +286,7 @@ export class ArtifactStore {
     this.artifacts.set(id, {
       id,
       ...entry,
+      ...scopeMetadata(entry.scopeProvenance),
       queryReview,
       storedAt: now,
       lastAccessedAt: now,
@@ -292,11 +302,63 @@ export class ArtifactStore {
           oldestId = aid;
         }
       }
-      if (oldestId) this.artifacts.delete(oldestId);
+      if (oldestId) {
+        this.artifacts.delete(oldestId);
+        this.executionCaptures.delete(oldestId);
+      }
       else break;
     }
 
     return id;
+  }
+
+  /** Private runtime witness registration; snapshots and display rows cannot recreate it. */
+  registerEvidenceCapture(id: string, witness: EvidenceTableWitness,
+    descriptor: {evidenceRefId: string; queryHash?: string; sourceRefs?: readonly string[]}): boolean {
+    const artifact = this.artifacts.get(id);
+    const table = capturedEvidenceTable(witness);
+    if (!artifact || !table || !descriptor.evidenceRefId.trim()) return false;
+    const envelope = createDataEnvelope({columns: [...table.columns], rows: []}, {
+      type: artifact.skillId === 'execute_sql' || artifact.skillId === 'execute_sql_on' ? 'sql_result' : 'skill_result',
+      source: artifact.skillId, title: artifact.title || artifact.skillId,
+      skillId: artifact.skillId, stepId: artifact.stepId,
+      artifactId: id, sourceArtifactId: id, evidenceRefId: descriptor.evidenceRefId,
+      sourceToolCallId: artifact.sourceToolCallId, paramsHash: artifact.paramsHash, queryHash: descriptor.queryHash,
+      traceId: artifact.traceProvenance?.traceId, traceSide: artifact.traceProvenance?.traceSide,
+      paneSide: artifact.traceProvenance?.paneSide, planPhaseId: artifact.planPhaseId,
+      executionStatus: artifact.executionStatus || 'observed', executionMessage: artifact.executionMessage,
+      executionError: artifact.executionError, scopeProvenance: artifact.scopeProvenance,
+      identityResolution: artifact.identityResolution,
+      identityRefId: artifact.identityResolution?.identityRefId, identityStatus: artifact.identityResolution?.status,
+      identityWarnings: artifact.identityResolution?.warnings,
+    });
+    this.captureRecord(id, witness, envelope.meta, envelope.display, descriptor.sourceRefs);
+    return true;
+  }
+
+  registerStandaloneEvidenceCapture(witness: EvidenceTableWitness,
+    descriptor: {meta: DataEnvelopeMeta; display: import('../types/dataContract').DataEnvelope['display']; sourceRefs?: readonly string[]}): boolean {
+    if (!capturedEvidenceTable(witness) || !descriptor.meta.evidenceRefId) return false;
+    this.captureRecord(`capture:${randomUUID()}`, witness, descriptor.meta, descriptor.display, descriptor.sourceRefs);
+    return true;
+  }
+
+  private captureRecord(key: string, witness: EvidenceTableWitness, meta: DataEnvelopeMeta,
+    display: import('../types/dataContract').DataEnvelope['display'], sourceRefs?: readonly string[]): void {
+    const table = capturedEvidenceTable(witness)!;
+    const {queryReview: _reviewOnly, ...capturedMeta} = meta;
+    this.executionCaptures.set(key, {witness, record: freezeEvidenceValue(structuredClone({
+      captureId: witness.captureId, storeId: this.evidenceStoreId, generation: ++this.captureGeneration,
+      columns: [...table.columns], totalRowCount: table.rows.length, fields: table.fields,
+      meta: {...capturedMeta, ...scopeMetadata(meta.scopeProvenance)}, display,
+      ...(sourceRefs ? {sourceRefs: [...sourceRefs]} : {}),
+    }))});
+    while (this.executionCaptures.size > this.maxArtifacts) this.executionCaptures.delete(this.executionCaptures.keys().next().value!);
+  }
+
+  createEvidenceReadView(options: EvidenceReadViewOptions): EvidenceReadView {
+    const admitted = new Set(this.executionCaptures.values());
+    return createEvidenceReadView(() => [...this.executionCaptures.values()].filter(record => admitted.has(record)), options);
   }
 
   updateQueryReview(id: string, queryReview: QueryReviewV1 | undefined): boolean {
@@ -343,6 +405,7 @@ export class ArtifactStore {
       planPhaseGoal: artifact.planPhaseGoal,
       sourceToolCallId: artifact.sourceToolCallId,
       identityResolution: artifact.identityResolution,
+      ...scopeMetadata(artifact.scopeProvenance),
       ...(artifact.traceProvenance?.traceSide ? { traceSide: artifact.traceProvenance.traceSide } : {}),
       ...(artifact.traceProvenance?.paneSide ? { paneSide: artifact.traceProvenance.paneSide } : {}),
       ...(artifact.traceProvenance?.traceId ? { traceId: artifact.traceProvenance.traceId } : {}),
@@ -576,6 +639,7 @@ export class ArtifactStore {
 
     return {
       id: full.id,
+      ...scopeMetadata(artifact?.scopeProvenance),
       stepId: full.stepId,
       title: full.title,
       rowCount: full.rowCount,
@@ -628,6 +692,7 @@ export class ArtifactStore {
           sourceToolCallId: artifact.sourceToolCallId,
           paramsHash: artifact.paramsHash,
           identityResolution: artifact.identityResolution,
+      ...scopeMetadata(artifact.scopeProvenance),
           traceSide: artifact.traceProvenance?.traceSide,
           paneSide: artifact.traceProvenance?.paneSide,
           traceId: artifact.traceProvenance?.traceId,
@@ -660,6 +725,7 @@ export class ArtifactStore {
           sourceToolCallId: artifact.sourceToolCallId,
           paramsHash: artifact.paramsHash,
           identityResolution: artifact.identityResolution,
+      ...scopeMetadata(artifact.scopeProvenance),
           traceSide: artifact.traceProvenance?.traceSide,
           paneSide: artifact.traceProvenance?.paneSide,
           traceId: artifact.traceProvenance?.traceId,
@@ -710,7 +776,8 @@ export class ArtifactStore {
   static fromSnapshot(artifacts: StoredArtifact[]): ArtifactStore {
     const store = new ArtifactStore();
     for (const art of artifacts) {
-      store.artifacts.set(art.id, art);
+      const { appliedProcessScope: _legacyScope, evidenceRole: _legacyRole, ...stored } = art;
+      store.artifacts.set(art.id, { ...stored, ...scopeMetadata(art.scopeProvenance) });
       const num = parseInt(art.id.replace('art-', ''), 10) || 0;
       if (num > store.counter) store.counter = num;
     }
@@ -720,6 +787,7 @@ export class ArtifactStore {
   /** Clear all artifacts (e.g., on session reset). */
   clear(): void {
     this.artifacts.clear();
+    this.executionCaptures.clear();
     this.counter = 0;
   }
 }

@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import { validateSkillInputs, validateSkillConditions, validateFragmentReferences } from '../skillValidator';
+import { validateSkillInputs, validateSkillConditions, validateFragmentReferences, validateProcessScopeDeclarations } from '../skillValidator';
 import { extractRootVariables, JS_BUILTINS } from '../expressionUtils';
 import type { SkillDefinition, SkillInput } from '../types';
 
@@ -288,6 +288,34 @@ describe('validateSkillConditions', () => {
 // =============================================================================
 
 describe('validateFragmentReferences', () => {
+  it('validates root and conditional branch fragment references', () => {
+    const warnings = validateFragmentReferences({
+      name: 'root', sql: 'SELECT 1', sql_fragments: ['fragments/root_missing.sql'],
+      steps: [{ id: 'branch', type: 'conditional', conditions: [{ when: 'true', then: {
+        id: 'nested', type: 'atomic', sql: 'SELECT 1', sql_fragments: ['fragments/nested_missing.sql'],
+      } }] }],
+    } as SkillDefinition, new Set());
+    expect(warnings).toHaveLength(2);
+  });
+
+  it('rejects a native scope declaration whose trusted binding only appears in comments', () => {
+    const warnings = validateProcessScopeDeclarations({
+      name: 'bad', type: 'atomic', sql: '-- ${__process_scope.upid}\nSELECT * FROM process',
+      process_scope: { role: 'target', binding: 'native_upid' },
+    } as SkillDefinition, new Map());
+    expect(warnings[0].message).toContain('must bind the trusted');
+  });
+
+  it('requires fragment-backed target SQL to consume the target relation', () => {
+    const warnings = validateProcessScopeDeclarations({
+      name: 'bad', type: 'atomic', sql: 'SELECT * FROM process',
+      process_scope: { role: 'target', binding: 'effective_target_processes' },
+      sql_fragments: ['fragments/effective_target_processes.sql'],
+    } as SkillDefinition, new Map([['fragments/effective_target_processes.sql',
+      'effective_target_processes AS (SELECT * FROM process WHERE upid = ${__process_scope.upid})']]));
+    expect(warnings[0].message).toContain('does not consume effective_target_processes');
+  });
+
   const makeSkill = (overrides: Partial<SkillDefinition>): SkillDefinition => ({
     name: 'test_skill',
     version: '1.0',

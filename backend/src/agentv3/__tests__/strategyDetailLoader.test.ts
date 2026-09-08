@@ -5,10 +5,11 @@
 import { describe, expect, it } from '@jest/globals';
 import {
   buildStrategyDetailExcerpt,
+  buildStrategyRegistrySnapshotFromDefinitions,
   getRegisteredScenes,
   getStrategyContent,
   getStrategyDetails,
-  matchStrategyDetailForPhase,
+  getStrategyDetailByRef,
 } from '../strategyLoader';
 
 describe('strategy detail loader', () => {
@@ -22,21 +23,18 @@ describe('strategy detail loader', () => {
     }
   });
 
-  it('matches scrolling root-cause phases to the root-cause detail', () => {
-    const match = matchStrategyDetailForPhase('scrolling', {
-      id: 'p2',
-      name: '根因深钻',
-      goal: '对 reason_code 代表帧执行 jank_frame_detail + frame_blocking_calls + blocking_chain_analysis',
-      expectedTools: ['invoke_skill', 'fetch_artifact'],
-      expectedCalls: [
-        { tool: 'invoke_skill', skillId: 'jank_frame_detail' },
-        { tool: 'invoke_skill', skillId: 'frame_blocking_calls' },
-        { tool: 'invoke_skill', skillId: 'blocking_chain_analysis' },
-      ],
-    });
-
-    expect(match?.detail.ref).toBe('scrolling:root_cause_drill');
-    expect(match?.matchedKeywords.length).toBeGreaterThan(0);
+  it('resolves explicit detail references from the supplied registry pin', () => {
+    const definitions = getRegisteredScenes();
+    const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions, overlayGeneration: 'explicit-detail'});
+    for (const definition of registry.getAllStrategies()) {
+      for (const detail of definition.detailSections) {
+        expect(getStrategyDetailByRef(detail.ref, undefined, registry)).toEqual(detail);
+        expect(getStrategyDetailByRef(detail.id, definition.scene, registry)).toEqual(detail);
+      }
+    }
+    const empty = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'empty-detail-pin'});
+    const existingRef = definitions.find(definition => definition.detailSections.length)!.detailSections[0].ref;
+    expect(getStrategyDetailByRef(existingRef, undefined, empty)).toBeUndefined();
   });
 
   it('caps strategy detail excerpts so plan tool history cannot re-expand the prompt', () => {

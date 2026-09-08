@@ -6,9 +6,12 @@ import express from 'express';
 import { SessionPersistenceService } from '../services/sessionPersistenceService';
 import { requireRequestContext } from '../middleware/auth';
 import { isOwnedByContext, sendResourceNotFound } from '../services/resourceOwnership';
+import {copyAnalysisDeliveryFields} from '../services/security/analysisDeliveryProjection';
 import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import {
   privateAnalysisQueryMessage,
+  projectPrivateAnalysisResult,
+  copyAnalysisResultForSnapshot,
   projectPrivateConclusion,
   projectPrivateStructuredValue,
   projectPrivateTerminationMessage,
@@ -37,7 +40,7 @@ export function registerAgentReportRoutes(
       return sendResourceNotFound(res, 'Session not found');
     }
 
-    if (session.status !== 'completed' && session.status !== 'quota_exceeded') {
+    if (session.status !== 'completed' && session.status !== 'quota_exceeded' && !(session.status === 'failed' && session.result)) {
       return res.status(400).json({
         success: false,
         error: 'Session is not completed yet',
@@ -45,8 +48,8 @@ export function registerAgentReportRoutes(
       });
     }
 
-    const result = deps.recoverResultForSessionIfNeeded(sessionId, session);
-    if (!result) {
+    const storedResult = deps.recoverResultForSessionIfNeeded(sessionId, session);
+    if (!storedResult) {
       return res.status(404).json({
         success: false,
         error: 'No completed turn result available for this session',
@@ -55,19 +58,13 @@ export function registerAgentReportRoutes(
     }
 
     const completedPayload = deps.getCompletedPayload?.(session);
-    const rawConclusion = completedPayload?.normalizedConclusion
-      || deps.normalizeNarrativeForClient(result.conclusion);
     const privateKnowledge = sessionUsesPrivateKnowledge(session);
     const outputLanguage = session.outputLanguage
       ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
-    const conclusion = privateKnowledge
-      ? projectPrivateConclusion({
-          sessionId,
-          conclusion: rawConclusion,
-          success: result.success === true,
-          language: outputLanguage,
-        })
-      : rawConclusion;
+    const result = privateKnowledge
+      ? projectPrivateAnalysisResult(sessionId, storedResult, outputLanguage)
+      : copyAnalysisResultForSnapshot(storedResult);
+    const conclusion = result.conclusion;
     const findings = Array.isArray(result.findings) ? result.findings : [];
     const rawClientFindings = deps.buildClientFindings(findings, session.scenes || []);
     const clientFindings = privateKnowledge
@@ -99,13 +96,10 @@ export function registerAgentReportRoutes(
     const uncertaintyFlags = privateKnowledge ? [] : snapshot?.uncertaintyFlags
       ?? (typeof session.orchestrator?.getSessionUncertaintyFlags === 'function'
         ? session.orchestrator.getSessionUncertaintyFlags(sessionId) : []);
-    const rawClaimSupport = completedPayload?.qualityArtifacts?.claimSupport || result.claimSupport;
-    const rawClaimVerification = completedPayload?.qualityArtifacts?.claimVerificationResult
-      || result.claimVerificationResult;
-    const rawIdentityResolutions = completedPayload?.qualityArtifacts?.identityResolutions
-      || result.identityResolutions;
-    const rawConclusionContract = completedPayload?.normalizedConclusionContract
-      || result.conclusionContract;
+    const rawClaimSupport = result.claimSupport;
+    const rawClaimVerification = result.claimVerificationResult;
+    const rawIdentityResolutions = result.identityResolutions;
+    const rawConclusionContract = result.conclusionContract;
     const rawUiActionProposals = completedPayload?.uiActionProposals || result.uiActionProposals || [];
 
     const report = {
@@ -114,7 +108,12 @@ export function registerAgentReportRoutes(
       query: privateKnowledge ? privateAnalysisQueryMessage(outputLanguage) : session.query,
       createdAt: session.createdAt,
       completedAt: Date.now(),
+      ...copyAnalysisDeliveryFields(result),
+      sourceUseDecision: result.sourceUseDecision,
+      sourceClaimVerificationResult: result.sourceClaimVerificationResult,
       summary: {
+        ...copyAnalysisDeliveryFields(result),
+        success: result.success,
         conclusion,
         confidence: result.confidence,
         totalDurationMs: result.totalDurationMs,
@@ -130,18 +129,10 @@ export function registerAgentReportRoutes(
       reportUrl: completedPayload?.finalArtifacts?.reportUrl,
       reportError: privateKnowledge ? undefined : completedPayload?.finalArtifacts?.reportError,
       resultSnapshotId: completedPayload?.finalArtifacts?.resultSnapshotId,
-      conclusionContract: privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, rawConclusionContract)
-        : rawConclusionContract,
-      claimSupport: privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, rawClaimSupport)
-        : rawClaimSupport,
-      claimVerificationResult: privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, rawClaimVerification)
-        : rawClaimVerification,
-      identityResolutions: privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, rawIdentityResolutions)
-        : rawIdentityResolutions,
+      conclusionContract: rawConclusionContract,
+      claimSupport: rawClaimSupport,
+      claimVerificationResult: rawClaimVerification,
+      identityResolutions: rawIdentityResolutions,
       uiActionProposals: privateKnowledge
         ? projectPrivateStructuredValue(sessionId, rawUiActionProposals)
         : rawUiActionProposals,

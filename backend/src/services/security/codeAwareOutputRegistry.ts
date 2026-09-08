@@ -3,6 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {createHash} from 'crypto';
+import {isPlainJsonObject} from '../../utils/isPlainJsonObject';
 
 import type {SanitizedRagResult} from '../rag/lookupResponseFilter';
 import {LLMEchoOutputStream, type CodeRef} from './llmEchoOutputFilter';
@@ -28,6 +29,57 @@ const DANGEROUS_STRUCTURED_TEXT_KEYS = new Set([
   'constructor',
 ]);
 const STRUCTURED_TEXT_VALUE_DROPPED = Symbol('structured-text-value-dropped');
+
+/** Internal only: never attach this receipt or its input hash to public output. */
+export interface CodeAwareTextProjectionReceipt {
+  readonly text: string;
+  readonly disposition: 'preserved' | 'redacted' | 'replaced';
+  readonly inputFingerprint: string;
+  readonly outputFingerprint: string;
+}
+
+const issuedProjectionReceipts = new WeakSet<object>();
+
+function textFingerprint(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function issueProjectionReceipt(
+  receipt: CodeAwareTextProjectionReceipt,
+): CodeAwareTextProjectionReceipt {
+  const issued = Object.freeze(receipt);
+  issuedProjectionReceipts.add(issued);
+  return issued;
+}
+
+function textProjectionReceipt(
+  input: string,
+  text: string,
+  replaced = false,
+): CodeAwareTextProjectionReceipt {
+  return issueProjectionReceipt({text, disposition: replaced ? 'replaced' : text === input ? 'preserved' : 'redacted',
+    inputFingerprint: textFingerprint(input), outputFingerprint: textFingerprint(text)});
+}
+
+export function isIssuedCodeAwareTextProjectionReceipt(value: unknown): value is CodeAwareTextProjectionReceipt {
+  return typeof value === 'object' && value !== null && issuedProjectionReceipts.has(value);
+}
+
+/** Only a contiguous chain of runtime-issued receipts can carry earlier replacement. */
+export function composeCodeAwareTextProjectionReceipts(
+  prior: CodeAwareTextProjectionReceipt | undefined,
+  current: CodeAwareTextProjectionReceipt,
+): CodeAwareTextProjectionReceipt {
+  if (!isIssuedCodeAwareTextProjectionReceipt(current)) throw new Error('Unissued text projection receipt');
+  if (!isIssuedCodeAwareTextProjectionReceipt(prior) || prior.outputFingerprint !== current.inputFingerprint) return current;
+  return issueProjectionReceipt({
+    text: current.text,
+    inputFingerprint: prior.inputFingerprint,
+    outputFingerprint: current.outputFingerprint,
+    disposition: prior.disposition === 'replaced' || current.disposition === 'replaced' ? 'replaced' :
+      prior.disposition === 'redacted' || current.disposition === 'redacted' ? 'redacted' : 'preserved',
+  });
+}
 
 class SessionCodeAwareOutputGuard {
   private readonly registrations: GuardRegistration[] = [];
@@ -60,10 +112,20 @@ class SessionCodeAwareOutputGuard {
   }
 
   projectComplete(text: string): string {
-    if (this.overflowed) return PRIVATE_OUTPUT_SUPPRESSED;
+    return this.projectCompleteOutcome(text).text;
+  }
+
+  projectCompleteWithReceipt(text: string): CodeAwareTextProjectionReceipt {
+    const projected = this.projectCompleteOutcome(text);
+    return textProjectionReceipt(text, projected.text, projected.replaced);
+  }
+
+  private projectCompleteOutcome(text: string): {text: string; replaced: boolean} {
+    if (this.overflowed) return {text: PRIVATE_OUTPUT_SUPPRESSED, replaced: true};
     const stream = this.createStream();
     try {
-      return stream.write(text) + stream.flush();
+      const projected = stream.write(text) + stream.flush();
+      return {text: projected, replaced: stream.outputSuppressed};
     } finally {
       stream.destroy();
     }
@@ -301,13 +363,36 @@ export function sanitizeCodeAwareText(sessionId: string | undefined, text: strin
   return guard ? guard.projectComplete(text) : text;
 }
 
+export function sanitizeCodeAwareTextWithReceipt(
+  sessionId: string | undefined,
+  text: string,
+): CodeAwareTextProjectionReceipt {
+  if (!sessionId || !text) return textProjectionReceipt(text, text);
+  const guard = touchGuard(sessionId);
+  if (!guard && sessionWasRevoked(sessionId)) return textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true);
+  return guard ? guard.projectCompleteWithReceipt(text) : textProjectionReceipt(text, text);
+}
+
+/** Same per-string limit and empty-string behavior as structured projection. */
+export function sanitizeCodeAwareStructuredTextWithReceipt(
+  sessionId: string | undefined,
+  text: string,
+): CodeAwareTextProjectionReceipt {
+  if (text.length > MAX_STRUCTURED_TEXT_STRING_BYTES ||
+    Buffer.byteLength(text, 'utf8') > MAX_STRUCTURED_TEXT_STRING_BYTES) {
+    return textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true);
+  }
+  return sanitizeCodeAwareTextWithReceipt(sessionId, text);
+}
+
 function sanitizeStructuredTextValue(
   sessionId: string | undefined,
   value: unknown,
-  state: {items: number; seen: WeakSet<object>},
+  state: {items: number; seen: WeakSet<object>; changed: boolean},
   depth: number,
 ): unknown | typeof STRUCTURED_TEXT_VALUE_DROPPED {
   if (depth > MAX_STRUCTURED_TEXT_DEPTH || state.items >= MAX_STRUCTURED_TEXT_ITEMS) {
+    state.changed = true;
     return STRUCTURED_TEXT_VALUE_DROPPED;
   }
   state.items += 1;
@@ -316,9 +401,12 @@ function sanitizeStructuredTextValue(
       value.length > MAX_STRUCTURED_TEXT_STRING_BYTES ||
       Buffer.byteLength(value, 'utf8') > MAX_STRUCTURED_TEXT_STRING_BYTES
     ) {
+      state.changed = true;
       return PRIVATE_OUTPUT_SUPPRESSED;
     }
-    return sanitizeCodeAwareText(sessionId, value);
+    const projected = sanitizeCodeAwareText(sessionId, value);
+    if (projected !== value) state.changed = true;
+    return projected;
   }
   if (
     value === null ||
@@ -328,11 +416,14 @@ function sanitizeStructuredTextValue(
   ) {
     return value;
   }
-  if (typeof value !== 'object') return STRUCTURED_TEXT_VALUE_DROPPED;
-  if (state.seen.has(value)) return STRUCTURED_TEXT_VALUE_DROPPED;
+  if (typeof value !== 'object' || state.seen.has(value)) {
+    state.changed = true;
+    return STRUCTURED_TEXT_VALUE_DROPPED;
+  }
   const isArray = Array.isArray(value);
   const prototype = Object.getPrototypeOf(value);
-  if (!isArray && prototype !== Object.prototype && prototype !== null) {
+  if (!isArray && !isPlainJsonObject(value)) {
+    state.changed = true;
     return STRUCTURED_TEXT_VALUE_DROPPED;
   }
 
@@ -342,17 +433,22 @@ function sanitizeStructuredTextValue(
       ? []
       : Object.create(prototype);
     for (const key of Reflect.ownKeys(value)) {
-      if (state.items >= MAX_STRUCTURED_TEXT_ITEMS) break;
+      if (state.items >= MAX_STRUCTURED_TEXT_ITEMS) {
+        state.changed = true;
+        break;
+      }
       if (isArray && key === 'length') continue;
       state.items += 1;
       if (
         typeof key !== 'string' ||
         DANGEROUS_STRUCTURED_TEXT_KEYS.has(key)
       ) {
+        state.changed = true;
         continue;
       }
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor?.enumerable || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+        if (descriptor?.enumerable) state.changed = true;
         continue;
       }
       const projected = sanitizeStructuredTextValue(
@@ -376,6 +472,7 @@ function sanitizeStructuredTextValue(
         Object.prototype.hasOwnProperty.call(lengthDescriptor, 'value') &&
         typeof lengthDescriptor.value === 'number'
       ) {
+        if (lengthDescriptor.value > MAX_STRUCTURED_TEXT_ITEMS) state.changed = true;
         Object.defineProperty(sanitized, 'length', {
           value: Math.min(lengthDescriptor.value, MAX_STRUCTURED_TEXT_ITEMS),
           enumerable: false,
@@ -399,19 +496,29 @@ export function sanitizeCodeAwareStructuredText<T>(
   sessionId: string | undefined,
   value: T,
 ): T {
+  return projectCodeAwareStructuredText(sessionId, value).value;
+}
+
+/** Internal change receipt; detects bounded drops without reading object accessors. */
+export function projectCodeAwareStructuredText<T>(
+  sessionId: string | undefined,
+  value: T,
+): {value: T; changed: boolean} {
+  const state = {items: 0, seen: new WeakSet<object>(), changed: false};
   const sanitized = sanitizeStructuredTextValue(
     sessionId,
     value,
-    {items: 0, seen: new WeakSet<object>()},
+    state,
     0,
   );
-  return (sanitized === STRUCTURED_TEXT_VALUE_DROPPED ? undefined : sanitized) as T;
+  return {value: (sanitized === STRUCTURED_TEXT_VALUE_DROPPED ? undefined : sanitized) as T, changed: state.changed};
 }
 
 export interface CodeAwareStreamingTextProjection {
   write(text: string): string;
   flush(): string;
   projectComplete(text: string): string;
+  projectCompleteWithReceipt(text: string): CodeAwareTextProjectionReceipt;
 }
 
 /** Stateful per-channel projection that keeps cross-token matches private. */
@@ -419,8 +526,9 @@ export function createCodeAwareStreamingTextProjection(
   sessionId: string | undefined,
   channel: string,
 ): CodeAwareStreamingTextProjection {
+  const preserved = (text: string) => textProjectionReceipt(text, text);
   if (!sessionId) {
-    return {write: text => text, flush: () => '', projectComplete: text => text};
+    return {write: text => text, flush: () => '', projectComplete: text => text, projectCompleteWithReceipt: preserved};
   }
   const guard = touchGuard(sessionId);
   if (!guard && sessionWasRevoked(sessionId)) {
@@ -428,15 +536,17 @@ export function createCodeAwareStreamingTextProjection(
       write: () => '',
       flush: () => PRIVATE_OUTPUT_SUPPRESSED,
       projectComplete: () => PRIVATE_OUTPUT_SUPPRESSED,
+      projectCompleteWithReceipt: text => textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true),
     };
   }
   if (!guard) {
-    return {write: text => text, flush: () => '', projectComplete: text => text};
+    return {write: text => text, flush: () => '', projectComplete: text => text, projectCompleteWithReceipt: preserved};
   }
   return {
     write: text => guard.write(channel, text),
     flush: () => guard.flush(channel),
     projectComplete: text => guard.projectComplete(text),
+    projectCompleteWithReceipt: text => guard.projectCompleteWithReceipt(text),
   };
 }
 

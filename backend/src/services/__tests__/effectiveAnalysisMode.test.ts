@@ -4,9 +4,9 @@
 
 import {describe, expect, it} from '@jest/globals';
 import {
-  analysisContextRequiresFullMode,
   buildSmartDeepDiveAnalysisContext,
   resolveEffectiveAnalysisMode,
+  type AnalysisModeContext,
 } from '../effectiveAnalysisMode';
 import {
   AnalysisContextAuthorizationChangedError,
@@ -17,34 +17,30 @@ import {
 } from '../resolvedAnalysisContext';
 
 describe('effective analysis mode', () => {
-  it('keeps dedicated conversation lightweight with authorized source context', () => {
-    expect(resolveEffectiveAnalysisMode('fast', {
-      assistantSurface: 'conversation',
-      codeAwareMode: 'provider_send',
-      codebaseIds: ['app'],
-      knowledgeSourceIds: ['wiki'],
-    })).toBe('fast');
-  });
+  const sourceSelections: ReadonlyArray<{label: string; context: AnalysisModeContext}> = [
+    {label: 'trace', context: {}},
+    {label: 'implicit metadata', context: {codebaseIds: ['app']}},
+    {label: 'source off', context: {codeAwareMode: 'off'}},
+    {label: 'metadata', context: {codeAwareMode: 'metadata_only', codebaseIds: ['app']}},
+    {label: 'source body', context: {codeAwareMode: 'provider_send', codebaseIds: ['app']}},
+  ];
+  const contexts = sourceSelections.flatMap(source => [false, true].flatMap(reference =>
+    [false, true].flatMap(rag => [false, true].map(conversation => ({
+      label: `${source.label}; reference=${reference}; RAG=${rag}; conversation=${conversation}`,
+      context: {
+        ...source.context,
+        ...(reference ? {referenceTraceId: 'reference'} : {}),
+        ...(rag ? {knowledgeSourceIds: ['wiki']} : {}),
+        ...(conversation ? {assistantSurface: 'conversation' as const} : {}),
+      } satisfies AnalysisModeContext,
+      defaultMode: conversation ? 'fast' : 'auto',
+    })))));
 
-  it.each([
-    ['trace only', {}, false, 'fast'],
-    ['codebase ids with implicit metadata mode', {codebaseIds: ['app']}, false, 'fast'],
-    ['provider source', {codeAwareMode: 'provider_send', codebaseIds: ['app']}, false, 'fast'],
-    ['private RAG only', {knowledgeSourceIds: ['wiki']}, true, 'full'],
-    ['source and private RAG', {
-      codeAwareMode: 'provider_send',
-      codebaseIds: ['app'],
-      knowledgeSourceIds: ['wiki'],
-    }, true, 'full'],
-    ['dual trace', {referenceTraceId: 'reference'}, true, 'full'],
-  ] as const)('%s resolves explicit fast without silently dropping capabilities', (
-    _label,
-    context,
-    requiresFull,
-    expectedMode,
-  ) => {
-    expect(analysisContextRequiresFullMode(context)).toBe(requiresFull);
-    expect(resolveEffectiveAnalysisMode('fast', context)).toBe(expectedMode);
+  it.each(contexts)('$label preserves each explicit budget and uses the surface default only when absent', ({context, defaultMode}) => {
+    expect(resolveEffectiveAnalysisMode('fast', context)).toBe('fast');
+    expect(resolveEffectiveAnalysisMode('full', context)).toBe('full');
+    expect(resolveEffectiveAnalysisMode('auto', context)).toBe('auto');
+    expect(resolveEffectiveAnalysisMode(undefined, context)).toBe(defaultMode);
   });
 
   it.each([
@@ -56,40 +52,16 @@ describe('effective analysis mode', () => {
     expect(analysisContextUsesPrivateKnowledge(context)).toBe(expected);
   });
 
-  it.each([
-    ['trace only', 'fast', {}, {analysisMode: 'fast'}],
-    ['source only', 'fast', {
-      codeAwareMode: 'metadata_only',
-      codebaseIds: ['app'],
-    }, {
-      analysisMode: 'fast',
-      codeAwareMode: 'metadata_only',
-      codebaseIds: ['app'],
-    }],
-    ['private RAG only', 'fast', {
-      knowledgeSourceIds: ['wiki'],
-    }, {
-      analysisMode: 'full',
-      knowledgeSourceIds: ['wiki'],
-    }],
-    ['source and private RAG', 'fast', {
-      codeAwareMode: 'provider_send',
-      codebaseIds: ['app'],
-      knowledgeSourceIds: ['wiki'],
-    }, {
-      analysisMode: 'full',
-      codeAwareMode: 'provider_send',
-      codebaseIds: ['app'],
-      knowledgeSourceIds: ['wiki'],
-    }],
-    ['default Smart deep dive', 'auto', {}, {analysisMode: 'full'}],
-  ] as const)('%s preserves the Smart deep-dive context contract', (
-    _label,
-    requested,
-    context,
-    expected,
-  ) => {
-    expect(buildSmartDeepDiveAnalysisContext(requested, context)).toEqual(expected);
+  it.each(contexts)('$label preserves Smart deep-dive defaults, explicit fast, and exact private allowlists', ({context}) => {
+    for (const [requested, expected] of [
+      [undefined, 'full'], ['auto', 'full'], ['full', 'full'], ['fast', 'fast'],
+    ] as const) {
+      const result = buildSmartDeepDiveAnalysisContext(requested, context);
+      expect(result.analysisMode).toBe(expected);
+      expect(result.codeAwareMode).toBe(context.codeAwareMode);
+      expect(result.codebaseIds).toBe(context.codebaseIds);
+      expect(result.knowledgeSourceIds).toBe(context.knowledgeSourceIds);
+    }
   });
 
   it('partitions in-memory SQL correction state by the exact private selection', () => {

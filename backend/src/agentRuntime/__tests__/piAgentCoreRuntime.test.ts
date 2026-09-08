@@ -7,8 +7,8 @@ import { z } from 'zod';
 import type { StreamingUpdate } from '../../agent/types';
 import { sessionContextManager } from '../../agent/context/enhancedSessionContext';
 import {
-  completePiAgentCoreFinalReportPhaseIfDelivered,
   createPiAgentCoreToolFromSharedSpec,
+  buildPiAnalysisCompletion,
   EXPERIMENTAL_PI_AGENT_CORE_RUNTIME_KIND,
   getPiAgentCorePlanCompletionStatus,
   getPiAgentCoreEngineCapabilities,
@@ -23,13 +23,11 @@ import {
   repairPiAgentCoreSubmitPlanArgs,
   sanitizePiAgentCoreConclusionText,
   selectAssistantConclusion,
-  shouldContinuePiAgentCoreFinalReportAfterPlanComplete,
-  verifyPiAgentCoreConclusionForCorrection,
   type PiAgentCoreEvent,
 } from '../piAgentCoreRuntime';
 import * as piAgentCoreRuntimeModule from '../piAgentCoreRuntime';
 import type { RuntimeToolResult, SharedToolSpec } from '../runtimeToolSpec';
-import * as quickEvidenceDirectAnswer from '../quickEvidenceDirectAnswer';
+import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../runtimeToolResult';
 import {createClaudeMcpServer} from '../../agentv3/claudeMcpServer';
 import {
   createRuntimeSourceFinalizationFixture,
@@ -40,6 +38,15 @@ import {createRuntimePerformanceRecorder} from '../runtimePerformance';
 import {withEffectiveRuntimeRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
 import type {EffectiveRuntimeRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
 import type {RunManifestAttributionSink} from '../../types/selfEvolution';
+import type {AnalysisTurnIntentDecision} from '../analysisTurnIntent';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes} from '../../agentv3/strategyLoader';
+import * as systemPromptModule from '../../agentv3/claudeSystemPrompt';
+import {registerCodeAwareCanary, revokeCodeAwareOutputGuards, clearCodeAwareOutputGuards} from '../../services/security/codeAwareOutputRegistry';
+import * as sourceProjectionModule from '../../services/codebase/sourceClaimVerifier';
+import * as qualityGateModule from '../../services/finalResultQualityGate';
+import {takeFinalizationContext, FINALIZATION_MAX_OUTPUT_TOKENS} from '../analysisFinalizationContext';
+import {ArtifactStore} from '../../agentv3/artifactStore';
 import {loadPiProviderRuntimeModules} from '../engines/pi/piAgentCoreProvider';
 
 const mockClaudeVerifierVerifyConclusion = jest.fn();
@@ -51,13 +58,25 @@ jest.mock('../engines/claude/claudeVerifier', () => {
   };
 });
 
-async function loadFakePiProviderRuntime(
-  config: {model: Record<string, unknown>},
-) {
+let piClassifierDecision: AnalysisTurnIntentDecision;
+let piClassifierResponses: Array<Record<string, unknown> | Error>;
+let piClassifierCalls: Array<{model: unknown; context: any; options: any}>;
+
+async function loadFakePiProviderRuntime(config: {model: Record<string, unknown>}) {
   return {
     model: config.model as any,
     models: {} as any,
-    streamFn: jest.fn() as any,
+    streamFn: ((model: unknown, context: unknown, options: unknown) => {
+      piClassifierCalls.push({model, context, options});
+      return {result: async () => {
+        const supplied = piClassifierResponses.shift();
+        if (supplied instanceof Error) throw supplied;
+        return supplied ?? {
+          role: 'assistant', stopReason: 'stop', model: config.model.id,
+          content: [{type: 'text', text: JSON.stringify(piClassifierDecision)}],
+        };
+      }};
+    }) as any,
   };
 }
 
@@ -83,6 +102,7 @@ class FakePiAgent {
   lastPrompt = '';
   prompts: string[] = [];
   promptCount = 0;
+  emittedTurns = 0;
   aborted = false;
 
   constructor(options?: Record<string, unknown>) {
@@ -113,13 +133,20 @@ class FakePiAgent {
     this.prompts.push(input);
     this.promptCount += 1;
     const assistantMessage = {
+      stopReason: 'stop',
       role: 'assistant',
       content: [{ type: 'text', text: 'Pi smoke final' }],
     };
     this.emit({ type: 'agent_start' });
-    const messages = await FakePiAgent.promptHandler?.(this, input, this.promptCount)
+    const turnBoundary = this.emittedTurns;
+    const rawMessages = await FakePiAgent.promptHandler?.(this, input, this.promptCount)
       ?? FakePiAgent.promptMessages
       ?? [assistantMessage];
+    const messages = rawMessages.map(message => {
+      const value = message as {role?: string};
+      return value.role === 'assistant' ? {stopReason: 'stop', ...value} : value;
+    });
+    if (this.emittedTurns === turnBoundary) this.emit({type: 'turn_end', message: messages[messages.length - 1]});
     this.emit({
       type: 'message_update',
       assistantMessageEvent: { type: 'text_delta', delta: 'Pi smoke final' },
@@ -142,11 +169,16 @@ class FakePiAgent {
   }
 
   private emit(event: PiAgentCoreEvent): void {
+    if (event.type === 'turn_end') this.emittedTurns++;
     for (const listener of this.listeners) listener(event);
   }
 }
 
 beforeEach(() => {
+  piClassifierDecision = {schemaVersion: 1, taskKind: 'fact', sceneId: 'general',
+    scope: 'bounded_question', recommendedComplexity: 'quick', deliverable: 'answer', evidenceAccess: 'read_new'};
+  piClassifierResponses = [];
+  piClassifierCalls = [];
   const actualVerifier = jest.requireActual('../engines/claude/claudeVerifier') as any;
   mockClaudeVerifierVerifyConclusion.mockReset();
   mockClaudeVerifierVerifyConclusion.mockImplementation((...args: unknown[]) => (
@@ -253,12 +285,9 @@ function createEffectiveRuntimeRegistrySnapshot(): EffectiveRuntimeRegistrySnaps
     baseStrategyRegistryFingerprint: 'base-strategies-test',
     overlayGeneration: 'overlay-test',
     skillRegistry,
-    strategyRegistry: {
-      registryFingerprint: 'strategy-registry-test',
-      overlayGeneration: 'overlay-test',
-      getStrategy: () => undefined,
-      getAllStrategies: () => [],
-    },
+    strategyRegistry: buildStrategyRegistrySnapshotFromDefinitions({
+      definitions: getRegisteredScenes(), overlayGeneration: 'overlay-test',
+    }),
     skillNotes: {
       registryFingerprint: 'skill-notes-test',
       getSkillNotes: () => [],
@@ -1015,8 +1044,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(result).toMatchObject({
       sessionId: 'session-pi-real',
       success: true,
-      partial: true,
-      terminationReason: 'plan_incomplete',
+      completion: expect.objectContaining({status: 'completed'}),
     });
     expect(result.claimVerificationResult).toBeUndefined();
     expect(result.claimSupport).toBeUndefined();
@@ -1058,9 +1086,9 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(agent.state.systemPrompt).toContain('provider_send');
     expect(agent.state.systemPrompt).toContain('源码使用决策契约');
     expect(result).toMatchObject({
-      success: false,
-      partial: true,
-      terminationReason: 'plan_incomplete',
+      success: true,
+      partial: undefined,
+      terminationReason: undefined,
       sourceUseDecision: expect.objectContaining({status: 'pending'}),
     });
   });
@@ -1265,10 +1293,11 @@ describe('experimental Pi agent-core runtime contract', () => {
     const second = runtime.analyze('second', 'session-pi-cache-b', 'trace-pi', {analysisMode: 'fast'});
     await Promise.resolve();
 
-    expect(moduleLoader).toHaveBeenCalledTimes(1);
+    expect(moduleLoader).not.toHaveBeenCalled();
     expect(providerRuntimeLoader).toHaveBeenCalledTimes(1);
+    providerLoad.resolve(await loadFakePiProviderRuntime({model: JSON.parse(PI_TEST_MODEL_JSON)}));
+    await waitUntil(() => moduleLoader.mock.calls.length === 1);
     moduleLoad.resolve({Agent: FakePiAgent});
-    providerLoad.resolve(await loadFakePiProviderRuntime(JSON.parse(PI_TEST_MODEL_JSON)));
 
     await expect(Promise.all([first, second])).resolves.toEqual([
       expect.objectContaining({success: true, conclusion: expect.stringContaining('first')}),
@@ -1276,7 +1305,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     ]);
   });
 
-  it('loads the Pi SDK module before provider preparation when Task 7 is not admitted', async () => {
+  it('resolves the pinned provider and semantic intent before main Pi SDK preparation', async () => {
     const moduleLoad = createDeferred<{Agent: typeof FakePiAgent}>();
     const moduleLoader = jest.fn(async () => moduleLoad.promise);
     const providerRuntimeLoader = jest.fn(loadFakePiProviderRuntime);
@@ -1293,10 +1322,9 @@ describe('experimental Pi agent-core runtime contract', () => {
     const pending = runtime.analyze('serial prep', 'session-pi-serial-prep', 'trace-pi', {
       analysisMode: 'fast',
     });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(moduleLoader).toHaveBeenCalledTimes(1);
-    expect(providerRuntimeLoader).not.toHaveBeenCalled();
+    await waitUntil(() => moduleLoader.mock.calls.length === 1);
+    expect(providerRuntimeLoader).toHaveBeenCalledTimes(1);
+    expect(piClassifierCalls).toHaveLength(1);
 
     moduleLoad.resolve({Agent: FakePiAgent});
     for (let attempt = 0; attempt < 20 && providerRuntimeLoader.mock.calls.length === 0; attempt += 1) {
@@ -1365,6 +1393,22 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(projected.content[0].text).toContain('truncated external tool result');
     expect(projected.content[0].text).not.toContain('TAIL_CANARY_FULL_DETAILS_ONLY');
     expect(JSON.stringify(projected.details)).toContain('TAIL_CANARY_FULL_DETAILS_ONLY');
+  });
+
+  it('reads the original producer receipt from Pi details after provider text is shortened', async () => {
+    const original = createRuntimeToolResult({success: false, planPhaseId: 'p1', error: 'x'.repeat(14000)}, {
+      decorate: text => '[accuracy] {"success":true}\n' + text,
+    });
+    const tool = createPiAgentCoreToolFromSharedSpec(createSharedSpec(async () => original), {
+      allowedToolNames: new Set(['query_trace']),
+    });
+    const result = await tool.execute('receipt-pi', {sql: 'select 1'}, undefined);
+    expect(result.content[0].text.length).toBeLessThanOrEqual(2000);
+    expect(readRuntimeToolResultFacts(result)).toEqual({success: false, planPhaseId: 'p1'});
+    const event = projectPiAgentCoreEventToStreamingUpdate({
+      type: 'tool_execution_end', toolName: 'query_trace', toolCallId: 'receipt-pi', result,
+    } as PiAgentCoreEvent);
+    expect(event).toMatchObject({type: 'agent_response', content: {isError: true}});
   });
 
   it('bounds multi-block Pi tool text to one total provider budget without leaking later canaries', async () => {
@@ -1496,8 +1540,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     const first = runtime.analyze('first', 'session-pi-pending-reset', 'trace-pi', {
       analysisMode: 'fast',
     });
-    await Promise.resolve();
-    expect(moduleLoader).toHaveBeenCalledTimes(1);
+    await waitUntil(() => moduleLoader.mock.calls.length === 1);
     runtime.reset();
     firstModuleLoad.resolve({Agent: FakePiAgent});
     await expect(first).resolves.toMatchObject({
@@ -1546,7 +1589,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     await Promise.resolve();
     expect(providerRuntimeLoader).toHaveBeenCalledTimes(1);
     runtime.reset();
-    firstProviderLoad.resolve(await loadFakePiProviderRuntime(JSON.parse(PI_TEST_MODEL_JSON)));
+    firstProviderLoad.resolve(await loadFakePiProviderRuntime({model: JSON.parse(PI_TEST_MODEL_JSON)}));
     await expect(first).resolves.toMatchObject({
       success: false,
       terminationReason: 'timeout',
@@ -1599,7 +1642,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect([...providerCache.values()]).toEqual(expect.arrayContaining([firstLoad, secondLoad]));
   });
 
-  it('selects native Pi global parallel for quick and relies on per-tool sequential descriptors', () => {
+  it('selects native Pi parallel by admitted scheduler and preserves per-tool sequential descriptors', () => {
     const makeSpec = (
       name: string,
       concurrency?: SharedToolSpec['concurrency'],
@@ -1633,11 +1676,12 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(resolveMode({quickMode: true, tools: safeTools, env: admittedEnv})).toBe('parallel');
     expect(resolveMode({quickMode: true, tools: mixedTools, env: admittedEnv})).toBe('parallel');
     expect(resolveMode({quickMode: false, tools: safeTools})).toBe('sequential');
+    expect(resolveMode({quickMode: false, tools: safeTools, env: admittedEnv})).toBe('parallel');
     expect(safeTools.map(tool => tool.executionMode)).toEqual(['parallel', 'parallel']);
     expect(mixedTools.map(tool => tool.executionMode)).toEqual(['parallel', 'sequential']);
   });
 
-  it('configures actual mixed Pi quick globally parallel and full globally sequential', async () => {
+  it('uses per-tool concurrency metadata independently of the selected Pi budget', async () => {
     FakePiAgent.promptHandler = async (agent) => [{
       role: 'assistant',
       content: [{
@@ -1673,7 +1717,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       ['execute_sql', 'sequential'],
       ['invoke_skill', 'sequential'],
     ]));
-    expect(FakePiAgent.instances[1].options?.toolExecution).toBe('sequential');
+    expect(FakePiAgent.instances[1].options?.toolExecution).toBe('parallel');
     const fullToolModes = (FakePiAgent.instances[1].state.tools as Array<{name: string; executionMode?: string}>)
       .map(tool => [tool.name, tool.executionMode]);
     expect(fullToolModes).toEqual(expect.arrayContaining([
@@ -2006,6 +2050,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       type: 'missing_evidence',
       severity: 'error',
       message: '报告缺少证据支撑，需要修正。',
+      recoveryKind: 'correct_evidence',
     };
     const correctedReport = buildVerifiedPiReport();
     mockClaudeVerifierVerifyConclusion
@@ -2032,7 +2077,6 @@ describe('experimental Pi agent-core runtime contract', () => {
           content: [{type: 'text', text: buildUnverifiedPiReport()}],
         }];
       }
-      expect(input).toContain('验证反馈');
       expect(agent.state.tools).toEqual([]);
       await delay(10);
       agent.emitForTest({
@@ -2271,6 +2315,7 @@ describe('experimental Pi agent-core runtime contract', () => {
   });
 
   it('cancels during focus preflight without architecture events or Pi provider start', async () => {
+    piClassifierDecision = {...piClassifierDecision, taskKind: 'investigation', scope: 'scene_wide', recommendedComplexity: 'full', deliverable: 'report'};
     const sessionId = 'session-pi-cancel-focus-preflight';
     const traceId = 'trace-pi-focus-cancel';
     const focusQuery = createDeferred<{columns: string[]; rows: unknown[][]; durationMs: number}>();
@@ -2323,6 +2368,7 @@ describe('experimental Pi agent-core runtime contract', () => {
   });
 
   it('cancels during architecture preflight before cache/event/session state mutation', async () => {
+    piClassifierDecision = {...piClassifierDecision, taskKind: 'investigation', scope: 'scene_wide', recommendedComplexity: 'full', deliverable: 'report'};
     const sessionId = 'session-pi-cancel-architecture-preflight';
     const traceId = 'trace-pi-architecture-cancel';
     const architectureQuery = createDeferred<{columns: string[]; rows: unknown[][]; durationMs: number}>();
@@ -2564,15 +2610,8 @@ describe('experimental Pi agent-core runtime contract', () => {
   });
 
   it('injects dual-trace pane mapping into the Pi comparison system prompt', async () => {
+    piClassifierDecision = {...piClassifierDecision, taskKind: 'comparison'};
     const traceProcessorService = createFakeTraceProcessorService();
-    traceProcessorService.query.mockImplementation(async (traceId: string, sql: string) => {
-      if (!sql.includes('sqlite_master')) return {columns: [], rows: [], durationMs: 1};
-      return {
-        columns: ['name'],
-        rows: [[traceId === 'trace-current' ? 'android_current_only' : 'android_reference_only']],
-        durationMs: 1,
-      };
-    });
     const runtime = new PiAgentCoreRuntime(
       traceProcessorService,
       { kind: 'pi-agent-core', source: 'env' },
@@ -2615,13 +2654,26 @@ describe('experimental Pi agent-core runtime contract', () => {
     });
 
     const agent = FakePiAgent.instances[0];
-    expect(agent.state.systemPrompt).toContain('## 对比模式');
-    expect(agent.state.systemPrompt).toContain('### 窗口映射');
-    expect(agent.state.systemPrompt).toContain('左侧/基线 Trace');
-    expect(agent.state.systemPrompt).toContain('右侧/对比 Trace');
-    expect(agent.state.systemPrompt).toContain('共有表/视图**: 0 个，不可直接对比');
-    expect(agent.state.systemPrompt).toContain('android_current_only');
-    expect(agent.state.systemPrompt).toContain('android_reference_only');
+    const blocks = agent.state.systemPrompt.split('\n').flatMap(line => {
+      try {
+        const value: unknown = JSON.parse(line);
+        return value && typeof value === 'object' && !Array.isArray(value)
+          ? [value as {context?: string; data?: unknown}] : [];
+      } catch { return []; }
+    });
+    expect(blocks.find(block => block.context === 'comparison_identity')?.data).toEqual({
+      referenceTraceId: 'trace-reference', capabilityProbeStatus: 'not_checked',
+      tracePairContext: {schemaVersion: 1, layout: 'horizontal', primarySide: 'left', referenceSide: 'right', panes: [
+        {side: 'left', traceSide: 'current', traceId: 'trace-current', visualState: 'live'},
+        {side: 'right', traceSide: 'reference', traceId: 'trace-reference', visualState: 'live'},
+      ]},
+    });
+    expect(blocks.find(block => block.context === 'comparison_details')?.data).toMatchObject({
+      commonCapabilities: [], traceNames: [
+        {traceSide: 'current', traceName: 'Current Trace'}, {traceSide: 'reference', traceName: 'Reference Trace'},
+      ], workspaceOpen: true,
+    });
+    expect(traceProcessorService.query).not.toHaveBeenCalled();
   });
 
   it('hydrates Pi agent-core transcript state from opaque snapshots on follow-up', async () => {
@@ -2656,7 +2708,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       : undefined;
     expect(piOpaque?.messages).toEqual([
       {
-        role: 'assistant',
+        role: 'assistant', stopReason: 'stop',
         content: [{ type: 'text', text: 'First Pi answer' }],
       },
     ]);
@@ -2687,15 +2739,18 @@ describe('experimental Pi agent-core runtime contract', () => {
       initialState: expect.objectContaining({
         messages: [
           {
-            role: 'assistant',
+            role: 'assistant', stopReason: 'stop',
             content: [{ type: 'text', text: 'First Pi answer' }],
           },
         ],
       }),
     });
     expect(restoredAgent.prompts[0]).toContain('follow-up question');
-    expect(restoredAgent.prompts[0]).toContain('first question');
-    expect(restoredAgent.prompts[0]).toContain('First Pi answer');
+    expect(restoredAgent.state.systemPrompt).toContain('first question');
+    expect(restoredAgent.state.messages).toEqual([
+      {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'First Pi answer'}]},
+      {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'Second Pi answer'}]},
+    ]);
   });
 
   it('never reuses a previous-turn Pi report as the current conclusion', async () => {
@@ -2827,653 +2882,12 @@ describe('experimental Pi agent-core runtime contract', () => {
       'invoke_skill',
       'lookup_sql_schema',
     ]));
-    expect(toolNames).not.toContain('submit_plan');
+    expect(toolNames).toContain('submit_plan');
     expect(result.claimVerificationResult).toBeUndefined();
     expect(result.terminationReason).toBeUndefined();
   });
 
-  it('answers default auto trace facts directly without loading the Pi SDK', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      expect(sql).toContain('runtime_cpu_core_count');
-      return {
-        columns: [
-          'observed_cpu_count',
-          'observed_cpus',
-          'universe_source',
-          'cpu_table_count',
-          'cpu_table_cpus',
-          'source_table',
-        ],
-        rows: [[
-          7,
-          '0, 1, 2, 3, 4, 5, 6',
-          'sched_observed',
-          7,
-          '0, 1, 2, 3, 4, 5, 6',
-          'sched_slice/thread_state',
-        ]],
-        durationMs: 2,
-      };
-    });
-    const moduleLoader = jest.fn(async () => ({ Agent: FakePiAgent }));
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader,
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-    const updates: StreamingUpdate[] = [];
-    runtime.on('update', (update) => updates.push(update));
-
-    const result = await runtime.analyze('这个 trace 的 CPU 有几个核心？', 'session-pi-auto-quick', 'trace-pi');
-
-    expect(moduleLoader).not.toHaveBeenCalled();
-    expect(FakePiAgent.instances).toHaveLength(0);
-    expect(result.quickRun).toMatchObject({
-      requestedMode: 'auto',
-      resolvedMode: 'quick',
-      actualTurns: 0,
-      stopReason: 'answered',
-      evidence: {
-        currentRunDataEnvelopes: 1,
-        citedEvidenceRefs: 1,
-      },
-    });
-    expect(result.rounds).toBe(0);
-    expect(result.conclusion).toContain('7 个 CPU 核心');
-    expect(result.conclusionContract?.claims?.[0]?.references?.[0]).toMatchObject({
-      column: 'observed_cpu_count',
-      value: 7,
-    });
-    expect(result.terminationReason).toBeUndefined();
-    expect(traceProcessorService.query).toHaveBeenCalledTimes(1);
-    expect(updates.map((update) => update.type)).toEqual([
-      'data',
-      'progress',
-      'conclusion',
-      'answer_token',
-    ]);
-  });
-
-  it('suppresses deferred quick-evidence trace updates after abort before provider start', async () => {
-    const sessionId = 'session-pi-quick-evidence-cancel';
-    const traceId = 'trace-pi-quick-evidence-cancel';
-    const traceFactQuery = createDeferred<{
-      columns: string[];
-      rows: unknown[][];
-      durationMs: number;
-    }>();
-    const traceProcessorService = createFakeTraceProcessorService();
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      expect(sql).toContain('runtime_cpu_core_count');
-      return traceFactQuery.promise;
-    });
-    const moduleLoader = jest.fn(async () => ({ Agent: FakePiAgent }));
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: {
-          [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON,
-          [PI_AGENT_CORE_REQUEST_TIMEOUT_MS_ENV]: '20',
-          [PI_AGENT_CORE_ABORT_JOIN_TIMEOUT_MS_ENV]: '30',
-        },
-        moduleLoader,
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-    const updates: StreamingUpdate[] = [];
-    runtime.on('update', update => updates.push(update));
-    const runtimePerformanceRecorder = createRuntimePerformanceRecorder();
-
-    const first = runtime.analyze(
-      '这个 trace 的 CPU 有几个核心？',
-      sessionId,
-      traceId,
-      {
-        runManifestAttributionSink: createNoopAttributionSink(runtimePerformanceRecorder),
-      },
-    );
-    await waitUntil(() => traceProcessorService.query.mock.calls.length === 1);
-    await expect(first).resolves.toMatchObject({
-      success: false,
-      terminationReason: 'timeout',
-    });
-
-    expect(moduleLoader).not.toHaveBeenCalled();
-    expect(FakePiAgent.instances).toHaveLength(0);
-    expect(updates).toEqual([]);
-    const turns = sessionContextManager.getOrCreate(sessionId, traceId).getAllTurns?.() ?? [];
-    expect(turns).toHaveLength(0);
-    const postAbortSnapshot = runtime.takeSnapshot(sessionId, traceId, createSnapshotFields());
-    expect(postAbortSnapshot.engineState?.kind === 'pi-agent-core'
-      ? postAbortSnapshot.engineState.pi.opaque
-      : undefined).toBeUndefined();
-    const receipt = runtimePerformanceRecorder.seal();
-    const quickEvidencePhases = receipt.phases.filter(phase => phase.name === 'quick_evidence');
-    expect(quickEvidencePhases).toHaveLength(1);
-    expect(quickEvidencePhases[0]).toEqual(expect.objectContaining({outcome: 'cancelled'}));
-    expect(quickEvidencePhases).not.toContainEqual(expect.objectContaining({outcome: 'ok'}));
-    const finalizationPhases = receipt.phases.filter(phase => phase.name === 'finalization');
-    expect(finalizationPhases).toHaveLength(1);
-    expect(finalizationPhases[0]).toEqual(expect.objectContaining({outcome: 'cancelled'}));
-    expect(finalizationPhases).not.toContainEqual(expect.objectContaining({outcome: 'ok'}));
-    expect(() => runtimePerformanceRecorder.startPhase('quick_evidence')).toThrow(
-      /runtime_performance_already_sealed:start_phase/,
-    );
-    await expect(runtime.analyze('second', sessionId, traceId, {
-      analysisMode: 'fast',
-    })).rejects.toThrow(/already in progress/i);
-    await expect(runtime.analyze('third', sessionId, traceId, {
-      analysisMode: 'fast',
-    })).rejects.toThrow(/already in progress/i);
-    const sealedReceiptJson = JSON.stringify(receipt);
-
-    traceFactQuery.resolve({
-      columns: [
-        'observed_cpu_count',
-        'observed_cpus',
-        'universe_source',
-        'cpu_table_count',
-        'cpu_table_cpus',
-        'source_table',
-      ],
-      rows: [[
-        8,
-        '0, 1, 2, 3, 4, 5, 6, 7',
-        'sched_observed',
-        8,
-        '0, 1, 2, 3, 4, 5, 6, 7',
-        'sched_slice/thread_state',
-      ]],
-      durationMs: 1,
-    });
-    await delay(30);
-    expect(JSON.stringify(runtimePerformanceRecorder.seal())).toBe(sealedReceiptJson);
-    await expect(runtime.analyze('这个 trace 的 CPU 有几个核心？', sessionId, traceId)).resolves.toMatchObject({
-      success: true,
-      quickRun: {
-        requestedMode: 'auto',
-        resolvedMode: 'quick',
-        actualTurns: 0,
-        stopReason: 'answered',
-      },
-    });
-    expect(moduleLoader).not.toHaveBeenCalled();
-    expect(FakePiAgent.instances).toHaveLength(0);
-    sessionContextManager.remove(sessionId);
-  });
-
-  it('answers acknowledgement follow-ups directly without loading the Pi SDK', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const moduleLoader = jest.fn(async () => ({ Agent: FakePiAgent }));
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader,
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-    const updates: StreamingUpdate[] = [];
-    runtime.on('update', (update) => updates.push(update));
-
-    const result = await runtime.analyze('谢谢', 'session-pi-ack', 'trace-pi');
-
-    expect(moduleLoader).not.toHaveBeenCalled();
-    expect(FakePiAgent.instances).toHaveLength(0);
-    expect(traceProcessorService.query).not.toHaveBeenCalled();
-    expect(result).toMatchObject({
-      success: true,
-      conclusion: '收到。',
-      confidence: 1,
-      rounds: 0,
-      quickRun: {
-        requestedMode: 'auto',
-        resolvedMode: 'quick',
-        actualTurns: 0,
-        stopReason: 'answered',
-      },
-    });
-    expect(result.claimVerificationResult).toBeUndefined();
-    expect(updates.map((update) => update.type)).toEqual([
-      'progress',
-      'conclusion',
-      'answer_token',
-    ]);
-  });
-
-  it('does not pre-run quick direct evidence for auto full scrolling diagnostics', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const moduleLoader = jest.fn(async () => ({ Agent: FakePiAgent }));
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader,
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-    runtime.restoreArchitectureCache('trace-pi-full-scroll', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-    const directEvidence = jest.spyOn(
-      quickEvidenceDirectAnswer,
-      'buildRuntimeQuickEvidenceAttempt',
-    );
-
-    try {
-      const result = await runtime.analyze(
-        '分析滑动性能',
-        'session-pi-full-scroll',
-        'trace-pi-full-scroll',
-      );
-
-      expect(directEvidence).not.toHaveBeenCalled();
-      expect(moduleLoader).toHaveBeenCalledTimes(1);
-      expect(FakePiAgent.instances).toHaveLength(1);
-      expect(result.quickRun).toBeUndefined();
-    } finally {
-      directEvidence.mockRestore();
-    }
-  });
-
-  it('skips focus detection for package-scoped trace fact fallback preparation', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const sqlQueries: string[] = [];
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      sqlQueries.push(sql);
-      return { columns: [], rows: [], durationMs: 1 };
-    });
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader: async () => ({ Agent: FakePiAgent }),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-    runtime.restoreArchitectureCache('trace-pi', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-
-    await runtime.analyze(
-      '滑动 FPS 是多少？',
-      'session-pi-package-fallback',
-      'trace-pi',
-      { packageName: 'com.example.app' },
-    );
-
-    expect(FakePiAgent.instances).toHaveLength(1);
-    expect(FakePiAgent.instances[0].state.systemPrompt).toContain('com.example.app');
-    expect(sqlQueries.some(sql => sql.includes('runtime_frame_metrics'))).toBe(true);
-    expect(sqlQueries.some(sql => sql.includes('android_battery_stats_event_slices'))).toBe(false);
-    expect(sqlQueries.some(sql => sql.includes('android_oom_adj_intervals'))).toBe(false);
-  });
-
-  it('reuses quick-evidence focus state on fallback without repeating Pi preflight queries', async () => {
-    const traceProcessorService = createFakeTraceProcessorService();
-    const sqlQueries: string[] = [];
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => {
-      sqlQueries.push(sql);
-      if (sql.includes('android_battery_stats_event_slices')) {
-        return {
-          columns: ['package_name', 'total_duration_ns', 'switch_count'],
-          rows: [['com.example.app', 2_000_000_000, 2]],
-          durationMs: 1,
-        };
-      }
-      if (sql.includes('runtime_frame_metrics')) {
-        return {
-          columns: [
-            'package_name',
-            'process_names',
-            'upid_count',
-            'total_frames',
-            'window_start_ns',
-            'window_end_ns',
-            'duration_s',
-            'fps',
-            'source_table',
-          ],
-          rows: [],
-          durationMs: 1,
-        };
-      }
-      throw new Error(`Unexpected SQL: ${sql}`);
-    });
-    const attemptSpy = jest.spyOn(quickEvidenceDirectAnswer, 'buildRuntimeQuickEvidenceAttempt');
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: {
-          [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON,
-          SMARTPERFETTO_ADMITTED_RUNTIME_CANDIDATES: 'task4',
-        },
-        moduleLoader: async () => ({ Agent: FakePiAgent }),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-    runtime.restoreArchitectureCache('trace-pi-reused-quick-attempt', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-
-    await runtime.analyze(
-      '滑动 FPS 是多少？',
-      'session-pi-reused-quick-attempt',
-      'trace-pi-reused-quick-attempt',
-    );
-
-    expect(attemptSpy).toHaveBeenCalledTimes(1);
-    expect(FakePiAgent.instances).toHaveLength(1);
-    expect(FakePiAgent.instances[0].state.systemPrompt).toContain('com.example.app');
-    expect(sqlQueries.filter(sql => sql.includes('android_battery_stats_event_slices'))).toHaveLength(1);
-    expect(sqlQueries.filter(sql => sql.includes('runtime_frame_metrics'))).toHaveLength(1);
-    expect(sqlQueries.filter(sql => sql.includes('android_oom_adj_intervals'))).toHaveLength(0);
-  });
-
-  it('keeps the final report when Pi emits trailing bookkeeping assistant text', async () => {
-    FakePiAgent.promptMessages = [
-      {
-        role: 'assistant',
-        content: [{
-          type: 'text',
-          text: '# 启动性能分析报告\n\n## 1. 概览\n冷启动由 ChaosTask 主导。[Evidence:data:skill:startup_analysis:test]',
-        }],
-      },
-      {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'All phases are complete. The analysis is done.' }],
-      },
-    ];
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader: async () => ({ Agent: FakePiAgent }),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze('分析启动性能', 'session-pi-report', 'trace-pi', {
-      analysisMode: 'fast',
-    });
-
-    expect(result.conclusion).toContain('# 启动性能分析报告');
-    expect(result.conclusion).toContain('ChaosTask');
-    expect(result.conclusion).not.toContain('All phases are complete');
-  });
-
-  it('refreshes the final report when plan completion adds evidence without a new report', async () => {
-    const correctedReport = buildVerifiedPiReport();
-    const traceProcessorService = createFakeTraceProcessorService();
-    traceProcessorService.query.mockImplementation(async (_traceId: string, sql: string) => (
-      sql.includes('plan_completion_rows')
-        ? {
-            columns: ['value'],
-            rows: Array.from({length: 60}, (_, index) => [index]),
-            durationMs: 1,
-          }
-        : {columns: [], rows: [], durationMs: 1}
-    ));
-    const initialReport = [
-      correctedReport,
-      '',
-      '## 初稿扩展边界',
-      ...Array.from({length: 12}, (_, index) => (
-        `- 初稿边界 ${index + 1}：该描述尚未吸收后续 SQL 补证结果。`
-      )),
-    ].join('\n');
-    expect(initialReport.length).toBeGreaterThan(correctedReport.length);
-    FakePiAgent.promptHandler = async (agent, input, promptIndex) => {
-      if (promptIndex === 1) {
-        const submitPlan = agent.state.tools.find((tool: any) => tool.name === 'submit_plan') as any;
-        await submitPlan.execute('plan-call', {
-          phases: [{
-            id: 'p1',
-            name: '归纳性能证据',
-            goal: '整理已采集证据的关键数值与边界',
-            expectedTools: ['fetch_artifact'],
-            expectedCalls: [{tool: 'fetch_artifact'}],
-          }],
-          successCriteria: '输出证据、根因、建议和限制完整的报告',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: initialReport}],
-        }];
-      }
-      if (promptIndex === 2) {
-        expect(input).toContain('"hasPlan": true');
-        expect(input).toContain('"id": "p1"');
-        const executeSql = agent.state.tools.find((tool: any) => tool.name === 'execute_sql') as any;
-        await executeSql.execute('sql-artifact-source', {
-          sql: 'SELECT value FROM plan_completion_rows',
-        });
-        const updatePlanPhase = agent.state.tools.find(
-          (tool: any) => tool.name === 'update_plan_phase',
-        ) as any;
-        await updatePlanPhase.execute('phase-call', {
-          phaseId: 'p1',
-          status: 'completed',
-          summary: '已归纳当前 trace 的关键耗时、代表样本和证据边界。',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: '证据阶段已闭合，等待生成更新后的最终报告。'}],
-        }];
-      }
-      if (promptIndex === 3) {
-        expect(input).toContain('"tool": "fetch_artifact"');
-        const fetchArtifact = agent.state.tools.find(
-          (tool: any) => tool.name === 'fetch_artifact',
-        ) as any;
-        await fetchArtifact.execute('artifact-call', {
-          artifactId: 'art-1',
-          detail: 'rows',
-          offset: 0,
-          limit: 50,
-        });
-        const updatePlanPhase = agent.state.tools.find(
-          (tool: any) => tool.name === 'update_plan_phase',
-        ) as any;
-        await updatePlanPhase.execute('phase-after-artifact', {
-          phaseId: 'p1',
-          status: 'completed',
-          summary: '已补齐 artifact 分页调用，并重新归纳了关键耗时与证据边界。',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: '必需 artifact 调用已补齐，plan 现在已完成。'}],
-        }];
-      }
-      expect(input).toContain('Final Report Contract');
-      return [{
-        role: 'assistant',
-        content: [{type: 'text', text: correctedReport}],
-      }];
-    };
-    const runtime = new PiAgentCoreRuntime(
-      traceProcessorService,
-      {kind: 'pi-agent-core', source: 'env'},
-      {
-        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON},
-        moduleLoader: async () => ({Agent: FakePiAgent}),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-plan-completion',
-      'trace-pi',
-      {analysisMode: 'full'},
-    );
-    const agent = FakePiAgent.instances[0];
-
-    expect(agent.promptCount).toBe(4);
-    expect(result.conclusion).toBe(correctedReport);
-    expect(result.partial).not.toBe(true);
-    expect(result.terminationReason).toBeUndefined();
-  });
-
-  it('continues with tools to resolve hypotheses after the plan is complete', async () => {
-    const report = buildVerifiedPiReport();
-    FakePiAgent.promptHandler = async (agent, input, promptIndex) => {
-      if (promptIndex === 1) {
-        await submitCompletedMinimalPlan(agent);
-        const submitHypothesis = agent.state.tools.find(
-          (tool: any) => tool.name === 'submit_hypothesis',
-        ) as any;
-        await submitHypothesis.execute('hypothesis-call', {
-          id: 'h1',
-          statement: '主线程同步重计算是代表帧超预算的直接原因',
-          basis: '代表帧 ANIMATION 阶段同步执行 47-59ms',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: report}],
-        }];
-      }
-
-      expect(input).toContain('"unresolvedHypotheses"');
-      expect(input).toContain('"id": "h1"');
-      const resolveHypothesis = agent.state.tools.find(
-        (tool: any) => tool.name === 'resolve_hypothesis',
-      ) as any;
-      await resolveHypothesis.execute('resolve-hypothesis-call', {
-        hypothesisId: 'h1',
-        status: 'confirmed',
-        evidence: '代表帧 ANIMATION 阶段同步执行 47-59ms，6/7 帧命中相同模式。',
-      });
-      return [{
-        role: 'assistant',
-        content: [{type: 'text', text: report}],
-      }];
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      {kind: 'pi-agent-core', source: 'env'},
-      {
-        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON},
-        moduleLoader: async () => ({Agent: FakePiAgent}),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-hypothesis-completion',
-      'trace-pi',
-      {analysisMode: 'full'},
-    );
-
-    expect(FakePiAgent.instances[0].promptCount).toBe(2);
-    expect(result.hypotheses).toEqual(expect.arrayContaining([
-      expect.objectContaining({id: 'h1', status: 'confirmed'}),
-    ]));
-    expect(result.partial).not.toBe(true);
-    expect(result.terminationReason).toBeUndefined();
-  });
-
-  it('keeps a fresh hypothesis-resolution report after a process-only plan continuation', async () => {
-    const report = buildVerifiedPiReport();
-    FakePiAgent.promptHandler = async (agent, input, promptIndex) => {
-      if (promptIndex === 1) {
-        const submitPlan = agent.state.tools.find((tool: any) => tool.name === 'submit_plan') as any;
-        await submitPlan.execute('plan-call', {
-          phases: [{
-            id: 'p1',
-            name: '闭合证据计划',
-            goal: '完成已有证据的核对与收敛',
-            expectedTools: [],
-          }],
-          successCriteria: '输出已验证的完整报告',
-        });
-        const submitHypothesis = agent.state.tools.find(
-          (tool: any) => tool.name === 'submit_hypothesis',
-        ) as any;
-        await submitHypothesis.execute('hypothesis-call', {
-          id: 'h1',
-          statement: '主线程同步重计算是代表帧超预算的直接原因',
-          basis: '代表帧 ANIMATION 阶段同步执行 47-59ms',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: '计划和假设已建立，准备闭合证据阶段。'}],
-        }];
-      }
-      if (promptIndex === 2) {
-        expect(input).toContain('"id": "p1"');
-        const updatePlanPhase = agent.state.tools.find(
-          (tool: any) => tool.name === 'update_plan_phase',
-        ) as any;
-        await updatePlanPhase.execute('phase-call', {
-          phaseId: 'p1',
-          status: 'completed',
-          summary: '已有证据已核对，计划阶段完成。',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: '证据阶段已闭合，接下来处理未决假设。'}],
-        }];
-      }
-      if (promptIndex === 3) {
-        expect(input).toContain('"unresolvedHypotheses"');
-        const resolveHypothesis = agent.state.tools.find(
-          (tool: any) => tool.name === 'resolve_hypothesis',
-        ) as any;
-        await resolveHypothesis.execute('resolve-call', {
-          hypothesisId: 'h1',
-          status: 'confirmed',
-          evidence: '代表帧 ANIMATION 阶段同步执行 47-59ms，6/7 帧命中相同模式。',
-        });
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: report}],
-        }];
-      }
-      throw new Error('fresh hypothesis report must not trigger another continuation');
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      {kind: 'pi-agent-core', source: 'env'},
-      {
-        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON},
-        moduleLoader: async () => ({Agent: FakePiAgent}),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-hypothesis-fresh-report',
-      'trace-pi',
-      {analysisMode: 'full'},
-    );
-
-    expect(FakePiAgent.instances[0].promptCount).toBe(3);
-    expect(result.conclusion).toBe(report);
-    expect(result.partial).not.toBe(true);
-    expect(result.terminationReason).toBeUndefined();
-  });
-
-  it('selects the latest shorter deliverable report instead of the longest stale draft', () => {
+  it('selects the current terminal assistant without preferring an older report-shaped message', () => {
     const correctedReport = buildScrollingPiReport(true);
     const initialReport = [
       buildScrollingPiReport(false),
@@ -3489,494 +2903,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       {role: 'assistant', content: [{type: 'text', text: initialReport}]},
       {role: 'assistant', content: [{type: 'text', text: correctedReport}]},
       {role: 'assistant', content: [{type: 'text', text: 'All phases are complete.'}]},
-    ])).toBe(correctedReport);
-  });
-
-  it('does not reuse a stale draft when the bounded final-report continuation emits no report', async () => {
-    const staleDraft = [
-      buildVerifiedPiReport(),
-      '',
-      'blocked_function=do_epoll_wait 持续 120ms，证明磁盘 IO 是根因。',
-    ].join('\n');
-    const processOnlyReply = 'The continuation ended without a refreshed final report.';
-    FakePiAgent.promptHandler = async (agent, input, promptIndex) => {
-      if (promptIndex === 1) {
-        await submitCompletedMinimalPlan(agent);
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: staleDraft}],
-        }];
-      }
-      if (promptIndex === 2) {
-        expect(input).toContain('Final Report Contract');
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: processOnlyReply}],
-        }];
-      }
-      throw new Error('text-only correction unavailable');
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      {kind: 'pi-agent-core', source: 'env'},
-      {
-        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON},
-        moduleLoader: async () => ({Agent: FakePiAgent}),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-final-refresh-boundary',
-      'trace-pi',
-      {analysisMode: 'full'},
-    );
-
-    expect(result.conclusion).not.toContain('do_epoll_wait');
-    expect(result.partial).toBe(true);
-    expect(result.terminationReason).toBeDefined();
-  });
-
-  it('repairs a truncated Pi final report deterministically and skips provider correction after verification passes', async () => {
-    const truncatedReport = [
-      buildVerifiedPiReport(),
-      '',
-      '## 截断段落',
-      '报告在这里突然结束，缺少完整收束',
-    ].join('\n');
-    const truncationIssue = {
-      type: 'truncation',
-      severity: 'error',
-      message: '结论文本被截断',
-    };
-    mockClaudeVerifierVerifyConclusion
-      .mockImplementationOnce(async () => ({
-        passed: false,
-        heuristicIssues: [truncationIssue],
-        llmIssues: [],
-        durationMs: 1,
-      }))
-      .mockImplementationOnce(async () => ({
-        passed: true,
-        heuristicIssues: [],
-        llmIssues: [],
-        durationMs: 1,
-      }))
-      .mockImplementation(async () => ({
-        passed: true,
-        heuristicIssues: [],
-        llmIssues: [],
-        durationMs: 1,
-      }));
-    FakePiAgent.promptHandler = async (agent, _input, promptIndex) => {
-      if (promptIndex === 1) {
-        await submitCompletedMinimalPlan(agent);
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: truncatedReport}],
-        }];
-      }
-      throw new Error('provider correction should not run after verified deterministic repair');
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      {kind: 'pi-agent-core', source: 'env'},
-      {
-        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON},
-        moduleLoader: async () => ({Agent: FakePiAgent}),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-deterministic-repair-skip',
-      'trace-pi',
-      {analysisMode: 'full'},
-    );
-
-    expect(FakePiAgent.instances[0].promptCount).toBe(1);
-    expect(mockClaudeVerifierVerifyConclusion).toHaveBeenCalledTimes(3);
-    expect(result.success).toBe(true);
-    expect(result.conclusion).not.toBe(truncatedReport);
-    expect(result.partial).not.toBe(true);
-  });
-
-  it('falls back to one Pi provider correction when deterministic truncation repair fails verification', async () => {
-    const truncatedReport = [
-      buildVerifiedPiReport(),
-      '',
-      '## 截断段落',
-      '报告在这里突然结束，缺少完整收束',
-    ].join('\n');
-    const correctedReport = buildVerifiedPiReport();
-    const truncationIssue = {
-      type: 'truncation',
-      severity: 'error',
-      message: '结论文本被截断',
-    };
-    const residualIssue = {
-      type: 'missing_evidence',
-      severity: 'error',
-      message: '本地修复后仍缺少证据支撑',
-    };
-    mockClaudeVerifierVerifyConclusion
-      .mockImplementationOnce(async () => ({
-        passed: false,
-        heuristicIssues: [truncationIssue],
-        llmIssues: [],
-        durationMs: 1,
-      }))
-      .mockImplementationOnce(async () => ({
-        passed: false,
-        heuristicIssues: [residualIssue],
-        llmIssues: [],
-        durationMs: 1,
-      }))
-      .mockImplementation(async () => ({
-        passed: true,
-        heuristicIssues: [],
-        llmIssues: [],
-        durationMs: 1,
-      }));
-    FakePiAgent.promptHandler = async (agent, input, promptIndex) => {
-      if (promptIndex === 1) {
-        await submitCompletedMinimalPlan(agent);
-        return [{
-          role: 'assistant',
-          content: [{type: 'text', text: truncatedReport}],
-        }];
-      }
-      expect(input).toContain('验证反馈');
-      expect(agent.state.tools).toEqual([]);
-      return [{
-        role: 'assistant',
-        content: [{type: 'text', text: correctedReport}],
-      }];
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      {kind: 'pi-agent-core', source: 'env'},
-      {
-        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON},
-        moduleLoader: async () => ({Agent: FakePiAgent}),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-deterministic-repair-fallback',
-      'trace-pi',
-      {analysisMode: 'full'},
-    );
-
-    expect(FakePiAgent.instances[0].promptCount).toBe(2);
-    expect(result.conclusion).toBe(correctedReport);
-    expect(result.partial).not.toBe(true);
-    expect(result.terminationReason).toBeUndefined();
-  });
-
-  it('uses a shorter verified Pi correction produced with tools disabled', async () => {
-    const originalReport = buildUnverifiedPiReport();
-    const correctedReport = buildVerifiedPiReport();
-    expect(originalReport.length).toBeGreaterThan(correctedReport.length);
-
-    FakePiAgent.promptHandler = async (agent, input, promptIndex) => {
-      if (promptIndex === 1) {
-        await submitCompletedMinimalPlan(agent);
-        return [{
-          role: 'assistant',
-          content: [{ type: 'text', text: originalReport }],
-        }];
-      }
-      expect(input).toContain('验证反馈');
-      expect(agent.state.tools).toEqual([]);
-      expect(agent.state.systemPrompt).toContain('最终报告修正器');
-      return [{
-        role: 'assistant',
-        content: [{ type: 'text', text: correctedReport }],
-      }];
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader: async () => ({ Agent: FakePiAgent }),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-correction',
-      'trace-pi',
-      { analysisMode: 'full' },
-    );
-    const agent = FakePiAgent.instances[0];
-
-    expect(agent.promptCount).toBe(2);
-    expect(agent.state.tools.length).toBeGreaterThan(0);
-    expect(result.conclusion).toBe(correctedReport);
-    expect(result.partial).not.toBe(true);
-    expect(result.terminationReason).toBeUndefined();
-  });
-
-  it('includes the scrolling scene contract in Pi correction verification', async () => {
-    const originalReport = buildScrollingPiReport(false);
-
-    const issues = await verifyPiAgentCoreConclusionForCorrection({
-      conclusion: originalReport,
-      plan: null,
-      hypotheses: [],
-      sceneType: 'scrolling',
-      outputLanguage: 'zh-CN',
-      query: '分析滑动性能',
-      allowPersistentLearning: false,
-    });
-
-    expect(issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        severity: 'error',
-        message: expect.stringContaining('代表帧分析'),
-      }),
-    ]));
-    const completeIssues = await verifyPiAgentCoreConclusionForCorrection({
-      conclusion: buildScrollingPiReport(true),
-      plan: null,
-      hypotheses: [],
-      sceneType: 'scrolling',
-      outputLanguage: 'zh-CN',
-      query: '分析滑动性能',
-      allowPersistentLearning: false,
-    });
-    expect(completeIssues).not.toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        severity: 'error',
-        message: expect.stringContaining('Final Report Contract'),
-      }),
-    ]));
-  });
-
-  it('includes final quality-gate semantic issues in Pi correction verification', async () => {
-    const issues = await verifyPiAgentCoreConclusionForCorrection({
-      conclusion: [
-        buildScrollingPiReport(true),
-        '',
-        '## 已排除因素',
-        '主线程 D/DK 只有 1.7%，因此轻度磁盘 IO 阻塞不是本次掉帧根因。',
-      ].join('\n'),
-      plan: null,
-      hypotheses: [],
-      sceneType: 'scrolling',
-      outputLanguage: 'zh-CN',
-      query: '分析滑动性能',
-      allowPersistentLearning: false,
-    });
-
-    expect(issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        severity: 'error',
-        message: expect.stringContaining('D/DK 只能说明不可中断等待'),
-      }),
-    ]));
-  });
-
-  it('includes missing dual-trace package identities in Pi correction verification', async () => {
-    const issues = await verifyPiAgentCoreConclusionForCorrection({
-      conclusion: [
-        '# 双 Trace 性能分析报告',
-        '',
-        '## 综合结论',
-        '',
-        '当前侧 com.example.heavy 明显慢于右侧 demo。',
-      ].join('\n'),
-      plan: null,
-      hypotheses: [],
-      sceneType: 'general',
-      outputLanguage: 'zh-CN',
-      query: '对比两个 trace',
-      allowPersistentLearning: false,
-      comparisonIdentity: {
-        currentPackageName: 'com.example.heavy',
-        referencePackageName: 'com.example.demo',
-      },
-    });
-
-    expect(issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        severity: 'error',
-        message: expect.stringContaining('com.example.demo'),
-      }),
-    ]));
-    expect(issues.filter(issue => issue.message.includes('com.example.demo'))).toHaveLength(1);
-  });
-
-  it('falls back to the original Pi report when text-only correction fails', async () => {
-    const originalReport = buildUnverifiedPiReport();
-    let correctionAttempts = 0;
-    FakePiAgent.promptHandler = async (agent, _input, promptIndex) => {
-      if (promptIndex === 1) {
-        await submitCompletedMinimalPlan(agent);
-        return [{
-          role: 'assistant',
-          content: [{ type: 'text', text: originalReport }],
-        }];
-      }
-      correctionAttempts += 1;
-      expect(agent.state.tools).toEqual([]);
-      throw new Error('correction provider unavailable');
-    };
-    const runtime = new PiAgentCoreRuntime(
-      createFakeTraceProcessorService(),
-      { kind: 'pi-agent-core', source: 'env' },
-      {
-        env: { [PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON },
-        moduleLoader: async () => ({ Agent: FakePiAgent }),
-        providerRuntimeLoader: loadFakePiProviderRuntime,
-      },
-    );
-
-    const result = await runtime.analyze(
-      '分析系统性能问题',
-      'session-pi-correction-failure',
-      'trace-pi',
-      { analysisMode: 'full' },
-    );
-    const agent = FakePiAgent.instances[0];
-
-    expect(correctionAttempts).toBe(1);
-    expect(agent.state.tools.length).toBeGreaterThan(0);
-    expect(result.success).toBe(true);
-    expect(result.conclusion).toBe(originalReport);
-    expect(result.partial).toBe(true);
-    expect(result.terminationMessage).toContain('缺少证据支撑');
-    expect(result.terminationReason).not.toBe('execution_error');
-  });
-
-  it('strips Pi process narration before a deliverable final report heading', () => {
-    const report = sanitizePiAgentCoreConclusionText(
-      'I have all the necessary knowledge and data. Now let me write the comprehensive final report.\n\n' +
-      'Key findings: cold startup is dominated by ChaosTask.\n\n' +
-      '# 启动性能分析报告\n\n' +
-      '## 1. 概览\n冷启动由 ChaosTask 主导。[Evidence:data:skill:startup_analysis:test]',
-    );
-
-    expect(report.startsWith('# 启动性能分析报告')).toBe(true);
-    expect(report).toContain('ChaosTask');
-    expect(report).not.toContain('I have all the necessary');
-    expect(report).not.toContain('Key findings:');
-  });
-
-  it('ignores Final Report Contract prose and starts at the actual Markdown report heading', () => {
-    const report = sanitizePiAgentCoreConclusionText(
-      'The system is asking me to output the final report. Let me check what I need to include based on the Final Report Contract:\n\n' +
-      '1. 启动类型与 TTID/TTFD\n' +
-      '2. 阶段耗时分解\n\n' +
-      'Let me now write the final report with all required elements.\n' +
-      '## 综合结论\n\n' +
-      '左侧冷启动 1338.65ms，右侧 301.84ms。[Evidence:data:skill:startup_analysis:test]',
-    );
-
-    expect(report.startsWith('## 综合结论')).toBe(true);
-    expect(report).toContain('1338.65ms');
-    expect(report).not.toContain('The system is asking me');
-    expect(report).not.toContain('Final Report Contract');
-  });
-
-  it('does not treat a Final Report Contract heading as the delivered report', () => {
-    const report = sanitizePiAgentCoreConclusionText(
-      'Let me verify the remaining contract.\n' +
-      '## Final Report Contract：综合结论、证据链必须完整\n\n' +
-      'The contract is now checked.\n' +
-      '## 综合结论\n\n' +
-      '冷启动耗时 1338.65ms。[Evidence:data:skill:startup_analysis:test]',
-    );
-
-    expect(report.startsWith('## 综合结论')).toBe(true);
-    expect(report).not.toContain('Final Report Contract');
-  });
-
-  it('preserves a bare Chinese analysis-report title as the report boundary', () => {
-    const report = sanitizePiAgentCoreConclusionText(
-      'Let me now write the report.\n\n' +
-      '启动性能分析报告\n\n' +
-      '综合结论：冷启动耗时 1338.65ms。[Evidence:data:skill:startup_analysis:test]',
-    );
-
-    expect(report.startsWith('启动性能分析报告')).toBe(true);
-    expect(report).not.toContain('Let me now write');
-  });
-
-  it('does not treat a Chinese report-writing instruction as the report boundary', () => {
-    const report = sanitizePiAgentCoreConclusionText(
-      'Let me prepare the report.\n' +
-      '请输出启动性能分析报告\n\n' +
-      '## 1. 综合结论\n\n' +
-      '冷启动耗时 1338.65ms。[Evidence:data:skill:startup_analysis:test]',
-    );
-
-    expect(report.startsWith('## 1. 综合结论')).toBe(true);
-    expect(report).not.toContain('请输出');
-  });
-
-  it('preserves a descriptive English Markdown report heading', () => {
-    const report = sanitizePiAgentCoreConclusionText(
-      'Let me now write the report.\n\n' +
-      '# Final Report for Startup\n\n' +
-      'Cold startup took 1338.65ms. [Evidence:data:skill:startup_analysis:test]',
-    );
-
-    expect(report.startsWith('# Final Report for Startup')).toBe(true);
-    expect(report).not.toContain('Let me now write');
-  });
-
-  it('auto-closes the final Pi report phase when the complete report is delivered', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '启动概览采集',
-          goal: '获取启动事件',
-          expectedTools: ['invoke_skill'],
-          status: 'completed',
-          summary: '已获取 startup_analysis 关键启动事件、TTID 和冷启动类型证据。',
-        },
-        {
-          id: 'p3',
-          name: '综合结论',
-          goal: '基于根因诊断决策树，输出完整结构化报告',
-          expectedTools: ['lookup_knowledge'],
-          status: 'in_progress',
-          summary: '',
-        },
-      ],
-      successCriteria: '输出完整结构化报告',
-      submittedAt: 1,
-      toolCallLog: [{
-        toolName: 'invoke_skill',
-        timestamp: 10,
-        success: true,
-        matchedPhaseId: 'p1',
-      }],
-    } as any;
-
-    const closed = completePiAgentCoreFinalReportPhaseIfDelivered(
-      plan,
-      '# 启动性能分析报告\n\n## 1. 概览\n冷启动由 ChaosTask 主导。[Evidence:data:skill:startup_analysis:test]',
-      'zh-CN',
-      () => 1234,
-    );
-
-    expect(closed?.id).toBe('p3');
-    expect(plan.phases[1]).toMatchObject({
-      status: 'completed',
-      completedAt: 1234,
-    });
-    expect(plan.phases[1].summary.length).toBeGreaterThanOrEqual(15);
-    expect(getPiAgentCorePlanCompletionStatus(plan).complete).toBe(true);
+    ])).toBe('All phases are complete.');
   });
 
   it('does not treat a completed Pi phase as closed when required tool evidence is missing', () => {
@@ -4006,102 +2933,522 @@ describe('experimental Pi agent-core runtime contract', () => {
     ]);
   });
 
-  it('continues Pi final report generation when completed plan still misses the scene contract', () => {
-    const planStatus = {
-      complete: true,
-      hasPlan: true,
-      pendingPhases: [],
+
+  function typedRuntime(input: {trace?: any; env?: Record<string, string>; loader?: any} = {}) {
+    return new PiAgentCoreRuntime(input.trace ?? createFakeTraceProcessorService(),
+      {kind: 'pi-agent-core', source: 'env'}, {
+        env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON, ...input.env},
+        moduleLoader: input.loader ?? (async () => ({Agent: FakePiAgent})),
+        providerRuntimeLoader: loadFakePiProviderRuntime,
+      });
+  }
+
+  function passVerification() {
+    mockClaudeVerifierVerifyConclusion.mockImplementation(async () => ({
+      passed: true, heuristicIssues: [], llmIssues: [], durationMs: 0,
+    }));
+  }
+
+  it.each([false, true])('keeps pending exploration advisory after native completion or failure: failed=%s', async nativeError => {
+    const body = 'The observed value is 17.';
+    const failedNext = {role: 'assistant', stopReason: 'error', errorMessage: 'Queued provider failure', content: []};
+    const replies: unknown[] = [{role: 'assistant', stopReason: nativeError ? 'error' : 'stop',
+      ...(nativeError ? {errorMessage: 'Native provider failure'} : {}), content: [{type: 'text', text: body}]}, failedNext];
+    FakePiAgent.promptHandler = async (agent, _input, index) => {
+      if (index === 1) {
+        const submitPlan = agent.state.tools.find((tool: any) => tool.name === 'submit_plan') as any;
+        await submitPlan.execute('exploration-plan', {phases: [{id: 'explore', name: 'Optional exploration',
+          goal: 'Investigate a further explanation', expectedTools: ['execute_sql']}], successCriteria: 'Explore the open question'});
+        const submitHypothesis = agent.state.tools.find((tool: any) => tool.name === 'submit_hypothesis') as any;
+        await submitHypothesis.execute('exploration-hypothesis', {id: 'open-hypothesis', statement: 'A separate cause may exist.'});
+      }
+      return [replies.shift()];
     };
-
-    expect(shouldContinuePiAgentCoreFinalReportAfterPlanComplete({
-      quickMode: false,
-      planStatus,
-      finalReportContinuations: 0,
-      query: '分析滑动性能',
-      sceneType: 'scrolling',
-      conclusion: [
-        '# 滑动性能分析报告',
-        '',
-        '## 1. 概览',
-        '真实掉帧 7 帧，最长帧 62.73ms。',
-        '',
-        '### 全帧根因分布',
-        '| 根因 | 帧数 | 占比 |',
-        '| --- | ---: | ---: |',
-        '| animation 同步阻塞 | 6 | 86% |',
-      ].join('\n'),
-    })).toBe(true);
+    const runtime = typedRuntime();
+    const sessionId = `typed-pi-advisory-${nativeError}`;
+    const result = await runtime.analyze('Read the current value', sessionId, 'trace-pi', {runId: sessionId});
+    expect(FakePiAgent.instances[0].promptCount).toBe(1);
+    expect(replies).toEqual([failedNext]);
+    expect(result.conclusion).toBe(body);
+    expect(result.completion).toMatchObject({status: nativeError ? 'failed' : 'completed', attemptId: '1',
+      conclusionFingerprint: analysisDeliveryFingerprint(body)});
+    expect(result.success).toBe(!nativeError);
+    expect(result.partial === true).toBe(nativeError);
+    expect(result.terminationReason).toBe(nativeError ? 'execution_error' : undefined);
+    const verification = await mockClaudeVerifierVerifyConclusion.mock.results[0].value;
+    expect(verification).toMatchObject({heuristicIssues: expect.arrayContaining([
+      expect.objectContaining({type: 'plan_deviation', severity: 'error'}),
+      expect.objectContaining({type: 'unresolved_hypothesis', severity: 'error'}),
+    ])});
+    const snapshot = runtime.takeSnapshot(sessionId, 'trace-pi', createSnapshotFields());
+    expect(snapshot.analysisPlan?.phases).toEqual([expect.objectContaining({id: 'explore', status: 'pending'})]);
+    expect(snapshot.claudeHypotheses).toEqual([expect.objectContaining({id: 'open-hypothesis', status: 'formed'})]);
   });
 
-  it('does not continue Pi final report generation once the scene contract is satisfied', () => {
-    const planStatus = {
-      complete: true,
-      hasPlan: true,
-      pendingPhases: [],
+  it('classifies once through the native pinned provider before any trace query and preserves a full bounded answer', async () => {
+    passVerification();
+    const trace = createFakeTraceProcessorService();
+    const events: string[] = [];
+    trace.query.mockImplementation(async () => { events.push('query'); return {columns: [], rows: []}; });
+    FakePiAgent.promptMessages = [{role: 'assistant', content: [{type: 'text', text: 'A concise observation'}]}];
+    const snapshot = createEffectiveRuntimeRegistrySnapshot();
+    const buildPrompt = jest.spyOn(systemPromptModule, 'buildSystemPrompt');
+    try {
+      const result = await withEffectiveRuntimeRegistrySnapshot(snapshot, () => typedRuntime({trace}).analyze(
+        '无需按标题整理：只解释刚才这个值', 'typed-pi-full-answer', 'trace-pi', {analysisMode: 'full', runId: 'run-bounded'},
+      ));
+      expect(piClassifierCalls).toHaveLength(1);
+      expect(piClassifierCalls[0].context.tools).toEqual([]);
+      expect(piClassifierCalls[0].options).toMatchObject({maxRetries: 0, maxTokens: 1024});
+      expect(events).toEqual([]);
+      expect(FakePiAgent.instances[0].promptCount).toBe(1);
+      expect(buildPrompt).toHaveBeenCalledWith(expect.objectContaining({
+        onDemandContext: true, strategyRegistry: snapshot.strategyRegistry,
+        turnIntent: expect.objectContaining({scope: 'bounded_question', deliverable: 'answer'}),
+      }));
+      expect(result).toMatchObject({conclusion: 'A concise observation',
+        turnIntent: {status: 'resolved', deliverable: 'answer'},
+        completion: {status: 'completed', runId: 'run-bounded', attemptId: '1',
+          conclusionFingerprint: analysisDeliveryFingerprint('A concise observation')}});
+      expect(result.quickRun).toBeUndefined();
+      expect(result.partial).not.toBe(true);
+    } finally { buildPrompt.mockRestore(); }
+  });
+
+  it('uses the same pinned healthy main model after an unavailable classifier without automatic trace prefetch', async () => {
+    passVerification();
+    piClassifierResponses.push(new Error('model_not_found'));
+    const trace = createFakeTraceProcessorService();
+    const result = await typedRuntime({trace}).analyze('不含路由暗号的问题', 'typed-pi-fallback', 'trace-pi');
+    expect(result.turnIntent).toMatchObject({status: 'unavailable', source: 'fallback', scope: 'bounded_question'});
+    expect(piClassifierCalls).toHaveLength(1);
+    expect(FakePiAgent.instances[0].state.model).toBe(piClassifierCalls[0].model);
+    expect((FakePiAgent.instances[0].state.model as any).id).toBe('pi-test-model');
+    expect(trace.query).not.toHaveBeenCalled();
+    expect(result.completion?.status).toBe('completed');
+  });
+
+  it('preserves fast comparison capabilities and explicit comparison identity without automatic probes', async () => {
+    passVerification();
+    piClassifierDecision = {...piClassifierDecision, taskKind: 'comparison'};
+    const trace = createFakeTraceProcessorService();
+    const buildPrompt = jest.spyOn(systemPromptModule, 'buildSystemPrompt');
+    try {
+      const result = await typedRuntime({trace}).analyze('比较已选中的两段', 'typed-pi-fast-comparison', 'trace-current', {
+        analysisMode: 'fast', referenceTraceId: 'trace-reference',
+      });
+      expect(result.quickRun?.requestedMode).toBe('fast');
+      expect(trace.query).not.toHaveBeenCalled();
+      expect(buildPrompt).toHaveBeenCalledWith(expect.objectContaining({comparison: expect.objectContaining({
+        referenceTraceId: 'trace-reference', capabilityProbeStatus: 'not_checked',
+      })}));
+      expect(FakePiAgent.instances[0].state.tools).toEqual(expect.arrayContaining([
+        expect.objectContaining({name: 'execute_sql'}), expect.objectContaining({name: 'submit_plan'}),
+      ]));
+    } finally { buildPrompt.mockRestore(); }
+  });
+
+  it('keeps existing artifacts available while an existing-only intent prevents new trace and source evidence', async () => {
+    passVerification();
+    piClassifierDecision = {...piClassifierDecision, evidenceAccess: 'existing_only'};
+    const trace = createFakeTraceProcessorService();
+    const result = await typedRuntime({trace}).analyze('继续解释上一轮证据', 'typed-pi-existing', 'trace-pi', {
+      analysisMode: 'full', referenceTraceId: 'trace-ref', codeAwareMode: 'provider_send', codebaseIds: ['selected-source'],
+    });
+    expect(result.turnIntent?.evidenceAccess).toBe('existing_only');
+    expect(trace.query).not.toHaveBeenCalled();
+    const names = FakePiAgent.instances[0].state.tools.map((tool: any) => tool.name);
+    expect(names).toContain('fetch_artifact');
+    expect(names).not.toContain('execute_sql');
+    expect(names).not.toContain('query_trace');
+    expect(names).not.toContain('source_lookup');
+    expect(piClassifierCalls).toHaveLength(1);
+  });
+
+  it('lets the model author an acknowledgement instead of using a canned lexical response', async () => {
+    passVerification();
+    piClassifierDecision = {...piClassifierDecision, taskKind: 'acknowledgement', evidenceAccess: 'existing_only'};
+    const trace = createFakeTraceProcessorService();
+    FakePiAgent.promptMessages = [{role: 'assistant', content: [{type: 'text', text: 'I will keep that context.'}]}];
+    const result = await typedRuntime({trace}).analyze('好的，记住这个边界', 'typed-pi-ack', 'trace-pi');
+    expect(result.conclusion).toBe('I will keep that context.');
+    expect(result.outputOrigin).toBe('sdk_final');
+    expect(result.completion?.status).toBe('completed');
+    expect(FakePiAgent.instances).toHaveLength(1);
+    expect(trace.query).not.toHaveBeenCalled();
+  });
+
+  it('bounds the native main turn loop and records the exact tool-use candidate as incomplete', async () => {
+    passVerification();
+    let dispatched = 0;
+    FakePiAgent.promptHandler = async agent => {
+      while (true) {
+        dispatched++;
+        const message = {role: 'assistant', stopReason: 'toolUse', content: [{type: 'text', text: `attempt ${dispatched}`} ]};
+        agent.emitForTest({type: 'turn_end', message});
+        if (await (agent.options?.shouldStopAfterTurn as any)({message})) return [message];
+        if (dispatched > 5) throw new Error('native turn guard was not enforced');
+      }
     };
-
-    expect(shouldContinuePiAgentCoreFinalReportAfterPlanComplete({
-      quickMode: false,
-      planStatus,
-      finalReportContinuations: 0,
-      query: '分析滑动性能',
-      sceneType: 'scrolling',
-      conclusion: [
-        '# 滑动性能分析报告',
-        '',
-        '## 1. 概览',
-        '真实掉帧 7 帧，最长帧 62.73ms。',
-        '',
-        '### 全帧根因分布',
-        '| 根因 | 帧数 | 占比 |',
-        '| --- | ---: | ---: |',
-        '| animation 同步阻塞 | 6 | 86% |',
-        '',
-        '### 代表帧分析',
-        '- 代表帧 frame_id=59665219：帧耗时 62.73ms，vsync_missed=7，超预算 54.4ms。关键 slice 为 CustomScroll_longFrameLoad 59.01ms。[Evidence:data:skill:scrolling_analysis:batch_frame_root_cause:test]',
-        '',
-        '### 峰值/口径指标',
-        '- 真实掉帧 7 帧，最长帧 62.73ms。',
-        '',
-        '### 优化建议',
-        '- 将 animation 回调里的同步重活拆分到后台线程，并用分帧提交结果；该建议直接覆盖 6/7 个掉帧样本。',
-      ].join('\n'),
-    })).toBe(false);
+    const result = await typedRuntime({env: {AGENT_QUICK_MAX_TURNS: '2'}}).analyze('继续收集', 'typed-pi-cap', 'trace-pi', {analysisMode: 'fast'});
+    expect(dispatched).toBe(2);
+    expect(result).toMatchObject({conclusion: 'attempt 2', rounds: 2, partial: true,
+      terminationReason: 'max_turns', completion: {status: 'incomplete', reason: 'turn_limit', sdkFinishReason: 'toolUse'},
+      quickRun: {enforcement: 'turn_cap', actualTurns: 2, hardCapTurns: 2}});
   });
 
-  it('does not auto-close Pi final phase while earlier phases remain pending', () => {
-    const plan = {
-      phases: [
-        {
-          id: 'p1',
-          name: '启动概览采集',
-          goal: '获取启动事件',
-          expectedTools: ['invoke_skill'],
-          status: 'pending',
-          summary: '',
-        },
-        {
-          id: 'p3',
-          name: '综合结论',
-          goal: '输出完整结构化报告',
-          expectedTools: ['lookup_knowledge'],
-          status: 'in_progress',
-          summary: '',
-        },
-      ],
-      successCriteria: '输出完整结构化报告',
-      submittedAt: 1,
-      toolCallLog: [],
-    } as any;
-
-    const closed = completePiAgentCoreFinalReportPhaseIfDelivered(
-      plan,
-      '# 启动性能分析报告\n\n## 1. 概览\n冷启动由 ChaosTask 主导。[Evidence:data:skill:startup_analysis:test]',
-      'zh-CN',
-      () => 1234,
-    );
-
-    expect(closed).toBeUndefined();
-    expect(getPiAgentCorePlanCompletionStatus(plan).complete).toBe(false);
+  it('applies the selected quick deadline to the whole run and keeps timeout provenance', async () => {
+    const pendingPrompt = createDeferred<unknown[]>();
+    FakePiAgent.promptHandler = async () => pendingPrompt.promise;
+    FakePiAgent.abortHandler = () => pendingPrompt.resolve([]);
+    const result = await typedRuntime({env: {
+      AGENT_QUICK_MAX_TURNS: '1', AGENT_QUICK_PER_TURN_MS: '100',
+      [PI_AGENT_CORE_REQUEST_TIMEOUT_MS_ENV]: '1000',
+    }}).analyze('bounded', 'typed-pi-deadline', 'trace-pi', {analysisMode: 'fast'});
+    expect(result).toMatchObject({success: false, outputOrigin: 'runtime_fallback',
+      turnIntent: {status: 'resolved'}, completion: {status: 'incomplete', reason: 'timeout'}});
+    expect(sessionContextManager.getOrCreate('typed-pi-deadline', 'trace-pi').getAllTurns()).toHaveLength(0);
   });
+
+  it('cancels native classification without entering the main SDK or publishing a session turn', async () => {
+    const classifier = createDeferred<Record<string, unknown>>();
+    let invoked = false;
+    const mainLoader = jest.fn(async () => ({Agent: FakePiAgent}));
+    const runtime = new PiAgentCoreRuntime(createFakeTraceProcessorService(), {kind: 'pi-agent-core', source: 'env'}, {
+      env: {[PI_AGENT_CORE_MODEL_JSON_ENV]: PI_TEST_MODEL_JSON}, moduleLoader: mainLoader,
+      providerRuntimeLoader: async config => ({model: config.model as any, models: {} as any,
+        streamFn: (() => {invoked = true; return {result: () => classifier.promise};}) as any}),
+    });
+    const pending = runtime.analyze('question', 'typed-pi-cancel-classification', 'trace-pi');
+    await waitUntil(() => invoked);
+    runtime.abortSession('typed-pi-cancel-classification');
+    const result = await pending;
+    expect(result.completion).toMatchObject({status: 'cancelled', reason: 'cancelled'});
+    expect(mainLoader).not.toHaveBeenCalled();
+    classifier.resolve({stopReason: 'stop', content: [{type: 'text', text: JSON.stringify(piClassifierDecision)}]});
+    await delay(1);
+    expect(mainLoader).not.toHaveBeenCalled();
+    expect(sessionContextManager.getOrCreate('typed-pi-cancel-classification', 'trace-pi').getAllTurns()).toHaveLength(0);
+  });
+
+  it('uses terminal stop facts for arbitrary prose, preserves thinking separation, and does not strip a prefix', () => {
+    const text = 'I need to explain why provider_error is an ordinary log value\n## Final Report\nnot a completion token';
+    expect(sanitizePiAgentCoreConclusionText(text)).toBe(text);
+    expect(selectAssistantConclusion([{role: 'assistant', content: [{type: 'thinking', thinking: 'private draft'}]}])).toBe('');
+    const candidate = {runId: 'r', attemptId: 'a', candidateRef: 'r:a', conclusionFingerprint: analysisDeliveryFingerprint(text)};
+    expect(buildPiAnalysisCompletion({runtimeKind: 'pi-agent-core', candidate,
+      assistant: {stopReason: 'stop', content: [{type: 'text', text}]}})).toMatchObject({status: 'completed'});
+    expect(buildPiAnalysisCompletion({runtimeKind: 'pi-agent-core', candidate,
+      assistant: {stopReason: 'length', content: [{type: 'text', text: '# Complete report.'}]}})).toMatchObject({status: 'incomplete', reason: 'output_limit'});
+    expect(buildPiAnalysisCompletion({runtimeKind: 'pi-agent-core', candidate,
+      assistant: {content: [{type: 'text', text: '# Complete report.'}]}})).toMatchObject({status: 'unknown'});
+  });
+
+  it.each([
+    {stopReason: 'aborted', status: 'cancelled', reason: 'cancelled'},
+    {stopReason: 'error', status: 'failed', reason: 'provider_error'},
+  ])('uses structured $stopReason despite identical error text', ({stopReason, status, reason}) => {
+    const candidate = {runId: 'r', attemptId: 'a', candidateRef: 'r:a', conclusionFingerprint: analysisDeliveryFingerprint('')};
+    expect(buildPiAnalysisCompletion({runtimeKind: 'pi-agent-core', candidate,
+      assistant: {stopReason, errorMessage: 'Request was aborted', content: []},
+    })).toMatchObject({status, reason, sdkFinishReason: stopReason});
+  });
+
+  it('binds a shorter unheaded correction to its own successful SDK attempt without reclassifying', async () => {
+    const issue = {type: 'missing_evidence', severity: 'error', message: '任意语言的说明', recoveryKind: 'correct_evidence'};
+    mockClaudeVerifierVerifyConclusion.mockImplementationOnce(async () => ({passed: false, heuristicIssues: [issue], llmIssues: []}))
+      .mockImplementation(async () => ({passed: true, heuristicIssues: [], llmIssues: []}));
+    FakePiAgent.promptHandler = async (agent, _input, index) => {
+      if (index === 2) expect(agent.state.tools).toEqual([]);
+      return [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: index === 1 ? 'Long unverified statement' : 'Bounded finding'}]}];
+    };
+    const result = await typedRuntime().analyze('same question', 'typed-pi-correction', 'trace-pi', {runId: 'r-correction', analysisMode: 'fast'});
+    expect(FakePiAgent.instances[0].promptCount).toBe(2);
+    expect(piClassifierCalls).toHaveLength(1);
+    expect(result).toMatchObject({conclusion: 'Bounded finding', completion: {status: 'completed', runId: 'r-correction', attemptId: '2',
+      conclusionFingerprint: analysisDeliveryFingerprint('Bounded finding')}});
+  });
+
+  it('does not lend an incomplete correction receipt to a previous completed answer', async () => {
+    mockClaudeVerifierVerifyConclusion.mockImplementation(async () => ({passed: false, heuristicIssues: [{
+      type: 'missing_evidence', severity: 'error', message: 'evidence gap', recoveryKind: 'correct_evidence',
+    }], llmIssues: []}));
+    FakePiAgent.promptHandler = async (_agent, _input, index) => [{role: 'assistant',
+      stopReason: index === 1 ? 'stop' : 'length', content: [{type: 'text', text: index === 1 ? 'Original evidence gap' : 'Cut-off replacement'}]}];
+    const result = await typedRuntime().analyze('question', 'typed-pi-failed-correction', 'trace-pi', {runId: 'r-original'});
+    expect(result.conclusion).toBe('Original evidence gap');
+    expect(result.completion).toMatchObject({status: 'completed', attemptId: '1',
+      conclusionFingerprint: analysisDeliveryFingerprint('Original evidence gap')});
+    expect(result.partial).toBe(true);
+  });
+
+  function observePiProjection() {
+    const projection = jest.spyOn(sourceProjectionModule, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const gate = jest.spyOn(qualityGateModule, 'applyFinalResultQualityGate');
+    return {
+      projection, gate,
+      assertReturnedContext(result: unknown) {
+        const projected = projection.mock.results.map(entry => entry.value as ReturnType<typeof sourceProjectionModule.finalizeSourceAwareAnalysisResultWithProjection>)
+          .find(entry => entry?.result === result);
+        const gateInput = gate.mock.calls.map(([input]) => input).find(input => input.result === result);
+        expect(projected).toBeDefined();
+        expect(gateInput?.context).toBe(projected?.deliveryContext);
+        return projected!;
+      },
+      restore() { projection.mockRestore(); gate.mockRestore(); },
+    };
+  }
+
+  it.each([
+    {id: 'zh', body: '当前输出只是讨论内容已隐藏这句话，不代表权限变化'},
+    {id: 'en', body: 'The log contains [PRIVATE_OUTPUT_SUPPRESSED] as ordinary text'},
+  ])('preserves literal privacy wording in a $id native candidate without changing completion', async ({id, body}) => {
+    passVerification();
+    const sessionId = `pi-projection-preserved-${id}`;
+    const observation = observePiProjection();
+    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: body}]}];
+    try {
+      const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi', {runId: `preserved-${id}`});
+      const projected = observation.assertReturnedContext(result);
+      expect(projected.conclusionProjection.disposition).toBe('preserved');
+      expect(result).toMatchObject({success: true, conclusion: body, outputOrigin: 'sdk_final', completion: {
+        status: 'completed', candidateRef: `preserved-${id}:pi:1`, conclusionFingerprint: analysisDeliveryFingerprint(body),
+      }});
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it.each([
+    {id: 'zh', body: '可公开的结论 PRIVATE_PI_CANARY 后续仍有可公开的证据边界'},
+    {id: 'en', body: 'Public observation PRIVATE_PI_CANARY followed by its public scope'},
+  ])('transfers only the matching $id native candidate through an issued redaction receipt', async ({id, body}) => {
+    passVerification();
+    const sessionId = `pi-projection-redacted-${id}`;
+    const observation = observePiProjection();
+    registerCodeAwareCanary(sessionId, 'PRIVATE_PI_CANARY');
+    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: body}]}];
+    try {
+      const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi', {runId: `redacted-${id}`});
+      const projected = observation.assertReturnedContext(result);
+      expect(projected.conclusionProjection).toMatchObject({disposition: 'redacted', inputFingerprint: analysisDeliveryFingerprint(body)});
+      expect(result.conclusion).not.toContain('PRIVATE_PI_CANARY');
+      expect(result.completion).toMatchObject({status: 'completed', runId: `redacted-${id}`, attemptId: '1',
+        conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)});
+      expect(result.completion?.candidateRef).not.toBe(`redacted-${id}:pi:1`);
+      expect(projected.deliveryContext).toMatchObject({acceptedCandidate: result.completion, completion: result.completion, outputOrigin: 'sdk_final'});
+      expect(result.outputOrigin).toBe('sdk_final');
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it.each([
+    {id: 'zh', body: '模型正常结束并输出了完整中文结论'},
+    {id: 'en', body: 'The model successfully delivered this English answer'},
+  ])('does not certify a $id whole-output replacement as SDK completion', async ({id, body}) => {
+    passVerification();
+    const sessionId = `pi-projection-replaced-${id}`;
+    const observation = observePiProjection();
+    FakePiAgent.promptHandler = async () => {
+      revokeCodeAwareOutputGuards(sessionId);
+      return [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: body}]}];
+    };
+    try {
+      const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi', {runId: `replaced-${id}`});
+      const projected = observation.assertReturnedContext(result);
+      expect(projected.conclusionProjection).toMatchObject({disposition: 'replaced', inputFingerprint: analysisDeliveryFingerprint(body)});
+      expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback', completion: {
+        status: 'unknown', runId: `replaced-${id}`, attemptId: '1', conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion),
+      }});
+      expect(projected.deliveryContext).toMatchObject({outputOrigin: 'runtime_fallback', completion: result.completion});
+      expect(result.completion?.candidateRef).not.toBe(`replaced-${id}:pi:1`);
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it('rejects a native empty answer before a retired-session projection can turn it into visible output', async () => {
+    passVerification();
+    const sessionId = 'pi-projection-empty';
+    const observation = observePiProjection();
+    FakePiAgent.promptHandler = async () => {
+      revokeCodeAwareOutputGuards(sessionId);
+      return [{role: 'assistant', stopReason: 'stop', content: []}];
+    };
+    try {
+      const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi');
+      const projected = observation.assertReturnedContext(result);
+      expect(result).toMatchObject({success: false, partial: true, conclusion: ''});
+      expect(projected.conclusionProjection).toMatchObject({disposition: 'preserved', inputFingerprint: analysisDeliveryFingerprint('')});
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it('projects the accepted correction and retains its attempt instead of overwriting it with the initial receipt', async () => {
+    const sessionId = 'pi-projection-correction';
+    const observation = observePiProjection();
+    mockClaudeVerifierVerifyConclusion.mockImplementationOnce(async () => ({passed: false, heuristicIssues: [{
+      type: 'missing_evidence', severity: 'error', message: 'correct this evidence', recoveryKind: 'correct_evidence',
+    }], llmIssues: []})).mockImplementation(async () => ({passed: true, heuristicIssues: [], llmIssues: []}));
+    registerCodeAwareCanary(sessionId, 'PRIVATE_PI_CANARY');
+    const nativeCorrection = 'Corrected evidence PRIVATE_PI_CANARY with a bounded conclusion';
+    FakePiAgent.promptHandler = async (_agent, _input, index) => [{role: 'assistant', stopReason: 'stop',
+      content: [{type: 'text', text: index === 1 ? 'Initial candidate' : nativeCorrection}]}];
+    try {
+      const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi', {runId: 'privacy-correction'});
+      const projected = observation.assertReturnedContext(result);
+      expect(projected.conclusionProjection.inputFingerprint).toBe(analysisDeliveryFingerprint(nativeCorrection));
+      expect(result.completion).toMatchObject({runId: 'privacy-correction', attemptId: '2', status: 'completed',
+        conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)});
+      expect(result.completion?.candidateRef).not.toBe('privacy-correction:pi:2');
+      expect(result.conclusion).not.toContain('PRIVATE_PI_CANARY');
+      expect(projected.deliveryContext).toMatchObject({acceptedCandidate: result.completion, completion: result.completion});
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it('preserves a native provider failure while redacting its body', async () => {
+    passVerification();
+    const sessionId = 'pi-projection-provider-failure';
+    const observation = observePiProjection();
+    registerCodeAwareCanary(sessionId, 'PRIVATE_PI_CANARY');
+    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'error', errorMessage: 'provider unavailable',
+      content: [{type: 'text', text: 'Partial PRIVATE_PI_CANARY observation'}]}];
+    try {
+      const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi');
+      const projected = observation.assertReturnedContext(result);
+      expect(projected.conclusionProjection.disposition).toBe('redacted');
+      expect(result).toMatchObject({success: false, outputOrigin: 'assistant_stream', completion: {status: 'failed', reason: 'provider_error'}});
+      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it('carries the returned replacement context on cancellation without reviving native success', async () => {
+    const sessionId = 'pi-projection-cancelled';
+    const observation = observePiProjection();
+    const released = createDeferred<unknown[]>();
+    FakePiAgent.promptHandler = async () => released.promise;
+    FakePiAgent.abortHandler = () => released.resolve([]);
+    const runtime = typedRuntime();
+    try {
+      const pending = runtime.analyze('context only', sessionId, 'trace-pi');
+      await waitUntil(() => FakePiAgent.instances.length === 1);
+      revokeCodeAwareOutputGuards(sessionId);
+      runtime.abortSession(sessionId);
+      const result = await pending;
+      const projected = observation.assertReturnedContext(result);
+      expect(projected.conclusionProjection.disposition).toBe('replaced');
+      expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback', completion: {status: 'unknown', reason: 'cancelled'}});
+      expect(projected.deliveryContext).toMatchObject({completion: result.completion, outputOrigin: 'runtime_fallback'});
+      expect(sessionContextManager.getOrCreate(sessionId, 'trace-pi').getAllTurns()).toHaveLength(0);
+    } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it('attaches finalization to the exact projected Pi result once and dispatches on the pinned model after runtime settlement', async () => {
+    passVerification();
+    const sessionId = 'pi-finalization-exact-result';
+    const trace = createFakeTraceProcessorService();
+    const runtime = typedRuntime({trace});
+    const readView = jest.spyOn(ArtifactStore.prototype, 'createEvidenceReadView');
+    const observation = observePiProjection();
+    registerCodeAwareCanary(sessionId, 'PRIVATE_PI_CANARY');
+    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'Public PRIVATE_PI_CANARY result'}]}];
+    try {
+      const options = {
+        analysisMode: 'fast' as const, runId: 'pi-finalization-run', referenceTraceId: 'trace-reference',
+        tenantId: 'tenant-pi', workspaceId: 'workspace-pi', userId: 'user-pi',
+        analysisContextFingerprint: 'pi-auth-pin',
+      };
+      const result = await runtime.analyze('context only', sessionId, 'trace-current', options);
+      const projected = observation.assertReturnedContext(result);
+      expect(takeFinalizationContext({...result})).toBeUndefined();
+      const context = takeFinalizationContext(result)!;
+      expect(context).toBeDefined();
+      options.analysisContextFingerprint = 'later-auth-context';
+      const providerQuery = context.getProviderQuery(new AbortController().signal);
+      expect(providerQuery).toEqual({text: 'context only', analysisContextFingerprint: 'pi-auth-pin'});
+      expect(Object.isFrozen(providerQuery)).toBe(true);
+      expect(JSON.stringify(result)).not.toContain('"providerQuery"');
+      expect(takeFinalizationContext(result)).toBeUndefined();
+      expect(context.deliveryContext).toEqual(projected.deliveryContext);
+      expect(context.traceIdentity).toEqual({currentTraceId: 'trace-current', referenceTraceId: 'trace-reference'});
+      expect(readView).toHaveBeenCalledTimes(1);
+      expect(readView.mock.calls[0][0].allowedTraces).toEqual([
+        {traceId: 'trace-current', traceSide: 'current'}, {traceId: 'trace-reference', traceSide: 'reference'},
+      ]);
+      expect(readView.mock.calls[0][0].ownerKey).toBeTruthy();
+      expect(JSON.stringify(result)).not.toContain(readView.mock.calls[0][0].ownerKey);
+      const queriesBefore = trace.query.mock.calls.length;
+      expect(piClassifierCalls).toHaveLength(1);
+      runtime.abortSession(sessionId); // The settled main lease cannot cancel the finalizer's own signal.
+      try {
+        const response = await context.dispatchText({prompt: 'semantic coverage', systemPrompt: '',
+          deadlineMs: Date.now() + 30_000, outputByteLimit: 8192, signal: new AbortController().signal});
+        expect(response.status).toBe('ok');
+        expect(piClassifierCalls).toHaveLength(2);
+        expect(piClassifierCalls[1].model).toBe(FakePiAgent.instances[0].state.model);
+        expect(piClassifierCalls[1].context.tools).toEqual([]);
+        expect(piClassifierCalls[1].context.messages).toHaveLength(1);
+        expect(piClassifierCalls[1].options.maxTokens).toBe(Math.min(FINALIZATION_MAX_OUTPUT_TOKENS, 4096));
+        expect(piClassifierCalls[1].options.maxTokens).toBeGreaterThan(piClassifierCalls[0].options.maxTokens);
+        expect(trace.query.mock.calls.length).toBe(queriesBefore);
+        expect(FakePiAgent.instances).toHaveLength(1);
+      } finally { context.dispose(); }
+    } finally { observation.restore(); readView.mockRestore(); clearCodeAwareOutputGuards(sessionId); }
+  });
+
+  it('retains the original selected absolute Pi deadline instead of starting a new finalization budget', async () => {
+    passVerification();
+    const beforeRun = Date.now();
+    FakePiAgent.promptHandler = async () => {
+      await delay(20);
+      return [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'Complete answer'}]}];
+    };
+    const result = await typedRuntime({env: {
+      AGENT_QUICK_MAX_TURNS: '1', AGENT_QUICK_PER_TURN_MS: '1000',
+      [PI_AGENT_CORE_REQUEST_TIMEOUT_MS_ENV]: '5000',
+    }}).analyze('question', 'pi-finalization-deadline', 'trace-pi', {analysisMode: 'fast'});
+    const context = takeFinalizationContext(result)!;
+    try {
+      expect(context).toBeDefined();
+      expect(context.deadlineMs).toBeGreaterThanOrEqual(beforeRun + 1000);
+      expect(context.deadlineMs).toBeLessThan(Date.now() + 1000);
+    } finally { context.dispose(); }
+  });
+
+  it('attaches a cancelled Pi run with its typed state and no transport that could restart provider work', async () => {
+    const sessionId = 'pi-finalization-cancelled';
+    const released = createDeferred<unknown[]>();
+    FakePiAgent.promptHandler = async () => released.promise;
+    FakePiAgent.abortHandler = () => released.resolve([]);
+    const runtime = typedRuntime();
+    const pending = runtime.analyze('question', sessionId, 'trace-pi', {runId: 'pi-cancelled-run'});
+    await waitUntil(() => FakePiAgent.instances.length === 1);
+    runtime.abortSession(sessionId);
+    const result = await pending;
+    const context = takeFinalizationContext(result)!;
+    expect(context).toBeDefined();
+    try {
+      expect(context.runId).toBe('pi-cancelled-run');
+      expect(context.hasSemanticTransport).toBe(false);
+      expect(context.deliveryContext).toMatchObject({completion: result.completion});
+      expect(await context.dispatchText({prompt: 'must not dispatch', systemPrompt: '',
+        deadlineMs: Date.now() + 30_000, outputByteLimit: 8192, signal: new AbortController().signal}))
+        .toMatchObject({status: 'unavailable', reason: 'invalid_configuration'});
+      expect(piClassifierCalls).toHaveLength(1);
+    } finally { context.dispose(); }
+  });
+
+  it('does not attach invented semantic state to the explicit Pi smoke path', async () => {
+    const result = await typedRuntime({env: {[PI_AGENT_CORE_FAKE_STREAM_ENV]: '1'}})
+      .analyze('smoke', 'pi-finalization-smoke', 'trace-pi');
+    expect(takeFinalizationContext(result)).toBeUndefined();
+  });
+
+  it('preserves an explicit full budget on the conversation surface without widening a bounded request', async () => {
+    passVerification();
+    const trace = createFakeTraceProcessorService();
+    const result = await typedRuntime({trace}).analyze('bounded follow-up', 'pi-full-conversation-budget', 'trace-pi', {
+      analysisMode: 'full', assistantSurface: 'conversation', conversationTraceAttached: true,
+    });
+    expect(result.turnIntent).toMatchObject({scope: 'bounded_question', deliverable: 'answer'});
+    expect(result.quickRun).toBeUndefined();
+    expect(FakePiAgent.instances[0].promptCount).toBe(1);
+    expect(trace.query).not.toHaveBeenCalled();
+    expect(result.completion?.status).toBe('completed');
+  });
+
 });

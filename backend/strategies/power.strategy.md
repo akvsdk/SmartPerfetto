@@ -3,6 +3,7 @@
 
 ---
 scene: power
+classification_description: "Energy use, battery drain, thermal behavior and resource activity associated with power consumption."
 priority: 4
 effort: medium
 required_capabilities:
@@ -51,11 +52,9 @@ final_report_contract:
     - id: job_work_fgs_governance_boundary
       label: Job/Work/FGS 治理边界
       description: '当问题涉及 JobScheduler、WorkManager、Foreground Service、UIDT 或 Android 16 quota 时，区分 trace 事件、app/API 诊断、pending reason、stop reason、版本/状态边界和缺失证据。'
-      trigger_patterns:
-        - 'JobScheduler|WorkManager|Foreground Service|\bFGS\b|foreground worker|JobParameters|WorkInfo|UIDT|user[- ]initiated data transfer'
-        - 'pending\s+reason|stop\s+reason|getPendingJobReasons?|getPendingJobReasonStats|getStopReason|runtime\s+quota|job\s+quota|standby\s+bucket|expedited\s+job'
-        - 'Android\s*1[56].*(?:quota|foreground service|JobScheduler|WorkManager|FGS|timeout)'
-        - 'dataSync|mediaProcessing|shortService|Service\.onTimeout|前台服务|前景服务|后台任务|作业调度'
+      condition:
+        kind: semantic
+        description: '当问题涉及后台任务、前台服务或用户发起传输的执行限制、配额、等待或停止原因时适用。'
       pattern_groups:
         - ['Job/Work/FGS', 'JobScheduler', 'WorkManager', 'Foreground Service', '\bFGS\b', 'UIDT', 'user[- ]initiated', '后台执行', 'background execution']
         - ['pending reason', 'stop reason', 'getPendingJobReason', 'getPendingJobReasons', 'getPendingJobReasonStats', 'getStopReason', 'runtime quota', 'job quota', '\bquota\b', 'standby bucket', 'timeout', 'Service\.onTimeout']
@@ -63,10 +62,9 @@ final_report_contract:
     - id: alarm_wakeup_vitals_boundary
       label: Alarm/Wakeup/Vitals 边界
       description: '当问题涉及 AlarmManager、wakeup、allow-while-idle、wakelock 或 Android/Play Vitals 时，区分本地 trace 窗口、Alarm API/权限证据、24h 聚合阈值和缺失数据。'
-      trigger_patterns:
-        - 'allow[- ]while[- ]idle|setExactAndAllowWhileIdle|exact alarm|AlarmManager|wakeup alarm|excessive wakeups'
-        - 'wakelock|wake lock|partial wakelock|Android vitals|Play vitals|stuck partial|excessive partial|Vitals'
-        - '\bwakeups?\b|唤醒'
+      condition:
+        kind: semantic
+        description: '当问题要求分析定时唤醒、持锁耗电、待机限制，或解释这类问题在外部质量平台上的聚合指标时适用。'
       pattern_groups:
         - ['Alarm/Wakeup/Vitals', 'AlarmManager', 'exact alarm', 'allow[- ]while[- ]idle', 'setExactAndAllowWhileIdle', 'wakeup', 'wakeups?', 'wakelock', 'wake lock', 'partial wakelock', 'vitals']
         - ['24h', '2h', '1h', 'one hour', 'two hours', 'observed window', 'trace window', '局部', '24\s*小时', '2\s*小时', '1\s*小时', '观测窗口', 'Play vitals', 'Android vitals', 'excessive', 'stuck']

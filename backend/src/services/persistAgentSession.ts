@@ -41,7 +41,10 @@ import {
   projectPrivateSessionStateSnapshot,
   projectPrivateTerminationMessage,
   sessionUsesPrivateKnowledge,
+  copyAnalysisResultForSnapshot,
+  projectPrivateAnalysisResult,
 } from './security/privateAnalysisProjection';
+import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import {
   getSessionBackgroundKnowledgeReferences,
 } from './androidInternalsPack/sessionBackgroundKnowledgeRegistry';
@@ -118,13 +121,7 @@ export interface PersistAgentTurnInput {
   sessionId: string;
   traceId: string;
   query: string;
-  result: {
-    conclusion: string;
-    totalDurationMs: number;
-    partial?: boolean;
-    terminationMessage?: string;
-    analysisReceipt?: import('../types/dataContract').AnalysisReceipt;
-  };
+  result: Pick<AnalysisResult, 'conclusion' | 'totalDurationMs'> & Partial<AnalysisResult>;
   /** Optional structured logger (HTTP route provides SessionLogger; CLI
    *  currently doesn't wire one through — `console` fallback is fine). */
   logger?: {
@@ -257,6 +254,15 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
     ? projectPrivateDataEnvelopes(sessionId, (session.dataEnvelopes || []) as DataEnvelope[])
     : (session.dataEnvelopes || []) as DataEnvelope[];
   const traceSummary = sanitizeStoredTraceSummaryAttribution(session.traceSummary);
+  // Older adapters may provide only message text. They cannot borrow a prior
+  // session result to manufacture current completion or verification metadata.
+  const finalResult = result.sessionId === sessionId && typeof result.success === 'boolean' &&
+    Array.isArray(result.findings) && Array.isArray(result.hypotheses) &&
+    typeof result.confidence === 'number' && typeof result.rounds === 'number'
+    ? privateKnowledge
+      ? projectPrivateAnalysisResult(sessionId, result as AnalysisResult, outputLanguage)
+      : copyAnalysisResultForSnapshot(result as AnalysisResult)
+    : undefined;
 
   try {
     const sessionContext = sessionContextManager.get(sessionId, traceId);
@@ -267,9 +273,10 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
           referenceTraceId: session.referenceTraceId,
           comparisonSource: session.comparisonSource,
           comparisonReportSection: session.comparisonReportSection,
-          ...(session.result?.analysisReceipt
-            ? {analysisReceipt: session.result.analysisReceipt}
+          ...(result.analysisReceipt
+            ? {analysisReceipt: result.analysisReceipt}
             : {}),
+          ...(finalResult ? {finalResult} : {}),
           ...(traceSummary ? {traceSummary} : {}),
           conversationSteps: session.conversationSteps || [],
           queryHistory: session.queryHistory || [],
@@ -277,9 +284,11 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
           agentDialogue: session.agentDialogue || [],
           agentResponses: session.agentResponses || [],
           dataEnvelopes: durableDataEnvelopes,
-          claimSupport: session.result?.claimSupport || (session as any).claimSupport,
-          claimVerificationResult: session.result?.claimVerificationResult || (session as any).claimVerificationResult,
-          identityResolutions: session.result?.identityResolutions || (session as any).identityResolutions,
+          claimSupport: finalResult?.claimSupport,
+          claimVerificationResult: finalResult?.claimVerificationResult,
+          sourceClaimVerificationResult: finalResult?.sourceClaimVerificationResult,
+          sourceUseDecision: finalResult?.sourceUseDecision,
+          identityResolutions: finalResult?.identityResolutions,
           hypotheses: session.hypotheses || [],
             agentRuntimeProviderId: session.providerId,
             agentRuntimeProviderSnapshotHash: session.providerSnapshotHash,

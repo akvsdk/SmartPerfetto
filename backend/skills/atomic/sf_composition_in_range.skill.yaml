@@ -59,6 +59,9 @@ display:
       type: duration
       format: duration_ms
 
+process_scope:
+  role: peer_context
+
 sql: |
   WITH sf_slices AS (
     SELECT

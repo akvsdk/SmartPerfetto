@@ -2,12 +2,13 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import { describe, expect, it } from '@jest/globals';
+import { describe, expect, it, jest } from '@jest/globals';
 import {
   buildAnalysisReceipt,
   buildLegacyAnalysisReceipt,
 } from '../analysisReceiptBuilder';
-import type { QuickRunReceipt } from '../../agent/core/orchestratorTypes';
+import type { AgentRuntimeAnalysisResult, QuickRunReceipt } from '../../agent/core/orchestratorTypes';
+import * as finalReportContractGate from '../finalReportContractGate';
 import type { ClaimVerificationResult } from '../../types/claimVerification';
 import type { ClaimSupportV1 } from '../../types/evidenceContract';
 import type { DataEnvelope } from '../../types/dataContract';
@@ -176,6 +177,71 @@ const verification: ClaimVerificationResult = {
 };
 
 describe('buildAnalysisReceipt', () => {
+  it.each([
+    ['passed', 'passed'],
+    ['not_applicable', 'not_applicable'],
+    ['not_checked', 'partial'],
+    ['unavailable', 'partial'],
+    ['coverage_incomplete', 'partial'],
+    ['failed', 'partial'],
+  ] as const)('projects exact %s assurance into the legacy %s receipt summary without changing delivery', (status, expected) => {
+    const result: AgentRuntimeAnalysisResult = {
+      sessionId: 'assured-run', success: true, partial: false, conclusion: 'A bounded answer.',
+      findings: [], hypotheses: [], confidence: 0.8, rounds: 1, totalDurationMs: 10,
+      quickRun,
+      deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'passed',
+        claims: status, source: 'not_checked', identity: status, report: status},
+    };
+    const before = structuredClone(result);
+    const assurance = result.deliveryAssurance;
+    const receipt = buildAnalysisReceipt({
+      runManifestId: 'assured-manifest', session: {sessionId: 'assured-session', traceId: 'trace-1'}, result,
+      qualityArtifacts: {
+        claimVerificationResult: {...verification, status: 'passed', passed: true,
+          checkedClaimCount: 1, unsupportedClaimCount: 0, claimResults: [{claimId: 'raw-claim', status: 'verified'}]},
+        identityResolutions: [{version: 'identity_contract@1', identityRefId: 'raw-identity',
+          target: {traceId: 'trace-1', source: 'derived'}, status: 'verified', processes: [], threads: [], warnings: []}],
+      },
+    });
+    expect(receipt.qualityGates).toEqual({
+      finalReportContract: expected, claimVerification: expected, identityResolution: expected,
+    });
+    expect(receipt.claimAudit).toEqual({totalClaims: 1, verifiedClaims: 1, unsupportedClaims: 0, uncertainClaims: 0});
+    expect(result).toEqual(before);
+    expect(result.deliveryAssurance).toBe(assurance);
+  });
+
+  it.each(['current', 'legacy'] as const)(
+    'projects supplied assurance for %s receipts without re-running report interpretation', kind => {
+      const applicability = jest.spyOn(finalReportContractGate, 'assessFinalReportContractApplicability');
+      const completeness = jest.spyOn(finalReportContractGate, 'assessFinalReportContractCompleteness');
+      try {
+        const result: AgentRuntimeAnalysisResult = {
+          sessionId: 'assured-run', success: true, conclusion: 'The answer does not use standard report headings.',
+          findings: [], hypotheses: [], confidence: 0.8, rounds: 1, totalDurationMs: 10,
+          conclusionContract: {schemaVersion: 'conclusion_contract_v1', mode: 'initial_report',
+            conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], metadata: {sceneId: 'startup'}},
+          deliveryAssurance: {schemaVersion: 1, entry: kind === 'legacy' ? 'historical_restore' : 'new_finalization',
+            completion: 'passed', claims: 'not_checked', source: 'unavailable', identity: 'not_applicable', report: 'passed'},
+        };
+        const before = structuredClone(result);
+        const input = {runManifestId: 'assured-manifest', result, sceneType: 'startup' as const,
+          session: {sessionId: 'assured-session', traceId: 'trace-1', query: 'debug cold start first frame', analysisMode: 'full' as const}};
+        const receipt = kind === 'legacy' ? buildLegacyAnalysisReceipt(input) : buildAnalysisReceipt(input);
+        expect(receipt.qualityGates).toEqual({
+          finalReportContract: 'passed', claimVerification: 'partial', identityResolution: 'not_applicable',
+        });
+        expect(applicability).not.toHaveBeenCalled();
+        expect(completeness).not.toHaveBeenCalled();
+        expect(result).toEqual(before);
+        expect(result.partial).toBeUndefined();
+      } finally {
+        applicability.mockRestore();
+        completeness.mockRestore();
+      }
+    },
+  );
+
   it('stores only sanitized capability manifest attribution without changing legacy fields', () => {
     const canary = '/private/RECEIPT_CAPABILITY_CANARY';
     const receipt = buildAnalysisReceipt({
@@ -362,7 +428,7 @@ describe('buildAnalysisReceipt', () => {
     expect(receipt.outputs).toEqual({ reportError: 'report failed' });
   });
 
-  it('marks generated reports partial when the final report contract is incomplete', () => {
+  it('projects a finalized report assessment into the generated report receipt', () => {
     const receipt = buildAnalysisReceipt({
       runManifestId: 'manifest-receipt-3',
       session: {
@@ -378,6 +444,8 @@ describe('buildAnalysisReceipt', () => {
         findings: [],
         hypotheses: [],
         conclusion: 'The launch is slow, but the report omits the required startup sections.',
+        deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'passed',
+          report: 'not_checked', claims: 'not_applicable', identity: 'not_applicable', source: 'not_applicable'},
         conclusionContract: {
           schemaVersion: 'conclusion_contract_v1',
           mode: 'initial_report',

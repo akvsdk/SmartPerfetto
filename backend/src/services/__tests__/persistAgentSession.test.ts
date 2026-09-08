@@ -14,8 +14,37 @@ import { createDataEnvelope } from '../../types/dataContract';
 import {CodeLookupLedger} from '../codebase/codeLookupLedger';
 import {SOURCE_USE_DECISION_SCHEMA_VERSION} from '../codebase/sourceUseDecision';
 import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../security/codeAwareOutputRegistry';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 
 describe('persistAgentTurn', () => {
+  it('attaches only the complete current result and matching quality fields to the snapshot', () => {
+    const save = jest.fn(() => true);
+    const takeSnapshot = jest.fn((_sessionId: string, _traceId: string, fields: Record<string, unknown>) => ({
+      version: 1, sessionId: 'session-current-result', traceId: 'trace-current-result', snapshotTimestamp: 1,
+      ...fields, analysisNotes: [], analysisPlan: null, planHistory: [], uncertaintyFlags: [],
+    }));
+    jest.spyOn(SessionPersistenceService, 'getInstance').mockReturnValue({saveSessionStateSnapshot: save} as any);
+    const sessionId = 'session-current-result';
+    const body = 'Current final body without report headings';
+    const current = {sessionId, success: true, findings: [], hypotheses: [], conclusion: body, confidence: 0.6, rounds: 1, totalDurationMs: 10,
+      completion: {schemaVersion: 1 as const, runtimeKind: 'openai-agents-sdk' as const, status: 'completed' as const,
+        candidateRef: 'candidate-current', runId: 'run-current', attemptId: 'attempt-current', conclusionFingerprint: analysisDeliveryFingerprint(body)},
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2' as const, status: 'not_checked' as const, policy: 'record_only' as const,
+        passed: false, checkedClaimCount: 0, unsupportedClaimCount: 0, claimResults: [], issues: []}};
+    const session = {sessionId, traceId: 'trace-current-result', orchestrator: {takeSnapshot},
+      result: {...current, conclusion: 'Old body', claimVerificationResult: {...current.claimVerificationResult, status: 'passed'}},
+      hypotheses: [], dataEnvelopes: [], createdAt: 1};
+    refreshPersistedAgentSnapshot({session: session as any, sessionId, traceId: session.traceId, query: 'current query', result: current});
+    expect((save.mock.calls[0] as unknown[])[1]).toMatchObject({finalResult: current, claimVerificationResult: current.claimVerificationResult});
+    expect(takeSnapshot.mock.calls[0][2].claimSupport).toBeUndefined();
+    refreshPersistedAgentSnapshot({session: session as any, sessionId, traceId: session.traceId, query: 'legacy query',
+      result: {conclusion: 'Legacy message only', totalDurationMs: 10}});
+    const historical = (save.mock.calls[1] as unknown[])[1] as Record<string, unknown>;
+    expect(historical).not.toHaveProperty('finalResult');
+    expect(historical.claimVerificationResult).toBeUndefined();
+  });
+
   afterEach(() => {
     jest.restoreAllMocks();
     sessionContextManager.remove('session-partial-message');
@@ -430,13 +459,17 @@ describe('persistAgentTurn', () => {
       createdAt: 1, orchestrator: {takeSnapshot}, traceSummary,
       result: {success: true},
     } as any;
-    const input = {
-      sessionId, traceId, query: 'summary',
-      result: {conclusion: 'done', totalDurationMs: 1}, session,
-    };
+    const result: AnalysisResult = {sessionId, success: true, findings: [], hypotheses: [], confidence: 0.5, rounds: 1,
+      conclusion: 'done', totalDurationMs: 1};
+    const input = {sessionId, traceId, query: 'summary', result, session};
 
     persistAgentTurn(input);
-    session.result.analysisReceipt = {schemaVersion: 2, runManifestId: 'manifest-final'};
+    input.result.analysisReceipt = {schemaVersion: 2, runManifestId: 'manifest-final', runId: 'run-final', sessionId, traceId,
+      mode: 'fast', resolvedMode: 'quick', providerId: null, generatedAt: 1,
+      traceEvidence: {sqlCount: 0, skillCount: 0, dataEnvelopeCount: 0, artifactCount: 0, evidenceRefCount: 0},
+      nonEvidenceContext: {frontendPrequeryCount: 0, memoryHintCount: 0, conversationContextCount: 0, strategyHintCount: 0},
+      claimAudit: {totalClaims: 0, verifiedClaims: 0, unsupportedClaims: 0, uncertainClaims: 0},
+      qualityGates: {finalReportContract: 'not_applicable', claimVerification: 'partial', identityResolution: 'not_applicable'}, outputs: {}};
     refreshPersistedAgentSnapshot(input);
 
     expect(saveSessionStateSnapshot).toHaveBeenCalledTimes(2);
@@ -446,6 +479,7 @@ describe('persistAgentTurn', () => {
     expect(first.traceSummary).toEqual(expect.objectContaining({status: 'ready'}));
     expect(first).not.toHaveProperty('analysisReceipt');
     expect(second.analysisReceipt).toEqual(expect.objectContaining({runManifestId: 'manifest-final'}));
+    expect(second.finalResult.analysisReceipt).toEqual(input.result.analysisReceipt);
     expect(second.traceSummary).toEqual(expect.objectContaining({resultDigestSha256: 'd'.repeat(64)}));
     expect(JSON.stringify(second)).not.toContain('/private/summary');
   });

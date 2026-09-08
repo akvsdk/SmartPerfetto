@@ -75,7 +75,7 @@ backend 与 frontend。
 | External Android knowledge | `backend/src/services/androidInternalsWiki/`, `externalKnowledgeSourceRegistry.ts`, `ragStore.ts` | 外部 Wiki 全库审计、版本/指纹、分代索引、许可/同意/scope 和私有内容投影 |
 | Trace processor | `backend/src/services/traceProcessorService.ts` | trace 加载、RPC 管理、SQL 查询 |
 | Reports | `backend/src/services/htmlReportGenerator.ts` | HTML 报告生成 |
-| Result quality pipeline | `backend/src/services/agentResultNormalizer.ts`, `finalReportContractGate.ts`, `evidence/`, `verifier/`, `analysisResultSnapshotPipeline.ts` | final report contract、evidence/claim verification、identity resolution、snapshot |
+| Result quality pipeline | `backend/src/services/canonicalAnalysisResult.ts`, `finalizeAnalysisResult.ts`, `finalSemanticAssessment.ts`, `evidence/`, `verifier/`, `analysisResultSnapshotPipeline.ts` | 原命题、原始采集、有限证明与最多一次语义审核，统一 finalization 后投影/持久化 |
 | CLI | `backend/src/cli-user/` | `smp` / `smartperfetto` 命令、session/history/report export |
 | Comparison services | `backend/src/services/comparison*Service.ts` | Raw trace 与 analysis-result 对比共享证据/报告 contract |
 
@@ -144,7 +144,9 @@ Session 和数据库所有权为准；前端请求头只是传输上下文，不
       -> AgentAnalyzeSessionService.prepareSession()
       -> createAgentOrchestrator()
       -> selected runtime analyze()
-      -> shared TraceCompleteness probe
+      -> native typed intent -> scope / evidence access / budget / deliverable
+      -> eligible automatic prefetch or on-demand context
+         -> shared TraceCompleteness probe when requested
          -> shadow capability_manifest@1 probe-time snapshot
 
 3. Agent 获取证据
@@ -158,26 +160,27 @@ Session 和数据库所有权为准；前端请求头只是传输上下文，不
          -> request source allowlist + live registry consent/scope check
          -> active RAG generation -> bounded attributed background context
       （两种 Android Internals 来源都不是当前 trace 证据）
-      -> selected codebase + source-investigation policy
-         -> record_source_use_decision（查询前结构化 stop）
+      -> selected codebase + live authorization + on-demand source access
+         -> record_source_use_decision（显式结构化状态，不是强制前置步骤）
          -> search_codebase / read_codebase_file（live root，不要求索引）
       -> resolve_symbol / lookup_app_source / lookup_aosp_source / lookup_kernel_source
          -> LookupResponseFilter -> CodeRef metadata
       -> propose_patch -> PatchProposer -> verified / sketch / unverified
 
-4. 结果归一化与质量产物
-   raw runtime result -> agentResultNormalizer
-      -> final_report_contract gate
-      -> evidence contract / claim verification / identity resolutions
+4. 产品层唯一 finalization
+   exact runtime result + private context -> finalizeAnalysisResult
+      -> canonical body + original claims + retained execution capture
+      -> finite proof + at most one no-tool semantic review
+      -> completion / report / claim / identity assessments
       -> SourceUseDecision + source claim binding verification
       -> QueryReviewV1（查询可审查元数据，不是独立证据）
 
 5. 后端流式输出
-   SDK/server events -> runtime bridge -> StreamProjector -> SSE
+   SDK/server events -> runtime bridge -> privacy/narrative projection -> SSE
       -> frontend renders progress, tables, thought, answer tokens
 
 6. 结束与报告
-   conclusion -> analysis_completed -> canonical safe source/CodeRef/patch metadata
+   finalized result -> analysis_completed -> canonical safe source/CodeRef/patch metadata
       -> AnalysisReceiptV2（包含 runManifestId）
       -> HTML report + CLI artifacts + analysis-result snapshot
       -> /api/reports/:id
@@ -254,19 +257,30 @@ SmartPerfetto 的最终回答不是单一 Markdown 字符串，而是一组共�
 
 | 产物 | 消费者 | 边界 |
 |---|---|---|
-| visible chat conclusion | 前端 AI panel | 保持可读，隐藏低价值 SQL/appendix/audit 噪音 |
+| visible chat conclusion | 前端 AI panel | 投影 canonical 正文与真实 machine sidecar；runtime appendix 单列，不机械删改正文 |
 | HTML report | 浏览器、导出、分享 | 保留 evidence、claim verification、identity resolution 和 appendix |
 | CLI artifacts | `smp run` / `smp ask` / `smp capture --analyze` / `smp report` | 持久化 turn、report、claim verification 和 identity files |
 | analysis-result snapshot | 多结果对比、历史回看 | 保存 conclusion contract、claim support、verification 和 identity metadata |
 | Query Review | AI panel、HTML report、Artifact | 说明实际查询的读取、过滤、输出和限制；固定为 review metadata，不能单独支撑诊断结论 |
 | Analysis Receipt | AI panel、HTML report、CLI、snapshot | 绑定 run/session/trace/runtime，汇总证据计数、claim audit、质量门禁和实际输出 |
 | Source Use Decision / Binding | AI panel 回执、HTML report、CLI、snapshot、API | 记录 selected/queried/used、status/coverage 和 trace-to-mechanism 绑定；Web 投影不保留 `CodeRef` |
+| Terminal / delivery metadata | SSE、report、CLI、snapshot | native completion、intent、output origin、report assessment 和 delivery assurance 分开记录；缺失历史字段不等于通过 |
 
 这些结构的字段和投影规则以
 [Data Contract](../../backend/docs/DATA_CONTRACT_DESIGN.md) 为准。不同表面可以压缩显示，
 但不能把 Query Review 提升成证据，也不能把 Receipt 的 `partial`/`not_applicable` 显示为通过。
 
 修复结论质量时先确认是哪一层出了问题：runtime 产物、contract/gate、evidence/verification、report 生成、snapshot，还是 frontend projection。不要为了让聊天更干净而删除报告或 snapshot 需要的来源信息。
+
+typed intent 的预算、范围、交付物和证据访问彼此独立，声明有效不等于真实或已授权。
+`existing_only` 严禁新采集，`read_new` 仍受原请求权限限制；计划和源码访问按需进行。
+finalizer 保留原命题，在原 deadline、pinned provider 和 owner/授权约束内最多执行一次
+无工具语义审核。有限证明目录以源码为准，不能把一般因果关系或未知字段解释成已证明。
+
+Conversation 可以在同一逻辑 session 的精确 trace/授权/owner scope 内保留原始采集，
+而每轮物理 run/session 保持唯一。模型只得到有界 artifact 定位目录；旧取消、回调和
+cleanup 不影响下一轮。历史读取只投影已有结果，不重跑审核，也不能从 snapshot 恢复
+原始 witness。详细生命周期见 [Agent Runtime 架构](agent-runtime.md)。
 
 ## 对比模式
 

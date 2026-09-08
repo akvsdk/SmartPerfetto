@@ -15,161 +15,94 @@ const authorized = {
   codebaseIds: ['app'],
 };
 
+const validPolicy = {
+  schema_version: 'analysis_source_activation_policy@2',
+  bounded_explicit: {max_search_calls: 1, max_read_calls: 2, max_duration_ms: 6000},
+  safe_replay: {max_turns: 6, max_chars_per_entry: 1200},
+};
+
 describe('analysis source activation policy', () => {
-  it('loads the bounded budget from the strategy asset', () => {
-    expect(loadAnalysisSourceActivationPolicy().boundedExplicit).toEqual({
-      maxSearchCalls: 1,
-      maxReadCalls: 2,
-      maxDurationMs: 6_000,
-    });
-    expect(loadAnalysisSourceActivationPolicy().safeReplay).toEqual({
-      maxTurns: 6,
-      maxCharsPerEntry: 1200,
+  it('loads optional source budgets and safe replay limits without an intent controller', () => {
+    expect(loadAnalysisSourceActivationPolicy()).toEqual({
+      schemaVersion: 'analysis_source_activation_policy@2',
+      boundedExplicit: {maxSearchCalls: 1, maxReadCalls: 2, maxDurationMs: 6_000},
+      safeReplay: {maxTurns: 6, maxCharsPerEntry: 1200},
     });
     expect(boundedAnalysisSourceUsePolicy()).toEqual({
-      phase: 'explicit',
-      maxSearchCalls: 1,
-      maxReadCalls: 2,
-      maxDurationMs: 6_000,
+      phase: 'explicit', maxSearchCalls: 1, maxReadCalls: 2, maxDurationMs: 6_000,
     });
   });
 
   it.each(['fast', 'auto', 'full'] as const)(
-    'keeps ordinary %s analysis source-dormant after authorization',
+    'keeps authorized source available in the primary %s run regardless of wording',
     analysisMode => {
-      expect(resolveAnalysisSourceActivation({
-        ...authorized,
-        analysisMode,
-        query: '分析这段 trace 的卡顿根因',
-      })).toBe('dormant');
+      for (const query of [
+        '分析这段 trace 的卡顿根因',
+        '这类卡顿用什么分析方法',
+        '这段逻辑在哪个源码文件',
+        'Foo::bar 的实现在哪里',
+        '完整审查整个源码并给出结论',
+        'What caused this delay?',
+        '',
+      ]) {
+        expect(resolveAnalysisSourceActivation({...authorized, analysisMode, query})).toBe('bounded_explicit');
+      }
     },
   );
 
   it.each([
-    '这类卡顿用什么分析方法',
-    '应该用什么方法分析掉帧',
-    '这类问题怎么排查',
-  ])('keeps ordinary Chinese analysis wording source-dormant: %s', query => {
-    for (const analysisMode of ['fast', 'auto', 'full'] as const) {
-      expect(resolveAnalysisSourceActivation({
-        ...authorized,
-        analysisMode,
-        query,
-      })).toBe('dormant');
-    }
-  });
-
-  it.each([
-    '定位到具体函数和调用链',
-    '这段逻辑在哪个源码文件',
-    '哪个函数负责处理这个回调',
-    'Foo::bar 的实现在哪里',
-  ])('keeps explicit source wording active: %s', query => {
+    {codeAwareMode: 'off' as const, codebaseIds: ['app'], hasAuthorizedCodebase: true},
+    {codeAwareMode: 'provider_send' as const, codebaseIds: [], hasAuthorizedCodebase: true},
+    {codebaseIds: ['app'], hasAuthorizedCodebase: true},
+    {codeAwareMode: 'metadata_only' as const, hasAuthorizedCodebase: true},
+    {...authorized, hasAuthorizedCodebase: false},
+    {},
+  ])('does not authorize source from prose or a boolean alone: %j', selection => {
     expect(resolveAnalysisSourceActivation({
-      ...authorized,
-      analysisMode: 'fast',
-      query,
-    })).toBe('bounded_explicit');
-  });
-
-  it.each(['fast', 'auto', 'full'] as const)(
-    'uses the bounded source path for explicit %s source questions',
-    analysisMode => {
-      expect(resolveAnalysisSourceActivation({
-        ...authorized,
-        analysisMode,
-        query: '定位到具体函数和调用链',
-      })).toBe('bounded_explicit');
-    },
-  );
-
-  it('admits deep source review only for an explicitly full request', () => {
-    expect(resolveAnalysisSourceActivation({
-      ...authorized,
-      analysisMode: 'full',
-      query: '完整审查整个源码并给出结论',
-    })).toBe('deep_supplement');
-    expect(resolveAnalysisSourceActivation({
-      ...authorized,
-      analysisMode: 'auto',
-      query: '完整审查整个源码并给出结论',
-    })).toBe('bounded_explicit');
-  });
-
-  it('keeps every request dormant without an authorized codebase', () => {
-    expect(resolveAnalysisSourceActivation({
-      analysisMode: 'full',
-      query: '完整审查整个源码',
-      codeAwareMode: 'off',
-      codebaseIds: ['app'],
+      ...selection, analysisMode: 'full', query: '完整审查整个源码 Foo::bar',
     })).toBe('dormant');
   });
 
-  it('removes source capability from dormant and deep primary runs', () => {
-    const options = {
-      analysisMode: 'full' as const,
-      ...authorized,
-      knowledgeSourceIds: ['wiki'],
-      analysisContextFingerprint: 'authorization',
-    };
-    for (const activation of ['dormant', 'deep_supplement'] as const) {
-      expect(projectPrimaryAnalysisOptions(options, activation)).toEqual({
-        analysisMode: 'full',
-        codeAwareMode: 'off',
-        codebaseIds: undefined,
+  it('keeps metadata-only source available without granting provider-send access', () => {
+    expect(resolveAnalysisSourceActivation({
+      codeAwareMode: 'metadata_only', codebaseIds: ['app'], query: '继续',
+    })).toBe('bounded_explicit');
+  });
+
+  it.each(['dormant', 'bounded_explicit', 'deep_supplement'] as const)(
+    'preserves caller authorization and policy for the %s historical activation value',
+    activation => {
+      const options = {
+        analysisMode: 'full' as const,
+        ...authorized,
         knowledgeSourceIds: ['wiki'],
-        sourceUsePolicy: undefined,
-        analysisContextFingerprint: undefined,
-      });
-    }
+        analysisContextFingerprint: 'authorization',
+        sourceUsePolicy: {phase: 'explicit' as const, maxSearchCalls: 4, maxReadCalls: 7, maxDurationMs: 19_000},
+        taskTimeoutMs: 27_000,
+      };
+      expect(projectPrimaryAnalysisOptions(options, activation)).toBe(options);
+      expect(projectPrimaryAnalysisOptions(options, activation).sourceUsePolicy).toBe(options.sourceUsePolicy);
+    },
+  );
+
+  it('does not inject a source policy that would narrow the MCP tool surface', () => {
+    const options = {...authorized, analysisContextFingerprint: 'authorization'};
+    expect(projectPrimaryAnalysisOptions(options, 'bounded_explicit')).toBe(options);
+    expect(projectPrimaryAnalysisOptions(options, 'bounded_explicit')).not.toHaveProperty('sourceUsePolicy');
   });
 
-  it('preserves authorization only for bounded explicit primary runs', () => {
-    expect(projectPrimaryAnalysisOptions({
-      analysisMode: 'full',
-      ...authorized,
-      analysisContextFingerprint: 'authorization',
-    }, 'bounded_explicit')).toMatchObject({
-      analysisMode: 'full',
-      ...authorized,
-      analysisContextFingerprint: 'authorization',
-      sourceUsePolicy: {
-        phase: 'explicit',
-        maxSearchCalls: 1,
-        maxReadCalls: 2,
-        maxDurationMs: 6_000,
-      },
-    });
-  });
-
-  it('fails closed on malformed policy budgets and regexes', () => {
+  it('rejects malformed budgets, replay limits, old schemas, and lexical controller fields', () => {
     expect(() => parseAnalysisSourceActivationPolicy({
-      schema_version: 'analysis_source_activation_policy@1',
-      bounded_explicit: {
-        max_search_calls: 0,
-        max_read_calls: 2,
-        max_duration_ms: 6000,
-      },
-      safe_replay: {max_turns: 6, max_chars_per_entry: 1200},
-      intent: {
-        explicit_patterns: ['source'],
-        explicit_case_sensitive_patterns: ['Foo::bar'],
-        deep_patterns: ['deep'],
-      },
+      ...validPolicy, bounded_explicit: {...validPolicy.bounded_explicit, max_search_calls: 0},
     })).toThrow('analysis_source_activation_policy_invalid_budget');
     expect(() => parseAnalysisSourceActivationPolicy({
-      schema_version: 'analysis_source_activation_policy@1',
-      bounded_explicit: {
-        max_search_calls: 1,
-        max_read_calls: 2,
-        max_duration_ms: 6000,
-      },
-      safe_replay: {max_turns: 6, max_chars_per_entry: 1200},
-      intent: {
-        explicit_patterns: ['['],
-        explicit_case_sensitive_patterns: ['Foo::bar'],
-        deep_patterns: ['deep'],
-      },
-    })).toThrow('analysis_source_activation_policy_invalid_explicit_patterns');
+      ...validPolicy, safe_replay: {...validPolicy.safe_replay, max_turns: 0},
+    })).toThrow('analysis_source_activation_policy_invalid_safe_replay');
+    expect(() => parseAnalysisSourceActivationPolicy({
+      ...validPolicy, schema_version: 'analysis_source_activation_policy@1',
+    })).toThrow('analysis_source_activation_policy_invalid_root');
+    expect(() => parseAnalysisSourceActivationPolicy({
+      ...validPolicy, intent: {explicit_patterns: ['source']},
+    })).toThrow('analysis_source_activation_policy_invalid_root');
   });
 });

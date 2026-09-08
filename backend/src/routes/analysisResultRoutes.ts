@@ -21,14 +21,7 @@ import type {
   AnalysisResultVisibility,
 } from '../types/multiTraceComparison';
 
-const VALID_SCENE_TYPES = new Set<AnalysisResultSceneType>([
-  'startup',
-  'scrolling',
-  'interaction',
-  'memory',
-  'cpu',
-  'general',
-]);
+import {getRegisteredScenes} from '../agentv3/strategyLoader';
 
 const VALID_VISIBILITIES = new Set<AnalysisResultVisibility>(['private', 'workspace']);
 
@@ -72,7 +65,8 @@ router.get('/', (req, res) => {
   }
 
   const sceneType = optionalString(req.query.sceneType);
-  if (sceneType && !VALID_SCENE_TYPES.has(sceneType as AnalysisResultSceneType)) {
+  // CPU is retained for snapshots written before registry scene IDs were stored.
+  if (sceneType && sceneType !== 'cpu' && !getRegisteredScenes().some(scene => scene.scene === sceneType)) {
     res.status(400).json({
       success: false,
       error: 'Invalid sceneType',

@@ -13,6 +13,7 @@ import type {CapabilityManifestAttributionV1} from '../../types/capabilityManife
 import {createDataEnvelope} from '../../types/dataContract';
 import {buildEvidenceContract} from '../evidence/evidenceContractBuilder';
 import {runDeterministicClaimVerifier} from '../verifier/deterministicClaimVerifier';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 
 const capabilityManifest: CapabilityManifestAttributionV1 = {
   schemaVersion: 'capability_manifest_attribution@1',
@@ -182,6 +183,34 @@ describe('AnalysisResultSnapshotRepository', () => {
   afterEach(() => {
     db?.close();
     db = undefined;
+  });
+
+  test('round-trips exact final body, delivery metadata and claim verifier v2 without recomputation', () => {
+    const repository = createAnalysisResultSnapshotRepository(db!);
+    const body = 'A bounded answer\n\nwith exact spacing and no terminal punctuation';
+    const value = snapshot({summary: {
+      headline: 'A bounded answer', conclusion: body,
+      completion: {schemaVersion: 1, runtimeKind: 'pi-agent-core', status: 'incomplete', reason: 'output_limit',
+        candidateRef: 'candidate-a', runId: 'run-a', attemptId: 'attempt-a', conclusionFingerprint: analysisDeliveryFingerprint(body)},
+      outputOrigin: 'assistant_stream',
+      deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'failed', claims: 'failed',
+        source: 'not_checked', identity: 'passed', report: 'coverage_incomplete'},
+    }, claimVerificationResult: {schemaVersion: 'claim_verifier@2', status: 'failed', policy: 'record_only', passed: false,
+      checkedClaimCount: 1, unsupportedClaimCount: 1, claimResults: [{claimId: 'Q1', status: 'unsupported',
+        referenceCells: [{evidenceRefId: 'env-a', status: 'matched'}],
+        deterministicProof: {kind: 'numeric_cell', status: 'proved', reason: 'numeric_match', anchorIds: ['anchor-a'], evidenceRefIds: ['env-a']},
+        propositionCoverage: {status: 'partial', covered: ['numeric_value'], uncovered: ['mechanism'], reason: 'incomplete_proposition'},
+      }], issues: [{claimId: 'Q1', severity: 'error', code: 'semantic_mismatch', message: 'The supplied value does not establish the stated mechanism.'}]}});
+    repository.createSnapshot(value);
+    const loaded = repository.getSnapshot({tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'}, value.id);
+    expect(loaded?.summary).toEqual(value.summary);
+    expect(loaded?.summary.conclusion).toBe(body);
+    expect(loaded?.claimVerificationResult).toEqual(value.claimVerificationResult);
+    const legacy = snapshot({id: 'snapshot-legacy'});
+    repository.createSnapshot(legacy);
+    const restored = repository.getSnapshot({tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'}, legacy.id);
+    expect(restored?.summary).not.toHaveProperty('completion');
+    expect(restored?.summary).not.toHaveProperty('deliveryAssurance');
   });
 
   test('persists snapshot, metrics, evidence, and audit event', () => {
@@ -415,9 +444,11 @@ describe('AnalysisResultSnapshotRepository', () => {
       expect.objectContaining({column: 'client_utid', value: 11, actualValue: 11}),
       expect.objectContaining({column: 'server_utid', value: 22, actualValue: 22}),
     ]);
-    expect(runDeterministicClaimVerifier({claimSupport: loaded?.claimSupport})).toEqual(
-      expect.objectContaining({status: 'passed', passed: true}),
-    );
+    const restoredVerification = runDeterministicClaimVerifier({claimSupport: loaded?.claimSupport});
+    expect(restoredVerification).toEqual(verification);
+    expect(restoredVerification).toMatchObject({schemaVersion: 'claim_verifier@2', status: 'partial', passed: false,
+      claimResults: [{status: 'inference', deterministicProof: {kind: 'none', status: 'not_checked'}, propositionCoverage: {status: 'none'}}]});
+    expect(loaded?.claimVerificationResult).toEqual(verification);
   });
 
   test('keeps snapshots without capability attribution readable', () => {

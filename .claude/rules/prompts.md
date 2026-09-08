@@ -44,11 +44,32 @@ YAML Skills
 Strategies shape agent behavior. Skills collect deterministic evidence. Keep
 that boundary intact.
 
-Final-report continuation templates must respect the same strategy contract as
-the main system prompt. Do not fix a missing conclusion by adding a
-scenario-specific TypeScript prompt string; fix the strategy/frontmatter or the
-shared continuation template so both Claude and OpenAI runtimes use the same
-rules.
+The five native runtimes share external typed-intent and conclusion-declaration
+templates. Scene choices come from the pinned strategy registry, and the finite
+proof catalog comes from `SUPPORTED_DETERMINISTIC_CLAIM_RULES`. Valid JSON only
+establishes a declaration's shape; it does not prove its interpretation or
+claims correct.
+
+Keep budget, question scope, deliverable and evidence access separate. An
+`existing_only` turn cannot acquire new evidence; `read_new` never widens
+authorization. Plans and source lookup are on demand. A larger budget does not
+require a report, extra source pass, fixed Skill sequence or plan template.
+
+Preserve the original claim semantics and references. Do not use wording,
+headings or error-like prose to infer native completion, rewrite causal claims
+into easier assertions, or force another answer. Structured delivery repairs
+must respect the same strategy contract and remaining runtime budget.
+
+The shared final semantic review uses an external template, the pinned provider
+and original deadline, with no tools and at most one review. It checks the
+canonical body, declarations and available evidence; it does not perform new
+queries or rewrite the body. Known-misdiagnosis regex metadata is not a substitute
+for this current semantic boundary.
+
+Conversation's retained-evidence template receives only bounded, authorized
+locator metadata from live captures. Titles and column names are data, not
+instructions or proof; private metadata passes the existing projection before
+entering the native prompt path. Missing or evicted data remains unavailable.
 
 ## Template Syntax
 

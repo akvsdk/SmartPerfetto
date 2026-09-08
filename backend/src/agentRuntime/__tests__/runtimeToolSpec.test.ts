@@ -6,11 +6,13 @@ import { describe, expect, it, jest } from '@jest/globals';
 import * as fs from 'fs';
 import * as path from 'path';
 import { z } from 'zod';
+import * as runtimeToolSpec from '../runtimeToolSpec';
 import {
   RUNTIME_TOOL_DESCRIPTION_MAX_CHARS,
   compactRuntimeToolDescription,
   createClaudeSdkToolFromSharedSpec,
   createJsonSchemaFromZodRawShape,
+  isClaudeSdkToolLike,
   normalizeRuntimeToolArgs,
   sharedToolSpecFromClaudeSdkTool,
   stringifyRuntimeToolResult,
@@ -19,12 +21,18 @@ import {
   type SharedToolSpec,
 } from '../runtimeToolSpec';
 import {createRuntimeToolConcurrencyCoordinator} from '../runtimeToolConcurrency';
+import {McpToolRegistry} from '../../agentv3/mcpToolRegistry';
 import {SMARTPERFETTO_ADMITTED_RUNTIME_CANDIDATES_ENV} from '../runtimeCandidateAdmission';
 import {
   RunManifestLifecycle,
   withRunManifestLifecycle,
 } from '../../services/selfEvolution/runManifestLifecycle';
 import type {RunManifestStore} from '../../services/selfEvolution/runManifestStore';
+import {
+  createRuntimeToolResult,
+  decodeRuntimeToolResult,
+  readRuntimeToolResultFacts,
+} from '../runtimeToolResult';
 
 function sdkTool(name: string) {
   return {
@@ -74,6 +82,43 @@ function createDeferred<T = void>() {
 }
 
 describe('SharedToolSpec', () => {
+  it('keeps producer facts through SDK adaptation and string transport before shortening', async () => {
+    const spec = sharedToolSpecFromClaudeSdkTool('execute_sql', {
+      name: 'execute_sql', description: 'Read trace data', inputSchema: {},
+      handler: async () => createRuntimeToolResult({success: false, planPhaseId: 'phase-1', error: 'x'.repeat(14000)}, {
+        decorate: text => '[accuracy] {"success":true}\n' + text + '\nReview this evidence.',
+      }),
+    }, 'public');
+    const claude = createClaudeSdkToolFromSharedSpec(spec);
+    const result = await claude.handler({}, {} as any);
+    expect(readRuntimeToolResultFacts(result)).toEqual({success: false, planPhaseId: 'phase-1'});
+    const transport = stringifyRuntimeToolResult(result);
+    expect(readRuntimeToolResultFacts(transport)).toEqual(readRuntimeToolResultFacts(result));
+    const shortened = {...result, content: [{type: 'text', text: 'truncated'}]};
+    expect(readRuntimeToolResultFacts(shortened)).toEqual(readRuntimeToolResultFacts(result));
+  });
+
+  it('normalizes known legacy outcomes but does not infer success from a normal return', async () => {
+    const spec = withRuntimeToolTiming({
+      name: 'test_tool', description: 'Test', exposure: 'public', inputSchema: {},
+      handler: async () => ({content: [{type: 'text' as const, text: '{"outcome":"consent_blocked"}'}]}),
+    });
+    expect(readRuntimeToolResultFacts(await spec.handler({}, {}))).toEqual({success: false});
+    expect(readRuntimeToolResultFacts({content: [{type: 'text', text: 'A normal result.'}]})).toEqual({});
+  });
+
+  it('decodes catalogue arrays, separate guidance blocks, and Pi details without guessing ambiguous JSON', () => {
+    expect(decodeRuntimeToolResult('[{"id":"skill-a"}]').body).toEqual({items: [{id: 'skill-a'}]});
+    const raw = createRuntimeToolResult({success: true, planPhaseId: 'p1', rows: []});
+    expect(decodeRuntimeToolResult({content: [{type: 'text', text: 'truncated'}], details: raw}).body)
+      .toEqual(raw.structuredContent);
+    expect(readRuntimeToolResultFacts({content: [
+      {type: 'text', text: '[note] Guidance'}, {type: 'text', text: '{"success":true}'},
+    ]})).toEqual({success: true});
+    expect(readRuntimeToolResultFacts({content: [
+      {type: 'text', text: '{"success":false}'}, {type: 'text', text: '{"success":true}'},
+    ]})).toEqual({});
+  });
   it('is registered exactly once in the live backend test gate', () => {
     const packageJson = JSON.parse(fs.readFileSync(
       path.resolve(__dirname, '../../../package.json'),
@@ -660,5 +705,61 @@ describe('SharedToolSpec', () => {
       { runtime: 'third-party-test-engine' },
     );
     expect((result.content[0] as any).text).toBe('{"payload":{"nested":true}}');
+  });
+
+  it('keeps one timing receipt when a registry observer wraps an already timed SDK handler', async () => {
+    const lifecycle = createLifecycle('run-observed-registry-tool');
+    const events: string[] = [];
+    const registry = new McpToolRegistry({
+      runManifestAttributionSink: lifecycle.builder,
+      toolObserver: event => {events.push(event.phase);},
+    });
+    registry.registerSdk(sdkTool('execute_sql'), 'execute_sql', 'public');
+    const descriptor = registry.list()[0].tool as ReturnType<typeof createClaudeSdkToolFromSharedSpec>;
+    try {
+      if (!isClaudeSdkToolLike(descriptor)) throw new Error('Expected an SDK tool descriptor');
+      await descriptor.handler({q: 'select 1'}, {});
+      expect(events).toEqual(['started', 'completed']);
+      expect(lifecycle.builder.runtimePerformanceRecorder.seal().tools).toEqual([
+        expect.objectContaining({outcome: 'ok', toolCallIdHash: expect.stringMatching(/^sha256:/)}),
+      ]);
+    } finally {
+      lifecycle.dispose();
+    }
+  });
+
+  it.each([true, false])('times each shared/SDK guarded invocation once with allowNewEvidence=%s', async allowNewEvidence => {
+    const lifecycle = createLifecycle(`run-guarded-${allowNewEvidence}`);
+    const body = jest.fn(async () => createRuntimeToolResult({success: true}));
+    const sdk = createClaudeSdkToolFromSharedSpec({
+      name: 'acquire', description: 'Acquire evidence', exposure: 'public', inputSchema: {}, handler: body,
+    });
+    const events: string[] = [];
+    const factory = jest.spyOn(runtimeToolSpec, 'createClaudeSdkToolFromSharedSpec');
+    try {
+      const registry = new McpToolRegistry({
+        requestScope: {sessionId: 's1', hasCodebaseAccess: false, allowNewEvidence},
+        runManifestAttributionSink: lifecycle.builder,
+        toolObserver: event => {events.push(event.phase);},
+      });
+      registry.registerSdk(sdk, 'acquire', 'public', {evidenceEffect: 'acquire'});
+      // Keep the actual generated descriptors, even when discovery hides them.
+      const shared = factory.mock.calls[0][0];
+      const descriptor = factory.mock.results[0].value;
+      if (!isClaudeSdkToolLike(descriptor)) throw new Error('Expected SDK descriptor');
+      const fromShared = await shared.handler({}, {toolCallId: 'shared'});
+      const fromSdk = await descriptor.handler({}, {toolCallId: 'sdk'});
+      expect(readRuntimeToolResultFacts(fromShared)).toEqual({success: allowNewEvidence});
+      expect(readRuntimeToolResultFacts(fromSdk)).toEqual({success: allowNewEvidence});
+      expect(body).toHaveBeenCalledTimes(allowNewEvidence ? 2 : 0);
+      expect(events).toEqual(['started', 'completed', 'started', 'completed']);
+      expect(lifecycle.builder.runtimePerformanceRecorder.seal().tools).toEqual([
+        expect.objectContaining({outcome: allowNewEvidence ? 'ok' : 'error'}),
+        expect.objectContaining({outcome: allowNewEvidence ? 'ok' : 'error'}),
+      ]);
+    } finally {
+      factory.mockRestore();
+      lifecycle.dispose();
+    }
   });
 });

@@ -213,6 +213,58 @@ describe('what the evidence line spends its words on', () => {
     ]);
     expect(compared).toContain('Trace');
   });
+
+  it.each([
+    ['left', 'right', '左侧', '右侧'],
+    ['top', 'bottom', '上方', '下方'],
+    [undefined, undefined, '', ''],
+  ])('keeps separate same-title events attributed with pane sides %s/%s', (currentPane, referencePane, currentLabel, referenceLabel) => {
+    const context = {comparisonActive: true, currentTraceId: 'a', referenceTraceId: 'b'};
+    const current = update('data', [envelope('掉帧列表', {traceSide: 'current', paneSide: currentPane})]);
+    const reference = update('data', [envelope('掉帧列表', {traceSide: 'reference', paneSide: referencePane})]);
+    for (const events of [[current, reference], [reference, current]]) {
+      const lines = events.map(event => deriveTimelineStep(event, 'zh-CN', context)?.text);
+      expect(lines).toContainEqual(expect.stringContaining(`${currentLabel ? currentLabel + '/' : ''}基线 Trace`));
+      expect(lines).toContainEqual(expect.stringContaining(`${referenceLabel ? referenceLabel + '/' : ''}对比 Trace`));
+    }
+  });
+
+  it('groups long same-title evidence by source before applying the stored text limit', () => {
+    const title = 'Long jank evidence title ' + 'detail '.repeat(100);
+    const event = update('data', [
+      envelope(title, {traceSide: 'current', paneSide: 'left'}),
+      envelope(title, {traceSide: 'reference', paneSide: 'right'}),
+    ]);
+    const text = deriveTimelineStep(event, 'en', {comparisonActive: true})!.text;
+    expect(text.length).toBeLessThanOrEqual(240);
+    expect(text).toContain('left/baseline trace');
+    expect(text).toContain('right/comparison trace');
+    expect(text.match(/Long jank/g)).toHaveLength(2);
+  });
+
+  it('uses only a unique exact trace ID to supplement missing source metadata', () => {
+    const event = update('data', [envelope('Jank frames', {traceSide: undefined, traceId: 'b'})]);
+    const context = {comparisonActive: true, currentTraceId: 'a', referenceTraceId: 'b'};
+    expect(deriveTimelineStep(event, 'en', context)?.text).toContain('comparison trace');
+    expect(deriveTimelineStep(event, 'en', {...context, currentTraceId: 'b'})?.text).toContain('unlabelled trace');
+    expect(deriveTimelineStep(event, 'en', {...context, referenceTraceId: 'other'})?.text).toContain('unlabelled trace');
+    const explicit = update('data', [envelope('Jank frames', {traceSide: 'reference', traceId: 'a'})]);
+    expect(deriveTimelineStep(explicit, 'en', context)?.text).toContain('comparison trace');
+  });
+
+  it('retains both trace roles within the stored limit when a replay spans many pane positions', () => {
+    const envelopes = ['current', 'reference'].flatMap(traceSide =>
+      ['left', 'right', 'top', 'bottom', undefined].map(paneSide =>
+        envelope('Frame latency', {traceSide, paneSide})));
+    envelopes.push(envelope('Source unavailable', {traceSide: undefined}));
+    const original = structuredClone(envelopes);
+    const text = summarizeDataEnvelopeForTimeline(update('data', envelopes), 'en', {comparisonActive: true});
+    expect(text.length).toBeLessThanOrEqual(240);
+    for (const label of ['baseline trace', 'comparison trace', 'unlabelled trace']) {
+      expect(text).toContain(label);
+    }
+    expect(envelopes).toEqual(original);
+  });
 });
 
 describe('the conclusion step', () => {

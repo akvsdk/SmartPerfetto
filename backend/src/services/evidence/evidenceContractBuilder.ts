@@ -12,6 +12,7 @@ import type {
 import type { ComparisonReportSection } from '../../agentv3/sessionStateSnapshot';
 import {
   validateDataEnvelope,
+  createDataEnvelope,
   type DataEnvelope,
   type DataPayload,
   type DataEnvelopeTraceSide,
@@ -35,6 +36,12 @@ import type {
   TraceTimestampNs,
 } from '../../types/evidenceContract';
 import { evidenceValuesMatch } from './valueComparison';
+import {copyScopeProvenance, scopeProvenanceForFields,
+  type EvidenceScopeProvenanceV1} from '../../types/identityContract';
+import {evidenceReferenceKey, preparedReferenceResolution, preparedEvidenceBindingEligibility, preparedEvidenceMatchesInput,
+  type PreparedClaimEvidence} from './claimEvidencePreparation';
+import {bindReadResolutionToAnchor, type EvidenceReadResolution} from './evidenceReadView';
+import {getCapturedAnchorFacts} from './evidenceCapture';
 
 export interface BuildEvidenceContractInput {
   conclusionContract?: ConclusionContract | null;
@@ -42,6 +49,8 @@ export interface BuildEvidenceContractInput {
   comparisonReportSection?: ComparisonReportSection;
   relationCandidates?: EvidenceRelationCandidateV1[];
   relationActivationClaimIds?: string[];
+  preparedEvidence?: PreparedClaimEvidence;
+  bindingEligibility?: import('../../agent/core/conclusionContract').ConclusionBindingEligibility;
 }
 
 interface EnvelopeMatch {
@@ -49,6 +58,7 @@ interface EnvelopeMatch {
   row?: Record<string, unknown>;
   rowIndex?: number;
   missingReason?: string;
+  readResolution?: EvidenceReadResolution;
 }
 
 interface BuiltRelations {
@@ -250,9 +260,7 @@ function rowsAsObjects(envelope: DataEnvelope): Record<string, unknown>[] {
 }
 
 function scalarEquals(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (a === null || a === undefined || b === null || b === undefined) return false;
-  return String(a) === String(b);
+  return a === b;
 }
 
 function valuesMatch(expected: unknown, actual: unknown): boolean {
@@ -387,6 +395,9 @@ function refMatchesAllProvidedEnvelopeIdentifiers(env: DataEnvelope, ref: Conclu
 
 function resolveRowAndCell(envelope: DataEnvelope, ref: ConclusionContractClaimReference): Omit<EnvelopeMatch, 'envelope'> {
   const rows = rowsAsObjects(envelope);
+  if (Array.isArray(envelope.data?.columns) && new Set(envelope.data.columns).size !== envelope.data.columns.length) {
+    return {missingReason: 'duplicate evidence columns'};
+  }
   let row: Record<string, unknown> | undefined;
   let rowIndex: number | undefined;
   let missingReason: string | undefined;
@@ -398,14 +409,16 @@ function resolveRowAndCell(envelope: DataEnvelope, ref: ConclusionContractClaimR
       row = rows[ref.rowIndex];
       if (!row) missingReason = `rowIndex ${ref.rowIndex} is outside evidence row range`;
     }
-  } else if (ref.rowSelector) {
-    rowIndex = rows.findIndex(candidate => rowMatchesSelector(candidate, ref.rowSelector!));
-    row = rowIndex >= 0 ? rows[rowIndex] : undefined;
-    if (!row) missingReason = 'rowSelector did not match any evidence row';
-  } else if (rows.length === 1) {
+  }
+  if (ref.rowSelector) {
+    const matches = rows.map((candidate, index) => rowMatchesSelector(candidate, ref.rowSelector!) ? index : -1).filter(index => index >= 0);
+    if (matches.length !== 1) missingReason = matches.length > 1 ? 'rowSelector matched multiple evidence rows' : 'rowSelector did not match any evidence row';
+    else if (rowIndex !== undefined && rowIndex !== matches[0]) missingReason = 'rowIndex and rowSelector refer to different rows';
+    else {rowIndex = matches[0]; row = rows[rowIndex];}
+  } else if (ref.rowIndex === undefined && rows.length === 1) {
     rowIndex = 0;
     row = rows[0];
-  } else if (ref.column) {
+  } else if (ref.rowIndex === undefined && ref.column) {
     missingReason = rows.length === 0
       ? 'referenced evidence has no rows'
       : 'rowIndex or rowSelector is required when citing a column from multi-row evidence';
@@ -422,7 +435,19 @@ function resolveRowAndCell(envelope: DataEnvelope, ref: ConclusionContractClaimR
   };
 }
 
-function findEnvelopeForRef(envelopes: DataEnvelope[], ref: ConclusionContractClaimReference): EnvelopeMatch | undefined {
+function findEnvelopeForRef(envelopes: DataEnvelope[], ref: ConclusionContractClaimReference,
+  prepared?: PreparedClaimEvidence, blockedReason?: string): EnvelopeMatch | undefined {
+  if (prepared || blockedReason) {
+    const resolution = prepared && !blockedReason ? preparedReferenceResolution(prepared, ref) : undefined;
+    if (!resolution || resolution.status !== 'resolved') return {
+      envelope: createDataEnvelope({columns: [], rows: []}, {type: 'skill_result', source: 'unavailable_evidence', title: 'Unavailable evidence'}),
+      missingReason: blockedReason || (resolution && 'reason' in resolution ? resolution.reason : 'prepared_reference_missing'),
+      ...(resolution ? {readResolution: resolution} : {}),
+    };
+    return {envelope: {meta: structuredClone(resolution.record.meta), display: structuredClone(resolution.record.display),
+      data: {columns: [...resolution.record.columns], rows: []}}, row: resolution.row && {...resolution.row},
+      rowIndex: resolution.originalRowIndex, readResolution: resolution};
+  }
   const indexed = envelopes.map((envelope, index) => ({ envelope, ordinal: index + 1 }));
   const candidates = indexed.filter(candidate => refMatchesAnyEnvelopeIdentifier(candidate.envelope, ref, candidate.ordinal));
   const matches = candidates.filter(candidate => refMatchesAllProvidedEnvelopeIdentifiers(candidate.envelope, ref, candidate.ordinal));
@@ -434,19 +459,13 @@ function findEnvelopeForRef(envelopes: DataEnvelope[], ref: ConclusionContractCl
   }
   if (matches.length === 0) return undefined;
 
-  const resolved = matches.map(match => ({
-    envelope: match.envelope,
-    ...resolveRowAndCell(match.envelope, ref),
-  }));
-  const valid = resolved.filter(match => !match.missingReason);
-  if (valid.length === 1) return valid[0];
-  if (valid.length > 1) {
+  if (matches.length > 1) {
     return {
-      envelope: valid[0].envelope,
+      envelope: matches[0].envelope,
       missingReason: 'claim reference is ambiguous across multiple DataEnvelope outputs; use evidenceRefId or artifactId',
     };
   }
-  return resolved[0];
+  return {envelope: matches[0].envelope, ...resolveRowAndCell(matches[0].envelope, ref)};
 }
 
 function inferProducerKind(envelope: DataEnvelope, ref: ConclusionContractClaimReference): EvidenceProducerKind {
@@ -631,9 +650,33 @@ function deriveTimeRange(row: Record<string, unknown> | undefined): EvidenceTime
   return undefined;
 }
 
-function deriveIdentity(envelope: DataEnvelope, row: Record<string, unknown> | undefined): EvidenceIdentityV1 | undefined {
+function deriveIdentity(envelope: DataEnvelope, row: Record<string, unknown> | undefined,
+  provenance: EvidenceScopeProvenanceV1 | undefined): EvidenceIdentityV1 | undefined {
   const meta = envelope.meta as Record<string, any>;
   const source = row || {};
+  if (meta.scopeProvenance !== undefined) {
+    const entries = provenance?.entries;
+    const resolution = envelope.meta.identityResolution;
+    // A row may include a target identifier beside global or peer metrics.
+    // Only the scope of the cited fields can bind that identifier to a claim.
+    if (provenance?.invalid || !entries?.length || entries.some(entry => entry.role !== 'target' ||
+      entry.availability === 'unavailable' || entry.scope.traceId !== meta.traceId ||
+      entry.scope.traceSide !== normalizeTraceSide(meta.traceSide) ||
+      !entry.scope.identityRefId || entry.scope.identityRefId !== meta.identityRefId) ||
+      !resolution || resolution.identityRefId !== meta.identityRefId ||
+      resolution.status !== meta.identityStatus ||
+      resolution.target.traceId !== meta.traceId ||
+      (resolution.target.traceSide ?? 'unknown') !== normalizeTraceSide(meta.traceSide)) return undefined;
+    const exactUpids = new Set(entries.filter(entry => entry.scope.mode === 'exact_upid')
+      .map(entry => entry.scope.upid));
+    if (exactUpids.size > 1 || (exactUpids.size === 1 && source.upid !== undefined &&
+      !exactUpids.has(toNumber(source.upid)))) return undefined;
+    if (exactUpids.size === 1 && (resolution.processes.length === 0 ||
+      resolution.processes.some(process => !exactUpids.has(process.upid)) ||
+      (resolution.target.upid !== undefined && !exactUpids.has(resolution.target.upid)))) return undefined;
+    if (source.upid !== undefined && !resolution.processes.some(process =>
+      process.upid === toNumber(source.upid))) return undefined;
+  }
   const status = ['verified', 'ambiguous', 'weak', 'missing', 'not_required', 'error'].includes(meta.identityStatus)
     ? meta.identityStatus as EvidenceIdentityV1['status']
     : undefined;
@@ -669,8 +712,8 @@ function buildCell(ref: ConclusionContractClaimReference, row: Record<string, un
     ...(ref.value !== undefined && ['string', 'number', 'boolean'].includes(typeof ref.value)
       ? { value: ref.value as string | number | boolean }
       : {}),
-    ...(hasActualValue && rawValue !== null && ['string', 'number', 'boolean'].includes(typeof rawValue)
-      ? { actualValue: rawValue as string | number | boolean }
+    ...(hasActualValue && (rawValue === null || ['string', 'number', 'boolean'].includes(typeof rawValue))
+      ? { actualValue: rawValue as string | number | boolean | null }
       : {}),
     ...(hasActualValue ? { displayValue: String(rawValue) } : {}),
   };
@@ -752,7 +795,22 @@ function buildAnchor(
   const artifactId = ref.artifactId || ref.sourceArtifactId || (meta as any).artifactId || (meta as any).sourceArtifactId;
   const cell = buildCell(ref, row);
   const declaredQualifiers = rowDeclaredQualifiers(row);
-  if (match.missingReason) {
+  const scopeProvenance = ref.column
+    ? scopeProvenanceForFields(meta.scopeProvenance, [ref.column])
+    : copyScopeProvenance(meta.scopeProvenance);
+  const invalidScope = meta.scopeProvenance !== undefined && (!scopeProvenance ||
+    scopeProvenance.invalid || scopeProvenance.entries.length === 0 ||
+    scopeProvenance.entries.some(entry => entry.scope.traceId !== meta.traceId ||
+      entry.scope.traceSide !== normalizeTraceSide(meta.traceSide)));
+  const unavailableScope = scopeProvenance?.entries.find(entry => entry.availability === 'unavailable');
+  const missingReason = match.missingReason || (invalidScope
+    ? 'referenced evidence has no valid scope declaration for this field and trace'
+    : unavailableScope ? unavailableScope.reason || 'referenced evidence scope is unavailable' : undefined);
+  if (missingReason) {
+    // An unresolved read has no cell witness, but does not establish that the
+    // cited evidence is absent. Keep its reason without manufacturing a binding.
+    const unresolvedRead = !invalidScope && !unavailableScope &&
+      (match.readResolution?.status === 'ambiguous' || match.readResolution?.status === 'incomplete');
     return {
       anchorId,
       version: 'evidence_contract@1',
@@ -773,14 +831,16 @@ function buildAnchor(
         ...(artifactId ? { artifactId: String(artifactId) } : {}),
         ...(ref.sourceArtifactId ? { sourceArtifactId: ref.sourceArtifactId } : {}),
       },
-      missing: true,
-      missingReason: match.missingReason,
+      ...(unresolvedRead ? {} : {missing: true}),
+      missingReason,
+      ...(scopeProvenance ? {scopeProvenance} : {}),
       ...(cell ? { cells: [cell] } : {}),
       ...declaredQualifiers,
       confidence: 0,
     };
   }
-  return {
+  const identity = deriveIdentity(envelope, row, scopeProvenance);
+  const anchor: EvidenceAnchorV1 = {
     anchorId,
     version: 'evidence_contract@1',
     evidenceRefId: meta.evidenceRefId || evidenceRefId,
@@ -802,45 +862,39 @@ function buildAnchor(
     },
     ...(cell ? { cells: [cell] } : {}),
     ...(deriveTimeRange(row) ? { timeRange: deriveTimeRange(row) } : {}),
-    ...(deriveIdentity(envelope, row) ? { identity: deriveIdentity(envelope, row) } : {}),
+    ...(identity ? {identity} : {}),
+    ...(scopeProvenance ? {scopeProvenance} : {}),
     ...declaredQualifiers,
     confidence: 1,
   };
+  const requiresTargetIdentity = scopeProvenance?.entries.some(entry => entry.role === 'target' && entry.scope.mode !== 'unscoped');
+  if (identity?.status === 'error' || (requiresTargetIdentity && identity?.status !== 'verified')) {
+    anchor.missing = true;
+    anchor.missingReason = 'captured_identity_conflict';
+    anchor.confidence = 0;
+  } else if (match.readResolution) bindReadResolutionToAnchor(anchor, match.readResolution);
+  return anchor;
 }
 
-function finiteTimestamp(value: TraceTimestampNs): number | undefined {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
-  const normalized = value.trim();
-  if (!/^-?(?:\d+\.?\d*|\.\d+)$/.test(normalized)) return undefined;
-  const parsed = Number(normalized);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function canonicalBigInt(value: unknown): bigint | undefined {
-  if (typeof value === 'bigint') return value;
-  if (typeof value === 'number') {
-    return Number.isSafeInteger(value) ? BigInt(value) : undefined;
-  }
-  if (typeof value !== 'string' || !/^-?\d+$/.test(value.trim())) return undefined;
-  try {
-    return BigInt(value.trim());
-  } catch {
-    return undefined;
-  }
-}
-
-function canonicalBigIntRange(match: EnvelopeMatch | undefined): {start: bigint; end: bigint} | undefined {
-  const row = match?.row;
-  if (!row) return undefined;
-  const exact = deriveExactEvidenceTimeRangeNs(row);
-  if (exact) return exact;
-  if (hasPreciseTimeAlias(row)) return undefined;
-  const start = canonicalBigInt(row.ts ?? row.start_ts ?? row.startTs);
-  if (start === undefined) return undefined;
-  const end = canonicalBigInt(row.end_ts ?? row.endTs);
-  if (end !== undefined) return {start, end};
-  const duration = canonicalBigInt(row.dur ?? row.duration_ns ?? row.durationNs);
-  return duration === undefined ? undefined : {start, end: start + duration};
+function canonicalBigIntRange(anchor: EvidenceAnchorV1): {start: bigint; end: bigint} | undefined {
+  const captured = getCapturedAnchorFacts(anchor);
+  if (!captured) return undefined;
+  const fields = Object.entries(captured.fields);
+  const starts = fields.filter(([, field]) => field.timeRole === 'start');
+  const ends = fields.filter(([, field]) => field.timeRole === 'end');
+  const durations = fields.filter(([, field]) => field.timeRole === 'duration');
+  if (starts.length !== 1 || ends.length > 1 || durations.length > 1 || (!ends.length && !durations.length)) return undefined;
+  const used = [...starts, ...ends, ...durations];
+  if (used.some(([column, field]) => field.unit !== 'ns' || field.clock !== 'trace_monotonic' ||
+      (anchor.scopeProvenance && !anchor.scopeProvenance.entries.some(entry => entry.availability !== 'unavailable' &&
+        (!entry.fields || entry.fields.includes(column)))))) return undefined;
+  const start = exactCanonicalNs(captured.row[starts[0][0]]);
+  const duration = durations.length ? exactCanonicalNs(captured.row[durations[0][0]]) : undefined;
+  const explicitEnd = ends.length ? exactCanonicalNs(captured.row[ends[0][0]]) : undefined;
+  if (start === undefined || (ends.length && explicitEnd === undefined) || (durations.length && duration === undefined)) return undefined;
+  const end = explicitEnd ?? (duration !== undefined && duration <= MAX_TRACE_TIMESTAMP_NS - start ? start + duration : undefined);
+  if (end === undefined || end < start || (duration !== undefined && start + duration !== end)) return undefined;
+  return {start, end};
 }
 
 function relationContextStatus(
@@ -872,8 +926,16 @@ function evaluateOverlap(
   if (context.status !== 'verified') {
     return {status: context.status, reasonCode: context.reasonCode!};
   }
-  const subjectCanonical = canonicalBigIntRange(subjectMatch);
-  const objectCanonical = canonicalBigIntRange(objectMatch);
+  // The finite typed verifier owns interval proof. Column-name aliases and
+  // legacy floating-point ranges are not a captured clock declaration.
+  if (!getCapturedAnchorFacts(subject) || !getCapturedAnchorFacts(object)) {
+    return {status: 'candidate', reasonCode: 'overlap_range_missing'};
+  }
+  const typedClock = (anchor: EvidenceAnchorV1) => Object.values(getCapturedAnchorFacts(anchor)!.fields)
+    .some(field => field.timeRole === 'start' && field.clock === 'trace_monotonic' && field.unit === 'ns');
+  if (!typedClock(subject) || !typedClock(object)) return {status: 'candidate', reasonCode: 'overlap_range_missing'};
+  const subjectCanonical = canonicalBigIntRange(subject);
+  const objectCanonical = canonicalBigIntRange(object);
   if (subjectCanonical && objectCanonical) {
     if (subjectCanonical.end < subjectCanonical.start || objectCanonical.end < objectCanonical.start) {
       return {status: 'rejected', reasonCode: 'overlap_range_invalid'};
@@ -887,20 +949,7 @@ function evaluateOverlap(
       ? {status: 'verified', reasonCode: 'overlap_verified'}
       : {status: 'rejected', reasonCode: 'overlap_disjoint'};
   }
-  const subjectStart = subject.timeRange && finiteTimestamp(subject.timeRange.startTs);
-  const subjectEnd = subject.timeRange && finiteTimestamp(subject.timeRange.endTs);
-  const objectStart = object.timeRange && finiteTimestamp(object.timeRange.startTs);
-  const objectEnd = object.timeRange && finiteTimestamp(object.timeRange.endTs);
-  if ([subjectStart, subjectEnd, objectStart, objectEnd].some(value => value === undefined)) {
-    return {status: 'candidate', reasonCode: 'overlap_range_missing'};
-  }
-  if (subjectEnd! < subjectStart! || objectEnd! < objectStart!) {
-    return {status: 'rejected', reasonCode: 'overlap_range_invalid'};
-  }
-  if (Math.max(subjectStart!, objectStart!) < Math.min(subjectEnd!, objectEnd!)) {
-    return {status: 'verified', reasonCode: 'overlap_verified'};
-  }
-  return {status: 'rejected', reasonCode: 'overlap_disjoint'};
+  return {status: 'candidate', reasonCode: 'overlap_range_missing'};
 }
 
 function evaluateBinaryRelation(
@@ -941,13 +990,9 @@ function evaluateBinaryRelation(
   if (identities.some(identity => !identity || identity.status !== 'verified' || !identity.identityRefId)) {
     return {status: 'candidate', reasonCode: 'identity_evidence_missing'};
   }
-  return {status: 'verified', reasonCode: 'binary_proof_verified'};
+  return {status: 'candidate', reasonCode: 'proof_binding_missing'};
 }
 
-function actualCellValue(anchor: EvidenceAnchorV1): unknown {
-  const cell = anchor.cells?.[0];
-  return cell?.actualValue !== undefined ? cell.actualValue : cell?.displayValue;
-}
 
 function evaluateComparisonDelta(
   candidate: EvidenceRelationCandidateV1,
@@ -964,21 +1009,10 @@ function evaluateComparisonDelta(
     !object.context.traceId || object.context.traceId === 'unknown') {
     return {status: 'candidate', reasonCode: 'trace_context_missing'};
   }
-  const subjectRaw = actualCellValue(subject);
-  const objectRaw = actualCellValue(object);
-  if (subjectRaw === undefined || objectRaw === undefined) {
-    return {status: 'candidate', reasonCode: 'comparison_metric_missing'};
-  }
-  const subjectValue = toNumber(subjectRaw);
-  const objectValue = toNumber(objectRaw);
-  if (subjectValue === undefined || objectValue === undefined) {
-    return {status: 'rejected', reasonCode: 'comparison_metric_invalid'};
-  }
-  const delta = subjectValue - objectValue;
-  if (!valuesMatch(candidate.value, delta)) {
-    return {status: 'rejected', reasonCode: 'comparison_delta_mismatch'};
-  }
-  return {status: 'verified', reasonCode: 'comparison_delta_verified'};
+  // Arithmetic alone is not a captured metric/population definition. Typed
+  // comparison proof is evaluated once by the finite claim verifier.
+  return {status: 'candidate', reasonCode: 'comparison_metric_missing'};
+
 }
 
 function withMetricColumn(
@@ -1041,6 +1075,8 @@ function cloneProofBindings(candidate: EvidenceRelationCandidateV1): EvidenceRel
 function buildRelations(
   candidatesInput: EvidenceRelationCandidateV1[] | undefined,
   envelopes: DataEnvelope[],
+  prepared?: PreparedClaimEvidence,
+  blockedReason?: string,
 ): BuiltRelations {
   if (candidatesInput === undefined) return {relations: [], anchors: [], warnings: []};
   if (!Array.isArray(candidatesInput)) {
@@ -1097,9 +1133,9 @@ function buildRelations(
     const proofRef = candidate.proof && isBinary
       ? withoutCellSelection(candidate.proof)
       : candidate.proof;
-    const subjectMatch = findEnvelopeForRef(envelopes, subjectRef);
-    const objectMatch = objectRef ? findEnvelopeForRef(envelopes, objectRef) : undefined;
-    const proofMatch = proofRef ? findEnvelopeForRef(envelopes, proofRef) : undefined;
+    const subjectMatch = findEnvelopeForRef(envelopes, subjectRef, prepared, blockedReason);
+    const objectMatch = objectRef ? findEnvelopeForRef(envelopes, objectRef, prepared, blockedReason) : undefined;
+    const proofMatch = proofRef ? findEnvelopeForRef(envelopes, proofRef, prepared, blockedReason) : undefined;
     const subject = buildAnchor(`relation:${candidate.id}:subject`, subjectRef, subjectMatch);
     const object = objectRef
       ? buildAnchor(`relation:${candidate.id}:object`, objectRef, objectMatch)
@@ -1173,7 +1209,7 @@ function supportLevelForClaim(
     return 'partial';
   }
   if (cellStatuses.length === 0 || cellStatuses.some(status => status === 'not_checked')) return 'partial';
-  return 'verified';
+  return 'partial';
 }
 
 function artifactRefsToClaimReferences(claim: ConclusionContractClaimItem): ConclusionContractClaimReference[] {
@@ -1198,19 +1234,27 @@ function buildClaimSupport(
   claim: ConclusionContractClaimItem,
   index: number,
   envelopes: DataEnvelope[],
+  prepared?: PreparedClaimEvidence,
+  bindingEligibility?: import('../../agent/core/conclusionContract').ConclusionBindingEligibility,
 ): ClaimSupportV1 {
   const claimId = claim.id || `claim-${index + 1}`;
   const references = [
     ...(claim.references || []),
     ...artifactRefsToClaimReferences(claim),
+    ...(claim.semantics?.scope.subjectRefs || []),
+    ...(claim.semantics?.scope.objectRefs || []),
   ];
-  const anchors = references.map(ref => buildAnchor(claimId, ref, findEnvelopeForRef(envelopes, ref)));
+  const unique = [...new Map(references.map(ref => [evidenceReferenceKey(ref), ref])).values()];
+  const anchors = unique.map(ref => buildAnchor(claimId, ref, findEnvelopeForRef(envelopes, ref, prepared,
+    bindingEligibility === 'ineligible' ? 'binding_ineligible' : undefined)));
   const kind = inferClaimKind(claim, references);
   const supportLevel = supportLevelForClaim(claim, kind, anchors);
   return {
     claimId,
     kind,
     text: claim.text,
+    semantics: claim.semantics,
+    bindingEligibility,
     anchors,
     supportLevel,
     ...(supportLevel === 'inference' && claim.kind === 'causal'
@@ -1265,7 +1309,12 @@ export function buildEvidenceContract(input: BuildEvidenceContractInput): Eviden
     return valid;
   });
   const claims = input.conclusionContract?.claims || [];
-  const builtRelations = buildRelations(input.relationCandidates, envelopes);
+  const relations = input.relationCandidates ?? input.conclusionContract?.relationProposals;
+  const eligibility = input.bindingEligibility === 'ineligible' || input.conclusionContract?.bindingEligibility === 'ineligible' ||
+    (input.preparedEvidence !== undefined && !preparedEvidenceMatchesInput(input.preparedEvidence, input.conclusionContract, relations))
+    ? 'ineligible' : input.preparedEvidence !== undefined ? preparedEvidenceBindingEligibility(input.preparedEvidence) : 'legacy_unchecked';
+  const builtRelations = buildRelations(relations, envelopes, input.preparedEvidence,
+    eligibility === 'ineligible' ? 'binding_ineligible' : undefined);
   const relationsById = new Map(builtRelations.relations.map(relation => [relation.id, relation]));
   const relationAnchorsById = new Map(builtRelations.anchors.map(anchor => [anchor.anchorId, anchor]));
   const relationActivationClaimIds = input.relationActivationClaimIds === undefined
@@ -1273,8 +1322,8 @@ export function buildEvidenceContract(input: BuildEvidenceContractInput): Eviden
     : new Set(input.relationActivationClaimIds);
   const claimSupport = claims.map((claim, index) => attachClaimRelations(
     claim,
-    buildClaimSupport(claim, index, envelopes),
-    input.relationCandidates !== undefined &&
+    buildClaimSupport(claim, index, envelopes, input.preparedEvidence, eligibility),
+    relations !== undefined &&
       (relationActivationClaimIds === undefined || relationActivationClaimIds.has(claim.id || `claim-${index + 1}`)),
     relationsById,
     relationAnchorsById,

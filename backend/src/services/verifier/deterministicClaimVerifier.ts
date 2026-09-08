@@ -2,246 +2,492 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import type { ClaimSupportV1, EvidenceAnchorV1 } from '../../types/evidenceContract';
+import type {ClaimSemanticsV1, ConclusionContractClaimReference} from '../../agent/core/conclusionContract';
+import type {ClaimSupportV1, EvidenceAnchorV1} from '../../types/evidenceContract';
 import type {
+  ClaimPropositionCoverage,
   ClaimReferenceVerificationResult,
-  ClaimVerificationClaimResult,
+  ClaimVerificationClaimResultV2,
   ClaimVerificationIssue,
   ClaimVerificationPolicy,
-  ClaimVerificationResult,
+  ClaimVerificationResultV2,
+  DeterministicClaimProof,
+  DeterministicClaimProofKind,
 } from '../../types/claimVerification';
-import { evidenceValuesMatch } from '../evidence/valueComparison';
+import {
+  getCapturedAnchorFacts,
+  type CapturedFieldSemantics,
+  type EvidenceScalar,
+} from '../evidence/evidenceCapture';
+import {evidenceReferenceKey} from '../evidence/claimEvidencePreparation';
 
 export interface DeterministicClaimVerifierInput {
   claimSupport?: ClaimSupportV1[];
   policy?: ClaimVerificationPolicy;
 }
 
-const VERIFIED_CAUSAL_MECHANISM_KINDS = new Set([
-  'wakeup',
-  'blocking_state',
-  'binder_peer',
-  'lock_owner',
-]);
+type CapturedFacts = NonNullable<ReturnType<typeof getCapturedAnchorFacts>>;
+type Rational = {numerator: bigint; denominator: bigint};
+type BoundAnchor = {anchor: EvidenceAnchorV1; facts: CapturedFacts};
+type BoundCell = BoundAnchor & {column: string; value: EvidenceScalar; field?: CapturedFieldSemantics};
+type Resolution<T> = {value: T} | {reason: string};
+type Unit = {dimension: string; numerator: bigint; denominator: bigint};
 
-function effectiveCausalRelationEvaluation(claim: ClaimSupportV1): NonNullable<ClaimSupportV1['relationEvaluation']> {
-  const declared = claim.relationEvaluation || 'not_configured';
-  if (declared !== 'verified') return declared;
-  const relations = claim.relations || [];
-  return relations.length > 0 && relations.every(relation =>
-    relation.verificationStatus === 'verified' && VERIFIED_CAUSAL_MECHANISM_KINDS.has(relation.kind))
-    ? 'verified'
-    : 'candidate';
+const hasOwn = (value: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(value, key);
+const proofKinds: Readonly<Record<string, DeterministicClaimProofKind>> = Object.freeze({
+  'numeric.cell': 'numeric_cell',
+  'interval.overlap': 'interval_overlap',
+  'comparison.delta': 'comparison_delta',
+});
+
+export interface SupportedDeterministicClaimRule {
+  readonly id: string;
+  readonly proofKind: DeterministicClaimProofKind;
 }
 
-function valuesMatch(expected: unknown, actual: unknown): boolean {
-  return evidenceValuesMatch(expected, actual);
+export const SUPPORTED_DETERMINISTIC_CLAIM_RULES: readonly SupportedDeterministicClaimRule[] = Object.freeze(
+  Object.entries(proofKinds).map(([id, proofKind]) => Object.freeze({id, proofKind})),
+);
+
+// These are explicit unit definitions, not aliases inferred from a column name.
+const units: Readonly<Record<string, Unit>> = {
+  ns: {dimension: 'time', numerator: 1n, denominator: 1n},
+  us: {dimension: 'time', numerator: 1000n, denominator: 1n},
+  'µs': {dimension: 'time', numerator: 1000n, denominator: 1n},
+  'μs': {dimension: 'time', numerator: 1000n, denominator: 1n},
+  ms: {dimension: 'time', numerator: 1000000n, denominator: 1n},
+  s: {dimension: 'time', numerator: 1000000000n, denominator: 1n},
+  count: {dimension: 'count', numerator: 1n, denominator: 1n},
+  frame: {dimension: 'frames', numerator: 1n, denominator: 1n},
+  frames: {dimension: 'frames', numerator: 1n, denominator: 1n},
+  event: {dimension: 'events', numerator: 1n, denominator: 1n},
+  events: {dimension: 'events', numerator: 1n, denominator: 1n},
+  ratio: {dimension: 'ratio', numerator: 1n, denominator: 1n},
+  '%': {dimension: 'ratio', numerator: 1n, denominator: 100n},
+  percent: {dimension: 'ratio', numerator: 1n, denominator: 100n},
+  B: {dimension: 'bytes', numerator: 1n, denominator: 1n},
+  bytes: {dimension: 'bytes', numerator: 1n, denominator: 1n},
+  KiB: {dimension: 'bytes', numerator: 1024n, denominator: 1n},
+  MiB: {dimension: 'bytes', numerator: 1048576n, denominator: 1n},
+  GiB: {dimension: 'bytes', numerator: 1073741824n, denominator: 1n},
+  Hz: {dimension: 'frequency', numerator: 1n, denominator: 1n},
+  kHz: {dimension: 'frequency', numerator: 1000n, denominator: 1n},
+  MHz: {dimension: 'frequency', numerator: 1000000n, denominator: 1n},
+  GHz: {dimension: 'frequency', numerator: 1000000000n, denominator: 1n},
+};
+
+function unitFor(unit: string | undefined): Unit | undefined {
+  return unit !== undefined && hasOwn(units, unit) ? units[unit] : undefined;
 }
 
-function verifyAnchor(anchor: EvidenceAnchorV1): ClaimReferenceVerificationResult[] {
-  if (anchor.missing) {
-    return [{
-      evidenceRefId: anchor.evidenceRefId,
-      artifactId: anchor.context.artifactId,
-      sourceToolCallId: anchor.context.sourceToolCallId,
-      status: 'missing',
-      message: anchor.missingReason || 'referenced evidence was not found',
-    }];
+function exactPrimitiveMatch(expected: unknown, actual: unknown): boolean {
+  if (expected === null || actual === null) return expected === actual;
+  if (typeof expected !== typeof actual) return false;
+  if (typeof expected === 'number') return Number.isFinite(expected) && expected === actual;
+  return (typeof expected === 'string' || typeof expected === 'boolean') && expected === actual;
+}
+
+function exactNumber(value: unknown): Rational | undefined {
+  if (typeof value === 'number' && (!Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER)) {
+    return undefined;
   }
-  const cells = anchor.cells || [];
-  if (cells.length === 0) {
-    return [{
-      evidenceRefId: anchor.evidenceRefId,
-      artifactId: anchor.context.artifactId,
-      sourceToolCallId: anchor.context.sourceToolCallId,
-      status: 'not_checked',
-      message: 'evidence row was found, but no cell value was provided for deterministic verification',
-    }];
+  if (typeof value !== 'number' && typeof value !== 'string') return undefined;
+  const text = String(value);
+  // Bound BigInt allocation even for hostile machine declarations.
+  if (text.length > 512) return undefined;
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(text);
+  if (!match) return undefined;
+  const exponent = Number(match[4] || '0') - (match[3]?.length || 0);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1024) return undefined;
+  const digits = BigInt(`${match[1]}${match[2]}${match[3] || ''}`);
+  return exponent >= 0
+    ? {numerator: digits * (10n ** BigInt(exponent)), denominator: 1n}
+    : {numerator: digits, denominator: 10n ** BigInt(-exponent)};
+}
+
+function scale(value: Rational, unit: Unit): Rational {
+  return {numerator: value.numerator * unit.numerator, denominator: value.denominator * unit.denominator};
+}
+
+function compare(left: Rational, right: Rational): number {
+  const difference = left.numerator * right.denominator - right.numerator * left.denominator;
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}
+
+function numericOperator(comparison: number, operator: NonNullable<ClaimSemanticsV1['numeric']>['operator']): boolean {
+  switch (operator) {
+    case 'eq': return comparison === 0;
+    case 'ne': return comparison !== 0;
+    case 'lt': return comparison < 0;
+    case 'lte': return comparison <= 0;
+    case 'gt': return comparison > 0;
+    case 'gte': return comparison >= 0;
   }
-  return cells.map(cell => {
-    const expected = cell.value;
-    const actual = cell.actualValue !== undefined ? cell.actualValue : cell.displayValue;
-    if (expected === undefined) {
-      return {
-        evidenceRefId: anchor.evidenceRefId,
-        artifactId: anchor.context.artifactId,
-        sourceToolCallId: anchor.context.sourceToolCallId,
-        sourceRef: cell.sourceRef,
-        status: 'not_checked',
-        message: `claim reference for ${cell.column} did not provide an expected value`,
-      };
+}
+
+function trustedField(field: CapturedFieldSemantics | undefined): field is CapturedFieldSemantics {
+  return Boolean(field && (field.origin.kind === 'skill_literal' || field.origin.kind === 'native_producer') &&
+    field.origin.definitionFingerprint);
+}
+
+function anchorFailure(anchor: EvidenceAnchorV1): string | undefined {
+  if (anchor.missing) return anchor.missingReason || 'referenced_evidence_missing';
+  const provenance = anchor.scopeProvenance;
+  if (provenance && (provenance.invalid || provenance.entries.length === 0 ||
+      provenance.entries.some(entry => entry.availability === 'unavailable' || entry.fields?.length === 0 ||
+        entry.scope.traceId !== anchor.context.traceId || entry.scope.traceSide !== anchor.context.traceSide))) {
+    return 'evidence_scope_invalid';
+  }
+  if (provenance && anchor.identity?.status === 'verified') {
+    const identity = anchor.identity;
+    const targets = provenance.entries.filter(entry => entry.role === 'target');
+    if (!identity.identityRefId || !targets.some(entry => entry.scope.identityRefId === identity.identityRefId &&
+        (entry.scope.upid === undefined || identity.upid === undefined || entry.scope.upid === identity.upid))) {
+      return 'evidence_identity_scope_conflict';
     }
-    if (actual === undefined) {
-      // Nothing was compared: either no row resolved, or the cited column is
-      // not in the row. The claim is still unsupported, but calling it a value
-      // mismatch sends whoever audits it looking for a numeric discrepancy
-      // that does not exist.
-      return {
-        evidenceRefId: anchor.evidenceRefId,
-        artifactId: anchor.context.artifactId,
-        sourceToolCallId: anchor.context.sourceToolCallId,
-        sourceRef: cell.sourceRef,
-        status: 'missing',
-        message: `no value was found for ${cell.column} in the referenced evidence`,
-      };
+  }
+  return undefined;
+}
+
+function scopeRoleForField(anchor: EvidenceAnchorV1, column: string): string | undefined {
+  const entries = anchor.scopeProvenance?.entries.filter(entry =>
+    entry.availability !== 'unavailable' && (entry.fields === undefined || entry.fields.includes(column)));
+  return entries?.length === 1 ? entries[0].role : undefined;
+}
+
+function verifyAnchor(anchor: EvidenceAnchorV1, ineligible: boolean): ClaimReferenceVerificationResult[] {
+  const base = {
+    anchorId: anchor.anchorId,
+    evidenceRefId: anchor.evidenceRefId,
+    artifactId: anchor.context.artifactId,
+    sourceToolCallId: anchor.context.sourceToolCallId,
+  };
+  const failure = anchorFailure(anchor);
+  if (failure) return [{...base, status: 'missing', message: failure}];
+  if (ineligible) return [{...base, status: 'ineligible', message: 'claim binding is ineligible'}];
+  const facts = getCapturedAnchorFacts(anchor);
+  if (!facts) return [{...base, status: 'not_checked', message: anchor.missingReason || 'immutable execution capture is unavailable'}];
+  if (!anchor.cells?.length) return [{...base, status: 'not_checked', message: 'no expected cell value was supplied'}];
+  return anchor.cells.map(cell => {
+    const reference = {...base, sourceRef: cell.sourceRef, column: cell.column};
+    if (anchor.scopeProvenance && !scopeRoleForField(anchor, cell.column)) {
+      return {...reference, status: 'missing', message: `no unambiguous scope exists for ${cell.column}`};
     }
-    const matched = valuesMatch(expected, actual);
+    if (!hasOwn(facts.row, cell.column)) {
+      return {...reference, status: 'missing', message: `no captured value exists for ${cell.column}`};
+    }
+    if (!hasOwn(cell, 'value') || cell.value === undefined) {
+      return {...reference, status: 'not_checked', message: `no expected value was supplied for ${cell.column}`};
+    }
+    const actual = facts.row[cell.column];
+    // The reference schema permits both numeric and string literals. Different
+    // encodings cannot prove equality or a contradiction; typed numeric proof
+    // independently compares the original proposition with the captured value.
+    if ((typeof cell.value === 'string' && typeof actual === 'number') ||
+      (typeof cell.value === 'number' && typeof actual === 'string')) {
+      return {...reference, status: 'not_checked', message: `reference value type is unresolved for ${cell.column}`};
+    }
+    const matched = exactPrimitiveMatch(cell.value, actual);
     return {
-      evidenceRefId: anchor.evidenceRefId,
-      artifactId: anchor.context.artifactId,
-      sourceToolCallId: anchor.context.sourceToolCallId,
-      sourceRef: cell.sourceRef,
+      ...reference,
       status: matched ? 'matched' : 'value_mismatch',
-      ...(matched ? {} : { message: `value mismatch for ${cell.column}` }),
+      ...(matched ? {} : {message: `value mismatch for ${cell.column}`}),
     };
   });
 }
 
-function issueForReference(claimId: string, ref: ClaimReferenceVerificationResult): ClaimVerificationIssue | undefined {
-  if (ref.status === 'matched' || ref.status === 'not_checked') return undefined;
+function referenceMatches(reference: ConclusionContractClaimReference, bound: BoundAnchor): boolean {
+  const {anchor, facts} = bound;
+  // Prepared references were already resolved against the complete capture.
+  // Their private key preserves all identifiers and locators without reinterpreting aliases.
+  if (facts.referenceKey !== undefined) return facts.referenceKey === evidenceReferenceKey(reference);
+  const context = anchor.context;
+  if (reference.evidenceRefId !== undefined && reference.evidenceRefId !== anchor.evidenceRefId) return false;
+  if (reference.sourceToolCallId !== undefined && reference.sourceToolCallId !== context.sourceToolCallId) return false;
+  const artifactId = context.artifactId || context.sourceArtifactId;
+  if (reference.artifactId !== undefined && reference.artifactId !== artifactId) return false;
+  if (reference.sourceArtifactId !== undefined && reference.sourceArtifactId !== artifactId) return false;
+  if (reference.sourceRef !== undefined && !anchor.cells?.some(cell => cell.sourceRef === reference.sourceRef)) return false;
+  if (reference.rowIndex !== undefined && reference.rowIndex !== facts.originalRowIndex) return false;
+  if (reference.rowSelector !== undefined && !Object.entries(reference.rowSelector).every(([key, value]) =>
+    hasOwn(facts.row, key) && exactPrimitiveMatch(value, facts.row[key]))) return false;
+  return reference.column === undefined || hasOwn(facts.row, reference.column);
+}
+
+function resolveReference(claim: ClaimSupportV1, reference: ConclusionContractClaimReference): Resolution<BoundAnchor> {
+  if (!reference.evidenceRefId && !reference.sourceToolCallId && !reference.artifactId &&
+      !reference.sourceArtifactId && !reference.sourceRef) return {reason: 'semantic_reference_identifier_missing'};
+  const candidates = [...claim.anchors, ...(claim.relationAnchors || [])].flatMap(anchor => {
+    const facts = getCapturedAnchorFacts(anchor);
+    return !anchorFailure(anchor) && facts && referenceMatches(reference, {anchor, facts}) ? [{anchor, facts}] : [];
+  });
+  const unique = new Map(candidates.map(bound => [`${bound.facts.captureId}:${bound.facts.originalRowIndex}`, bound]));
+  if (unique.size !== 1) return {reason: unique.size === 0 ? 'semantic_reference_missing' : 'semantic_reference_ambiguous'};
+  const bound = [...unique.values()][0];
+  if (!bound.anchor.context.traceId || bound.anchor.context.traceId === 'unknown' ||
+      !bound.anchor.context.traceSide || bound.anchor.context.traceSide === 'unknown') {
+    return {reason: 'trace_context_missing'};
+  }
+  return {value: bound};
+}
+
+function resolveCell(claim: ClaimSupportV1, reference: ConclusionContractClaimReference): Resolution<BoundCell> {
+  const bound = resolveReference(claim, reference);
+  if ('reason' in bound) return bound;
+  const columns = reference.column ? [reference.column] : [...new Set(bound.value.anchor.cells?.map(cell => cell.column))];
+  if (columns.length !== 1) return {reason: 'numeric_cell_ambiguous'};
+  const column = columns[0];
+  if (!hasOwn(bound.value.facts.row, column)) return {reason: 'numeric_cell_missing'};
+  return {value: {...bound.value, column, value: bound.value.facts.row[column], field: bound.value.facts.fields[column]}};
+}
+
+function proof(
+  kind: DeterministicClaimProofKind,
+  status: DeterministicClaimProof['status'],
+  reason: string,
+  anchors: EvidenceAnchorV1[] = [],
+): DeterministicClaimProof {
+  return {
+    kind, status, reason,
+    anchorIds: [...new Set(anchors.map(anchor => anchor.anchorId))],
+    evidenceRefIds: [...new Set(anchors.map(anchor => anchor.evidenceRefId))],
+  };
+}
+
+function numericProof(claim: ClaimSupportV1, semantics: ClaimSemanticsV1): DeterministicClaimProof {
+  const kind = 'numeric_cell';
+  if (semantics.scope.subjectRefs?.length !== 1 || (semantics.scope.objectRefs?.length || 0) !== 0) {
+    return proof(kind, 'candidate', 'numeric_scope_requires_one_cell');
+  }
+  if (!semantics.numeric) return proof(kind, 'candidate', 'numeric_declaration_missing');
+  const resolved = resolveCell(claim, semantics.scope.subjectRefs[0]);
+  if ('reason' in resolved) return proof(kind, 'candidate', resolved.reason);
+  const cell = resolved.value;
+  const anchors = [cell.anchor];
+  if (cell.anchor.scopeProvenance && !scopeRoleForField(cell.anchor, cell.column)) {
+    return proof(kind, 'candidate', 'numeric_field_scope_unknown', anchors);
+  }
+  const actualUnit = unitFor(cell.field?.unit);
+  const expectedUnit = unitFor(semantics.numeric.unit);
+  if (!trustedField(cell.field) || !actualUnit || !expectedUnit) {
+    return proof(kind, 'candidate', 'unit_authority_unknown', anchors);
+  }
+  if (actualUnit.dimension !== expectedUnit.dimension) return proof(kind, 'rejected', 'unit_dimension_mismatch', anchors);
+  const actual = exactNumber(cell.value);
+  const expected = exactNumber(semantics.numeric.value);
+  if (!actual || !expected) return proof(kind, 'candidate', 'exact_numeric_value_unavailable', anchors);
+  const matched = numericOperator(compare(scale(actual, actualUnit), scale(expected, expectedUnit)), semantics.numeric.operator);
+  return proof(kind, matched ? 'proved' : 'rejected', matched ? 'numeric_operator_proved' : 'numeric_operator_rejected', anchors);
+}
+
+function exactNanoseconds(value: EvidenceScalar, field: CapturedFieldSemantics): bigint | undefined {
+  const unit = unitFor(field.unit);
+  if (!trustedField(field) || field.clock !== 'trace_monotonic' || !unit || unit.dimension !== 'time') return undefined;
+  const rational = exactNumber(value);
+  if (!rational) return undefined;
+  const ns = scale(rational, unit);
+  return ns.numerator % ns.denominator === 0n ? ns.numerator / ns.denominator : undefined;
+}
+
+function capturedInterval(bound: BoundAnchor): Resolution<{start: bigint; end: bigint}> {
+  const byRole = (role: CapturedFieldSemantics['timeRole']) => Object.entries(bound.facts.fields)
+    .filter(([column, field]) => field.timeRole === role && hasOwn(bound.facts.row, column));
+  const starts = byRole('start');
+  const ends = byRole('end');
+  const durations = byRole('duration');
+  if (starts.length !== 1 || ends.length > 1 || durations.length > 1 || (ends.length === 0 && durations.length === 0)) {
+    return {reason: 'interval_time_roles_unknown'};
+  }
+  if (bound.anchor.scopeProvenance) {
+    const roles = [...starts, ...ends, ...durations].map(([column]) => scopeRoleForField(bound.anchor, column));
+    if (roles.some(role => role === undefined)) return {reason: 'interval_field_scope_unknown'};
+    if (new Set(roles).size !== 1) return {reason: 'interval_field_scope_mismatch'};
+  }
+  const read = ([column, field]: [string, CapturedFieldSemantics]) => exactNanoseconds(bound.facts.row[column], field);
+  const start = read(starts[0]);
+  const end = ends.length ? read(ends[0]) : undefined;
+  const duration = durations.length ? read(durations[0]) : undefined;
+  if (start === undefined || (ends.length && end === undefined) || (durations.length && duration === undefined)) {
+    return {reason: 'interval_exact_clock_unavailable'};
+  }
+  const effectiveEnd = end ?? (start + duration!);
+  if (start < 0n || effectiveEnd <= start || (duration !== undefined && start + duration !== effectiveEnd)) {
+    return {reason: 'interval_range_invalid'};
+  }
+  return {value: {start, end: effectiveEnd}};
+}
+
+function intervalProof(claim: ClaimSupportV1, semantics: ClaimSemanticsV1): DeterministicClaimProof {
+  const kind = 'interval_overlap';
+  if (semantics.scope.subjectRefs?.length !== 1 || semantics.scope.objectRefs?.length !== 1 || semantics.numeric) {
+    return proof(kind, 'candidate', 'interval_scope_requires_two_rows');
+  }
+  const subject = resolveReference(claim, semantics.scope.subjectRefs[0]);
+  const object = resolveReference(claim, semantics.scope.objectRefs[0]);
+  if ('reason' in subject) return proof(kind, 'candidate', subject.reason);
+  if ('reason' in object) return proof(kind, 'candidate', object.reason);
+  const anchors = [subject.value.anchor, object.value.anchor];
+  if (anchors[0].context.traceId !== anchors[1].context.traceId || anchors[0].context.traceSide !== anchors[1].context.traceSide) {
+    return proof(kind, 'rejected', 'interval_trace_context_mismatch', anchors);
+  }
+  const left = capturedInterval(subject.value);
+  const right = capturedInterval(object.value);
+  if ('reason' in left) return proof(kind, left.reason === 'interval_range_invalid' ? 'rejected' : 'candidate', left.reason, anchors);
+  if ('reason' in right) return proof(kind, right.reason === 'interval_range_invalid' ? 'rejected' : 'candidate', right.reason, anchors);
+  const overlaps = left.value.start < right.value.end && right.value.start < left.value.end;
+  return proof(kind, overlaps ? 'proved' : 'rejected', overlaps ? 'half_open_interval_overlap_proved' : 'half_open_intervals_disjoint', anchors);
+}
+
+function comparisonProof(claim: ClaimSupportV1, semantics: ClaimSemanticsV1): DeterministicClaimProof {
+  const kind = 'comparison_delta';
+  if (semantics.scope.subjectRefs?.length !== 1 || semantics.scope.objectRefs?.length !== 1 || !semantics.numeric) {
+    return proof(kind, 'candidate', 'comparison_scope_requires_two_cells');
+  }
+  const current = resolveCell(claim, semantics.scope.subjectRefs[0]);
+  const reference = resolveCell(claim, semantics.scope.objectRefs[0]);
+  if ('reason' in current) return proof(kind, 'candidate', current.reason);
+  if ('reason' in reference) return proof(kind, 'candidate', reference.reason);
+  const left = current.value;
+  const right = reference.value;
+  const anchors = [left.anchor, right.anchor];
+  if (left.anchor.context.traceSide !== 'current' || right.anchor.context.traceSide !== 'reference') {
+    return proof(kind, 'rejected', 'comparison_side_mismatch', anchors);
+  }
+  if (!trustedField(left.field) || !trustedField(right.field)) return proof(kind, 'candidate', 'comparison_metric_authority_unknown', anchors);
+  for (const key of ['metricId', 'aggregation', 'populationKey'] as const) {
+    if (!left.field[key] || !right.field[key]) return proof(kind, 'candidate', `comparison_${key}_unknown`, anchors);
+    if (left.field[key] !== right.field[key]) return proof(kind, 'rejected', `comparison_${key}_mismatch`, anchors);
+  }
+  if (left.field.origin.definitionFingerprint !== right.field.origin.definitionFingerprint ||
+      left.field.origin.kind !== right.field.origin.kind || left.field.origin.skillId !== right.field.origin.skillId ||
+      left.field.origin.stepId !== right.field.origin.stepId) return proof(kind, 'rejected', 'comparison_metric_definition_mismatch', anchors);
+  const leftRole = scopeRoleForField(left.anchor, left.column);
+  const rightRole = scopeRoleForField(right.anchor, right.column);
+  if (!leftRole || !rightRole) return proof(kind, 'candidate', 'comparison_field_scope_unknown', anchors);
+  if (leftRole !== rightRole) return proof(kind, 'rejected', 'comparison_field_scope_mismatch', anchors);
+  const leftUnit = unitFor(left.field.unit);
+  const rightUnit = unitFor(right.field.unit);
+  const declaredUnit = unitFor(semantics.numeric.unit);
+  if (!leftUnit || !rightUnit || !declaredUnit) return proof(kind, 'candidate', 'unit_authority_unknown', anchors);
+  if (leftUnit.dimension !== rightUnit.dimension || leftUnit.dimension !== declaredUnit.dimension) {
+    return proof(kind, 'rejected', 'unit_dimension_mismatch', anchors);
+  }
+  const leftNumber = exactNumber(left.value);
+  const rightNumber = exactNumber(right.value);
+  const declaredNumber = exactNumber(semantics.numeric.value);
+  if (!leftNumber || !rightNumber || !declaredNumber) return proof(kind, 'candidate', 'exact_numeric_value_unavailable', anchors);
+  const a = scale(leftNumber, leftUnit);
+  const b = scale(rightNumber, rightUnit);
+  const delta = {numerator: a.numerator * b.denominator - b.numerator * a.denominator, denominator: a.denominator * b.denominator};
+  const matched = numericOperator(compare(delta, scale(declaredNumber, declaredUnit)), semantics.numeric.operator);
+  return proof(kind, matched ? 'proved' : 'rejected', matched ? 'cited_metric_delta_proved' : 'comparison_delta_rejected', anchors);
+}
+
+function deterministicProof(claim: ClaimSupportV1, references: ClaimReferenceVerificationResult[]): DeterministicClaimProof {
+  const semantics = claim.semantics;
+  const kind = semantics && hasOwn(proofKinds, semantics.predicate) ? proofKinds[semantics.predicate] : 'none';
+  if (claim.bindingEligibility === 'ineligible') return proof(kind, 'rejected', 'binding_ineligible');
+  if (!semantics) return proof(kind, 'not_checked', 'semantics_not_declared');
+  if (claim.bindingEligibility !== 'eligible') return proof(kind, 'candidate', 'binding_eligibility_unchecked');
+  if (kind === 'none') return proof(kind, 'candidate', 'unsupported_predicate');
+  if (references.some(reference => reference.status === 'missing' || reference.status === 'ambiguous' || reference.status === 'value_mismatch')) {
+    return proof(kind, 'candidate', 'reference_cells_unresolved');
+  }
+  if (claim.anchors.some(anchor => !getCapturedAnchorFacts(anchor))) return proof(kind, 'candidate', 'execution_capture_missing');
+  if (semantics.discourse !== 'asserted' || semantics.polarity !== 'affirmed' || semantics.modality !== 'certain') {
+    return proof(kind, 'candidate', 'proposition_assertion_not_supported');
+  }
+  if (semantics.quantifier !== 'one') return proof(kind, 'candidate', 'proposition_quantifier_not_supported');
+  if (semantics.conditions?.length) return proof(kind, 'candidate', 'proposition_conditions_unproved');
+  if (semantics.scope.population !== 'cited_rows') return proof(kind, 'candidate', 'proposition_population_unproved');
+  if (semantics.scope.timeRangeNs) return proof(kind, 'candidate', 'proposition_window_unproved');
+  if ((kind === 'numeric_cell' && claim.kind !== 'numeric') || (kind === 'interval_overlap' && claim.kind !== 'time_range') ||
+      (kind === 'comparison_delta' && claim.kind !== 'comparison')) return proof(kind, 'candidate', 'claim_kind_predicate_mismatch');
+  switch (kind) {
+    case 'numeric_cell': return numericProof(claim, semantics);
+    case 'interval_overlap': return intervalProof(claim, semantics);
+    case 'comparison_delta': return comparisonProof(claim, semantics);
+  }
+}
+
+function coverageFor(proved: DeterministicClaimProof, references: ClaimReferenceVerificationResult[]): ClaimPropositionCoverage {
+  if (proved.status === 'proved') return {
+    status: 'complete',
+    covered: ['predicate', 'polarity', 'discourse', 'quantifier', 'modality', 'conditions', 'scope',
+      ...(proved.kind === 'interval_overlap' ? [] : ['numeric'])],
+    uncovered: [],
+    reason: 'complete_typed_proposition_proved',
+  };
+  const matched = references.some(reference => reference.status === 'matched');
+  return {
+    status: matched ? 'partial' : 'none',
+    covered: matched ? ['reference_cells'] : [],
+    uncovered: ['typed_proposition'],
+    reason: proved.reason,
+  };
+}
+
+function issueForReference(claimId: string, reference: ClaimReferenceVerificationResult): ClaimVerificationIssue | undefined {
+  if (reference.status === 'matched' || reference.status === 'not_checked') return undefined;
   return {
     claimId,
-    severity: ref.status === 'missing' || ref.status === 'value_mismatch' ? 'error' : 'warning',
-    code: `claim_reference_${ref.status}`,
-    message: ref.message || `claim reference ${ref.status}`,
-    evidenceRefId: ref.evidenceRefId,
+    severity: 'error',
+    code: `claim_reference_${reference.status}`,
+    message: reference.message || `claim reference ${reference.status}`,
+    evidenceRefId: reference.evidenceRefId,
   };
 }
 
-function verifyClaim(claim: ClaimSupportV1): { result: ClaimVerificationClaimResult; issues: ClaimVerificationIssue[] } {
-  if (claim.kind === 'inference' && claim.anchors.length === 0) {
-    return {
-      result: { claimId: claim.claimId, status: 'inference', referenceResults: [] },
-      issues: [],
-    };
-  }
-
-  const referenceResults = claim.anchors.flatMap(verifyAnchor);
-  const issues = referenceResults
-    .map(ref => issueForReference(claim.claimId, ref))
+function verifyClaim(claim: ClaimSupportV1): {result: ClaimVerificationClaimResultV2; issues: ClaimVerificationIssue[]} {
+  const referenceCells = claim.anchors.flatMap(anchor => verifyAnchor(anchor, claim.bindingEligibility === 'ineligible'));
+  const evaluated = deterministicProof(claim, referenceCells);
+  const propositionCoverage = coverageFor(evaluated, referenceCells);
+  const issues = referenceCells.map(reference => issueForReference(claim.claimId, reference))
     .filter((issue): issue is ClaimVerificationIssue => Boolean(issue));
-
-  if (claim.kind === 'causal') {
-    const relationEvaluation = effectiveCausalRelationEvaluation(claim);
-    if (relationEvaluation === 'rejected') {
-      issues.push({
-        claimId: claim.claimId,
-        severity: 'error',
-        code: 'causal_relation_rejected',
-        message: 'causal claim references a deterministically rejected EvidenceRelationV1 relation',
-      });
-    } else if (relationEvaluation === 'candidate') {
-      issues.push({
-        claimId: claim.claimId,
-        severity: 'warning',
-        code: 'causal_relation_candidate',
-        message: 'causal claim relation support remains an unverified deterministic candidate',
-      });
-    } else if (relationEvaluation === 'missing' ||
-      (relationEvaluation === 'not_configured' && (!claim.relations || claim.relations.length === 0))) {
-      issues.push({
-        claimId: claim.claimId,
-        severity: 'warning',
-        code: 'causal_relation_missing',
-        message: 'causal claim has no explicit EvidenceRelationV1 relation support',
-      });
-    }
-  }
-
-  if (claim.kind === 'identity') {
-    const weakIdentity = claim.anchors.some(anchor =>
-      anchor.identity?.status !== 'verified' || !anchor.identity?.identityRefId
-    );
-    if (weakIdentity) {
-      issues.push({
-        claimId: claim.claimId,
-        severity: 'warning',
-        code: 'identity_not_verified',
-        message: 'identity-sensitive claim requires verified identity support with identityRefId',
-      });
-    }
-  }
-
-  if (claim.anchors.some(anchor => !anchor.context.traceId || anchor.context.traceId === 'unknown')) {
-    issues.push({
-      claimId: claim.claimId,
-      severity: 'warning',
-      code: 'evidence_trace_unknown',
-      message: 'claim evidence is missing traceId and cannot be treated as fully verified',
-    });
-  }
-
-  const hasReferenceErrors = referenceResults.some(ref =>
-    ref.status === 'missing' || ref.status === 'value_mismatch');
-  const hasUncheckedReferences = referenceResults.some(ref => ref.status === 'not_checked');
-  const hasMatchedReferences = referenceResults.some(ref => ref.status === 'matched');
-  const relationEvaluation = claim.kind === 'causal'
-    ? effectiveCausalRelationEvaluation(claim)
-    : undefined;
-  const relationVerified = relationEvaluation === 'verified';
-  const relationRejected = relationEvaluation === 'rejected';
-  const status: ClaimVerificationClaimResult['status'] = hasReferenceErrors || relationRejected ||
-    (claim.supportLevel === 'unsupported' && !relationVerified)
-    ? 'unsupported'
-    : hasUncheckedReferences && !hasMatchedReferences
-      ? 'not_checked'
-      : hasUncheckedReferences
-        ? 'partial'
-        : claim.supportLevel === 'inference' && !relationVerified
-      ? 'inference'
-      : issues.length > 0 || claim.supportLevel === 'partial'
-        ? 'partial'
-        : 'verified';
-
-  return {
-    result: {
-      claimId: claim.claimId,
-      status,
-      referenceResults,
-    },
-    issues,
-  };
+  if (evaluated.status === 'rejected' || evaluated.status === 'candidate') issues.push({
+    claimId: claim.claimId,
+    severity: evaluated.status === 'rejected' ? 'error' : 'warning',
+    code: evaluated.reason,
+    message: `deterministic proposition proof: ${evaluated.reason}`,
+  });
+  if (claim.kind === 'causal') issues.push({
+    claimId: claim.claimId,
+    severity: 'warning',
+    code: claim.relations?.length ? 'causal_relation_candidate' : 'causal_relation_missing',
+    message: 'causal mechanisms require canonical native proof; endpoint equality is not mechanism evidence',
+  });
+  const hasError = issues.some(issue => issue.severity === 'error');
+  // This stage checks the typed declaration, not whether it represents the prose.
+  // Only the final shared semantic assessment may join a draft into verified.
+  const status = hasError ? 'unsupported'
+    : evaluated.status === 'proved' && propositionCoverage.status === 'complete' ? 'partial'
+      : claim.kind === 'inference' || claim.kind === 'causal' ? 'inference'
+        : evaluated.status === 'candidate' || referenceCells.some(reference => reference.status === 'matched') ? 'partial'
+          : 'not_checked';
+  return {result: {
+    claimId: claim.claimId,
+    status,
+    referenceResults: referenceCells,
+    referenceCells,
+    deterministicProof: evaluated,
+    propositionCoverage,
+  }, issues};
 }
 
-export function runDeterministicClaimVerifier(input: DeterministicClaimVerifierInput): ClaimVerificationResult {
-  const claimSupport = input.claimSupport || [];
-  const policy = input.policy || 'record_only';
-  if (claimSupport.length === 0) {
-    return {
-      schemaVersion: 'claim_verifier@1',
-      status: 'not_checked',
-      policy,
-      notCheckedReason: 'no structured claim support was available',
-      passed: false,
-      checkedClaimCount: 0,
-      unsupportedClaimCount: 0,
-      claimResults: [],
-      issues: [],
-    };
-  }
-
-  const verified = claimSupport.map(verifyClaim);
+export function runDeterministicClaimVerifier(input: DeterministicClaimVerifierInput): ClaimVerificationResultV2 {
+  const verified = (input.claimSupport || []).map(verifyClaim);
   const claimResults = verified.map(item => item.result);
   const issues = verified.flatMap(item => item.issues);
   const unsupportedClaimCount = claimResults.filter(item => item.status === 'unsupported').length;
-  const hasErrors = issues.some(issue => issue.severity === 'error');
-  const hasUnsupported = unsupportedClaimCount > 0;
-  const hasPartial = claimResults.some(item => item.status === 'partial' || item.status === 'inference');
-  const hasNotChecked = claimResults.some(item => item.status === 'not_checked');
-  const allNotChecked = claimResults.length > 0 && claimResults.every(item => item.status === 'not_checked');
-  const status = hasErrors || hasUnsupported
-    ? 'failed'
-    : allNotChecked
-      ? 'not_checked'
-      : hasPartial || hasNotChecked
-      ? 'partial'
-      : 'passed';
-
+  const status = unsupportedClaimCount > 0 || issues.some(issue => issue.severity === 'error') ? 'failed'
+    : claimResults.length === 0 || claimResults.every(item => item.status === 'not_checked') ? 'not_checked'
+      : 'partial';
   return {
-    schemaVersion: 'claim_verifier@1',
+    schemaVersion: 'claim_verifier@2',
     status,
-    policy,
-    passed: status === 'passed',
+    policy: input.policy || 'record_only',
+    ...(claimResults.length === 0 ? {notCheckedReason: 'no structured claim support was available'} : {}),
+    passed: false,
     checkedClaimCount: claimResults.length,
     unsupportedClaimCount,
     claimResults,

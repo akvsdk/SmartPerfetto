@@ -3,6 +3,7 @@
 
 ---
 scene: teaching
+classification_description: "Explaining a trace concept, component role or mechanism using available context."
 priority: 3
 effort: medium
 required_capabilities: []

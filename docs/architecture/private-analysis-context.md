@@ -16,10 +16,11 @@ SmartPerfetto 把 trace 证据、用户源码和外部知识视为三个独立�
 | 无 | 有 | 使用精确 `knowledgeSourceIds` 和对应 active generation；外部知识仅作背景，不冒充当前 trace 证据 |
 | 有 | 有 | 两套 allowlist 同时生效，分别校验后进入同一私有投影和报告边界 |
 
-除轻量 Conversation surface 外，源码、外部 RAG 或 reference trace 任一被选择时，
-轻量 runtime 不具备所需工具，`fast` / `auto` 会解析为 `full`。Conversation
-固定使用 fast executor 并只返回受限引用；需要源码/RAG 深证据时必须 handoff 到新的
-完整分析。Smart Profile 的 preview 只生成场景盘点；从 preview
+`fast` / `full` 选择预算，源码、外部 RAG 和 reference trace 的授权独立保留，不因
+预算模式被自动移除，也不强制升级为完整报告。五个原生 runtime 按 typed intent 的
+范围和证据访问约束按需调用工具；`existing_only` 禁止新采集，`read_new` 不扩大授权。
+Conversation 复用这些按需能力，不自动启动额外源码分析。Smart Profile 的 preview
+只生成场景盘点；从 preview
 进入深度分析时，源码模式、`codebaseIds`、`knowledgeSourceIds`、输出语言和 preview
 身份必须原样传给实际 run，不能依赖 UI 的隐式全局状态。
 
@@ -35,6 +36,12 @@ SmartPerfetto 把 trace 证据、用户源码和外部知识视为三个独立�
 报告或 snapshot；旧版本留下的私有 context snapshot 在私有请求尝试恢复时会被清除。
 最终结论、确定性 trace 证据和有界 provenance 经过共享投影后，才分别进入聊天、报告、
 CLI artifact 和 analysis-result snapshot。
+
+Conversation 的逻辑会话可保留当前进程内的原始 artifact/capture，但每轮仍使用唯一
+物理 session/run ID。私有签发的 binding 绑定精确 trace pair、授权指纹和 owner scope；
+JSON、历史正文或 snapshot 都不能恢复该能力。模型得到的有界目录仅用于定位仍保留的
+artifact，不包含 rows 或验证权。授权/范围变化和会话销毁撤销 context；旧轮次取消、
+迟到回调或 cleanup 不能影响新轮次。每次 finalization 的读取视图固定其可读取的采集集合。
 
 ## 注册与删除生命周期
 

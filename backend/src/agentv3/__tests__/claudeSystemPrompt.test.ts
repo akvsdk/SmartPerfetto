@@ -16,10 +16,14 @@
 
 import { jest, describe, it, expect } from '@jest/globals';
 import type { ClaudeAnalysisContext } from '../types';
+import type {AnalysisTurnIntent} from '../../agentRuntime/analysisTurnIntent';
+import type {ReadonlyStrategyRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
+import type {StrategyDefinition} from '../strategyLoader';
 
 // Mock strategyLoader — return minimal templates
 jest.mock('../strategyLoader', () => ({
-  getFinalReportContract: jest.fn((scene: string) => {
+  getFinalReportContract: jest.fn((scene: string, registry?: ReadonlyStrategyRegistrySnapshot) => {
+    if (registry) return registry.getStrategy(scene)?.finalReportContract ?? null;
     if (scene !== 'scrolling') return null;
     return {
       requiredSections: [
@@ -42,9 +46,6 @@ jest.mock('../strategyLoader', () => ({
       ],
     };
   }),
-  // Consumed through getScenePlanTemplate by the architecture plan-requirement
-  // section; the frontmatter-driven templates are covered by their own suites.
-  getPlanTemplate: jest.fn(() => undefined),
   getRegisteredScenes: jest.fn(() => []),
   getStrategyContent: jest.fn((scene: string) => {
     if (scene === 'scrolling') return '滑动分析：检查 frame_timeline 表，关注掉帧根因';
@@ -53,6 +54,8 @@ jest.mock('../strategyLoader', () => ({
     return '通用分析指引';
   }),
   loadPromptTemplate: jest.fn((name: string) => {
+    if (name === 'prompt-turn-policy') return 'Typed turn protocol; scope, deliverable, and evidence access are server data.';
+    if (name === 'prompt-conclusion-contract-schema') return '<!-- authoring note -->\n{{sidecarOpeningMarker}}\n```json\n{"schemaVersion":"conclusion_contract_v1","mode":"focused_answer","conclusions":[],"clusters":[],"evidenceChain":[],"uncertainties":[],"nextSteps":[]}\n```\n-->\n{{supportedProofRules}}';
     if (name === 'prompt-role') return '# 角色\n\n你是 SmartPerfetto Android 性能分析专家。';
     if (name === 'prompt-language-zh') return '## 输出语言\n\n所有面向用户的回答必须使用简体中文。';
     if (name === 'prompt-language-en') return '## Output Language\n\nAll user-facing answers MUST be written in English.';
@@ -96,6 +99,8 @@ import {
 } from '../../services/codebase/sourceUseDecision';
 import { buildQuickSystemPrompt, buildSystemPrompt, buildSystemPromptParts, estimatePromptTokens } from '../claudeSystemPrompt';
 import {loadPromptTemplate} from '../strategyLoader';
+import {CONCLUSION_CONTRACT_SIDECAR_MARKER, parseConclusionContractSidecar} from '../../agent/core/conclusionContract';
+import {SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../../services/verifier/deterministicClaimVerifier';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -964,5 +969,199 @@ describe('quick prompt carries matched SQL definitions', () => {
 
     expect(prompt).not.toContain('Perfetto SQL 定义参考');
     expect(prompt).not.toContain('{{');
+  });
+});
+
+describe('typed turn prompt assembly', () => {
+  function fixture(overrides: Partial<AnalysisTurnIntent> = {}): ClaudeAnalysisContext {
+    const scene: StrategyDefinition = {
+      scene: 'scrolling', classificationDescription: 'Frame delivery during scrolling.',
+      strategyKind: 'normal', priority: 1, effort: 'high', keywords: [], compoundPatterns: [],
+      requiredCapabilities: ['frames'], optionalCapabilities: [], phaseHints: [],
+      planTemplate: null, verifierMisdiagnosisPatterns: [], detailSections: [],
+      sourcePath: '/pinned/scrolling.strategy.md',
+      content: 'Legacy recipe that must stay out of typed prompts.',
+      finalReportContract: {requiredSections: [{
+        id: 'frame_observation', label: 'Frame observation', description: 'Explain the observed frame data.',
+        required: true, triggerPatterns: ['legacy trigger'], patterns: ['legacy title'],
+        patternGroups: [['legacy group']], recoveryText: {zh: ['legacy recovery'], en: ['legacy recovery']},
+      }, {
+        id: 'conditional_observation', label: 'Conditional observation', required: true,
+        condition: {kind: 'semantic', description: 'When the question concerns event delivery.'},
+        triggerPatterns: [], patterns: [], patternGroups: [], recoveryText: {zh: [], en: []},
+      }]},
+    };
+    const registry: ReadonlyStrategyRegistrySnapshot = {
+      registryFingerprint: 'pin-one', overlayGeneration: 'one',
+      getStrategy: id => id === scene.scene ? scene : undefined,
+      getAllStrategies: () => [scene],
+    };
+    return {
+      query: 'How was frame delivery?', strategyRegistry: registry,
+      turnIntent: {
+        schemaVersion: 1, status: 'resolved', source: 'semantic', sceneId: 'scrolling',
+        taskKind: 'fact', scope: 'bounded_question', recommendedComplexity: 'full',
+        deliverable: 'answer', evidenceAccess: 'read_new', registryFingerprint: 'pin-one',
+        ...overrides,
+      },
+    };
+  }
+
+  const segmentData = (parts: ReturnType<typeof buildSystemPromptParts>, label: string) => {
+    const segment = parts.segments.find(item => item.label === label);
+    return segment ? JSON.parse(segment.content).data : undefined;
+  };
+
+  it('injects shared framing and the actual proof catalog after removing authoring comments', () => {
+    const parts = buildSystemPromptParts(fixture());
+    const segment = parts.segments.find(item => item.label === 'conclusion_declaration')!;
+    expect(segment).toMatchObject({tier: 1, droppable: false, truncatable: false});
+    const parsed = parseConclusionContractSidecar(segment.content);
+    expect(parsed).toMatchObject({status: 'valid', bindingEligibility: 'eligible'});
+    expect(segment.content.startsWith(CONCLUSION_CONTRACT_SIDECAR_MARKER)).toBe(true);
+    expect(JSON.parse(parsed.narrative.trim())).toEqual(SUPPORTED_DETERMINISTIC_CLAIM_RULES);
+    expect(segment.content).not.toContain('authoring note');
+    expect(segment.content).not.toMatch(/\{\{\w+\}\}/);
+  });
+
+  it.each(['Thanks.', 'Which trace should I attach?'])(
+    'keeps acknowledgement policy bounded when declaration guidance is present: %s', query => {
+      const context = {...fixture({taskKind: 'acknowledgement', recommendedComplexity: 'quick',
+        deliverable: 'answer', scope: 'bounded_question', evidenceAccess: 'existing_only'}), query};
+      const parts = buildSystemPromptParts(context);
+      expect(segmentData(parts, 'turn_policy')).toMatchObject({taskKind: 'acknowledgement',
+        deliverable: 'answer', scope: 'bounded_question', evidenceAccess: 'existing_only'});
+      expect(parts.segments.some(item => item.label === 'conclusion_declaration')).toBe(true);
+      expect(parts.segments.some(item => ['report_requirements', 'scene_strategy_core',
+        'plan_architecture_requirements', 'base_methodology'].includes(item.label))).toBe(false);
+      expect(buildQuickSystemPrompt(context)).toBe(parts.fullPrompt);
+    },
+  );
+
+  it.each([
+    '分析卡顿，为什么为什么，完整报告',
+    'Do not run the literal phrase "full scene analysis"; answer the observed value.',
+    '刚才那个，嗯。',
+  ])('routes different natural prose only by the typed decision: %s', query => {
+    const context = fixture();
+    const original = buildSystemPromptParts(context);
+    const changed = buildSystemPromptParts({...context, query,
+      turnIntent: {...context.turnIntent!, reason: query}});
+    expect(changed).toEqual(original);
+  });
+
+  it('uses one presentation contract for the quick and full entrypoints', () => {
+    const context = fixture();
+    expect(buildQuickSystemPrompt(context)).toBe(buildSystemPrompt(context));
+    const quickIntent = {...context, turnIntent: {...context.turnIntent!, recommendedComplexity: 'quick' as const}};
+    expect(buildSystemPromptParts(quickIntent)).toEqual(buildSystemPromptParts(context));
+    expect(buildQuickSystemPrompt(context, 4_000)).toBe(buildSystemPrompt(context, 4_000));
+  });
+
+  it('keeps a bounded full-budget answer free of report, plan, and scene recipes', () => {
+    const parts = buildSystemPromptParts({...fixture(), sceneType: 'scrolling',
+      architecture: {type: 'FLUTTER', confidence: 1, evidence: [],
+        flutter: {engine: 'IMPELLER', surfaceType: 'TEXTUREVIEW'}},
+      availableAgents: ['system-expert']});
+    const legacyLabels = [
+      'output_format', 'plan_architecture_requirements', 'scene_strategy_core', 'report_requirements',
+      'base_methodology', 'sub_agents',
+    ];
+    expect(parts.segments.filter(segment => legacyLabels.includes(segment.label))).toEqual([]);
+    expect(segmentData(parts, 'turn_policy')).toMatchObject({deliverable: 'answer', onDemandContext: true});
+    expect(segmentData(parts, 'available_agents')).toEqual(['system-expert']);
+    expect(segmentData(parts, 'scene_context')).toBeUndefined();
+  });
+
+  it('supplies pinned semantic report obligations even through the quick entrypoint', () => {
+    const context = fixture({deliverable: 'report', recommendedComplexity: 'quick'});
+    const parts = buildSystemPromptParts(context);
+    expect(buildQuickSystemPrompt(context)).toBe(parts.fullPrompt);
+    expect(segmentData(parts, 'report_requirements')).toEqual({
+      sceneId: 'scrolling', registryFingerprint: 'pin-one', requirements: [{
+        id: 'frame_observation', label: 'Frame observation', description: 'Explain the observed frame data.', required: true,
+      }, {id: 'conditional_observation', label: 'Conditional observation', required: true,
+        condition: {kind: 'semantic', description: 'When the question concerns event delivery.'}}],
+    });
+    expect(parts.segments.find(segment => segment.label === 'report_requirements')).toMatchObject({droppable: false, truncatable: false});
+  });
+
+  it('uses scene descriptions for broad context without importing the strategy execution recipe', () => {
+    const context = fixture({scope: 'scene_wide', taskKind: 'investigation'});
+    const parts = buildSystemPromptParts(context);
+    expect(segmentData(parts, 'scene_context')).toEqual({sceneId: 'scrolling',
+      description: 'Frame delivery during scrolling.', requiredCapabilities: ['frames'], optionalCapabilities: []});
+    expect(parts.segments.some(segment => segment.label === 'scene_strategy_core')).toBe(false);
+    expect(segmentData(buildSystemPromptParts({...context, onDemandContext: true}), 'scene_context')).toBeUndefined();
+  });
+
+  it('does not allow a caller density hint to widen a bounded question', () => {
+    const parts = buildSystemPromptParts({...fixture(), onDemandContext: false});
+    expect(segmentData(parts, 'turn_policy').onDemandContext).toBe(true);
+  });
+
+  it('preserves the existing-only restriction without loading lookup guidance', () => {
+    const context = {...fixture({evidenceAccess: 'existing_only'}), codeAwareMode: 'provider_send' as const,
+      codebaseIds: ['cb-one'], selectionContext: {kind: 'track_event' as const, eventId: 7, ts: 123, dur: 9},
+      conversationSummary: 'Prior finding is not independently verified.'};
+    const parts = buildSystemPromptParts(context);
+    expect(segmentData(parts, 'turn_policy').evidenceAccess).toBe('existing_only');
+    expect(segmentData(parts, 'source_authorization')).toEqual({mode: 'provider_send', codebaseIds: ['cb-one'], evidenceAccess: 'existing_only'});
+    expect(parts.segments.some(segment => segment.label === 'source_use_decision')).toBe(false);
+    expect(segmentData(parts, 'selection_context')).toEqual(context.selectionContext);
+    expect(segmentData(parts, 'conversation_context').conversationSummary).toBe(context.conversationSummary);
+    expect(buildQuickSystemPrompt(context)).toBe(parts.fullPrompt);
+  });
+
+  it.each(['not_checked', 'unavailable', 'checked', undefined] as const)('preserves comparison identity and probe status %s under pressure', capabilityProbeStatus => {
+    const context: ClaudeAnalysisContext = {...fixture(), comparison: {
+      referenceTraceId: 'reference-id', commonCapabilities: [], capabilityProbeStatus,
+      tracePairContext: {schemaVersion: 1, layout: 'vertical', primarySide: 'top', referenceSide: 'bottom',
+        panes: [{side: 'top', traceSide: 'current', traceId: 'current-id', traceFingerprint: 'current-fingerprint', traceName: 'a'.repeat(40_000)},
+          {side: 'bottom', traceSide: 'reference', traceId: 'reference-id', traceFingerprint: 'reference-fingerprint'}]},
+    }, conversationSummary: 'prior context '.repeat(20_000)};
+    const parts = buildSystemPromptParts(context, 2_000);
+    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(2_000);
+    expect(segmentData(parts, 'comparison_identity')).toMatchObject({referenceTraceId: 'reference-id',
+      capabilityProbeStatus: capabilityProbeStatus ?? 'not_checked', tracePairContext: {panes: [
+        {side: 'top', traceSide: 'current', traceId: 'current-id', traceFingerprint: 'current-fingerprint'},
+        {side: 'bottom', traceSide: 'reference', traceId: 'reference-id', traceFingerprint: 'reference-fingerprint'},
+      ]}});
+    expect(parts.droppedLabels).toContain('comparison_details');
+    expect(segmentData(parts, 'conversation_context')).toMatchObject({truncated: true});
+  });
+
+  it('fails closed when required identity cannot fit instead of truncating trace IDs', () => {
+    expect(() => buildQuickSystemPrompt(fixture(), 1)).toThrow('hard budget');
+    expect(() => buildQuickSystemPrompt(fixture(), Number.NaN)).toThrow('Invalid prompt token budget');
+  });
+
+  it('rejects missing, changed, or absent-scene pins without consulting global strategies', () => {
+    const context = fixture();
+    expect(() => buildSystemPrompt({...context, strategyRegistry: undefined})).toThrow('registry pin');
+    expect(() => buildSystemPrompt({...context, strategyRegistry: {...context.strategyRegistry!, registryFingerprint: 'pin-two'}})).toThrow('disagree');
+    expect(() => buildSystemPrompt({...context, strategyRegistry: {...context.strategyRegistry!, getStrategy: () => undefined}})).toThrow('absent');
+  });
+
+  it('keeps unavailable intent neutral even when general is absent from the pinned registry', () => {
+    const parts = buildSystemPromptParts(fixture({status: 'unavailable', source: 'fallback', sceneId: 'general'}));
+    expect(segmentData(parts, 'turn_policy')).toMatchObject({status: 'unavailable', onDemandContext: true});
+    expect(segmentData(parts, 'scene_context')).toBeUndefined();
+    expect(segmentData(parts, 'report_requirements')).toBeUndefined();
+  });
+
+  it('fails clearly when the typed protocol asset is missing', () => {
+    jest.mocked(loadPromptTemplate).mockReturnValueOnce(undefined);
+    expect(() => buildSystemPrompt(fixture())).toThrow('prompt-turn-policy');
+  });
+
+  it('fails clearly when the declaration asset is unavailable', () => {
+    jest.mocked(loadPromptTemplate).mockReturnValueOnce('Typed turn protocol').mockReturnValueOnce(undefined);
+    expect(() => buildSystemPrompt(fixture())).toThrow('prompt-conclusion-contract-schema');
+  });
+
+  it('returns a cache prefix and volatile suffix that exactly compose the full prompt', () => {
+    const parts = buildSystemPromptParts({...fixture(), packageName: 'sample.app', conversationSummary: 'Earlier answer.'});
+    expect(parts.fullPrompt).toBe([parts.stablePrefix, parts.volatileSuffix].filter(Boolean).join('\n\n'));
   });
 });

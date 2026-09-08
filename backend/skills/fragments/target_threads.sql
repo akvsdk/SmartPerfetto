@@ -28,8 +28,10 @@ target_threads AS (
     END as thread_end_ts
   FROM thread t
   JOIN process p ON t.upid = p.upid
-  WHERE (
-      '${package}' = ''
+  WHERE (${__process_scope.upid} IS NULL OR p.upid = ${__process_scope.upid})
+    AND (
+      ${__process_scope.upid} IS NOT NULL
+      OR '${package}' = ''
       OR p.name = '${package}'
       OR p.name GLOB '${package}:*'
     )

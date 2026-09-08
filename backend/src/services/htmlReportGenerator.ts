@@ -130,6 +130,14 @@ export interface AgentDrivenReportData {
       contradictingEvidence: any[];
     }>;
     conclusion: string;
+    turnIntent?: import('../agent/core/orchestratorTypes').AnalysisResult['turnIntent'];
+    completion?: import('../types/analysisDelivery').AnalysisCompletion;
+    outputOrigin?: import('../types/analysisDelivery').AnalysisOutputOrigin;
+    runtimeAppendix?: import('../types/analysisDelivery').AnalysisRuntimeAppendix;
+    reportAssessment?: import('../types/analysisDelivery').FinalReportAssessment;
+    deliveryAssurance?: import('../types/analysisDelivery').AnalysisDeliveryAssurance;
+    sourceUseDecision?: import('./codebase/sourceUseDecision').SourceUseDecisionV1;
+    sourceClaimVerificationResult?: import('./codebase/sourceClaimVerifier').SourceClaimVerificationResult;
     conclusionContract?: unknown;
     claimSupport?: ClaimSupportV1[];
     claimVerificationResult?: ClaimVerificationResult;

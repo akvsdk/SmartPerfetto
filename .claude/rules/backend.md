@@ -38,9 +38,10 @@ POST /api/agent/v1/analyze
   -> backend/src/routes/agentRoutes.ts
   -> AgentAnalyzeSessionService.prepareSession()
   -> createAgentOrchestrator()
-  -> selected runtime engine
-  -> shared MCP tools / Skill engine / trace_processor_shell
-  -> result normalization / quality artifacts
+  -> selected runtime: typed turn intent + authorized, on-demand tools
+  -> shared MCP / Skill / trace_processor_shell + raw execution capture
+  -> exact runtime result + private finalization context
+  -> product-owned finalizeAnalysisResult()
   -> SSE projection + report generation + analysis-result snapshot
 ```
 
@@ -63,11 +64,15 @@ Key files:
 | `backend/src/agentv3/planCompletionStatus.ts` | provider-neutral plan completion status |
 | `backend/src/agentv3/claudeSystemPrompt.ts` | system prompt assembly for Claude path |
 | `backend/src/agentv3/strategyLoader.ts` | loads `*.strategy.md` and `*.template.md` |
-| `backend/src/agentv3/queryComplexityClassifier.ts` | fast/full/auto routing |
-| `backend/src/agentv3/sceneClassifier.ts` | strategy-frontmatter-driven scene classifier |
-| `backend/src/agentv3/claudeVerifier.ts` | verifier for full Claude analysis |
+| `backend/src/agentRuntime/analysisTurnIntent.ts`, `runtimeTurnPolicy.ts` | typed semantic intent and separate budget/evidence/delivery policy |
+| `backend/src/agentRuntime/analysisFinalizationContext.ts` | private run-bound provider, deadline, evidence reader and terminal context |
+| `backend/src/agentRuntime/runtimeEvidenceContext.ts` | issued in-memory evidence continuity with exact scope and run leases |
+| `backend/src/agentRuntime/engines/claude/claudeVerifier.ts` | shared structured delivery diagnostics; no additional semantic LLM call |
 | `backend/src/agentv3/sessionStateSnapshot.ts` | persisted runtime state snapshot |
 | `backend/src/services/agentResultNormalizer.ts` | normalizes final result and preserves report/client boundaries |
+| `backend/src/services/canonicalAnalysisResult.ts`, `finalizeAnalysisResult.ts` | canonical body/claim extraction and the single asynchronous finalization boundary |
+| `backend/src/services/finalSemanticAssessment.ts` | bounded no-tool semantic review of the current body and declarations |
+| `backend/src/services/evidence/evidenceCapture.ts`, `evidenceReadView.ts` | original execution witnesses and bounded reads of retained captures |
 | `backend/src/services/finalReportContractGate.ts` | checks strategy `final_report_contract` completeness |
 | `backend/src/services/evidence/evidenceContractBuilder.ts` | builds evidence and claim-support contract from DataEnvelope output |
 | `backend/src/services/verifier/claimVerificationRunner.ts` | deterministic claim verification and identity-resolution collection |
@@ -82,8 +87,9 @@ Treat the final answer as a multi-surface contract, not one Markdown string:
 
 ```text
 Runtime output
-  -> AnalysisResult / conclusion contract
-  -> evidence contract + claim verification + identity resolutions
+  -> exact AnalysisResult + private RuntimeFinalizationContext
+  -> canonical body / original typed claims / captured evidence
+  -> finite proof + at most one no-tool semantic review
   -> HTML report and CLI turn files
   -> analysis-result snapshot
   -> frontend SSE projection and visible chat conclusion
@@ -95,6 +101,21 @@ Keep these boundaries intact:
   enforce required sections instead of relying only on prompt wording.
 - Claims in the final result should be backed by Skill/SQL evidence, claim
   verification, or an explicit uncertainty marker.
+- A parsed turn intent or claim declaration is model input, not truth or
+  authorization. Preserve the original proposition and its references; do not
+  rewrite a causal claim into a simpler numeric claim to obtain a passing check.
+- The product owner takes the private context from the exact runtime result
+  before copying or projecting it and invokes `finalizeAnalysisResult` once.
+  Finalization keeps the pinned provider, original absolute deadline and live
+  owner/authorization checks. Its semantic review has no tools and cannot
+  restart acquisition, extend the deadline, or rewrite the answer to repair
+  style. Missing evidence/review remains explicit.
+- Finite proof reads issued, immutable execution captures whose original values
+  were retained before display or transport truncation. Units and field semantics
+  need producer authority;
+  display strings, inferred column names, Query Review and restored snapshots
+  cannot supply it. The supported predicate catalog is
+  `SUPPORTED_DETERMINISTIC_CLAIM_RULES`; general causality is not a finite proof.
 - Chat projection may hide low-signal appendix details, raw SQL, snapshot IDs,
   or audit metadata, but reports, snapshots, and CLI artifacts must keep the
   provenance needed for later review and comparison.
@@ -120,28 +141,11 @@ Keep these boundaries intact:
   `submit_hypothesis`, `list_skills`, …) emit nothing. The same rule trims the
   evidence line and the phase-transition line; full provenance stays in the
   report and the snapshot, which is where it is consulted.
-- A provider can answer with an error string in the success channel, and every
-  runtime reads "this conclusion is bad" as "ask the model again" — so an
-  expired token bought up to four full report continuations on the OpenAI path,
-  each one the whole prompt re-sent. `looksLikeProviderErrorConclusion` stops
-  that, and `terminationReasonForProviderFailure` names the cause: `??=` is not
-  enough, because a provider that dies mid-run leaves `plan_incomplete` already
-  set and that reason would keep the slot, blaming the run for the transport.
-  Only `timeout`, `max_budget_usd`, `max_structured_output_retries` and an
-  existing `execution_error` outrank it; those name a limit the run really hit.
-- That detector cannot work on wording alone, and the reason generalises. This
-  product analyses traces, so `ECONNRESET`, `socket hang up` and
-  `Connection error` are things a trace *contains*: "ECONNRESET 出现 12 次" is
-  an ordinary short answer, and the first version of the matcher flagged five
-  of six such answers. What separates a failure from an answer about one is
-  authorship, and authorship is legible in the run, not the string — only a run
-  that dispatched no tools, collected no findings and streamed no prose could
-  have had its conclusion written by the transport. Hence the required
-  `AnalysisRunEvidence` argument: a caller that cannot say what the run did may
-  not ask the question, and Pi and OpenCode therefore do not ask. Both project
-  their conclusion out of assistant messages with no separate error channel, so
-  neither can observe authorship; leaving their bounded retry in place is
-  better than reintroducing the false positive on two more runtimes.
+- Native completion and output origin establish delivery state. Error words,
+  XML/tool-call examples, answer length or missing headings cannot establish
+  provider failure or authorize another report attempt. Unknown native status
+  stays unknown; submitted plan/hypothesis obligations and bound report
+  assessments are checked separately from evidence and prose semantics.
 - Evidence counts must come from a monotone, run-scoped signal. The two
   tool-call logs are not one: they are plan-adherence records, capped and
   trimmed from the front, and `replayPrePlanToolCalls` drops pre-plan calls
@@ -222,12 +226,12 @@ fixed tool count in docs or code.
 
 Tool visibility is request-shaped:
 
-- Quick/lightweight analysis registers only core evidence tools, plus
-  `list_skills` so `invoke_skill` is discoverable, and may include
-  `fetch_artifact` when an artifact store exists. The quick `list_skills`
-  projection is capped; the full catalog is full-mode only.
-- Full analysis registers the data, knowledge, memory, planning/hypothesis,
-  artifact, baseline, and optional code-aware tool families.
+- Quick/full shares the same request authorization and evidence-effect rules.
+  Lightweight mode may compact result/catalog projections, but does not define
+  a separate permission set or remove optional planning and authorized source
+  tools merely because the budget is quick.
+- `existing_only` denies acquisition tools at the shared handler/registry
+  boundary while preserving allowed metadata and retained-artifact reads.
 - Code-aware tools require codebase permission.
 - Comparison tools are registered only when a `referenceTraceId` exists.
 - External/public contracts should be derived from the registry view, not from
@@ -303,7 +307,8 @@ scorer fixtures test scoring mechanics only.
 `agentRoutes.ts` passes options into `orchestrator.analyze(...)` through an
 explicit whitelist. When adding a field to `AnalysisOptions`, update that
 whitelist in the same change. Otherwise the HTTP body field is silently dropped
-before it reaches either runtime.
+before it reaches a runtime. Private issued capabilities are internal options
+sidecars, never fields accepted from request JSON.
 
 Important whitelisted examples:
 
@@ -317,10 +322,17 @@ Important whitelisted examples:
 
 `options.analysisMode` accepts `fast`, `full`, or `auto`.
 
-- `fast`: quick mode, lightweight tool surface, no verifier/sub-agent path.
-- `full`: full tool surface, plan/verifier path where supported.
-- `auto`: minimal non-negotiable local rules (for example comparison mode),
-  then shared semantic classifier fallback.
+- `fast` and `full` choose runtime budgets; neither selects a report, requires a
+  plan, grants source access, or silently removes authorized capabilities.
+- `auto` follows the shared typed intent's complexity recommendation. Every
+  native engine uses its own pinned no-tool intent transport and the same
+  registry validation. Unavailable classification uses the explicit fallback,
+  not a keyword or deleted scene-classifier routing path.
+- Scope, deliverable and evidence access are separate intent dimensions.
+  `existing_only` strictly prohibits new evidence acquisition while allowing
+  retained artifact reads. `read_new` still requires the request's existing
+  authorization. Bounded or unavailable intent does not trigger automatic
+  prefetch. Planning is on demand; an explicitly submitted plan remains binding.
 
 Keep scoped selection questions lightweight. A selected slice/range is a scope
 signal, not an automatic quick/full decision.
@@ -336,6 +348,18 @@ signal, not an automatic quick/full decision.
   provider-not-found error instead of silently falling back.
 - Comparison sessions include both current and reference trace context; do not
   register comparison-only tools when no reference trace exists.
+- Conversation keeps a product-owned, memory-only evidence context for the
+  logical session and exact trace pair, authorization fingerprint and owner
+  scope. Each physical runtime session/run stays unique. Issued bindings survive
+  internal option spreads but cannot be recreated by JSON; a missing binding
+  cannot fall back to a cached issued store facade.
+- Release an evidence binding after finalization and clean up that physical
+  session. Scope changes or product disposal revoke the evidence context. Old
+  cancellation, callbacks and cleanup must not affect a successor. A bounded
+  retained-artifact catalog supplies locators, not rows, coverage or proof.
+- Historical report/snapshot reads project stored results without invoking a
+  new finalizer or granting new evidence authority. Normal read authorization
+  still applies; persisted captures cannot recreate private execution witnesses.
 
 ## TypeScript Conventions
 

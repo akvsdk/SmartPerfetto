@@ -79,7 +79,7 @@ and frontend readiness.
 | External Android knowledge | `backend/src/services/androidInternalsWiki/`, `externalKnowledgeSourceRegistry.ts`, `ragStore.ts` | Full-corpus Wiki audit, version/fingerprint identity, generation indexing, license/consent/scope, and private-content projection |
 | Trace processor | `backend/src/services/traceProcessorService.ts` | Trace loading, RPC management, SQL query execution |
 | Reports | `backend/src/services/htmlReportGenerator.ts` | HTML report generation |
-| Result quality pipeline | `backend/src/services/agentResultNormalizer.ts`, `finalReportContractGate.ts`, `evidence/`, `verifier/`, `analysisResultSnapshotPipeline.ts` | final report contract, evidence/claim verification, identity resolution, snapshots |
+| Result quality pipeline | `backend/src/services/canonicalAnalysisResult.ts`, `finalizeAnalysisResult.ts`, `finalSemanticAssessment.ts`, `evidence/`, `verifier/`, `analysisResultSnapshotPipeline.ts` | Original propositions, captures, finite proof and at most one semantic review, followed by shared projection/persistence |
 | CLI | `backend/src/cli-user/` | `smp` / `smartperfetto` commands, session/history/report export |
 | Comparison services | `backend/src/services/comparison*Service.ts` | Shared evidence/report contract for raw-trace and analysis-result comparison |
 
@@ -166,7 +166,9 @@ metadata-only visibility.
    UI -> POST /api/agent/v1/analyze
       -> AgentAnalyzeSessionService.prepareSession()
       -> selected runtime analyze()
-      -> shared TraceCompleteness probe
+      -> native typed intent -> scope / evidence access / budget / deliverable
+      -> eligible automatic prefetch or on-demand context
+         -> shared TraceCompleteness probe when requested
          -> shadow capability_manifest@1 probe-time snapshot
 
 3. Agent gathers evidence
@@ -180,26 +182,27 @@ metadata-only visibility.
          -> request source allowlist + live registry consent/scope check
          -> active RAG generation -> bounded attributed background context
       (neither Android Internals source is current-trace evidence)
-      -> selected codebase + source-investigation policy
-         -> record_source_use_decision (structured pre-lookup stop)
+      -> selected codebase + live authorization + on-demand source access
+         -> record_source_use_decision (explicit status, not a mandatory prerequisite)
          -> search_codebase / read_codebase_file (live root, no index required)
       -> resolve_symbol / lookup_app_source / lookup_aosp_source / lookup_kernel_source
          -> LookupResponseFilter -> CodeRef metadata
       -> propose_patch -> PatchProposer -> verified / sketch / unverified
 
-4. Result normalization and quality artifacts
-   raw runtime result -> agentResultNormalizer
-      -> final_report_contract gate
-      -> evidence contract / claim verification / identity resolutions
+4. Single product finalization
+   exact runtime result + private context -> finalizeAnalysisResult
+      -> canonical body + original claims + retained execution capture
+      -> finite proof + at most one no-tool semantic review
+      -> completion / report / claim / identity assessments
       -> SourceUseDecision + source-claim-binding verification
       -> QueryReviewV1 (review metadata, not standalone evidence)
 
 5. Backend streams output
-   SDK events -> runtime bridge -> StreamProjector -> SSE
+   SDK events -> runtime bridge -> privacy/narrative projection -> SSE
       -> frontend renders progress, tables, thoughts, answer tokens
 
 6. Finish and report
-   conclusion -> analysis_completed -> canonical safe source/CodeRef/patch metadata
+   finalized result -> analysis_completed -> canonical safe source/CodeRef/patch metadata
       -> AnalysisReceiptV2 (including runManifestId)
       -> HTML report + CLI artifacts + analysis-result snapshot
       -> /api/reports/:id
@@ -292,13 +295,14 @@ artifacts with different consumers:
 
 | Artifact | Consumer | Boundary |
 |---|---|---|
-| Visible chat conclusion | Frontend AI panel | Readable, with low-value SQL/appendix/audit noise hidden |
+| Visible chat conclusion | Frontend AI panel | Projects the canonical body and actual machine sidecars; separates runtime appendix without mechanically editing prose |
 | HTML report | Browser, export, sharing | Keeps evidence, claim verification, identity resolution, and appendix detail |
 | CLI artifacts | `smp run`, `smp ask`, `smp capture --analyze`, `smp report` | Persists turns, reports, claim verification, and identity files |
 | Analysis-result snapshot | Multi-result comparison and later review | Stores conclusion contract, claim support, verification, and identity metadata |
 | Query Review | AI panel, HTML report, artifact | Explains actual reads, filters, outputs, and limitations; it remains review metadata and cannot independently support a diagnosis |
 | Analysis Receipt | AI panel, HTML report, CLI, snapshot | Binds run/session/trace/runtime and summarizes evidence counts, claim audit, quality gates, and actual outputs |
 | Source Use Decision / Binding | AI panel receipt, HTML report, CLI, snapshot, API | Records selected/queried/used IDs, status/coverage, and trace-to-mechanism bindings; the Web projection retains no `CodeRef` |
+| Terminal / delivery metadata | SSE, report, CLI, snapshot | Separately records native completion, intent, output origin, report assessment and delivery assurance; missing historical fields are not passes |
 
 See the [Data Contract](../../backend/docs/DATA_CONTRACT_DESIGN.en.md) for the
 field and projection rules. A surface may compact the display, but it must not
@@ -309,6 +313,21 @@ When fixing conclusion quality, identify the failing layer first: runtime
 output, contract/gate, evidence/verification, report generation, snapshot, or
 frontend projection. Do not make chat cleaner by deleting provenance required by
 reports or snapshots.
+
+Typed-intent budget, scope, deliverable and evidence access are independent;
+valid declarations are not truth or authorization. `existing_only` prohibits
+new acquisition, and `read_new` still respects request permissions. Planning and
+source access are on demand. The finalizer preserves original propositions and
+performs at most one no-tool semantic review under the original deadline, pinned
+provider and owner/authorization checks. The finite proof catalog is defined in
+source; general causality and unknown fields cannot be presented as proved.
+
+Conversation may retain original captures within a logical session's exact
+trace/authorization/owner scope while physical run/session IDs remain unique.
+The model receives only a bounded artifact-locator catalog. Old cancellation,
+callbacks and cleanup cannot affect a later turn. Historical reads only project
+stored results; they neither rerun review nor restore original witnesses from a
+snapshot. See [Agent Runtime Architecture](agent-runtime.en.md) for lifecycle details.
 
 ## Comparison Modes
 

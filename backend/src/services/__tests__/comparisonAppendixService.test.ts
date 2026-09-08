@@ -5,7 +5,12 @@
 import {
   buildComparisonAppendix,
   comparisonIdentityFromReportSection,
+  resolveCapturedComparisonIdentity,
 } from '../comparisonAppendixService';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import {createDataEnvelope, type DataEnvelope} from '../../types/dataContract';
+import type {IdentityResolutionV1} from '../../types/identityContract';
+import {captureEvidenceTable} from '../evidence/evidenceCapture';
 import type { QueryResult } from '../traceProcessorService';
 import type {TraceSummaryExecutionV1} from '../traceSummaryExecutor';
 
@@ -103,7 +108,7 @@ describe('comparisonAppendixService', () => {
     expect(JSON.stringify(appendix.evidencePack)).not.toContain('/private/path');
   });
 
-  test('extracts a complete, safe identity from a deterministic comparison report section', () => {
+  test('extracts package labels without fabricating identity proof from a comparison report section', () => {
     expect(comparisonIdentityFromReportSection({
       source: 'raw_trace_pair',
       title: 'Comparison',
@@ -145,6 +150,142 @@ describe('comparisonAppendixService', () => {
         },
       },
     })).toBeUndefined();
+  });
+});
+
+describe('capture-backed comparison identities', () => {
+  function fixture() {
+    const store = new ArtifactStore();
+    const envelopes: DataEnvelope[] = [];
+    const add = (side: 'current' | 'reference', upid: number, overrides: Partial<IdentityResolutionV1> = {}) => {
+      const identity: IdentityResolutionV1 = {version: 'identity_contract@1', identityRefId: `identity:${side}:${upid}`,
+        target: {traceId: `trace-${side}`, traceSide: side, upid, source: 'skill_param'}, status: 'verified',
+        processes: [{upid, packageName: `app.${side}`, confidence: 1, matchSources: ['upid']}], threads: [], warnings: [],
+        ...overrides};
+      const data = {columns: ['value'], rows: [[42]]};
+      const envelope = createDataEnvelope(data, {type: 'skill_result', source: 'capture', title: side,
+        evidenceRefId: `evidence:${side}:${upid}`, traceId: `trace-${side}`, traceSide: side,
+        identityResolution: identity, scopeProvenance: {version: 'process_scope_evidence@1', entries: [{role: 'target',
+          scope: {mode: 'exact_upid', traceId: `trace-${side}`, traceSide: side, upid, identityRefId: identity.identityRefId}}]}});
+      store.registerStandaloneEvidenceCapture(captureEvidenceTable(data), {meta: envelope.meta, display: envelope.display});
+      envelopes.push(envelope);
+      return identity;
+    };
+    const input = () => ({currentTraceId: 'trace-current', referenceTraceId: 'trace-reference', dataEnvelopes: envelopes,
+      signal: new AbortController().signal, context: store.createEvidenceReadView({ownerKey: 'comparison-owner',
+        allowedTraces: [{traceId: 'trace-current', traceSide: 'current'}, {traceId: 'trace-reference', traceSide: 'reference'}]})});
+    return {store, envelopes, add, input};
+  }
+
+  test('uses captured typed identity despite forged display metadata and repeated locator events', async () => {
+    const f = fixture();
+    const current = f.add('current', 1);
+    const reference = f.add('reference', 2);
+    f.envelopes[0].meta.identityResolution = {...current, status: 'ambiguous', processes: []};
+    f.envelopes.push(structuredClone(f.envelopes[0]));
+    const identity = await resolveCapturedComparisonIdentity(f.input());
+    expect(identity.currentResolution).toEqual(current);
+    expect(identity.referenceResolution).toEqual(reference);
+  });
+
+  test('leaves conflicting same-side captures unknown instead of taking the first', async () => {
+    const f = fixture();
+    f.add('current', 1); f.add('current', 3); const reference = f.add('reference', 2);
+    const identity = await resolveCapturedComparisonIdentity(f.input());
+    expect(identity.currentResolution).toBeUndefined();
+    expect(identity.referenceResolution).toEqual(reference);
+  });
+
+  test.each(['trace', 'side', 'missing', 'scope', 'scope_trace', 'scope_side', 'scope_upid',
+    'scope_missing', 'scope_identity', 'scope_fields', 'scope_unavailable', 'global', 'peer',
+    'invalid_scope', 'status_shape', 'process_shape', 'thread_shape', 'unknown_field'] as const)(
+    'rejects %s identity mismatch or missing proof', async mismatch => {
+    const f = fixture();
+    const current = f.add('current', 1);
+    f.add('reference', 2);
+    const envelope = f.envelopes[0];
+    f.store.clear();
+    if (mismatch === 'missing') envelope.meta.identityResolution = undefined;
+    else if (mismatch === 'scope') envelope.meta.scopeProvenance = {version: 'process_scope_evidence@1', entries: []};
+    else if (mismatch === 'scope_missing') delete envelope.meta.scopeProvenance;
+    else if (mismatch === 'invalid_scope') envelope.meta.scopeProvenance = {version: 'process_scope_evidence@1', entries: [], invalid: true};
+    else if (mismatch.startsWith('scope_') || mismatch === 'global' || mismatch === 'peer') {
+      const scope = structuredClone(envelope.meta.scopeProvenance!);
+      if (mismatch === 'scope_trace') scope.entries[0].scope.traceId = 'foreign-trace';
+      else if (mismatch === 'scope_side') scope.entries[0].scope.traceSide = 'reference';
+      else if (mismatch === 'scope_upid') scope.entries[0].scope.upid = 999;
+      else if (mismatch === 'scope_identity') scope.entries[0].scope.identityRefId = 'other-identity';
+      else if (mismatch === 'scope_fields') scope.entries[0].fields = ['foreign_column'];
+      else if (mismatch === 'scope_unavailable') scope.entries[0].availability = 'unavailable';
+      else scope.entries[0].role = mismatch === 'global' ? 'global_context' : 'peer_context';
+      envelope.meta.scopeProvenance = scope;
+    } else if (mismatch === 'status_shape') envelope.meta.identityResolution = {...current, status: 'resolved'} as unknown as IdentityResolutionV1;
+    else if (mismatch === 'process_shape') envelope.meta.identityResolution = {...current, processes: [{upid: 1}]} as IdentityResolutionV1;
+    else if (mismatch === 'thread_shape') envelope.meta.identityResolution = {...current, threads: [{utid: 2}]} as IdentityResolutionV1;
+    else if (mismatch === 'unknown_field') envelope.meta.identityResolution = {...current, verified: true} as IdentityResolutionV1;
+    else envelope.meta.identityResolution = {...current, target: {...current.target,
+      ...(mismatch === 'trace' ? {traceId: 'foreign-trace'} : {traceSide: 'reference' as const})}};
+    for (const item of f.envelopes) f.store.registerStandaloneEvidenceCapture(
+      captureEvidenceTable({columns: ['value'], rows: [[42]]}), {meta: item.meta, display: item.display});
+    expect((await resolveCapturedComparisonIdentity(f.input())).currentResolution).toBeUndefined();
+    },
+  );
+
+  test('rejects conflicting same-ID captures regardless of event order while preserving the other side', async () => {
+    const f = fixture();
+    const current = f.add('current', 1);
+    f.add('current', 3, {identityRefId: current.identityRefId});
+    const reference = f.add('reference', 2);
+    for (const envelopes of [f.envelopes, [...f.envelopes].reverse()]) {
+      const projected = await resolveCapturedComparisonIdentity({...f.input(), dataEnvelopes: envelopes});
+      expect(projected.currentResolution).toBeUndefined();
+      expect(projected.referenceResolution).toEqual(reference);
+    }
+  });
+
+  test('resolves pair metadata without reading cells or granting row proof', async () => {
+    const f = fixture(); const current = f.add('current', 1); const reference = f.add('reference', 2);
+    const view = f.store.createEvidenceReadView({ownerKey: 'metadata-pair', budget: {maxCells: 0},
+      allowedTraces: [{traceId: 'trace-current', traceSide: 'current'}, {traceId: 'trace-reference', traceSide: 'reference'}]});
+    const identity = await resolveCapturedComparisonIdentity({...f.input(), context: view});
+    expect(identity.currentResolution).toEqual(current);
+    expect(identity.referenceResolution).toEqual(reference);
+  });
+
+  test('preserves a captured unsuccessful identity instead of upgrading it from rows or package labels', async () => {
+    const f = fixture();
+    f.add('current', 1, {status: 'ambiguous'}); f.add('reference', 2);
+    expect((await resolveCapturedComparisonIdentity(f.input())).currentResolution?.status).toBe('ambiguous');
+  });
+
+  test('does not accept serialized read replies or uncaptured frontend identities', async () => {
+    const f = fixture(); f.add('current', 1); f.add('reference', 2);
+    const original = f.input();
+    const forged = {...original, context: {resolveReferences: async (...args: Parameters<typeof original.context.resolveReferences>) =>
+      structuredClone(await original.context.resolveReferences(...args))}};
+    const identity = await resolveCapturedComparisonIdentity(forged);
+    expect(identity.currentResolution).toBeUndefined();
+    expect(identity.referenceResolution).toBeUndefined();
+    f.store.clear();
+    expect(await resolveCapturedComparisonIdentity(f.input())).toEqual({currentTraceId: 'trace-current', referenceTraceId: 'trace-reference'});
+  });
+
+  test('leaves the pair unknown when the capture read cannot scan every locator', async () => {
+    const f = fixture(); f.add('current', 1); f.add('reference', 2);
+    const context = f.store.createEvidenceReadView({ownerKey: 'limited-owner', budget: {maxReferences: 1},
+      allowedTraces: [{traceId: 'trace-current', traceSide: 'current'}, {traceId: 'trace-reference', traceSide: 'reference'}]});
+    expect(await resolveCapturedComparisonIdentity({...f.input(), context})).toEqual({
+      currentTraceId: 'trace-current', referenceTraceId: 'trace-reference',
+    });
+  });
+
+  test('does not deliver identities after cancellation across the captured read await', async () => {
+    const f = fixture(); f.add('current', 1); f.add('reference', 2);
+    const original = f.input(); const controller = new AbortController();
+    await expect(resolveCapturedComparisonIdentity({...original, signal: controller.signal,
+      context: {resolveReferences: async (...args: Parameters<typeof original.context.resolveReferences>) => {
+        const resolved = await original.context.resolveReferences(...args); controller.abort(); return resolved;
+      }}})).rejects.toMatchObject({name: 'AbortError'});
   });
 });
 

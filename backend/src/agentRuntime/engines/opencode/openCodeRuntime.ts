@@ -28,6 +28,7 @@ import {
   recordEvaluationTokenDeltaIfPresent,
 } from '../../../services/selfEvolution/evaluationRuntimeHooks';
 import { ArtifactStore } from '../../../agentv3/artifactStore';
+import {resolveRuntimeEvidenceStore} from '../../runtimeEvidenceContext';
 import {
   buildNegativePatternSection,
   buildPatternContextSection,
@@ -47,9 +48,8 @@ import { detectFocusApps, focusAppTimeRangeFromSelection } from '../../../agentv
 import { localize, parseOutputLanguage, type OutputLanguage } from '../../../agentv3/outputLanguage';
 import { formatToolCallNarration, formatToolResultNarration, toolResultIsFailure } from '../../../agentv3/toolNarration';
 import { estimateAnalysisConfidence } from '../../../agentv3/analysisTermination';
-import { planPhaseUpdatedContent } from '../../../agentv3/planPhaseEvents';
-import { classifyScene, type SceneType } from '../../../agentv3/sceneClassifier';
-import {loadPromptTemplate, renderTemplate} from '../../../agentv3/strategyLoader';
+import {planPhaseUpdatedContent} from '../../../agentv3/planPhaseEvents';
+import { type SceneType } from '../../../agentv3/sceneClassifier';
 import { probeTraceCompleteness } from '../../../agentv3/traceCompletenessProber';
 import type {
   AnalysisNote,
@@ -63,9 +63,7 @@ import {
   getAnalysisPlanCompletionStatus,
   type AnalysisPlanCompletionStatus,
 } from '../../../agentv3/planCompletionStatus';
-import {isConclusionLikePlanPhase} from '../../../agentv3/planPhaseSemantics';
 import {
-  formatPlanEvidenceGap,
   recordPlanOrPrePlanToolCall,
   resetPrePlanToolCallsForNewRun,
   readToolResultFacts,
@@ -83,27 +81,16 @@ import type { McpToolDefinition } from '../../../agentv3/mcpToolRegistry';
 import type { JsonRpcRequest, JsonRpcResponse } from '../../../agentv3/standaloneMcpServer';
 import { RPC_ERROR_CODES } from '../../../agentv3/standaloneMcpServer';
 import {
-  assessFinalResultQuality,
   applyFinalResultQualityGate,
-  hasDeliverableFinalReportHeading,
-  serializeFinalResultQualityIssueContext,
-  stripLeadingProcessNarrationFromFinalReport,
   type FinalResultComparisonIdentity,
-  type FinalResultQualityIssue,
 } from '../../../services/finalResultQualityGate';
-import {resolveEffectiveAnalysisMode} from '../../../services/effectiveAnalysisMode';
 import {analysisContextUsesPrivateKnowledge} from '../../../services/resolvedAnalysisContext';
 import { verifyConclusion } from '../claude/claudeVerifier';
 import { getExtendedKnowledgeBase } from '../../../services/sqlKnowledgeBase';
-import { sanitizeCodeAwareText } from '../../../services/security/codeAwareOutputRegistry';
-import {
-  assessFinalReportContractCompleteness,
-  type FinalReportContractCompletenessResult,
-} from '../../../services/finalReportContractGate';
+import {sanitizeCodeAwareTextWithReceipt} from '../../../services/security/codeAwareOutputRegistry';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
-import {completeFinalReportCodeReferences} from '../../../services/codebase/codeReferenceContract';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
-import {finalizeSourceAwareAnalysisResult} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import { getProviderService, type ProviderConfig, type ProviderScope } from '../../../services/providerManager';
 import {providerSubprocessEnv} from '../../../services/providerManager/envIsolation';
 import type { RuntimeSelection } from '../../runtimeSelection';
@@ -119,7 +106,7 @@ import { createAnalysisRunSpec, type AnalysisRunSpec } from '../../analysisRunSp
 import {
   buildQuickConversationContext,
   buildRuntimeTracePairComparisonContext,
-  buildQuickKnowledgeBaseContext,
+  buildRuntimeTracePairIdentityContext,
 } from '../../runtimePromptContext';
 import {
   buildQuickRunReceipt,
@@ -127,34 +114,22 @@ import {
   buildQuickMemoryContextPayload,
   captureSkillDisplayEntities,
   createRuntimeSkillNotesBudget,
-  findTruncationVerificationIssue,
   quickStopReasonFromTermination,
-  repairTruncatedFinalReport,
   resolveQuickTurnBudget,
   toProtocolHypothesis as toRuntimeProtocolHypothesis,
 } from '../../runtimeCommon';
 import { buildRuntimeCaseBackgroundContext } from '../../../services/caseEvolution/caseBackgroundContext';
-import { resolveRuntimeQuickMode } from '../../quickModeResolution';
+import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
+import {buildComplexityClassifierInput} from '../../../agentv3/queryComplexityContext';
+import {runOpenCodeIntentTransport, type OpenCodeClassifierHost, type OpenCodeIntentTransportInput} from './openCodeIntentTransport';
+import {resolveRuntimeTurnPolicy, type RuntimeTurnPolicy} from '../../runtimeTurnPolicy';
+import {attachFinalizationContext} from '../../analysisFinalizationContext';
+import type {ReadonlyStrategyRegistrySnapshot} from '../../../services/selfEvolution/effectiveRuntimeRegistryContext';
+import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisDeliveryContext} from '../../../types/analysisDelivery';
+import {resolveAgentRuntimeBudgetConfig} from '../../../config';
 import { RuntimeExecutionGuard, type RuntimeExecutionLease } from '../../runtimeExecutionGuard';
 import {isRuntimeCandidateAdmitted} from '../../runtimeCandidateAdmission';
-import {buildAdaptiveRoutingForQuickResolution} from '../../adaptiveRoutingProjection';
-import {reconcileDeliveredFinalReportPhase} from '../../finalReportPhaseReconciliation';
-import {resolveRuntimeFinalReportSceneType} from '../../finalReportSceneResolution';
-import {loadRuntimePlanCompletionContinuationPrompt} from '../../planCompletionContinuation';
-import {
-  buildRuntimeQuickEvidenceAttempt,
-  selectReusableRuntimeQuickEvidenceAttempt,
-  type RuntimeQuickEvidenceCounts,
-  type RuntimeQuickEvidenceDirectAnswer,
-  type RuntimeQuickEvidenceAttempt,
-} from '../../quickEvidenceDirectAnswer';
-import {
-  buildQuickDirectAcknowledgementAnalysisResult,
-  buildQuickDirectEvidenceAnalysisResult,
-  countCompletedQuickConversationTurns,
-  emitQuickDirectAnswerEvents,
-  emitQuickDirectQualityGateIssue,
-} from '../../quickDirectResult';
+import {countCompletedQuickConversationTurns} from '../../quickDirectResult';
 import {
   createJsonSchemaFromZodRawShape,
   normalizeRuntimeToolArgs,
@@ -203,8 +178,6 @@ export const OPENCODE_MCP_TIMEOUT_MIN_MS = 100;
 export const OPENCODE_MCP_TIMEOUT_MAX_MS = 300_000;
 const OPENCODE_BRIDGE_TIMEOUT_MS_ENV = 'SMARTPERFETTO_OPENCODE_BRIDGE_TIMEOUT_MS';
 const STANDALONE_MCP_NAME = 'smartperfetto';
-const OPENCODE_MAX_PLAN_COMPLETION_CONTINUATIONS = 2;
-const OPENCODE_MAX_HYPOTHESIS_RESOLUTION_CONTINUATIONS = 1;
 
 const STANDALONE_MCP_PUBLIC_TOOLS = [
   'lookup_blog_knowledge',
@@ -344,6 +317,8 @@ interface OpenCodeAnalysisPreparation {
   toolDefinitions: McpToolDefinition[];
   allowedToolNames: Set<string>;
   quickMode: boolean;
+  turnIntent: AnalysisTurnIntent;
+  turnPolicy: RuntimeTurnPolicy;
   sceneType: SceneType;
   packageName?: string;
   architecture?: ArchitectureInfo;
@@ -564,6 +539,7 @@ export function createOpenCodeHardenedConfig(
   env: EnvLike = process.env,
   bridge?: OpenCodeMcpBridgeHandle,
   modelConfig?: OpenCodeModelConfig,
+  maxSteps = resolveAgentRuntimeBudgetConfig(env).maxTurns,
 ): Record<string, unknown> {
   const mcpToolNames = bridge
     ? createOpenCodeMcpToolNames(allowedToolNames)
@@ -619,7 +595,7 @@ export function createOpenCodeHardenedConfig(
         ...(modelConfig ? { model: `${modelConfig.model.providerID}/${modelConfig.model.modelID}` } : {}),
         tools,
         permission,
-        maxSteps: 80,
+        maxSteps,
       },
     },
   };
@@ -919,6 +895,12 @@ export async function dispatchOpenCodeBridgeRequest(
       const codeReferences = extractSourceLookupCodeReferences(definition.name, result);
       recordPlanOrPrePlanToolCall(options.analysisPlan, {
         toolName: definition.name,
+        toolCallId: taskId,
+        onPhaseAutoCompleted: phase => emitOpenCodeBridgeUpdateIfDeliverable(emitUpdate, options, {
+          type: 'plan_phase_updated',
+          content: planPhaseUpdatedContent({phaseId: phase.id, phaseName: phase.name, status: 'completed', summary: phase.summary, origin: 'auto'}),
+          timestamp: Date.now(),
+        }),
         input: args,
         resultText,
         // Read before truncation: planPhaseId and success sit after the body.
@@ -1668,6 +1650,27 @@ function resolveOpenCodeModelConfig(
   };
 }
 
+/** Register an explicitly configured same-provider light model with its complete connection. */
+function registerOpenCodeLightModel(config: OpenCodeModelConfig): OpenCodeModelConfig {
+  const configured = config.smallModel?.trim();
+  if (!configured || !config.providerConfig) return {...config, smallModel: undefined};
+  const prefix = `${config.model.providerID}/`;
+  const lightId = configured.startsWith(prefix) ? configured.slice(prefix.length)
+    : configured.includes('/') ? undefined : configured;
+  const provider = config.providerConfig[config.model.providerID];
+  const models = isRecord(provider) && isRecord(provider.models) ? provider.models : undefined;
+  const primary = models?.[config.model.modelID];
+  if (!lightId || !isRecord(provider) || !models || !isRecord(primary)) {
+    return {...config, smallModel: undefined};
+  }
+  return {
+    ...config, smallModel: `${prefix}${lightId}`,
+    providerConfig: {...config.providerConfig, [config.model.providerID]: {
+      ...provider, models: {...models, [lightId]: {...primary, id: lightId, name: lightId}},
+    }},
+  };
+}
+
 function extractTextParts(value: unknown): string {
   if (!value) return '';
   if (Array.isArray(value)) {
@@ -1712,34 +1715,11 @@ export function extractOpenCodeAssistantText(value: unknown): string {
   const nonEmptyAssistantTexts = assistantTexts.filter(Boolean);
   const assistantText = selectBestOpenCodeAssistantText(nonEmptyAssistantTexts);
   if (assistantText) return assistantText;
-  if (isRecord(value) && Array.isArray(value.parts)) return extractTextParts(value).trim();
-  if (isRecord(value) && 'data' in value && isRecord(value.data) && Array.isArray(value.data.parts)) {
-    return extractTextParts(value.data).trim();
-  }
   return '';
 }
 
-function scoreOpenCodeAssistantText(text: string): number {
-  const trimmed = text.trim();
-  if (!trimmed) return 0;
-  let score = Math.min(trimmed.length, 50_000);
-  const headingCount = trimmed.match(/^#{1,3}\s+\S/gm)?.length ?? 0;
-  if (headingCount > 0) score += 20_000 + Math.min(headingCount, 8) * 1000;
-  if (/\b(report|analysis)\b/i.test(trimmed) || /报告|分析/.test(trimmed)) {
-    score += 3000;
-  }
-  return score;
-}
-
 function selectBestOpenCodeAssistantText(texts: readonly string[]): string | undefined {
-  let best: { text: string; score: number } | undefined;
-  for (const text of texts) {
-    const score = scoreOpenCodeAssistantText(text);
-    if (!best || score >= best.score) {
-      best = { text, score };
-    }
-  }
-  return best?.text;
+  return texts[texts.length - 1];
 }
 
 function collectOpenCodeAssistantMessages(value: unknown, output: Record<string, unknown>[]): void {
@@ -1908,9 +1888,7 @@ function getLatestOpenCodeAssistantMessage(value: unknown): Record<string, unkno
 function isOpenCodeAssistantMessageComplete(message: Record<string, unknown> | undefined): boolean {
   if (!message) return false;
   const info = isRecord(message.info) ? message.info : message;
-  if (info.error !== undefined) {
-    throw new Error(`OpenCode assistant message failed: ${describeOpenCodeSdkError(info.error)}`);
-  }
+  if (info.error != null) return true;
   if (typeof info.finish === 'string' && info.finish.trim()) {
     return info.finish.trim() !== 'tool-calls';
   }
@@ -1939,7 +1917,9 @@ function openCodePromptAbortError(): Error {
 }
 
 function openCodePromptTimeoutError(timeoutMs: number): Error {
-  return new Error(`OpenCode prompt timed out after ${timeoutMs}ms`);
+  return Object.assign(new Error(`OpenCode prompt timed out after ${timeoutMs}ms`), {
+    name: 'TimeoutError', code: 'OPENCODE_PROMPT_TIMEOUT', timeoutMs,
+  });
 }
 
 function throwIfOpenCodePromptStopped(options: {
@@ -2019,10 +1999,7 @@ async function resolveOpenCodeCurrentTurnMessages(options: {
 
     const rawWindowCount = getOpenCodeRawMessageWindowCount(messagesResponse);
     if (rawWindowCount < limit) {
-      return getOpenCodeAssistantMessagesAfterBaseline(
-        messagesResponse,
-        options.baselineWatermark,
-      );
+      throw new Error('OpenCode current-turn history no longer contains the restored assistant watermark');
     }
     if (limit >= OPENCODE_MESSAGE_WINDOW_MAX_LIMIT) {
       throw new Error(
@@ -2048,6 +2025,7 @@ export async function runOpenCodePrompt(
     resumedSession?: boolean;
     pollDelay?: (ms: number) => Promise<void>;
     adaptiveObservation?: boolean;
+    maxSteps?: number;
   },
 ): Promise<{ promptResponse?: unknown; messagesResponse?: unknown }> {
   const {
@@ -2140,8 +2118,7 @@ export async function runOpenCodePrompt(
         assertSdkSuccess(statusResponse, 'OpenCode session status');
         const sessionStatus = getOpenCodeSessionStatus(statusResponse, sessionId);
         if (
-          sessionStatus === 'idle' &&
-          extractOpenCodeAssistantText(currentTurnMessagesResponse)
+          sessionStatus === 'idle' && latestAssistant
         ) {
           const finalMessagesResponse = await fetchMessagesWindow(
             OPENCODE_MESSAGE_WINDOW_INITIAL_LIMIT,
@@ -2156,8 +2133,8 @@ export async function runOpenCodePrompt(
           const latestCanonical = finalAssistantMessages[finalAssistantMessages.length - 1];
           if (
             latestCanonical &&
-            isOpenCodeAssistantMessageComplete(latestCanonical) &&
-            extractOpenCodeAssistantText(openCodeAssistantMessagesResponse(finalAssistantMessages))
+            (isOpenCodeAssistantMessageComplete(latestCanonical) ||
+              (options.maxSteps !== undefined && finalAssistantMessages.length >= options.maxSteps))
           ) {
             recordOpenCodeAssistantUsage(finalAssistantMessages);
             return {messagesResponse: openCodeAssistantMessagesResponse(finalAssistantMessages)};
@@ -2204,8 +2181,14 @@ export async function runOpenCodePrompt(
     baselineWatermark,
     fetchWindow: limit => fetchMessagesWindow(limit),
   });
-  const messagesResponse = openCodeAssistantMessagesResponse(currentTurnMessages);
-  const promptAssistantMessages = getOpenCodeAssistantMessages(promptResponse);
+  const promptAssistantMessages = getOpenCodeAssistantMessages(promptResponse).filter(message =>
+    !baselineWatermark || getOpenCodeAssistantMessageSignature(message) !== baselineWatermark.signature);
+  const directIds = new Set(promptAssistantMessages.map(getOpenCodeAssistantMessageId).filter(Boolean));
+  const combinedMessages = [
+    ...currentTurnMessages.filter(message => !directIds.has(getOpenCodeAssistantMessageId(message))),
+    ...promptAssistantMessages,
+  ];
+  const messagesResponse = openCodeAssistantMessagesResponse(combinedMessages);
   const observedAssistantMessages = promptAssistantMessages.length > 0
     ? promptAssistantMessages
     : currentTurnMessages.slice(-1);
@@ -2213,7 +2196,7 @@ export async function runOpenCodePrompt(
     recordFirstAssistantMessage();
   }
   recordOpenCodeAssistantUsage(observedAssistantMessages);
-  return { promptResponse, messagesResponse };
+  return { promptResponse: openCodeAssistantMessagesResponse(promptAssistantMessages), messagesResponse };
 }
 
 export function getOpenCodePlanCompletionStatus(plan: AnalysisPlanV3 | null): AnalysisPlanCompletionStatus & {
@@ -2224,111 +2207,22 @@ export function getOpenCodePlanCompletionStatus(plan: AnalysisPlanV3 | null): An
   });
   const pending = status.hasPlan
     ? status.pendingPhases.map((phase: any) => phase.id || phase.title || 'unknown')
-    : ['plan_missing'];
-  return { ...status, pending };
+    : [];
+  return { ...status, complete: !status.hasPlan || status.complete, pending };
 }
 
+/** @deprecated Final output does not implicitly complete a model-submitted plan. */
 export function completeOpenCodeFinalReportPhaseIfDelivered(
-  plan: AnalysisPlanV3 | null,
-  conclusion: string,
-  outputLanguage: string,
-  now: () => number = Date.now,
+  _plan: AnalysisPlanV3 | null,
+  _conclusion: string,
+  _outputLanguage: string,
+  _now: () => number = Date.now,
 ): PlanPhase | undefined {
-  return reconcileDeliveredFinalReportPhase({
-    plan,
-    conclusion,
-    minSummaryChars: MIN_PHASE_SUMMARY_CHARS,
-    isDeliverableReport: hasDeliverableFinalReportHeading,
-    buildSummary: () => localize(
-      outputLanguage as any,
-      '最终报告已由 OpenCode 直接交付；该最终结论阶段按完整报告自动闭合。',
-      'The final report was delivered by OpenCode; the final-report phase was auto-closed from the complete report.',
-    ),
-    now,
-  });
-}
-
-function getCompletedOpenCodeFinalReportPhaseSummary(
-  plan: AnalysisPlanV3 | null,
-  outputLanguage: OutputLanguage,
-): string | undefined {
-  const phase = [...(plan?.phases ?? [])]
-    .reverse()
-    .find(candidate =>
-      candidate.status === 'completed' &&
-      isConclusionLikePlanPhase(candidate) &&
-      (candidate.summary?.trim().length ?? 0) >= MIN_PHASE_SUMMARY_CHARS,
-    );
-  const summary = phase?.summary?.trim();
-  if (!summary) return undefined;
-  if (hasDeliverableFinalReportHeading(summary)) return summary;
-  return `${localize(outputLanguage, '## 综合结论', '## Final Conclusion')}\n\n${summary}`;
+  return undefined;
 }
 
 export function sanitizeOpenCodeConclusionText(conclusion: string): string {
-  return stripLeadingProcessNarrationFromFinalReport(conclusion);
-}
-
-function formatIncompletePlanMessage(
-  status: { pending: string[]; evidenceGaps?: AnalysisPlanCompletionStatus['evidenceGaps'] },
-  outputLanguage: string,
-): string {
-  const pending = status.pending.join(', ');
-  const evidenceGapText = status.evidenceGaps?.length
-    ? localize(
-        outputLanguage as any,
-        `；缺失关键工具证据：${status.evidenceGaps.map(gap => formatPlanEvidenceGap(gap, outputLanguage)).join('；')}`,
-        `; missing required tool evidence: ${status.evidenceGaps.map(gap => formatPlanEvidenceGap(gap, outputLanguage)).join('; ')}`,
-      )
-    : '';
-  return localize(
-    outputLanguage as any,
-    `OpenCode 分析 plan 尚未完成。未完成阶段：${pending || 'unknown'}${evidenceGapText}`,
-    `OpenCode analysis plan is incomplete. Pending phases: ${pending || 'unknown'}${evidenceGapText}`,
-  );
-}
-
-function loadOpenCodeFinalReportContinuationPrompt(
-  outputLanguage: OutputLanguage,
-  missingContractSections: FinalReportContractCompletenessResult['missingSections'] = [],
-  qualityIssue?: FinalResultQualityIssue,
-): string {
-  const templateName = outputLanguage === 'en'
-    ? 'prompt-openai-final-report-continuation-en'
-    : 'prompt-openai-final-report-continuation-zh';
-  const template = loadPromptTemplate(templateName);
-  if (!template) {
-    throw new Error(`Missing OpenCode final-report continuation prompt template: ${templateName}`);
-  }
-  let prompt = template;
-
-  if (missingContractSections.length > 0) {
-    const missingSectionsTemplateName = outputLanguage === 'en'
-      ? 'prompt-final-report-missing-sections-en'
-      : 'prompt-final-report-missing-sections-zh';
-    const missingSectionsTemplate = loadPromptTemplate(missingSectionsTemplateName);
-    if (!missingSectionsTemplate) {
-      throw new Error(`Missing final-report missing-sections prompt template: ${missingSectionsTemplateName}`);
-    }
-    prompt += `\n\n${renderTemplate(missingSectionsTemplate, {
-      missing_sections: missingContractSections
-        .map(section => `- ${section.label}${section.description ? `: ${section.description}` : ''}`)
-        .join('\n'),
-    })}`;
-  }
-
-  if (!qualityIssue) return prompt;
-
-  const qualityTemplateName = outputLanguage === 'en'
-    ? 'prompt-final-report-quality-issue-en'
-    : 'prompt-final-report-quality-issue-zh';
-  const qualityTemplate = loadPromptTemplate(qualityTemplateName);
-  if (!qualityTemplate) {
-    throw new Error(`Missing final-report quality prompt template: ${qualityTemplateName}`);
-  }
-  return `${prompt}\n\n${renderTemplate(qualityTemplate, {
-    quality_issue_context: serializeFinalResultQualityIssueContext(qualityIssue),
-  })}`;
+  return conclusion.trim();
 }
 
 export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
@@ -2466,7 +2360,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
   ): Promise<AnalysisResult> {
     options = {
       ...(options ?? {}),
-      analysisMode: resolveEffectiveAnalysisMode(options?.analysisMode, options ?? {}),
+      analysisMode: options?.analysisMode ?? 'auto',
     };
     const executionLease = this.executionGuard.begin({
       runtime: OPENCODE_RUNTIME_KIND,
@@ -2657,140 +2551,89 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     executionLease.throwIfAborted();
     const outputLanguage = options.outputLanguage
       ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
-    const sceneType = classifyScene(query);
+    const pinnedEnv = {...this.env};
+    const modelConfig = registerOpenCodeLightModel(
+      resolveOpenCodeModelConfig(pinnedEnv, this.selection, this.input.providerScope),
+    );
+    const classifierModel = modelConfig.smallModel
+      ? {providerID: modelConfig.model.providerID,
+          modelID: modelConfig.smallModel.slice(modelConfig.model.providerID.length + 1)}
+      : modelConfig.model;
+    let sdkPromise: Promise<OpenCodeSdkModule> | undefined;
+    const loadSdk = () => sdkPromise ??= this.moduleLoader(this.env);
     const sessionContext = sessionContextManager.getOrCreate(sessionId, traceId);
     const previousTurns = sessionContext.getAllTurns?.() || [];
-    const quickResolution = resolveRuntimeQuickMode({
-      query,
-      sceneType,
-      analysisMode: options.analysisMode,
-      conversationSurface: options.assistantSurface === 'conversation',
-      selectionContext: options.selectionContext,
-      packageName: options.packageName,
-      hasReferenceTrace: Boolean(options.referenceTraceId),
-      previousTurns,
-    });
-    runtimePerformance.finishClassification('ok');
-    if (quickResolution.quickMode && quickResolution.quickAcknowledgementDirectAnswer) {
-      const analysisRunSpec = createAnalysisRunSpec({
-        query,
-        sessionId,
-        traceId,
-        options,
-        runtimeSelection: this.selection,
-        engineCapabilities: getOpenCodeEngineCapabilities(this.selection.kind),
-        sceneType,
-        outputLanguage,
-        resolvedMode: 'quick',
-        budget: {model: 'runtime-acknowledgement'},
-        adaptiveRouting: buildAdaptiveRoutingForQuickResolution({
-          options,
-          resolution: quickResolution,
-        }),
-      });
-      return this.buildDirectQuickAcknowledgementResult({
-        query,
-        sessionId,
-        options,
-        startedAt,
-        sceneType,
-        outputLanguage,
-        sessionContext,
-        previousTurns,
-        analysisRunSpec,
-        executionLease,
-        runtimePerformance,
-      });
-    }
-
-    let quickEvidenceAttempt: RuntimeQuickEvidenceAttempt | undefined;
-    if (quickResolution.quickMode) {
-      const quickEvidencePhase = runtimePerformance.startPhase('quick_evidence');
+    const createNoToolsHost: OpenCodeIntentTransportInput['createClassifierHost'] = async ({signal, deadlineMs, model}) => {
+      const sdk = await loadSdk();
+      signal.throwIfAborted();
+      const dirs = createEphemeralOpenCodeSessionDirs();
+      let instance: OpenCodeInstance | undefined;
       try {
-        quickEvidenceAttempt = await buildRuntimeQuickEvidenceAttempt({
-          query,
-          traceId,
-          packageName: options.packageName,
-          selectionContext: options.selectionContext,
-          traceProcessorService: this.input.traceProcessorService,
-          outputLanguage,
-          quickFocusAppPreEvidence: quickResolution.quickFocusAppPreEvidence,
-          quickProcessIdentityPreEvidence: quickResolution.quickProcessIdentityPreEvidence,
-          quickTraceFactPreEvidence: quickResolution.quickTraceFactPreEvidence,
-          quickScrollingTriagePreEvidence: quickResolution.quickScrollingTriagePreEvidence,
-          emitUpdate: update => this.emitUpdate(update),
+        const classifierEnv = {...pinnedEnv, [OPENCODE_ENABLE_STANDALONE_MCP_ENV]: '0'};
+        const config = createOpenCodeHardenedConfig([], classifierEnv, undefined,
+          {...modelConfig, model, smallModel: undefined}, 1);
+        instance = await createOpenCodeInstanceWithExplicitEnv(sdk, dirs, classifierEnv, {
+          hostname: '127.0.0.1', timeout: Math.max(1, deadlineMs - Date.now()), config,
         });
-        quickEvidencePhase.end('ok');
+        // The transport owns late resources too: return the host even if its
+        // deadline elapsed while the native server was being created.
+        const host = instance;
+        return {
+          client: host.client as OpenCodeClassifierHost['client'],
+          projectDir: dirs.projectDir,
+          agentName: 'smartperfetto',
+          disabledTools: createOpenCodeToolAllowlist([]),
+          close: async () => {
+            try { await host.server.close(); }
+            finally { fs.rmSync(dirs.ephemeralRoot, {recursive: true, force: true}); }
+          },
+        };
       } catch (error) {
-        quickEvidencePhase.end(runtimeOutcomeFromError(error, executionLease.signal));
+        try { await instance?.server.close(); }
+        finally { fs.rmSync(dirs.ephemeralRoot, {recursive: true, force: true}); }
         throw error;
       }
-    }
+    };
+    const resolver = createAnalysisTurnIntentResolver({
+      context: buildComplexityClassifierInput({
+        query, sceneType: 'general', selectionContext: options.selectionContext,
+        hasReferenceTrace: Boolean(options.referenceTraceId), previousTurns,
+        requestedMode: options.analysisMode ?? 'auto',
+      }),
+      signal: executionLease.signal,
+      deadlineMs: Date.now() + (numericEnv(this.env.OPENCODE_CLASSIFIER_TIMEOUT_MS) ?? 30_000),
+      dispatch: input => runOpenCodeIntentTransport({
+        ...input,
+        model: classifierModel,
+        createClassifierHost: createNoToolsHost,
+      }),
+    });
+    const turnIntent = await resolver.resolve();
+    const turnPolicy = resolveRuntimeTurnPolicy(turnIntent, options.analysisMode);
+    runtimePerformance.finishClassification(turnIntent.status === 'resolved' ? 'ok' : 'error');
     executionLease.throwIfAborted();
-    if (quickEvidenceAttempt?.directAnswer) {
-      const analysisRunSpec = createAnalysisRunSpec({
-        query,
-        sessionId,
-        traceId,
-        options: {
-          ...options,
-          ...(quickEvidenceAttempt.effectivePackageName ? {
-            packageName: quickEvidenceAttempt.effectivePackageName,
-          } : {}),
-        },
-        runtimeSelection: this.selection,
-        engineCapabilities: getOpenCodeEngineCapabilities(this.selection.kind),
-        sceneType,
-        outputLanguage,
-        resolvedMode: 'quick',
-        budget: {model: 'runtime-pre-evidence'},
-        adaptiveRouting: buildAdaptiveRoutingForQuickResolution({
-          options,
-          resolution: quickResolution,
-        }),
-      });
-      return this.buildDirectQuickEvidenceResult({
-        query,
-        sessionId,
-        options,
-        startedAt,
-        sceneType,
-        outputLanguage,
-        sessionContext,
-        previousTurns,
-        analysisRunSpec,
-        directAnswer: quickEvidenceAttempt.directAnswer,
-        evidenceCounts: quickEvidenceAttempt.evidenceCounts,
-        executionLease,
-        runtimePerformance,
-      });
-    }
-
+    // The classifier and answer share a fully configured provider/model. A
+    // failed optional classifier never switches the answer to an invalid light ID.
     const sdkStartPhase = runtimePerformance.startPhase('sdk_start');
-    let sdk: Awaited<ReturnType<OpenCodeSdkModuleLoader>>;
+    let sdk: OpenCodeSdkModule;
     try {
-      sdk = await this.moduleLoader(this.env);
+      const timeoutMs = numericEnv(this.env[OPENCODE_SERVER_TIMEOUT_MS_ENV]) ?? DEFAULT_SERVER_TIMEOUT_MS;
+      sdk = await awaitOpenCodePromptOperation(loadSdk, {
+        signal: executionLease.signal, deadlineAt: Date.now() + timeoutMs, timeoutMs,
+      });
       sdkStartPhase.end('ok');
     } catch (error) {
       sdkStartPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
       throw error;
     }
     executionLease.throwIfAborted();
-    const modelConfig = resolveOpenCodeModelConfig(this.env, this.selection, this.input.providerScope);
     const prep = await this.prepareAnalysis(
-      query,
-      sessionId,
-      traceId,
-      options,
+      query, sessionId, traceId, options,
       `${modelConfig.model.providerID}/${modelConfig.model.modelID}`,
-        selectReusableRuntimeQuickEvidenceAttempt(quickEvidenceAttempt, this.env),
+      turnIntent, turnPolicy, resolver.strategyRegistry,
     );
     executionLease.throwIfAborted();
-    const resolveFinalReportSceneType = () => resolveRuntimeFinalReportSceneType({
-      query,
-      initialSceneType: prep.sceneType,
-      plan: prep.analysisPlan.current,
-    });
+    const resolveFinalReportSceneType = () => prep.sceneType;
     const abortController = new AbortController();
     const mcpTimeout = resolveOpenCodeMcpTimeoutMs(this.env[OPENCODE_MCP_TIMEOUT_MS_ENV]);
     const bridge = await this.bridgeStarter(
@@ -2798,7 +2641,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       update => this.emitUpdate(update),
       {
         getSignal: () => abortController.signal,
-        analysisPlan: prep.quickMode ? undefined : prep.analysisPlan,
+        analysisPlan: prep.analysisPlan,
         timeoutMs: mcpTimeout,
       },
     );
@@ -2821,75 +2664,26 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     }
     const port = numericEnv(this.env[OPENCODE_SERVER_PORT_ENV]);
     const timeout = numericEnv(this.env[OPENCODE_SERVER_TIMEOUT_MS_ENV]) ?? DEFAULT_SERVER_TIMEOUT_MS;
-    const promptTimeout = numericEnv(this.env[OPENCODE_PROMPT_TIMEOUT_MS_ENV]) ?? DEFAULT_PROMPT_TIMEOUT_MS;
+    // SDK maxSteps forces a text-only iteration; it does not guarantee a total call cap.
+    const quickBudget = resolveQuickTurnBudget({env: this.env, enforcement: 'timeout_only'});
+    const maxSteps = prep.quickMode ? quickBudget.hardCapTurns : resolveAgentRuntimeBudgetConfig(this.env).maxTurns;
+    const promptTimeout = Math.min(
+      numericEnv(this.env[OPENCODE_PROMPT_TIMEOUT_MS_ENV]) ?? DEFAULT_PROMPT_TIMEOUT_MS,
+      prep.quickMode ? maxSteps * (numericEnv(this.env.OPENCODE_QUICK_PER_TURN_MS) ?? 30_000) : DEFAULT_PROMPT_TIMEOUT_MS,
+    );
+    // The native answer and final semantic review share one absolute budget.
+    const deadlineMs = Date.now() + promptTimeout;
+    const runId = options.runId ?? crypto.randomUUID();
+    const attemptId = crypto.randomUUID();
+    let acceptedMessage: Record<string, unknown> | undefined;
+    let actualTurns = 0;
 
     let promptResponse: unknown;
     let messagesResponse: unknown;
     let conclusion = '';
-    let planCompletionContinuations = 0;
-    let hypothesisResolutionContinuations = 0;
-    let planCompletionContinuationFailed = false;
-    let planCompletionFailureMessage: string | undefined;
-    let requireFreshFinalReport = false;
-    let finalReportContinuationAttempted = false;
-    let finalReportContinuationQualified = false;
-    let finalReportContinuationFailureMessage: string | undefined;
     let activeSession: OpenCodeActiveSession | undefined;
     let bridgeOwnedByActiveSession = false;
     let unownedOpenCodeInstance: OpenCodeInstance | undefined;
-    const projectConclusionText = (text: string): string => {
-      let candidate = sanitizeOpenCodeConclusionText(text);
-      if (!candidate) return '';
-      if (privateKnowledge) {
-        candidate = sanitizeCodeAwareText(sessionId, candidate);
-      }
-      return completeFinalReportCodeReferences({
-        plan: prep.analysisPlan.current,
-        conclusion: candidate,
-        outputLanguage: prep.analysisRunSpec.outputLanguage,
-      });
-    };
-    const projectAssistantConclusion = (
-      currentMessagesResponse: unknown,
-      currentPromptResponse: unknown,
-    ): string => projectConclusionText(
-      extractOpenCodeAssistantText(currentMessagesResponse) ||
-      extractOpenCodeAssistantText(currentPromptResponse),
-    );
-    const reconcileFinalReportPhase = (candidate: string): void => {
-      const closedFinalPhase = completeOpenCodeFinalReportPhaseIfDelivered(
-        prep.analysisPlan.current,
-        candidate,
-        prep.analysisRunSpec.outputLanguage,
-      );
-      if (!closedFinalPhase) return;
-      this.emitUpdate({
-        type: 'plan_phase_updated',
-        content: planPhaseUpdatedContent({
-          phaseId: closedFinalPhase.id,
-          status: closedFinalPhase.status,
-          summary: closedFinalPhase.summary,
-          phaseName: closedFinalPhase.name,
-          origin: 'auto',
-        }),
-        timestamp: Date.now(),
-      });
-    };
-    const assessCandidateQuality = (candidate: string) => assessFinalResultQuality({
-      result: {
-        sessionId,
-        success: true,
-        findings: extractFindingsFromText(candidate),
-        hypotheses: prep.hypotheses.map(h => toRuntimeProtocolHypothesis(h, 'opencode')),
-        conclusion: candidate,
-        confidence: 1,
-        rounds: 1,
-        totalDurationMs: 0,
-      },
-      query,
-      sceneType: resolveFinalReportSceneType(),
-      comparisonIdentity: prep.comparisonIdentity,
-    });
     try {
       const opencode = await this.createOpenCodeInstance(sdk, dirs, {
         hostname: '127.0.0.1',
@@ -2899,7 +2693,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           Array.from(prep.allowedToolNames),
           this.env,
           bridge,
-          modelConfig,
+          turnIntent.status === 'unavailable' ? {...modelConfig, smallModel: undefined} : modelConfig,
+          maxSteps,
         ),
       });
       unownedOpenCodeInstance = opencode;
@@ -2950,6 +2745,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
         restoredOpenCodeSessionId && openCodeSessionId === restoredOpenCodeSessionId,
       );
       const runAnalysisPrompt = async (text: string) => {
+        if (Date.now() >= deadlineMs) throw openCodePromptTimeoutError(promptTimeout);
         const promptResult = await runOpenCodePrompt(opencode, {
           path: {id: openCodeSessionId},
           query: {directory: dirs.projectDir},
@@ -2965,7 +2761,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
         }, {
           sessionId: openCodeSessionId,
           projectDir: dirs.projectDir,
-          timeoutMs: promptTimeout,
+          timeoutMs: Math.max(1, deadlineMs - Date.now()),
+          maxSteps,
           resumedSession: resumedPromptSession,
           signal: promptSession.abortController?.signal,
           isAborted: () => (
@@ -2990,188 +2787,12 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       executionLease.throwIfAborted();
       promptResponse = promptResult.promptResponse;
       messagesResponse = promptResult.messagesResponse;
-      conclusion = projectAssistantConclusion(messagesResponse, promptResponse);
-      reconcileFinalReportPhase(conclusion);
-
-      while (!prep.quickMode) {
-        const planStatus = getOpenCodePlanCompletionStatus(prep.analysisPlan.current);
-        const unresolvedHypotheses = prep.hypotheses.filter(
-          hypothesis => hypothesis.status === 'formed',
-        );
-        const continuePlan = !planStatus.complete &&
-          planCompletionContinuations < OPENCODE_MAX_PLAN_COMPLETION_CONTINUATIONS;
-        const resolveHypotheses = planStatus.complete &&
-          unresolvedHypotheses.length > 0 &&
-          hypothesisResolutionContinuations < OPENCODE_MAX_HYPOTHESIS_RESOLUTION_CONTINUATIONS;
-        if (!continuePlan && !resolveHypotheses) break;
-
-        if (continuePlan) planCompletionContinuations++;
-        else hypothesisResolutionContinuations++;
-        this.emitUpdate({
-          type: 'progress',
-          content: {
-            module: 'opencode',
-            phase: 'concluding',
-            message: localize(
-              prep.analysisRunSpec.outputLanguage,
-              continuePlan
-                ? '分析 plan 尚未闭合，正在继续补齐未完成阶段和必需证据。'
-                : '分析 plan 已闭合，正在用已有证据处理尚未判定的假设。',
-              continuePlan
-                ? 'The analysis plan is still open; continuing the pending phases and required evidence.'
-                : 'The analysis plan is complete; resolving the remaining hypotheses against existing evidence.',
-            ),
-          },
-          timestamp: Date.now(),
-        });
-        try {
-          const continuationResult = await runAnalysisPrompt(
-            loadRuntimePlanCompletionContinuationPrompt({
-              planStatus,
-              unresolvedHypotheses,
-              outputLanguage: prep.analysisRunSpec.outputLanguage,
-            }),
-          );
-          executionLease.throwIfAborted();
-          const continuationConclusion = projectAssistantConclusion(
-            continuationResult.messagesResponse,
-            continuationResult.promptResponse,
-          );
-          const deliveredFreshReport = Boolean(
-            continuationConclusion && hasDeliverableFinalReportHeading(continuationConclusion),
-          );
-          requireFreshFinalReport = !deliveredFreshReport;
-          if (deliveredFreshReport) {
-            promptResponse = continuationResult.promptResponse;
-            messagesResponse = continuationResult.messagesResponse;
-            conclusion = continuationConclusion;
-            reconcileFinalReportPhase(conclusion);
-          }
-        } catch (error) {
-          const aborted = promptSession.aborted || abortController.signal.aborted ||
-            isTraceProcessorQueryCancelledError(error) ||
-            /OpenCode prompt aborted/i.test(String((error as Error)?.message || error));
-          if (aborted) throw error;
-          planCompletionContinuationFailed = true;
-          planCompletionFailureMessage = localize(
-            prep.analysisRunSpec.outputLanguage,
-            'OpenCode 计划补全失败；保留已有报告并按不完整结果返回。',
-            'The OpenCode plan-completion continuation failed; the existing report is retained as an incomplete result.',
-          );
-          break;
-        }
-      }
-
-      const initialPlanStatus = getOpenCodePlanCompletionStatus(prep.analysisPlan.current);
-      const unresolvedHypotheses = prep.hypotheses.filter(
-        hypothesis => hypothesis.status === 'formed',
-      );
-      let initialContractIssue = assessFinalReportContractCompleteness({
-        conclusion,
-        query,
-        sceneType: resolveFinalReportSceneType(),
-      });
-      let initialQualityIssue = assessCandidateQuality(conclusion);
-      if (
-        !prep.quickMode &&
-        initialPlanStatus.complete &&
-        unresolvedHypotheses.length === 0 &&
-        !planCompletionContinuationFailed &&
-        !requireFreshFinalReport &&
-        (initialContractIssue?.missingSections.length || initialQualityIssue)
-      ) {
-        const completedPhaseConclusion = getCompletedOpenCodeFinalReportPhaseSummary(
-          prep.analysisPlan.current,
-          prep.analysisRunSpec.outputLanguage,
-        );
-        if (completedPhaseConclusion) {
-          const projectedPhaseConclusion = projectConclusionText(completedPhaseConclusion);
-          const completedPhaseContractIssue = assessFinalReportContractCompleteness({
-            conclusion: projectedPhaseConclusion,
-            query,
-            sceneType: resolveFinalReportSceneType(),
-          });
-          const completedPhaseQualityIssue = assessCandidateQuality(projectedPhaseConclusion);
-          if (!completedPhaseContractIssue && !completedPhaseQualityIssue) {
-            conclusion = projectedPhaseConclusion;
-            initialContractIssue = undefined;
-            initialQualityIssue = undefined;
-          }
-        }
-      }
-      if (
-        !prep.quickMode &&
-        initialPlanStatus.complete &&
-        unresolvedHypotheses.length === 0 &&
-        !planCompletionContinuationFailed &&
-        (requireFreshFinalReport || initialContractIssue?.missingSections.length || initialQualityIssue)
-      ) {
-        finalReportContinuationAttempted = true;
-        this.emitUpdate({
-          type: 'progress',
-          content: {
-            module: 'opencode',
-            phase: 'concluding',
-            message: localize(
-              prep.analysisRunSpec.outputLanguage,
-              '最终报告仍需补齐合同或质量边界，正在用已有证据整理完整结论。',
-              'The final report still needs contract or quality-boundary completion; assembling the complete conclusion from existing evidence.',
-            ),
-          },
-          timestamp: Date.now(),
-        });
-        try {
-          const continuationResult = await runAnalysisPrompt(
-            loadOpenCodeFinalReportContinuationPrompt(
-              prep.analysisRunSpec.outputLanguage,
-              initialContractIssue?.missingSections,
-              initialQualityIssue,
-            ),
-          );
-          executionLease.throwIfAborted();
-          const continuationConclusion = projectAssistantConclusion(
-            continuationResult.messagesResponse,
-            continuationResult.promptResponse,
-          );
-          const continuationContractIssue = continuationConclusion
-            ? assessFinalReportContractCompleteness({
-                conclusion: continuationConclusion,
-                query,
-                sceneType: resolveFinalReportSceneType(),
-              })
-            : undefined;
-          const continuationQualityIssue = continuationConclusion
-            ? assessCandidateQuality(continuationConclusion)
-            : undefined;
-          finalReportContinuationQualified = Boolean(
-            continuationConclusion &&
-            hasDeliverableFinalReportHeading(continuationConclusion) &&
-            !continuationContractIssue &&
-            !continuationQualityIssue,
-          );
-          if (finalReportContinuationQualified) {
-            promptResponse = continuationResult.promptResponse;
-            messagesResponse = continuationResult.messagesResponse;
-            conclusion = continuationConclusion;
-          } else {
-            finalReportContinuationFailureMessage = localize(
-              prep.analysisRunSpec.outputLanguage,
-              'OpenCode 最终报告补写未产出同时满足 Final Report Contract 与质量门禁的新报告。',
-              'The OpenCode final-report continuation did not produce a new report satisfying both the Final Report Contract and quality gate.',
-            );
-          }
-        } catch (error) {
-          const aborted = promptSession.aborted || abortController.signal.aborted ||
-            isTraceProcessorQueryCancelledError(error) ||
-            /OpenCode prompt aborted/i.test(String((error as Error)?.message || error));
-          if (aborted) throw error;
-          finalReportContinuationFailureMessage = localize(
-            prep.analysisRunSpec.outputLanguage,
-            'OpenCode 最终报告补写失败；保留原始报告并按不完整结果返回。',
-            'The OpenCode final-report continuation failed; the original report is retained as an incomplete result.',
-          );
-        }
-      }
+      const observed = getOpenCodeAssistantMessages(messagesResponse);
+      const direct = getOpenCodeAssistantMessages(promptResponse);
+      acceptedMessage = observed[observed.length - 1] ?? direct[direct.length - 1];
+      actualTurns = observed.length || direct.length;
+      // Bind terminal facts to the actual native body before privacy projection.
+      conclusion = acceptedMessage ? extractTextParts(acceptedMessage).trim() : '';
     } finally {
       if (activeSession && !privateKnowledge && !executionLease.signal.aborted) {
         this.sessionOpaqueStates.set(sessionId, createOpenCodeOpaqueState(
@@ -3189,226 +2810,78 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       if (ephemeralRoot) fs.rmSync(ephemeralRoot, {recursive: true, force: true});
     }
 
-    if (!conclusion) {
-      conclusion = 'OpenCode runtime completed without assistant text.';
-      if (privateKnowledge) {
-        conclusion = sanitizeCodeAwareText(sessionId, conclusion);
-      }
-    }
-
-    const planStatus = getOpenCodePlanCompletionStatus(prep.analysisPlan.current);
-    const unresolvedHypotheses = prep.hypotheses.filter(
-      hypothesis => hypothesis.status === 'formed',
-    );
-    let partial = false;
-    let terminationReason: AnalysisResult['terminationReason'];
-    let terminationMessage: string | undefined;
-    if (!prep.quickMode && !planStatus.complete) {
-      partial = true;
-      terminationReason = 'plan_incomplete';
-      terminationMessage = formatIncompletePlanMessage(
-        planStatus,
-        prep.analysisRunSpec.outputLanguage,
-      );
-    }
-    if (!prep.quickMode && unresolvedHypotheses.length > 0) {
-      partial = true;
-      terminationReason = 'plan_incomplete';
-      terminationMessage = localize(
-        prep.analysisRunSpec.outputLanguage,
-        `OpenCode 分析仍有未判定假设：${unresolvedHypotheses.map(h => h.id).join(', ')}`,
-        `OpenCode analysis still has unresolved hypotheses: ${unresolvedHypotheses.map(h => h.id).join(', ')}`,
-      );
-    }
-    if (planCompletionContinuationFailed) {
-      partial = true;
-      terminationReason = 'plan_incomplete';
-      terminationMessage = planCompletionFailureMessage;
-    }
-    if (finalReportContinuationAttempted && !finalReportContinuationQualified) {
-      partial = true;
-      terminationReason = 'plan_incomplete';
-      terminationMessage = finalReportContinuationFailureMessage ?? localize(
-        prep.analysisRunSpec.outputLanguage,
-        'OpenCode 最终报告补写未完成。',
-        'The OpenCode final-report continuation did not complete.',
-      );
-    }
-
+    const info = acceptedMessage && (isRecord(acceptedMessage.info) ? acceptedMessage.info : acceptedMessage);
+    const finish = typeof info?.finish === 'string' ? info.finish : undefined;
+    const sdkError = info?.error != null;
+    const outputLimited = finish === 'length';
+    const turnLimited = finish === 'tool-calls' && actualTurns >= maxSteps;
+    const completed = !sdkError && (finish === 'stop' || finish === 'end_turn' || finish === 'stop_sequence');
+    const completion: AnalysisCompletion = {
+      schemaVersion: 1, runtimeKind: prep.analysisRunSpec.runtime.kind,
+      candidateRef: crypto.randomUUID(), runId, attemptId,
+      conclusionFingerprint: analysisDeliveryFingerprint(conclusion),
+      status: sdkError ? 'failed' : completed ? 'completed' : outputLimited || turnLimited ? 'incomplete' : 'unknown',
+      ...(sdkError ? {reason: 'provider_error' as const}
+        : outputLimited ? {reason: 'output_limit' as const}
+        : turnLimited ? {reason: 'turn_limit' as const} : {}),
+      ...(finish ? {sdkFinishReason: finish} : {}),
+    };
+    const partial = completion.status !== 'completed' || !conclusion;
     const findings = extractFindingsFromText(conclusion);
     const result: AnalysisResult = {
-      sessionId,
-      success: true,
-      findings,
+      sessionId, success: Boolean(conclusion) && !sdkError, findings,
       hypotheses: prep.hypotheses.map(h => toRuntimeProtocolHypothesis(h, 'opencode')),
-      conclusion,
-      confidence: estimateAnalysisConfidence({findings, partial}),
-      rounds: 1 + planCompletionContinuations + hypothesisResolutionContinuations +
-        (finalReportContinuationAttempted ? 1 : 0),
-      totalDurationMs: Date.now() - startedAt,
+      conclusion, confidence: estimateAnalysisConfidence({findings, partial}),
+      rounds: actualTurns, totalDurationMs: Date.now() - startedAt,
+      turnIntent, completion, outputOrigin: acceptedMessage ? 'sdk_final' : 'assistant_stream',
       partial: partial || undefined,
-      terminationReason,
-      terminationMessage,
-      quickRun: prep.quickMode
-        ? (() => {
-            const quickBudget = resolveQuickTurnBudget({
-              env: this.env,
-              targetEnvKeys: ['AGENT_QUICK_TARGET_TURNS'],
-              hardCapEnvKeys: ['AGENT_QUICK_MAX_TURNS'],
-              enforcement: 'timeout_only',
-            });
-            return buildQuickRunReceipt({
-              requestedMode: options.analysisMode ?? 'auto',
-              query,
-              budget: quickBudget,
-              actualTurns: 1,
-              elapsedMs: Date.now() - startedAt,
-              stopReason: quickStopReasonFromTermination({
-                partial,
-                terminationReason,
-                actualTurns: 1,
-                targetTurns: quickBudget.targetTurns,
-                hardCapTurns: quickBudget.hardCapTurns,
-              }),
-              evidence: {
-                frontendPrequeryInjected: prep.analysisRunSpec.traceContext.datasetCount,
-              },
-              contextInjected: {
-                conversationTurns: countCompletedQuickConversationTurns(prep.previousTurns),
-                ...(prep.quickMemoryContextCounts ?? {
-                  recentSqlResults: 0,
-                  sqlPitfallPairs: 0,
-                  patternHints: 0,
-                  negativePatternHints: 0,
-                  caseBackgroundCases: 0,
-                }),
-              },
-              adaptiveRouting: prep.analysisRunSpec.mode.adaptiveRouting,
-            });
-          })()
-        : undefined,
+      ...(turnLimited ? {terminationReason: 'max_turns' as const} : {}),
+      quickRun: prep.quickMode ? buildQuickRunReceipt({
+        requestedMode: options.analysisMode ?? 'auto', turnIntent, budget: quickBudget,
+        actualTurns, elapsedMs: Date.now() - startedAt,
+        stopReason: quickStopReasonFromTermination({partial, terminationReason: turnLimited ? 'max_turns' : undefined,
+          actualTurns, targetTurns: quickBudget.targetTurns, hardCapTurns: quickBudget.hardCapTurns}),
+        evidence: {frontendPrequeryInjected: prep.analysisRunSpec.traceContext.datasetCount},
+        contextInjected: {
+          conversationTurns: countCompletedQuickConversationTurns(prep.previousTurns),
+          ...prep.quickMemoryContextCounts,
+        },
+      }) : undefined,
     };
-
-    if (!prep.quickMode) {
-      const finalReportSceneType = resolveFinalReportSceneType();
-      const verifyCurrentConclusion = async () => {
-        result.conclusion = completeFinalReportCodeReferences({
-          plan: prep.analysisPlan.current,
-          conclusion: result.conclusion,
-          outputLanguage: prep.analysisRunSpec.outputLanguage,
-        });
-        result.findings = extractFindingsFromText(result.conclusion);
-        return verifyConclusion(result.findings, result.conclusion, {
-          emitUpdate: (update) => this.emitUpdate(update),
-          enableLLM: false,
-          plan: prep.analysisPlan.current,
-          hypotheses: prep.hypotheses,
-          sceneType: finalReportSceneType,
-          outputLanguage: prep.analysisRunSpec.outputLanguage,
-          query,
-          emitIssueProgress: false,
-          allowPersistentLearning: !analysisContextUsesPrivateKnowledge(options),
-        });
-      };
-      executionLease.throwIfAborted();
-      const verificationPhase = runtimePerformance.startPhase('verification');
-      let verification: Awaited<ReturnType<typeof verifyCurrentConclusion>>;
-      try {
-        verification = await verifyCurrentConclusion();
-        verificationPhase.end('ok');
-      } catch (error) {
-        verificationPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
-        throw error;
-      }
-      executionLease.throwIfAborted();
-      let verificationIssue = [
-        ...verification.heuristicIssues,
-        ...(verification.llmIssues || []),
-      ].find(issue => issue.severity === 'error');
-      const contractIssue = assessFinalReportContractCompleteness({
-        conclusion: result.conclusion,
-        query,
-        sceneType: finalReportSceneType,
-        caseRecommendations: result.conclusionContract?.caseRecommendations,
+    const nativeDeliveryContext: AnalysisDeliveryContext = {
+      entry: 'runtime_draft', acceptedCandidate: completion, completion,
+      turnIntent, outputOrigin: result.outputOrigin,
+    };
+    const priorProjection = sanitizeCodeAwareTextWithReceipt(sessionId, result.conclusion);
+    result.conclusion = priorProjection.text;
+    const {deliveryContext} = finalizeSourceAwareAnalysisResultWithProjection(result, prep.sourceUse, {
+      priorProjection, context: nativeDeliveryContext,
+    });
+    executionLease.throwIfAborted();
+    const verificationPhase = runtimePerformance.startPhase('verification');
+    try {
+      const verification = await verifyConclusion(result.findings, result.conclusion, {
+        emitUpdate: update => this.emitUpdate(update), enableLLM: false,
+        plan: prep.analysisPlan.current, hypotheses: prep.hypotheses,
+        sceneType: prep.sceneType, outputLanguage: prep.analysisRunSpec.outputLanguage,
+        query, emitIssueProgress: false,
+        deliveryContext,
+        allowPersistentLearning: !analysisContextUsesPrivateKnowledge(options) && turnPolicy.allowNewEvidence,
       });
-      const truncationIssue = findTruncationVerificationIssue([
-        ...verification.heuristicIssues,
-        ...(verification.llmIssues || []),
-      ].filter(issue => issue.severity === 'error'));
-      if (
-        (!finalReportContinuationAttempted || finalReportContinuationQualified) &&
-        verificationIssue &&
-        (truncationIssue || Boolean(contractIssue?.missingSections.length)) &&
-        planStatus.complete
-      ) {
-        const repairedConclusion = repairTruncatedFinalReport({
-          conclusion: result.conclusion,
-          plan: prep.analysisPlan.current,
-          hypotheses: prep.hypotheses,
-          outputLanguage: prep.analysisRunSpec.outputLanguage,
-          recoveryKind: truncationIssue ? 'truncation' : 'missing_contract',
-          missingContractSections: contractIssue?.missingSections,
-        });
-        if (repairedConclusion) {
-          const preRecoveryConfidence = result.confidence;
-          result.conclusion = repairedConclusion;
-          result.findings = extractFindingsFromText(repairedConclusion);
-          result.confidence = Math.min(
-            preRecoveryConfidence,
-            estimateAnalysisConfidence({findings: result.findings, partial: Boolean(result.partial)}),
-          );
-          this.emitUpdate({
-            type: 'progress',
-            content: {
-              phase: 'concluding',
-              message: localize(
-                prep.analysisRunSpec.outputLanguage,
-                truncationIssue
-                  ? '最终报告输出被截断，已基于结构化证据补齐收尾并重新验证。'
-                  : '最终报告缺少必需结构，已基于完成阶段的证据补齐并重新验证。',
-                truncationIssue
-                  ? 'The final report output was truncated; it was closed from structured evidence and re-verified.'
-                  : 'The final report missed required structure; it was completed from finished-phase evidence and re-verified.',
-              ),
-            },
-            timestamp: Date.now(),
-          });
-          executionLease.throwIfAborted();
-          const recoveryVerificationPhase = runtimePerformance.startPhase('verification');
-          try {
-            verification = await verifyCurrentConclusion();
-            recoveryVerificationPhase.end('ok');
-          } catch (error) {
-            recoveryVerificationPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
-            throw error;
-          }
-          executionLease.throwIfAborted();
-          verificationIssue = [
-            ...verification.heuristicIssues,
-            ...(verification.llmIssues || []),
-          ].find(issue => issue.severity === 'error');
-        }
-      }
-      if (verificationIssue) {
+      const issue = [...verification.heuristicIssues, ...(verification.llmIssues ?? [])]
+        .find(issue => issue.severity === 'error' && issue.type !== 'plan_deviation' && issue.type !== 'unresolved_hypothesis');
+      if (issue) {
         result.partial = true;
-        result.terminationReason = result.terminationReason ?? 'plan_incomplete';
-        result.terminationMessage = result.terminationMessage ?? verificationIssue.message;
-        result.confidence = Math.min(0.55, result.confidence);
-        this.emitUpdate({
-          type: 'degraded',
-          content: {
-            module: 'openCodeRuntime',
-            fallback: 'verification_failed',
-            partial: true,
-            terminationReason: result.terminationReason,
-            message: verificationIssue.message,
-          },
-          timestamp: Date.now(),
-        });
+        result.terminationReason ??= 'quality_gate_failed';
+        result.terminationMessage ??= issue.message;
+        result.confidence = estimateAnalysisConfidence({findings: result.findings, partial: true});
       }
+      verificationPhase.end('ok');
+    } catch (error) {
+      verificationPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
+      throw error;
     }
-
-    finalizeSourceAwareAnalysisResult(result, prep.sourceUse);
+    executionLease.throwIfAborted();
     const wasPartialBeforeQualityGate = result.partial === true;
     const gateIssue = applyFinalResultQualityGate({
       result,
@@ -3416,8 +2889,9 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       sceneType: resolveFinalReportSceneType(),
       comparisonIdentity: prep.comparisonIdentity,
       deferFocusedEvidenceFinalization: true,
+      context: deliveryContext,
     });
-    if (gateIssue && !wasPartialBeforeQualityGate) {
+    if (gateIssue && result.partial === true && !wasPartialBeforeQualityGate) {
       result.confidence = estimateAnalysisConfidence({findings: result.findings, partial: true});
       this.emitUpdate({
         type: 'degraded',
@@ -3454,143 +2928,35 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       result.findings,
     );
 
-    return result;
-  }
-
-  private buildDirectQuickEvidenceResult(input: {
-    query: string;
-    sessionId: string;
-    options: AnalysisOptions;
-    startedAt: number;
-    sceneType: SceneType;
-    outputLanguage: OutputLanguage;
-    sessionContext: ReturnType<typeof sessionContextManager.getOrCreate>;
-    previousTurns: ConversationTurn[];
-    analysisRunSpec: AnalysisRunSpec;
-    directAnswer: RuntimeQuickEvidenceDirectAnswer;
-    evidenceCounts: RuntimeQuickEvidenceCounts;
-    executionLease: RuntimeExecutionLease;
-    runtimePerformance: RuntimePerformanceRun;
-  }): AnalysisResult {
-    const quickBudget = resolveQuickTurnBudget({
-      env: this.env,
-      targetEnvKeys: ['AGENT_QUICK_TARGET_TURNS'],
-      hardCapEnvKeys: ['AGENT_QUICK_MAX_TURNS'],
-      enforcement: 'timeout_only',
-    });
-    const result = buildQuickDirectEvidenceAnalysisResult({
-      query: input.query,
-      sessionId: input.sessionId,
-      options: input.options,
-      startedAt: input.startedAt,
-      analysisRunSpec: input.analysisRunSpec,
-      budget: quickBudget,
-      directAnswer: input.directAnswer,
-      evidenceCounts: input.evidenceCounts,
-      previousTurns: input.previousTurns,
-    });
-    emitQuickDirectQualityGateIssue({
-      emitUpdate: update => this.emitUpdate(update),
-      module: 'openCodeRuntime',
-      result,
-      query: input.query,
-      sceneType: input.sceneType,
-    });
-    input.executionLease.throwIfAborted();
-    input.sessionContext.addTurn(
-      input.query,
-      {
-        primaryGoal: input.query,
-        aspects: [],
-        expectedOutputType: 'diagnosis',
-        complexity: 'simple',
-        followUpType: input.previousTurns.length > 0 ? 'extend' : 'initial',
-      },
-      {
-        agentId: 'opencode',
-        success: result.success,
-        findings: result.findings,
-        confidence: result.confidence,
-        message: result.conclusion,
-      },
-      result.findings,
-    );
-    input.executionLease.throwIfAborted();
-    input.runtimePerformance.recordFirstOutput();
-    emitQuickDirectAnswerEvents({
-      emitUpdate: update => this.emitUpdate(update),
-      result,
-      startedAt: input.startedAt,
-      outputLanguage: input.outputLanguage,
-      runtime: this.selection.kind,
-      model: 'runtime-pre-evidence',
-    });
-    return result;
-  }
-
-  private buildDirectQuickAcknowledgementResult(input: {
-    query: string;
-    sessionId: string;
-    options: AnalysisOptions;
-    startedAt: number;
-    sceneType: SceneType;
-    outputLanguage: OutputLanguage;
-    sessionContext: ReturnType<typeof sessionContextManager.getOrCreate>;
-    previousTurns: ConversationTurn[];
-    analysisRunSpec: AnalysisRunSpec;
-    executionLease: RuntimeExecutionLease;
-    runtimePerformance: RuntimePerformanceRun;
-  }): AnalysisResult {
-    const quickBudget = resolveQuickTurnBudget({
-      env: this.env,
-      targetEnvKeys: ['AGENT_QUICK_TARGET_TURNS'],
-      hardCapEnvKeys: ['AGENT_QUICK_MAX_TURNS'],
-      enforcement: 'timeout_only',
-    });
-    const result = buildQuickDirectAcknowledgementAnalysisResult({
-      sessionId: input.sessionId,
-      options: input.options,
-      outputLanguage: input.outputLanguage,
-      startedAt: input.startedAt,
-      analysisRunSpec: input.analysisRunSpec,
-      budget: quickBudget,
-      previousTurns: input.previousTurns,
-    });
-    emitQuickDirectQualityGateIssue({
-      emitUpdate: update => this.emitUpdate(update),
-      module: 'openCodeRuntime',
-      result,
-      query: input.query,
-      sceneType: input.sceneType,
-    });
-    input.executionLease.throwIfAborted();
-    input.sessionContext.addTurn(
-      input.query,
-      {
-        primaryGoal: input.query,
-        aspects: [],
-        expectedOutputType: 'diagnosis',
-        complexity: 'simple',
-        followUpType: input.previousTurns.length > 0 ? 'extend' : 'initial',
-      },
-      {
-        agentId: 'opencode',
-        success: result.success,
-        findings: result.findings,
-        confidence: result.confidence,
-        message: result.conclusion,
-      },
-      result.findings,
-    );
-    input.executionLease.throwIfAborted();
-    input.runtimePerformance.recordFirstOutput();
-    emitQuickDirectAnswerEvents({
-      emitUpdate: update => this.emitUpdate(update),
-      result,
-      startedAt: input.startedAt,
-      outputLanguage: input.outputLanguage,
-      runtime: this.selection.kind,
-      model: 'runtime-acknowledgement',
+    if (!deliveryContext || deliveryContext.entry === 'historical_restore' || !deliveryContext.acceptedCandidate) {
+      throw new Error('OpenCode finalization requires the accepted projected candidate');
+    }
+    const artifactStore = this.artifactStores.get(sessionId);
+    const scopeIdentity = (scope: AnalysisRunSpec['scopes']['knowledge']) => scope
+      ? Object.fromEntries(Object.entries(scope).filter(([, value]) => value !== undefined)) : null;
+    attachFinalizationContext(result, {
+      runId, sessionId, deadlineMs, turnIntent, strategyRegistry: resolver.strategyRegistry,
+      traceIdentity: {currentTraceId: traceId, referenceTraceId: options.referenceTraceId},
+      deliveryContext,
+      sourceUse: prep.sourceUse?.getSourceUseDecision(),
+      ...(artifactStore ? {evidenceReadView: artifactStore.createEvidenceReadView({
+        allowedTraces: [
+          {traceId, traceSide: 'current'},
+          ...(options.referenceTraceId ? [{traceId: options.referenceTraceId, traceSide: 'reference' as const}] : []),
+        ],
+        ownerKey: canonicalContentHash({runId, sessionId, scopes: {
+          provider: scopeIdentity(prep.analysisRunSpec.scopes.provider),
+          knowledge: scopeIdentity(prep.analysisRunSpec.scopes.knowledge),
+          providerId: prep.analysisRunSpec.scopes.providerId ?? null,
+        }, providerScope: scopeIdentity(this.input.providerScope),
+          analysisContextFingerprint: options.analysisContextFingerprint ?? null}),
+      })} : {}),
+      ...(result.success && result.completion?.status !== 'failed' && result.completion?.status !== 'cancelled' ? {
+        providerQuery: {text: prep.analysisRunSpec.query.text, analysisContextFingerprint: options.analysisContextFingerprint},
+        dispatchText: input => runOpenCodeIntentTransport({
+          ...input, model: modelConfig.model, createClassifierHost: createNoToolsHost,
+        }),
+      } : {}),
     });
     return result;
   }
@@ -3601,47 +2967,29 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     traceId: string,
     options: AnalysisOptions,
     model: string,
-    quickEvidenceAttempt?: RuntimeQuickEvidenceAttempt,
+    turnIntent: AnalysisTurnIntent,
+    turnPolicy: RuntimeTurnPolicy,
+    strategyRegistry: ReadonlyStrategyRegistrySnapshot,
   ): Promise<OpenCodeAnalysisPreparation> {
     const outputLanguage = options.outputLanguage
       ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
-    const sceneType = classifyScene(query);
+    const sceneType = turnIntent.sceneId;
     const sessionContext = sessionContextManager.getOrCreate(sessionId, traceId);
     const previousTurns = sessionContext.getAllTurns?.() || [];
-    const quickResolution = resolveRuntimeQuickMode({
-      query,
-      sceneType,
-      analysisMode: options.analysisMode,
-      conversationSurface: options.assistantSurface === 'conversation',
-      selectionContext: options.selectionContext,
-      packageName: options.packageName,
-      hasReferenceTrace: Boolean(options.referenceTraceId),
-      previousTurns,
-    });
-    const quickMode = quickResolution.quickMode;
-    const focusResult = quickEvidenceAttempt?.focusResult ?? (quickResolution.skipFocusDetection
-      ? { apps: [], method: 'none' as const }
-      : await detectFocusApps(this.input.traceProcessorService, traceId, {
+    const quickMode = turnPolicy.budgetMode === 'quick';
+    const focusResult = turnPolicy.allowAutomaticPrefetch
+      ? await detectFocusApps(this.input.traceProcessorService, traceId, {
           timeRange: focusAppTimeRangeFromSelection(options.selectionContext),
-        }));
-    const effectivePackageName = options.packageName
-      || quickEvidenceAttempt?.effectivePackageName
-      || focusResult.primaryApp;
+        })
+      : {apps: [], method: 'none' as const};
+    const effectivePackageName = options.packageName || focusResult.primaryApp;
     const analysisRunSpec = createAnalysisRunSpec({
-      query,
-      sessionId,
-      traceId,
-      options,
+      query, sessionId, traceId, options, turnIntent,
       runtimeSelection: this.selection,
       engineCapabilities: getOpenCodeEngineCapabilities(this.selection.kind),
-      sceneType,
-      outputLanguage,
-      resolvedMode: quickMode ? 'quick' : 'full',
-      budget: {model},
-      adaptiveRouting: buildAdaptiveRoutingForQuickResolution({
-        options,
-        resolution: quickResolution,
-      }),
+      sceneType, outputLanguage, resolvedMode: quickMode ? 'quick' : 'full', resolvedModel: model,
+      budget: {model, maxTurns: quickMode ? resolveAgentRuntimeBudgetConfig(this.env).quickMaxTurns
+        : resolveAgentRuntimeBudgetConfig(this.env).maxTurns},
     });
 
     await ensureSkillRegistryInitialized();
@@ -3654,7 +3002,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     );
 
     let architecture = getLruCacheEntry(this.architectureCache, traceId);
-    if (!architecture && !quickResolution.skipTracePreflightDetection) {
+    if (!architecture && turnPolicy.allowAutomaticPrefetch) {
       try {
         architecture = await createArchitectureDetector().detect({
           traceId,
@@ -3675,7 +3023,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     }
 
     let traceCompleteness: Awaited<ReturnType<typeof probeTraceCompleteness>> | undefined;
-    if (!quickMode) {
+    if (turnPolicy.allowAutomaticPrefetch) {
       try {
         traceCompleteness = await probeTraceCompleteness(
           this.input.traceProcessorService,
@@ -3695,10 +3043,9 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       : undefined;
     const entityContext = buildEntityContext(sessionContext.getEntityStore());
 
-    if (!this.artifactStores.has(sessionId)) {
-      this.artifactStores.set(sessionId, new ArtifactStore());
-    }
-    const artifactStore = this.artifactStores.get(sessionId)!;
+    const artifactStore = resolveRuntimeEvidenceStore(options, {sessionId, traceId},
+      () => this.artifactStores.get(sessionId) ?? new ArtifactStore());
+    this.artifactStores.set(sessionId, artifactStore);
 
     let notes = this.sessionNotes.get(sessionId);
     if (!notes) {
@@ -3726,15 +3073,28 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
 
     const knowledgeScope = analysisRunSpec.scopes.knowledge;
     const privateAnalysisContext = analysisContextUsesPrivateKnowledge(options);
-    const recentSqlErrors = loadLearnedSqlFixPairs(5, knowledgeScope, options);
-    const skillNotesBudget = createRuntimeSkillNotesBudget(quickMode);
-    const comparisonContext = await buildRuntimeTracePairComparisonContext({
+    const allowMemoryPrefetch = turnPolicy.allowAutomaticPrefetch && !privateAnalysisContext;
+    const recentSqlErrors = turnPolicy.allowAutomaticPrefetch ? loadLearnedSqlFixPairs(5, knowledgeScope, options) : [];
+    const skillNotesBudget = createRuntimeSkillNotesBudget(turnPolicy.onDemandContext);
+    const comparisonContext = turnPolicy.allowAutomaticPrefetch
+      ? await buildRuntimeTracePairComparisonContext({
       traceProcessorService: this.input.traceProcessorService,
       currentTraceId: traceId,
       ...(options.referenceTraceId ? { referenceTraceId: options.referenceTraceId } : {}),
       ...(options.tracePairContext ? { tracePairContext: options.tracePairContext } : {}),
-    });
+    }) : buildRuntimeTracePairIdentityContext({
+      referenceTraceId: options.referenceTraceId, tracePairContext: options.tracePairContext});
+    const comparisonIdentity = comparisonContext ? {
+      currentPackageName: effectivePackageName,
+      referencePackageName: comparisonContext.referencePackageName,
+    } : undefined;
+    const extraSystemPrompt = normalizeOptionalString(
+      getProviderForSelection(this.selection, this.input.providerScope)?.connection.openCodeSystemPrompt,
+    ) || normalizeOptionalString(this.env[OPENCODE_SYSTEM_PROMPT_ENV]);
+    const withConfiguredSystemPrompt = (prompt: string): string => extraSystemPrompt
+      ? `${prompt}\n\n${extraSystemPrompt}` : prompt;
     const { toolDefinitions, sourceUse } = createClaudeMcpServer({
+      strategyRegistry,
       conversationTraceAttached: options.assistantSurface === 'conversation'
         ? options.conversationTraceAttached === true
         : undefined,
@@ -3753,12 +3113,13 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       artifactStore,
       cachedArchitecture: architecture,
       recentSqlErrors,
-      analysisPlan: quickMode ? undefined : analysisPlan,
+      analysisPlan,
       watchdogWarning: { current: null },
       hypotheses,
       sceneType,
       uncertaintyFlags,
-      lightweight: quickMode,
+      lightweight: turnPolicy.onDemandContext,
+      allowNewEvidence: turnPolicy.allowNewEvidence,
       skillNotesBudget,
       outputLanguage,
       knowledgeScope,
@@ -3782,53 +3143,57 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       sceneType,
       packageName: effectivePackageName,
     });
+    let knowledgeBaseContext: string | undefined;
+    if (turnPolicy.allowAutomaticPrefetch) {
+      try {
+        const kb = await getExtendedKnowledgeBase();
+        knowledgeBaseContext = kb.getContextForAI(query, 8);
+      } catch {
+        // On-demand lookup tools remain available if automatic context fails.
+      }
+    }
 
-    if (quickMode) {
+    if (turnPolicy.onDemandContext) {
       const quickConversationContext = buildQuickConversationContext(previousTurns, outputLanguage);
       if (quickConversationContext) {
         prompt = `${quickConversationContext}\n\n${prompt}`;
       }
       const quickMemoryPayload = buildQuickMemoryContextPayload({
-        patternContext: privateAnalysisContext
-          ? undefined
-          : buildPatternContextSection(traceFeatures, knowledgeScope),
-        negativePatternContext: privateAnalysisContext
-          ? undefined
-          : buildNegativePatternSection(traceFeatures, knowledgeScope),
-        caseBackgroundContext: buildRuntimeCaseBackgroundContext({
+        patternContext: allowMemoryPrefetch
+          ? buildPatternContextSection(traceFeatures, knowledgeScope) : undefined,
+        negativePatternContext: allowMemoryPrefetch
+          ? buildNegativePatternSection(traceFeatures, knowledgeScope) : undefined,
+        caseBackgroundContext: allowMemoryPrefetch ? buildRuntimeCaseBackgroundContext({
           sceneType,
           architectureType: architecture?.type,
           knowledgeScope,
           outputLanguage,
           privateAnalysisContext,
-        }),
+        }) : undefined,
         sqlErrorFixPairs: recentSqlErrors,
         recentSqlResultsContext: sessionContext.generateRecentSqlResultPromptContext(3),
         outputLanguage,
       });
       const quickMemoryContext = quickMemoryPayload.text;
-      // Quick mode hands the model execute_sql with no schema knowledge, so a
-      // targeted lookup can only be reached by trial. This is a local index hit.
-      const quickKnowledgeBaseContext = quickMode
-        ? await buildQuickKnowledgeBaseContext(query)
-        : undefined;
       return {
-        systemPrompt: buildQuickSystemPrompt({
+        systemPrompt: withConfiguredSystemPrompt(buildQuickSystemPrompt({
+          turnIntent, strategyRegistry, onDemandContext: turnPolicy.onDemandContext,
+          ...(comparisonContext ? {comparison: comparisonContext} : {}),
           architecture,
           packageName: effectivePackageName,
           focusApps: focusResult.apps.length > 0 ? focusResult.apps : undefined,
           focusMethod: focusResult.method,
           selectionContext: options.selectionContext,
           quickMemoryContext,
-          knowledgeBaseContext: quickKnowledgeBaseContext,
+          knowledgeBaseContext,
           outputLanguage,
           codeAwareMode: options.codeAwareMode,
           codebaseIds: options.codebaseIds,
-        }),
+        })),
         prompt,
         toolDefinitions,
         allowedToolNames,
-        quickMode,
+        quickMode, turnIntent, turnPolicy,
         sceneType,
         packageName: effectivePackageName,
         architecture,
@@ -3840,20 +3205,14 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
         uncertaintyFlags,
         analysisRunSpec,
         sourceUse,
+        comparisonIdentity,
         quickMemoryContextCounts: quickMemoryPayload.counts,
       };
     }
 
-    let knowledgeBaseContext: string | undefined;
-    try {
-      const kb = await getExtendedKnowledgeBase();
-      knowledgeBaseContext = kb.getContextForAI(query, 8);
-    } catch {
-      // Non-fatal. OpenCode can still use lookup_sql_schema/knowledge tools.
-    }
-
     const traceInfo = this.input.traceProcessorService.getTrace(traceId);
     const analysisContext: ClaudeAnalysisContext = {
+      turnIntent, strategyRegistry, onDemandContext: turnPolicy.onDemandContext,
       query,
       architecture,
       packageName: effectivePackageName,
@@ -3873,19 +3232,17 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           errorMessage: entry.errorMessage,
           fixedSql: entry.fixedSql,
         })),
-      patternContext: privateAnalysisContext
-        ? undefined
-        : buildPatternContextSection(traceFeatures, knowledgeScope),
-      negativePatternContext: privateAnalysisContext
-        ? undefined
-        : buildNegativePatternSection(traceFeatures, knowledgeScope),
-      caseBackgroundContext: buildRuntimeCaseBackgroundContext({
+      patternContext: allowMemoryPrefetch
+        ? buildPatternContextSection(traceFeatures, knowledgeScope) : undefined,
+      negativePatternContext: allowMemoryPrefetch
+        ? buildNegativePatternSection(traceFeatures, knowledgeScope) : undefined,
+      caseBackgroundContext: allowMemoryPrefetch ? buildRuntimeCaseBackgroundContext({
         sceneType,
         architectureType: architecture?.type,
         knowledgeScope,
         outputLanguage,
         privateAnalysisContext,
-      }),
+      }) : undefined,
       previousPlan,
       planHistory: analysisPlan.history.length > 0 ? analysisPlan.history : undefined,
       selectionContext: options.selectionContext,
@@ -3898,17 +3255,12 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       ...(comparisonContext ? { comparison: comparisonContext } : {}),
     };
     const sharedSystemPrompt = buildSystemPrompt(analysisContext);
-    const extraSystemPrompt = normalizeOptionalString(
-      getProviderForSelection(this.selection, this.input.providerScope)?.connection.openCodeSystemPrompt,
-    ) || normalizeOptionalString(this.env[OPENCODE_SYSTEM_PROMPT_ENV]);
     return {
-      systemPrompt: extraSystemPrompt
-        ? `${sharedSystemPrompt}\n\n${extraSystemPrompt}`
-        : sharedSystemPrompt,
+      systemPrompt: withConfiguredSystemPrompt(sharedSystemPrompt),
       prompt,
       toolDefinitions,
       allowedToolNames,
-      quickMode,
+      quickMode, turnIntent, turnPolicy,
       sceneType,
       packageName: effectivePackageName,
       architecture,
@@ -3920,12 +3272,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       uncertaintyFlags,
       analysisRunSpec,
       sourceUse,
-      ...(comparisonContext ? {
-        comparisonIdentity: {
-          currentPackageName: effectivePackageName,
-          referencePackageName: comparisonContext.referencePackageName,
-        },
-      } : {}),
+      comparisonIdentity,
     };
   }
 

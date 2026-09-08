@@ -108,6 +108,64 @@ function verify(input: {
 }
 
 describe('verifySourceClaimBindings', () => {
+  test('does not promote source text and a verified interval into a native mechanism proof', () => {
+    const source = reference();
+    const declaration = contract();
+    declaration.bindingEligibility = 'eligible';
+    declaration.claims![0].semantics = {schemaVersion: 'claim_semantics@1', predicate: 'interval.overlap',
+      polarity: 'affirmed', discourse: 'asserted', quantifier: 'one', modality: 'certain', scope: {population: 'cited_rows'}};
+    declaration.sourceClaimBindings = [{claimId: 'claim-1', mechanismStatus: 'corroborated',
+      sourceReferenceIds: [source.id], traceEvidenceRefIds: ['data:trace-1']}];
+    const verified = verifySourceClaimBindings({conclusionContract: declaration, actualSourceUseDecision: decision(source),
+      semanticsPolicy: 'declared', matchedTraceEvidenceRefIdsByClaimId: {'claim-1': ['data:trace-1']},
+      verifiedTraceOccurrenceRefIdsByClaimId: {'claim-1': ['data:trace-1']}});
+    expect(verified).toMatchObject({status: 'partial', bindings: [{mechanismStatus: 'compatible'}],
+      issues: [{code: 'source_binding_mechanism_unverified'}]});
+    expect(declaration.sourceClaimBindings[0].mechanismStatus).toBe('corroborated');
+  });
+
+  test.each(['missing', 'duplicate'] as const)('does not manufacture source claim identity for %s IDs', kind => {
+    const source = reference();
+    const declaration = contract();
+    if (kind === 'missing') delete declaration.claims![0].id;
+    else declaration.claims![1].id = declaration.claims![0].id;
+    declaration.sourceClaimBindings = [{claimId: kind === 'missing' ? 'Q1' : 'claim-1', mechanismStatus: 'compatible',
+      sourceReferenceIds: [source.id], traceEvidenceRefIds: []}];
+    const verified = verifySourceClaimBindings({conclusionContract: declaration, actualSourceUseDecision: decision(source),
+      semanticsPolicy: 'declared'});
+    expect(verified.status).toBe('partial');
+    expect(verified.bindings).toEqual([]);
+  });
+  test.each(['源码不存在', 'The implementation is absent', '这只是任意展示文字'])(
+    'uses declared source semantics independently from wording: %s', text => {
+      const source = reference();
+      const declaration = contract(text);
+      declaration.bindingEligibility = 'eligible';
+      declaration.claims![0].semantics = {schemaVersion: 'claim_semantics@1', predicate: 'source.existence',
+        polarity: 'negated', discourse: 'asserted', quantifier: 'all', modality: 'certain', scope: {population: 'codebase'}};
+      declaration.sourceClaimBindings = [{claimId: 'claim-1', mechanismStatus: 'compatible',
+        sourceReferenceIds: [source.id], traceEvidenceRefIds: []}];
+      for (const status of ['corroborated', 'search_incomplete'] as const) {
+        const verified = verifySourceClaimBindings({conclusionContract: declaration,
+          actualSourceUseDecision: decision(source, {status, coverageComplete: true}), semanticsPolicy: 'declared'});
+        expect(verified.status).toBe('partial');
+        expect(verified.issues).toEqual([expect.objectContaining({severity: 'warning', code: 'source_absence_requires_complete_search'})]);
+      }
+    });
+
+  test('still reports actual unauthorized references when declared semantics are unchecked', () => {
+    const source = reference();
+    const declaration = contract();
+    declaration.sourceClaimBindings = [{claimId: 'claim-1', mechanismStatus: 'compatible',
+      sourceReferenceIds: ['never-returned'], traceEvidenceRefIds: []}];
+    const verified = verifySourceClaimBindings({conclusionContract: declaration,
+      actualSourceUseDecision: decision(source), semanticsPolicy: 'declared'});
+    expect(verified.status).toBe('failed');
+    expect(verified.issues.map(issue => issue.code)).toEqual(expect.arrayContaining([
+      'source_claim_semantics_unchecked', 'source_reference_not_returned',
+    ]));
+  });
+
   test('accepts corroborated provider body evidence bound to a verified trace occurrence', () => {
     const result = verify({});
 

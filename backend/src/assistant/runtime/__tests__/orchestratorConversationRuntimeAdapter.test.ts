@@ -3,23 +3,326 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {EventEmitter} from 'events';
+import {setImmediate as nextImmediate} from 'node:timers/promises';
+import {beforeEach, describe, expect, it, jest} from '@jest/globals';
+import type {FinalizeAnalysisResultInput, FinalizedAnalysisResult} from '../../../services/finalizeAnalysisResult';
+import {canonicalizeAnalysisResult} from '../../../services/canonicalAnalysisResult';
+import * as finalizationContexts from '../../../agentRuntime/analysisFinalizationContext';
+import type {RuntimeFinalizationContextInput} from '../../../agentRuntime/analysisFinalizationContext';
+import {buildStrategyRegistrySnapshotFromDefinitions} from '../../../agentv3/strategyLoader';
+import {analysisDeliveryFingerprint} from '../../../types/analysisDelivery';
+import {createDataEnvelope} from '../../../types/dataContract';
+import * as authorization from '../../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../../services/scopedKnowledgeStore';
 import {listProductionRuntimeKinds} from '../../../agentRuntime/runtimeKinds';
 import type {AnalysisOptions, AnalysisResult, IOrchestrator} from '../../../agent/core/orchestratorTypes';
 import {OrchestratorConversationRuntimeAdapter} from '../orchestratorConversationRuntimeAdapter';
+import {ArtifactStore} from '../../../agentv3/artifactStore';
+import {createClaudeMcpServer} from '../../../agentv3/claudeMcpServer';
+import {SkillExecutor} from '../../../services/skillEngine/skillExecutor';
+import type {TraceProcessorService} from '../../../services/traceProcessorService';
+import {resolveRuntimeEvidenceStore} from '../../../agentRuntime/runtimeEvidenceContext';
+import {captureEvidenceTable} from '../../../services/evidence/evidenceCapture';
+import {buildTraceProcessorQueryProvenance} from '../../../services/traceProcessorConnectionModel';
+import {renderConclusionContractSidecar, type ConclusionContract} from '../../../agent/core/conclusionContract';
+
+const mockFinalize = jest.fn<(input: FinalizeAnalysisResultInput) => Promise<FinalizedAnalysisResult>>();
+jest.mock('../../../services/finalizeAnalysisResult', () => ({
+  finalizeAnalysisResult: (input: FinalizeAnalysisResultInput) => mockFinalize(input),
+}));
+
+const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'conversation-finalization-test'});
+function attachContext(value: AnalysisResult, runId: string, intent: Partial<RuntimeFinalizationContextInput['turnIntent']> = {},
+  extra: Partial<RuntimeFinalizationContextInput> = {}) {
+  const candidate = {runId, attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: analysisDeliveryFingerprint(value.conclusion)};
+  finalizationContexts.attachFinalizationContext(value, {runId, sessionId: value.sessionId, deadlineMs: Date.now() + 10_000,
+    strategyRegistry: registry, traceIdentity: {currentTraceId: 'trace-1'},
+    turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: registry.registryFingerprint,
+      taskKind: 'fact', sceneId: 'general', scope: 'bounded_question', recommendedComplexity: 'quick', deliverable: 'answer',
+      evidenceAccess: 'existing_only', ...intent},
+    deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
+      completion: {...candidate, schemaVersion: 1, status: 'completed', runtimeKind: 'openai-agents-sdk'}}, ...extra});
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(settle => {resolve = settle;});
+  return {promise, resolve};
+}
+
+beforeEach(() => {
+  mockFinalize.mockReset();
+  mockFinalize.mockImplementation(async input => {
+    try {
+      input.owner.signal.throwIfAborted();
+      input.owner.assertAuthorized();
+      const canonical = canonicalizeAnalysisResult(input.result, {conversation: input.conversation});
+      return {result: canonical.result, conversationOutcome: canonical.conversationOutcome
+        ? {...canonical.conversationOutcome, message: canonical.result.conclusion} : undefined};
+    } finally {input.context?.dispose();}
+  });
+});
+
+describe('Conversation evidence and stream consumer boundaries', () => {
+  function useActualFinalizer() {
+    mockFinalize.mockImplementation(jest.requireActual<typeof import('../../../services/finalizeAnalysisResult')>(
+      '../../../services/finalizeAnalysisResult').finalizeAnalysisResult);
+  }
+
+  function attachStoreContext(value: AnalysisResult, options: AnalysisOptions, traceId: string, store: ArtifactStore,
+    body: string, claimIds: string[] = []) {
+    attachContext(value, options.runId!, {}, {
+      traceIdentity: {currentTraceId: traceId},
+      evidenceReadView: store.createEvidenceReadView({ownerKey: value.sessionId,
+        allowedTraces: [{traceId, traceSide: 'current'}]}),
+      dispatchText: async () => ({status: 'ok', text: JSON.stringify({schemaVersion: 'final_semantic_response@1',
+        bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: body.length}]},
+        claims: claimIds.map(claimId => ({claimId, consistency: 'consistent',
+          contentLocations: [{start: 0, end: body.length, text: body}], issues: []})),
+        omissions: [], requirements: []})}),
+    });
+  }
+
+  function issuedStore(options: AnalysisOptions, sessionId: string, traceId: string) {
+    return resolveRuntimeEvidenceStore(options, {sessionId, traceId}, () => {
+      throw new Error('Conversation must supply a live evidence binding');
+    });
+  }
+
+  function record(store: ArtifactStore, traceId: string) {
+    const data = {columns: ['metric'], rows: [[7]]};
+    const id = store.store({skillId: 'fixture', title: 'Prior metric', data,
+      traceProvenance: buildTraceProcessorQueryProvenance({traceId, traceSide: 'current'})});
+    store.registerEvidenceCapture(id, captureEvidenceTable(data), {evidenceRefId: 'prior-metric'});
+    return id;
+  }
+
+  function updateRecord(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an update object');
+    return value as Record<string, unknown>;
+  }
+  function text(update: unknown): string {
+    const content = updateRecord(update).content;
+    if (typeof content === 'string') return content;
+    const record = updateRecord(content);
+    const value = record.token ?? record.delta ?? record.conclusion ?? '';
+    if (typeof value !== 'string') throw new Error('Expected update text');
+    return value;
+  }
+  const isAnswer = (update: unknown) => updateRecord(update).type === 'answer_token';
+
+  it('provides discoverable live locators and reads them via real MCP on the second turn without another SQL query', async () => {
+    useActualFinalizer();
+    const emitter = createOrchestrator(async () => result('unused'));
+    emitter.cleanupSession = jest.fn();
+    const query = jest.fn(async () => ({columns: ['id', 'metric'], rows: Array.from({length: 301}, (_, id) => [id, 7]), durationMs: 1}));
+    const physicalSessions: string[] = [];
+    const rawResults: AnalysisResult[] = [];
+    let artifactId: string | undefined;
+    emitter.analyze = jest.fn<IOrchestrator['analyze']>(async (prompt, sessionId, traceId, options = {}) => {
+      const firstTurn = physicalSessions.length === 0;
+      physicalSessions.push(sessionId);
+      const store = issuedStore(options, sessionId, traceId);
+      const mcp = createClaudeMcpServer({traceId, sessionId, userQuery: prompt,
+        artifactStore: store, traceProcessorService: {query} as unknown as TraceProcessorService,
+        skillExecutor: new SkillExecutor({query}), analysisNotes: [], hypotheses: [], uncertaintyFlags: [],
+        watchdogWarning: {current: null}, lightweight: true, allowNewEvidence: firstTurn,
+        conversationTraceAttached: true, androidInternalsPackStore: null,
+        emitUpdate: update => emitter.emit('update', update)});
+      const invoke = async (name: string, args: Record<string, unknown>) => {
+        const tool = mcp.toolDefinitions.find(definition => definition.name === name);
+        if (!tool) throw new Error(`Missing real MCP tool ${name}`);
+        return tool.shared.handler(args, {});
+      };
+      await nextImmediate();
+      if (firstTurn) {
+        await invoke('execute_sql', {sql: 'SELECT id, metric FROM measured'});
+        artifactId = store.serialize().find(artifact => artifact.skillId === 'execute_sql')?.id;
+        expect(artifactId).toBeDefined();
+      } else {
+        const catalog = prompt.split('\n').flatMap(line => {
+          try {const item = JSON.parse(line); return item?.context === 'retained_artifacts' ? [item] : [];} catch {return [];}
+        })[0];
+        expect(catalog.artifacts).toEqual([expect.objectContaining({artifactId, traceId, traceSide: 'current', rowCount: 301})]);
+        expect(catalog.artifacts[0]).not.toHaveProperty('rows');
+        // Select the locator from the actual prompt, not from test-owned history.
+        const fetched = await invoke('fetch_artifact', {artifactId: catalog.artifacts[0].artifactId,
+          detail: 'rows', offset: 300, limit: 1});
+        expect(fetched).toMatchObject({structuredContent: {success: true, rows: [[300, 7]]}});
+      }
+      const body = 'The retained metric is 7.\n';
+      const reference = {artifactId: artifactId!, rowIndex: 300, column: 'metric', value: 7};
+      const contract: ConclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+        conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+        claims: [{id: 'metric', kind: 'numeric', text: body.trim(), references: [reference],
+          semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed',
+            discourse: 'asserted', modality: 'certain', quantifier: 'one',
+            scope: {population: 'cited_rows', subjectRefs: [reference]}, numeric: {operator: 'eq', value: 7, unit: 'count'}}}]};
+      const marker = renderConclusionContractSidecar(contract);
+      for (const token of [body, marker.slice(0, 19), marker.slice(19)]) {
+        emitter.emit('update', {type: 'answer_token', content: {token}, timestamp: Date.now()});
+      }
+      const value = result(body + marker, sessionId);
+      rawResults.push(value);
+      attachStoreContext(value, options, traceId, store, body, ['metric']);
+      return value;
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter);
+    const first = await adapter.run({sessionId: 'conversation', runId: 'first', query: 'Observe the metric', history: [],
+      traceContext: {kind: 'attached', traceId: 'trace-1'}});
+    expect(query).toHaveBeenCalled();
+    query.mockClear();
+    const updates: unknown[] = [];
+    const second = await adapter.run({sessionId: 'conversation', runId: 'second', query: 'Use the previous observation',
+      history: [{role: 'assistant', content: first.message}], traceContext: {kind: 'attached', traceId: 'trace-1'},
+      onUpdate: update => updates.push(update)});
+    expect(physicalSessions).toEqual(['conversation:first', 'conversation:second']);
+    expect(query).not.toHaveBeenCalled();
+    expect(second.message).toBe('The retained metric is 7.\n');
+    expect(updates.filter(isAnswer).map(text).join('')).toBe(second.message);
+    expect(rawResults[1].conclusion).toContain('smartperfetto:conclusion-contract@');
+    expect(mockFinalize.mock.calls[1][0].result).toBe(rawResults[1]);
+    expect(second.finalResult?.claimVerificationResult?.claimResults[0]).toMatchObject({
+      referenceCells: [expect.objectContaining({status: 'matched'})],
+      // Raw SQL provides no declared unit. A real read must not manufacture one.
+      deterministicProof: {status: 'candidate', reason: 'unit_authority_unknown'},
+    });
+    await nextImmediate();
+    expect(emitter.cleanupSession).toHaveBeenCalledWith('conversation:first');
+    expect(emitter.cleanupSession).toHaveBeenCalledWith('conversation:second');
+    await adapter.dispose();
+  });
+
+  it('flushes an ordinary withheld prefix at settlement without inventing native completion', async () => {
+    const emitter = createOrchestrator(async () => {
+      await nextImmediate();
+      emitter.emit('update', {type: 'answer_token', content: {token: 'Visible\n<', totalChars: 9}, timestamp: Date.now(), id: 'last-sdk-event'});
+      return result('Visible\n<');
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter);
+    const updates: unknown[] = [];
+    await adapter.run({sessionId: 'conversation', runId: 'tail', query: 'question', history: [], traceContext: {kind: 'none'},
+      onUpdate: update => updates.push(update)});
+    expect(updates.map(text).join('')).toBe('Visible\n<');
+    expect(updates[updates.length - 1]).not.toHaveProperty('id');
+    expect(updates[updates.length - 1]).not.toHaveProperty('content.done');
+    await adapter.dispose();
+  });
+
+  it('rejects old producer events and delayed abort/cleanup while a replacement physical run is active', async () => {
+    const startedOld = deferred<void>();
+    const finishOld = deferred<void>();
+    const startedNew = deferred<void>();
+    const finishNew = deferred<void>();
+    const oldCleanup = deferred<void>();
+    const emitter = createOrchestrator(async () => result('unused'));
+    emitter.cleanupSession = jest.fn<NonNullable<IOrchestrator['cleanupSession']>>(sessionId => {
+      if (sessionId.endsWith(':old')) oldCleanup.resolve();
+    });
+    emitter.analyze = jest.fn<IOrchestrator['analyze']>(async (_query, sessionId, traceId, options = {}) => {
+      const store = issuedStore(options, sessionId, traceId);
+      const old = options.runId === 'old';
+      (old ? startedOld : startedNew).resolve();
+      await (old ? finishOld : finishNew).promise;
+      emitter.emit('update', {type: 'answer_token', content: {token: old ? 'OLD_EVENT_CANARY' : 'New answer'}, timestamp: Date.now()});
+      emitter.emit('update', {type: 'data', content: createDataEnvelope({columns: ['run'], rows: [[old ? 'old' : 'new']]},
+        {type: 'sql_result', source: 'fixture', title: old ? 'Old envelope' : 'New envelope'}), timestamp: Date.now()});
+      const value = result(old ? 'Old answer' : 'New answer', sessionId);
+      // An aborted runtime may still return its independently attached context.
+      if (old) attachContext(value, options.runId!);
+      else attachStoreContext(value, options, traceId, store, 'New answer');
+      return value;
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter);
+    const old = adapter.run({sessionId: 'conversation', runId: 'old', query: 'first', history: [], traceContext: {kind: 'attached', traceId: 'trace-1'}});
+    await startedOld.promise;
+    await adapter.cancel('conversation', 'old');
+    await expect(old).resolves.toEqual({kind: 'cancelled', message: ''});
+    const updates: unknown[] = [];
+    const current = adapter.run({sessionId: 'conversation', runId: 'new', query: 'second', history: [], traceContext: {kind: 'attached', traceId: 'trace-1'},
+      onUpdate: update => updates.push(update)});
+    await startedNew.promise;
+    await adapter.cancel('conversation', 'old');
+    finishOld.resolve();
+    await oldCleanup.promise;
+    expect(updates).toEqual([]);
+    expect(emitter.abortSession).not.toHaveBeenCalledWith('conversation:new');
+    finishNew.resolve();
+    await expect(current).resolves.toMatchObject({kind: 'answered', message: 'New answer'});
+    expect(updates.filter(isAnswer).map(text).join('')).toBe('New answer');
+    expect(mockFinalize.mock.calls).toHaveLength(1);
+    expect(mockFinalize.mock.calls[0][0].dataEnvelopes).toEqual([
+      expect.objectContaining({display: expect.objectContaining({title: 'New envelope'})}),
+    ]);
+    await adapter.dispose();
+  });
+
+  it.each(['trace', 'tenantId', 'workspaceId', 'userId', 'codebaseIds', 'knowledgeSourceIds'] as const)(
+    'replaces retained evidence when %s changes and never restores it when the old scope returns', async changed => {
+      const options: AnalysisOptions = {tenantId: 'tenant', workspaceId: 'workspace', userId: 'user'};
+      const emitter = createOrchestrator(async () => result('unused'));
+      let calls = 0;
+      emitter.analyze = jest.fn<IOrchestrator['analyze']>(async (prompt, sessionId, traceId, runtimeOptions = {}) => {
+        const store = issuedStore(runtimeOptions, sessionId, traceId);
+        if (calls++ === 0) record(store, traceId);
+        else {expect(store.size).toBe(0); expect(prompt).not.toContain('"context":"retained_artifacts"');}
+        return result('answer', sessionId);
+      });
+      const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {analysisOptions: options});
+      const input = {sessionId: 'conversation', query: 'question', history: [], traceContext: {kind: 'attached' as const, traceId: 'trace-1'}};
+      await adapter.run({...input, runId: 'first'});
+      if (changed === 'codebaseIds' || changed === 'knowledgeSourceIds') options[changed] = ['another-source'];
+      else if (changed !== 'trace') options[changed] = 'another-owner';
+      await adapter.run({...input, runId: 'second', ...(changed === 'trace' ? {traceContext: {kind: 'attached' as const, traceId: 'trace-2'}} : {})});
+      if (changed === 'codebaseIds' || changed === 'knowledgeSourceIds') delete options[changed];
+      else if (changed !== 'trace') options[changed] = changed === 'tenantId' ? 'tenant' : changed === 'workspaceId' ? 'workspace' : 'user';
+      await adapter.run({...input, runId: 'third'});
+      await adapter.dispose();
+    });
+
+  it('revokes a current captured read view on product disposal and rejects later runs', async () => {
+    const started = deferred<void>();
+    const finish = deferred<void>();
+    let store!: ArtifactStore;
+    let artifactId!: string;
+    let view!: ReturnType<ArtifactStore['createEvidenceReadView']>;
+    const emitter = createOrchestrator(async () => result('unused'));
+    emitter.analyze = jest.fn<IOrchestrator['analyze']>(async (_query, sessionId, traceId, options = {}) => {
+      store = issuedStore(options, sessionId, traceId);
+      artifactId = record(store, traceId);
+      view = store.createEvidenceReadView({ownerKey: sessionId, allowedTraces: [{traceId, traceSide: 'current'}]});
+      started.resolve();
+      await finish.promise;
+      return result('late', sessionId);
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter);
+    const input = {sessionId: 'conversation', runId: 'current', query: 'question', history: [],
+      traceContext: {kind: 'attached' as const, traceId: 'trace-1'}};
+    const pending = adapter.run(input);
+    await started.promise;
+    const requests = [{key: 'metric', reference: {artifactId, rowIndex: 0, column: 'metric'}, requiredColumns: ['metric']}];
+    expect((await view.resolveReferences(requests))[0]).toMatchObject({status: 'resolved', row: {metric: 7}});
+    await adapter.dispose();
+    await expect(pending).resolves.toEqual({kind: 'cancelled', message: ''});
+    await expect(view.resolveReferences(requests)).rejects.toThrow();
+    expect(() => store.fetch(artifactId, 'rows')).toThrow();
+    await expect(adapter.run({...input, runId: 'later'})).rejects.toThrow('Conversation adapter disposed');
+    finish.resolve();
+  });
+});
 
 function createOrchestrator(
   analyze: (options: AnalysisOptions) => Promise<AnalysisResult>,
 ): IOrchestrator {
   const emitter = new EventEmitter() as unknown as IOrchestrator;
-  emitter.analyze = jest.fn(async (_query, _sessionId, _traceId, options = {}) => analyze(options));
+  emitter.analyze = jest.fn<IOrchestrator['analyze']>(async (_query, _sessionId, _traceId, options = {}) => analyze(options));
   emitter.reset = jest.fn();
-  emitter.abortSession = jest.fn();
+  emitter.abortSession = jest.fn<NonNullable<IOrchestrator['abortSession']>>(() => undefined);
   return emitter;
 }
 
-function result(conclusion: string): AnalysisResult {
+function result(conclusion: string, sessionId = 'runtime-session'): AnalysisResult {
   return {
-    sessionId: 'runtime-session',
+    sessionId,
     success: true,
     findings: [{
       id: 'ev-1',
@@ -53,9 +356,9 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
         query: '怎么分析？',
         history: [],
         traceContext: {kind: 'none'},
-      })).resolves.toEqual({
+      })).resolves.toMatchObject({
         kind: 'answered',
-        message: '可以先看主线程。',
+        message: '可以先看主线程。\n',
         evidence: [{id: 'ev-1', label: 'Trace evidence', source: 'sql'}],
       });
       expect(receivedOptions).toMatchObject({
@@ -116,7 +419,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
     const orchestrator = createOrchestrator(() => new Promise((_resolve, reject) => {
       rejectRun = reject;
     }));
-    orchestrator.abortSession = jest.fn(() => rejectRun?.(new Error('Analysis aborted')));
+    orchestrator.abortSession = jest.fn<NonNullable<IOrchestrator['abortSession']>>(() => rejectRun?.(new Error('Analysis aborted')));
     const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator);
     const completion = adapter.run({
       sessionId: 'conversation-1',
@@ -135,7 +438,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
   it('projects private runtime updates and terminal outcomes before publishing them', async () => {
     const privateQuery = 'private pasted source line';
     const emitter = new EventEmitter() as unknown as IOrchestrator;
-    emitter.analyze = jest.fn(async () => {
+    emitter.analyze = jest.fn<IOrchestrator['analyze']>(async () => {
       emitter.emit('update', {
         type: 'progress',
         content: {message: privateQuery},
@@ -144,7 +447,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
       return result(`Answer repeats ${privateQuery}`);
     });
     emitter.reset = jest.fn();
-    emitter.abortSession = jest.fn();
+    emitter.abortSession = jest.fn<NonNullable<IOrchestrator['abortSession']>>(() => undefined);
     const updates: unknown[] = [];
     const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {
       analysisOptions: {
@@ -172,7 +475,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
     const previousPrivateQuery = 'private source pasted in the previous turn';
     const currentPrivateQuery = 'continue reviewing that source';
     const emitter = new EventEmitter() as unknown as IOrchestrator;
-    emitter.analyze = jest.fn(async () => {
+    emitter.analyze = jest.fn<IOrchestrator['analyze']>(async () => {
       emitter.emit('update', {
         type: 'progress',
         content: {message: previousPrivateQuery},
@@ -181,7 +484,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
       return result(`Answer repeats ${previousPrivateQuery}`);
     });
     emitter.reset = jest.fn();
-    emitter.abortSession = jest.fn();
+    emitter.abortSession = jest.fn<NonNullable<IOrchestrator['abortSession']>>(() => undefined);
     const updates: unknown[] = [];
     const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {
       analysisOptions: {
@@ -208,120 +511,76 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
     expect(outcome.message).toContain('[PRIVATE_QUERY_REFERENCE]');
   });
 
-  it('keeps authorized source dormant for ordinary analysis questions', async () => {
+  it.each([
+    '为什么这次启动很慢？',
+    '结合源码看看 Foo::bar 的调用链',
+    '完整审查整个源码',
+  ])('preserves authorized source and fingerprint without adding a source budget: %s', async query => {
     let receivedOptions: AnalysisOptions | undefined;
-    const emitter = new EventEmitter() as unknown as IOrchestrator;
-    emitter.analyze = jest.fn(async (_query, _sessionId, _traceId, options = {}) => {
+    const orchestrator = createOrchestrator(async options => {
       receivedOptions = options;
-      emitter.emit('update', {
-        type: 'progress',
-        content: {message: 'trace-first progress'},
-        timestamp: Date.now(),
+      return result('Trace answer');
+    });
+    const analysisOptions: AnalysisOptions = {
+      codeAwareMode: 'provider_send', codebaseIds: ['private-app'], taskTimeoutMs: 21_000,
+    };
+    analysisOptions.analysisContextFingerprint = authorization.buildAnalysisContextAuthorizationFingerprint(
+      analysisOptions, resolveKnowledgeScope(analysisOptions));
+    const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions});
+    await adapter.run({sessionId: 'conversation-source', runId: 'run-source', query, history: [],
+      traceContext: {kind: 'attached', traceId: 'trace-1'}});
+
+    expect(receivedOptions).toMatchObject({...analysisOptions, assistantSurface: 'conversation', analysisMode: 'fast'});
+    expect(receivedOptions?.sourceUsePolicy).toBeUndefined();
+    expect(mockFinalize.mock.calls[0][0].owner.analysisContextFingerprint).toBe(analysisOptions.analysisContextFingerprint);
+    expect(orchestrator.analyze).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves an explicit caller source policy and the total runtime budget', async () => {
+    let receivedOptions: AnalysisOptions | undefined;
+    const orchestrator = createOrchestrator(async options => {
+      receivedOptions = options;
+      return result('answer');
+    });
+    const sourceUsePolicy = {phase: 'explicit' as const, maxSearchCalls: 4, maxReadCalls: 5, maxDurationMs: 17_000};
+    const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: {
+      codeAwareMode: 'provider_send', codebaseIds: ['private-app'], sourceUsePolicy, taskTimeoutMs: 25_000,
+    }});
+    await adapter.run({sessionId: 'conversation', runId: 'run', query: '继续', history: [], traceContext: {kind: 'none'}});
+    expect(receivedOptions?.sourceUsePolicy).toBe(sourceUsePolicy);
+    expect(receivedOptions?.taskTimeoutMs).toBe(25_000);
+  });
+
+  it.each(['provider_send', 'metadata_only', 'off', undefined] as const)(
+    'uses actual %s authorization to retain or filter source-derived history', async codeAwareMode => {
+      let receivedQuery = '';
+      const orchestrator = createOrchestrator(async () => result('trace answer'));
+      orchestrator.analyze = jest.fn<IOrchestrator['analyze']>(async query => {
+        receivedQuery = query;
+        return result('trace answer');
       });
-      return result('先基于 Trace 回答');
-    });
-    emitter.reset = jest.fn();
-    emitter.abortSession = jest.fn();
-    const updates: unknown[] = [];
-    const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {
-      analysisOptions: {
-        outputLanguage: 'zh-CN',
-        codeAwareMode: 'provider_send',
-        codebaseIds: ['private-app'],
-        analysisContextFingerprint: 'authorized-source-fingerprint',
-      },
-    });
+      const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: {
+        codeAwareMode, codebaseIds: ['private-app'],
+      }});
+      await adapter.run({sessionId: 'conversation-history', runId: 'run-history', query: '继续分析启动耗时',
+        history: [
+          {role: 'user', content: '上一轮普通问题'},
+          {role: 'assistant', content: '普通 Trace 回答'},
+          {role: 'assistant', content: 'PRIVATE_SOURCE_DERIVED_CANARY', sourceDerived: true},
+        ], traceContext: {kind: 'attached', traceId: 'trace-1'}});
+      expect(receivedQuery).toContain('普通 Trace 回答');
+      expect(receivedQuery.includes('PRIVATE_SOURCE_DERIVED_CANARY')).toBe(
+        codeAwareMode === 'provider_send' || codeAwareMode === 'metadata_only');
+    },
+  );
 
-    await adapter.run({
-      sessionId: 'conversation-dormant',
-      runId: 'run-dormant',
-      query: '为什么这次启动很慢？',
-      history: [],
-      traceContext: {kind: 'attached', traceId: 'trace-1'},
-      onUpdate: update => updates.push(update),
-    });
-
-    expect(receivedOptions).toMatchObject({
-      codeAwareMode: 'off',
-      assistantSurface: 'conversation',
-    });
-    expect(receivedOptions?.codebaseIds).toBeUndefined();
-    expect(receivedOptions?.analysisContextFingerprint).toBeUndefined();
-    expect(updates).toContainEqual(expect.objectContaining({
-      type: 'progress',
-      content: {message: 'trace-first progress'},
-    }));
-  });
-
-  it('uses the bounded source policy for an explicit source question', async () => {
-    let receivedOptions: AnalysisOptions | undefined;
-    const orchestrator = createOrchestrator(async (options) => {
-      receivedOptions = options;
-      return result('源码回答');
-    });
-    const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {
-      analysisOptions: {
-        codeAwareMode: 'provider_send',
-        codebaseIds: ['private-app'],
-      },
-    });
-
-    await adapter.run({
-      sessionId: 'conversation-explicit',
-      runId: 'run-explicit',
-      query: '结合源码看看 Foo::bar 的调用链',
-      history: [],
-      traceContext: {kind: 'attached', traceId: 'trace-1'},
-    });
-
-    expect(receivedOptions).toMatchObject({
-      codeAwareMode: 'provider_send',
-      codebaseIds: ['private-app'],
-      sourceUsePolicy: {
-        phase: 'explicit',
-        maxSearchCalls: 1,
-        maxReadCalls: 2,
-        maxDurationMs: 6_000,
-      },
-    });
-  });
-
-  it('does not inject source-derived history into a dormant primary analysis', async () => {
-    let receivedQuery = '';
-    const emitter = new EventEmitter() as unknown as IOrchestrator;
-    emitter.analyze = jest.fn(async (query: string) => {
-      receivedQuery = query;
-      return result('trace answer');
-    });
-    emitter.reset = jest.fn();
-    emitter.abortSession = jest.fn();
-    const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {
-      analysisOptions: {
-        codeAwareMode: 'provider_send',
-        codebaseIds: ['private-app'],
-      },
-    });
-
-    await adapter.run({
-      sessionId: 'conversation-history',
-      runId: 'run-history',
-      query: '继续分析启动耗时',
-      history: [
-        {role: 'user', content: '上一轮普通问题'},
-        {role: 'assistant', content: '普通 Trace 回答'},
-        {role: 'assistant', content: 'PRIVATE_SOURCE_DERIVED_CANARY', sourceDerived: true},
-      ],
-      traceContext: {kind: 'attached', traceId: 'trace-1'},
-    });
-
-    expect(receivedQuery).toContain('普通 Trace 回答');
-    expect(receivedQuery).not.toContain('PRIVATE_SOURCE_DERIVED_CANARY');
-  });
-
-  it('never returns internal tool protocol text as a user answer', async () => {
-    const orchestrator = createOrchestrator(async () => result(
-      '<｜｜DSML｜｜tools_calling><｜｜DSML｜｜invoke name="bash">secret</｜｜DSML｜｜invoke>',
-    ));
+  it.each([
+    '```xml\n<invoke name="example">quoted text</invoke>\n```',
+    '> <tool_call>quoted text</tool_call>',
+    'The DSML tools_calling token is ordinary text in this explanation.',
+    '<｜｜DSML｜｜tools_calling><｜｜DSML｜｜invoke name="example">text</｜｜DSML｜｜invoke>',
+  ])('finalizes protocol examples as model text without inferring tool execution: %s', async body => {
+    const orchestrator = createOrchestrator(async () => result(body));
     const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator);
 
     const outcome = await adapter.run({
@@ -332,86 +591,232 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
       traceContext: {kind: 'none'},
     });
 
-    expect(outcome.kind).toBe('needs_user_input');
-    expect(outcome.message).not.toContain('DSML');
-    expect(outcome.message).not.toContain('invoke');
+    expect(outcome.kind).toBe('answered');
+    expect(outcome.message).toBe(body);
+    expect(mockFinalize).toHaveBeenCalledTimes(1);
+    expect(mockFinalize.mock.calls[0][0].result.conclusion).toBe(body);
   });
 
-  it('starts automatic source enrichment only for a narrow trace-backed anchor', () => {
-    const adapter = new OrchestratorConversationRuntimeAdapter(
-      createOrchestrator(async () => result('answer')),
-      {
-        analysisOptions: {
-          codeAwareMode: 'provider_send',
-          codebaseIds: ['private-app'],
-        },
-      },
-    );
-    const input = {
-      sessionId: 'conversation-auto',
-      runId: 'run-auto',
-      query: '为什么启动慢？',
-      history: [],
-      traceContext: {kind: 'attached' as const, traceId: 'trace-1'},
-    };
+  it.each(['Main thread busy', 'Foo::bar', 'app/src/Foo.kt:L42'])(
+    'keeps the primary runtime and tool capability unchanged for finding label %s', async label => {
+      let receivedOptions: AnalysisOptions | undefined;
+      const orchestrator = createOrchestrator(async options => {
+        receivedOptions = options;
+        const value = result('answer');
+        value.findings[0].title = label;
+        attachContext(value, options.runId!, {scope: 'scene_wide', evidenceAccess: 'read_new'});
+        return value;
+      });
+      const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: {
+        codeAwareMode: 'provider_send', codebaseIds: ['private-app'],
+      }});
+      await adapter.run({sessionId: 'conversation', runId: 'run', query: '为什么启动慢？', history: [],
+        traceContext: {kind: 'attached', traceId: 'trace-1'}});
+      expect(orchestrator.analyze).toHaveBeenCalledTimes(1);
+      expect(mockFinalize).toHaveBeenCalledTimes(1);
+      expect(receivedOptions).toMatchObject({codeAwareMode: 'provider_send', codebaseIds: ['private-app']});
+      expect(receivedOptions?.sourceUsePolicy).toBeUndefined();
+      expect(adapter).not.toHaveProperty('shouldStartSourceEnrichment');
+      expect(adapter).not.toHaveProperty('runSourceEnrichment');
+    },
+  );
 
-    expect(adapter.shouldStartSourceEnrichment(input, {
-      kind: 'answered',
-      message: 'trace answer',
-      evidence: [{id: 'ev-1', label: 'Foo::bar', source: 'sql'}],
-    })).toBe(true);
-    expect(adapter.shouldStartSourceEnrichment(input, {
-      kind: 'answered',
-      message: 'trace answer',
-      evidence: [{id: 'ev-2', label: 'Main thread busy', source: 'sql'}],
-    })).toBe(false);
+  it('takes the exact runtime result, collects raw envelopes, and preserves the finalized body', async () => {
+    const envelope = createDataEnvelope({columns: ['value'], rows: [[7]]}, {type: 'sql_result', source: 'execute_sql', title: 'actual data'});
+    let raw!: AnalysisResult;
+    const emitter = createOrchestrator(async options => {
+      emitter.emit('update', {type: 'data', content: envelope, timestamp: Date.now()});
+      raw = result('  Exact body.\r\n');
+      attachContext(raw, options.runId!);
+      return raw;
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter);
+    const updates: unknown[] = [];
+    const outcome = await adapter.run({sessionId: 'conversation', runId: 'run', query: 'question', history: [],
+      traceContext: {kind: 'attached', traceId: 'trace-1'}, onUpdate: update => updates.push(update)});
+    expect(mockFinalize).toHaveBeenCalledTimes(1);
+    const received = mockFinalize.mock.calls[0][0];
+    expect(received.result).toBe(raw);
+    expect(received.owner.runId).toBe('run');
+    expect(received.comparisonIdentity).toBeUndefined();
+    expect(received.dataEnvelopes?.[0]).toBe(envelope);
+    expect(finalizationContexts.takeFinalizationContext(raw)).toBeUndefined();
+    expect(() => received.context!.runId).toThrow('finalization_context_disposed');
+    expect(outcome.message).toBe('  Exact body.\r\n');
+    expect(outcome.finalResult?.conclusion).toBe(outcome.message);
+    expect(updates).toHaveLength(1);
   });
 
-  it('runs automatic source enrichment with a distinct bounded runtime phase', async () => {
-    const received: Array<{sessionId: string; options: AnalysisOptions; query: string}> = [];
-    const emitter = new EventEmitter() as unknown as IOrchestrator;
-    emitter.analyze = jest.fn(async (query, sessionId, _traceId, options = {}) => {
-      received.push({query, sessionId, options});
-      return result('补充定位到 Foo.kt:L10-L12');
-    });
-    emitter.reset = jest.fn();
-    emitter.abortSession = jest.fn();
-    const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {
-      analysisOptions: {
-        outputLanguage: 'zh-CN',
-        codeAwareMode: 'provider_send',
-        codebaseIds: ['private-app'],
-      },
-    });
-
-    const outcome = await adapter.runSourceEnrichment({
-      sessionId: 'conversation-auto',
-      runId: 'run-auto',
-      query: '为什么启动慢？',
-      history: [],
-      traceContext: {kind: 'attached', traceId: 'trace-1'},
-      primaryOutcome: {
-        kind: 'answered',
-        message: 'Trace 指向 Foo::bar',
-        evidence: [{id: 'ev-1', label: 'Foo::bar', source: 'sql'}],
-      },
-    });
-
-    expect(received[0]).toMatchObject({
-      sessionId: 'conversation-auto:run-auto:source-enrichment',
-      options: {
-        codeAwareMode: 'provider_send',
-        codebaseIds: ['private-app'],
-        analysisMode: 'fast',
-        assistantSurface: 'conversation',
-        sourceUsePolicy: {
-          phase: 'automatic_enrichment',
-          maxSearchCalls: 1,
-          maxReadCalls: 2,
-          maxDurationMs: 6_000,
-        },
-      },
-    });
-    expect(outcome.message).toContain('Foo.kt:L10-L12');
+  it('delivers partial results with their typed failed verification instead of rejecting their message', async () => {
+    const value = {...result('  Partial but useful answer.\r\n'), success: false, partial: true};
+    mockFinalize.mockImplementationOnce(async input => ({result: {...input.result,
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2', status: 'failed', policy: 'record_only', passed: false,
+        checkedClaimCount: 1, unsupportedClaimCount: 1, claimResults: [{claimId: 'claim', status: 'unsupported'}], issues: []}},
+      conversationOutcome: {kind: 'answered', message: value.conclusion}}));
+    const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async () => value));
+    const outcome = await adapter.run({sessionId: 'conversation', runId: 'partial', query: 'question', history: [], traceContext: {kind: 'none'}});
+    expect(outcome).toMatchObject({kind: 'answered', message: value.conclusion, finalResult: {partial: true,
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2', status: 'failed', passed: false}}});
   });
+
+  it('keeps invalid conversation control ineligible without inventing a clarification', async () => {
+    const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async () =>
+      result('Answer body\n<!-- smartperfetto:conversation-control {invalid} -->')));
+    const outcome = await adapter.run({sessionId: 'conversation', runId: 'invalid', query: 'question', history: [], traceContext: {kind: 'none'}});
+    expect(outcome.kind).toBe('answered');
+    expect(mockFinalize).toHaveBeenCalledTimes(1);
+    expect(outcome.message).toBe(outcome.finalResult?.conclusion);
+    expect(outcome.message).toBe('Answer body\n');
+  });
+
+  it.each(['cancel', 'dispose'] as const)('blocks late finalizer results and updates after %s', async action => {
+    const started = deferred<FinalizeAnalysisResultInput>();
+    const finish = deferred<FinalizedAnalysisResult>();
+    mockFinalize.mockImplementationOnce(input => {started.resolve(input); return finish.promise.finally(() => input.context?.dispose());});
+    const emitter = createOrchestrator(async options => {
+      const value = result('answer'); attachContext(value, options.runId!); return value;
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter);
+    const updates: unknown[] = [];
+    const pending = adapter.run({sessionId: 'conversation', runId: 'pending', query: 'question', history: [], traceContext: {kind: 'none'},
+      onUpdate: update => updates.push(update)});
+    const input = await started.promise;
+    if (action === 'cancel') await adapter.cancel('conversation', 'pending'); else await adapter.dispose();
+    expect(input.owner.signal.aborted).toBe(true);
+    await expect(pending).resolves.toEqual({kind: 'cancelled', message: ''});
+    emitter.emit('update', {type: 'data', content: createDataEnvelope({columns: ['value'], rows: [[8]]},
+      {type: 'sql_result', source: 'execute_sql', title: 'late'}), timestamp: Date.now()});
+    expect(updates).toHaveLength(0);
+    expect(input.dataEnvelopes).toHaveLength(0);
+    finish.resolve({result: input.result, conversationOutcome: {kind: 'answered', message: 'late'}});
+    await mockFinalize.mock.results[0].value;
+    expect(() => input.context!.runId).toThrow('finalization_context_disposed');
+  });
+
+  it('rejects a context belonging to a different run instead of adopting its identity', async () => {
+    const take = finalizationContexts.takeFinalizationContext;
+    let context: ReturnType<typeof take>;
+    const spy = jest.spyOn(finalizationContexts, 'takeFinalizationContext').mockImplementation(value => (context = take(value)));
+    try {
+      const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async () => {
+        const value = result('answer'); attachContext(value, 'another-run'); return value;
+      }));
+      await expect(adapter.run({sessionId: 'conversation', runId: 'current-run', query: 'question', history: [], traceContext: {kind: 'none'}}))
+        .rejects.toThrow('finalization_run_identity_mismatch');
+      expect(mockFinalize).not.toHaveBeenCalled();
+      expect(() => context!.runId).toThrow('finalization_context_disposed');
+    } finally {spy.mockRestore();}
+  });
+
+  it('rechecks authorization after finalization and cannot publish a revoked result', async () => {
+    let revoked = false;
+    const authorizationCheck = jest.spyOn(authorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
+      if (revoked) throw new authorization.AnalysisContextAuthorizationChangedError();
+    });
+    const started = deferred<FinalizeAnalysisResultInput>();
+    const finish = deferred<FinalizedAnalysisResult>();
+    mockFinalize.mockImplementationOnce(input => {started.resolve(input); return finish.promise;});
+    try {
+      const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async () => result('answer')));
+      const pending = adapter.run({sessionId: 'conversation', runId: 'revoke', query: 'question', history: [], traceContext: {kind: 'none'}});
+      const input = await started.promise;
+      revoked = true;
+      finish.resolve({result: input.result, conversationOutcome: {kind: 'answered', message: 'answer'}});
+      await expect(pending).rejects.toThrow('analysis_context_changed_restart_required');
+    } finally {authorizationCheck.mockRestore();}
+  });
+
+  it('does not let an old finalizer return into the replacement run', async () => {
+    const started = deferred<FinalizeAnalysisResultInput>();
+    const finish = deferred<FinalizedAnalysisResult>();
+    mockFinalize.mockImplementationOnce(input => {started.resolve(input); return finish.promise;});
+    const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async () => result('answer')));
+    const first = adapter.run({sessionId: 'conversation', runId: 'old', query: 'first', history: [], traceContext: {kind: 'none'}});
+    const oldInput = await started.promise;
+    const second = await adapter.run({sessionId: 'conversation', runId: 'new', query: 'second', history: [], traceContext: {kind: 'none'}});
+    await expect(first).resolves.toEqual({kind: 'cancelled', message: ''});
+    expect(second.kind).toBe('answered');
+    expect(oldInput.owner.signal.aborted).toBe(true);
+    finish.resolve({result: oldInput.result, conversationOutcome: {kind: 'answered', message: 'late old result'}});
+    await mockFinalize.mock.results[0].value;
+  });
+
+  it.each(['legacy', 'existing_only', 'unavailable', 'bounded'] as const)('does not start another runtime for %s evidence policy', async mode => {
+    const emitter = createOrchestrator(async options => {
+      const value = result('answer');
+      if (mode !== 'legacy') attachContext(value, options.runId!, {status: mode === 'unavailable' ? 'unavailable' : 'resolved',
+        scope: mode === 'bounded' ? 'bounded_question' : 'scene_wide', evidenceAccess: mode === 'existing_only' ? 'existing_only' : 'read_new'});
+      return value;
+    });
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter, {analysisOptions: {codeAwareMode: 'provider_send', codebaseIds: ['private-app']}});
+    const input = {sessionId: 'conversation', runId: 'policy', query: '为什么启动慢？', history: [], traceContext: {kind: 'attached' as const, traceId: 'trace-1'}};
+    await adapter.run(input);
+    expect(mockFinalize).toHaveBeenCalledTimes(1);
+    expect(emitter.analyze).toHaveBeenCalledTimes(1);
+  });
+
+  it('projects a private final result with its failed @2 status intact and keeps the shell body consistent', async () => {
+    const privateQuery = '请看源码确认 PRIVATE_FINAL_CANARY 为什么返回空';
+    mockFinalize.mockImplementationOnce(async input => ({result: {...input.result, conclusion: `Answer repeats ${privateQuery}`,
+      claimVerificationResult: {schemaVersion: 'claim_verifier@2', status: 'failed', policy: 'record_only', passed: false,
+        checkedClaimCount: 0, unsupportedClaimCount: 0, claimResults: [], issues: []}},
+      conversationOutcome: {kind: 'answered', message: `Answer repeats ${privateQuery}`}}));
+    const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async () => result('answer')),
+      {analysisOptions: {codeAwareMode: 'metadata_only', codebaseIds: ['private-app']}});
+    const outcome = await adapter.run({sessionId: 'private', runId: 'private-run', query: privateQuery, history: [], traceContext: {kind: 'none'}});
+    expect(outcome.finalResult?.claimVerificationResult).toMatchObject({schemaVersion: 'claim_verifier@2', status: 'failed', passed: false});
+    expect(outcome.message).toBe(outcome.finalResult?.conclusion);
+    expect(JSON.stringify(outcome)).not.toContain('PRIVATE_FINAL_CANARY');
+    expect(outcome).not.toHaveProperty('semanticAssessment');
+    expect(outcome).not.toHaveProperty('context');
+  });
+
+  it('passes protocol-like text through the same take/finalize/dispose boundary', async () => {
+    const take = finalizationContexts.takeFinalizationContext;
+    let context: ReturnType<typeof take>;
+    const spy = jest.spyOn(finalizationContexts, 'takeFinalizationContext').mockImplementation(value => (context = take(value)));
+    try {
+      const adapter = new OrchestratorConversationRuntimeAdapter(createOrchestrator(async options => {
+        const value = result('<｜｜DSML｜｜tools_calling><｜｜DSML｜｜invoke name="bash">secret</｜｜DSML｜｜invoke>');
+        attachContext(value, options.runId!); return value;
+      }));
+      const outcome = await adapter.run({sessionId: 'conversation', runId: 'protocol', query: 'question', history: [], traceContext: {kind: 'none'}});
+      expect(outcome.kind).toBe('answered');
+      expect(outcome.finalResult?.conclusion).toBe(outcome.message);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(mockFinalize).toHaveBeenCalledTimes(1);
+      expect(() => context!.runId).toThrow('finalization_context_disposed');
+    } finally {spy.mockRestore();}
+  });
+
+  it('takes and disposes a late primary runtime context after cancellation without finalizing it', async () => {
+    const lateResult = deferred<AnalysisResult>();
+    const started = deferred<void>();
+    const contextTaken = deferred<void>();
+    const emitter = createOrchestrator(async () => {started.resolve(); return lateResult.promise;});
+    const adapter = new OrchestratorConversationRuntimeAdapter(emitter,
+      {analysisOptions: {codeAwareMode: 'provider_send', codebaseIds: ['private-app']}});
+    const input = {sessionId: 'conversation', runId: 'source', query: '为什么启动慢？', history: [],
+      traceContext: {kind: 'attached' as const, traceId: 'trace-1'}};
+    const take = finalizationContexts.takeFinalizationContext;
+    let context: ReturnType<typeof take>;
+    const spy = jest.spyOn(finalizationContexts, 'takeFinalizationContext').mockImplementation(value => {
+      context = take(value);
+      contextTaken.resolve();
+      return context;
+    });
+    try {
+      const pending = adapter.run(input);
+      await started.promise;
+      await adapter.cancel(input.sessionId, input.runId);
+      await expect(pending).resolves.toEqual({kind: 'cancelled', message: ''});
+      const value = {...result('late private source answer'), sessionId: 'conversation:source'};
+      attachContext(value, 'source');
+      lateResult.resolve(value);
+      await contextTaken.promise;
+      expect(mockFinalize).not.toHaveBeenCalled();
+      expect(() => context!.runId).toThrow('finalization_context_disposed');
+    } finally {spy.mockRestore();}
+  });
+
 });

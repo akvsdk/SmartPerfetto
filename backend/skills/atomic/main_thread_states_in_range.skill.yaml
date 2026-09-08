@@ -82,16 +82,20 @@ display:
       type: number
       format: compact
 
+process_scope:
+  role: target
+  binding: native_upid
+
 sql: |
   WITH main_thread AS (
     SELECT t.utid
     FROM thread t
     JOIN process p ON t.upid = p.upid
     WHERE (
-        (${upid|0} > 0 AND p.upid = ${upid|0})
-        OR (${upid|0} <= 0 AND ${pid|0} > 0 AND p.pid = ${pid|0}
+        (COALESCE(${__process_scope.upid}, ${upid|0}) > 0 AND p.upid = COALESCE(${__process_scope.upid}, ${upid|0}))
+        OR (COALESCE(${__process_scope.upid}, ${upid|0}) <= 0 AND ${pid|0} > 0 AND p.pid = ${pid|0}
             AND ('${package|}' = '' OR p.name = '${package|}' OR p.name GLOB '${package|}:*'))
-        OR (${upid|0} <= 0 AND ${pid|0} <= 0
+        OR (COALESCE(${__process_scope.upid}, ${upid|0}) <= 0 AND ${pid|0} <= 0
             AND ('${package|}' = '' OR p.name = '${package|}' OR p.name GLOB '${package|}:*'))
       )
       AND t.tid = p.pid

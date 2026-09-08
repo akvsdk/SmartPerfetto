@@ -59,7 +59,7 @@ function rowCountFromDisplayResult(displayResult: DisplayResult): number | undef
 }
 
 export function buildSkillQueryReview(input: BuildSkillQueryReviewInput): QueryReviewV1 | undefined {
-  if (input.producer?.sourceToolCallId?.startsWith('compare_skill')) return undefined;
+  if (input.producer?.sourceToolCallId?.startsWith('compare_skill') || input.displayResult.executionStatus === 'unavailable') return undefined;
 
   const outputLanguage = input.outputLanguage ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
   const executableSql = typeof input.displayResult.sql === 'string' ? input.displayResult.sql : undefined;
@@ -78,6 +78,8 @@ export function buildSkillQueryReview(input: BuildSkillQueryReviewInput): QueryR
     : [];
   const limitations = [
     ...introspection.limitations,
+    ...(input.displayResult.scopeProvenance?.entries.map(entry =>
+      `Evidence scope: ${entry.role}; ${entry.scope.mode}${entry.scope.upid !== undefined ? ` UPID ${entry.scope.upid}` : ''}; fields=${entry.fields?.join(',') || 'all'}`) || []),
     ...(!executableSql ? ['Skill result review was derived from observed display metadata; full Skill YAML remains the source of truth.'] : []),
   ];
   const queryHash = executableSql

@@ -259,7 +259,8 @@ async function startConversation(req: express.Request, res: express.Response): P
         options.codebaseIds?.length &&
         resolvePrimaryConversationSourceUse({
           query,
-          hasAuthorizedCodebase: true,
+          codeAwareMode: options.codeAwareMode,
+          codebaseIds: options.codebaseIds,
         }) === 'explicit'
       ),
     );

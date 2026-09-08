@@ -2,6 +2,9 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import type {EvidenceScopeProvenanceV1} from './identityContract';
+import type {ClaimSemanticsV1, ConclusionBindingEligibility} from '../agent/core/conclusionContract';
+
 export type EvidenceContractVersion = 'evidence_contract@1';
 export type TraceTimestampNs = string | number;
 
@@ -120,9 +123,9 @@ export interface EvidenceCellV1 {
   rowSelector?: Record<string, string | number | boolean>;
   column: string;
   /** Expected value stated by the claim reference, when the claim is value-bearing. */
-  value?: string | number | boolean;
+  value?: string | number | boolean | null;
   /** Actual primitive value read from the cited evidence row. */
-  actualValue?: string | number | boolean;
+  actualValue?: string | number | boolean | null;
   isSqlNull?: boolean;
   displayValue?: string;
   unit?: string;
@@ -136,6 +139,8 @@ export interface EvidenceAnchorV1 {
   cells?: EvidenceCellV1[];
   timeRange?: EvidenceTimeRangeV1;
   identity?: EvidenceIdentityV1;
+  /** Scope of the cited fields; relativeTo is context, never subject identity. */
+  scopeProvenance?: EvidenceScopeProvenanceV1;
   confidence?: number;
   /**
    * Qualifiers the evidence row declares about itself, verbatim from the
@@ -221,6 +226,8 @@ export interface ClaimSupportV1 {
   claimId: string;
   kind: ClaimKindV1;
   text: string;
+  semantics?: ClaimSemanticsV1;
+  bindingEligibility?: ConclusionBindingEligibility;
   anchors: EvidenceAnchorV1[];
   relationAnchors?: EvidenceAnchorV1[];
   relations?: EvidenceRelationV1[];

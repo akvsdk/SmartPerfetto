@@ -51,6 +51,7 @@ interface DataEnvelope<T = DataPayload> {
 - `observed`: the query succeeded and produced an observed result;
 - `empty`: the query succeeded with no matching rows;
 - `optional_error`: an optional query was unavailable or failed.
+- `unavailable`: current data cannot be obtained and is not a successful observation.
 
 Do not collapse `empty` and `optional_error` into "no issue." Comparison
 envelopes also preserve `traceSide`, pane, trace id, query hash, and evidence
@@ -148,6 +149,47 @@ explain what a query did, but cannot support a diagnostic claim by itself or
 replace an `evidenceRefId`. The complete object follows its DataEnvelope or
 artifact into reports; the compact model projection omits executable SQL; and
 private-analysis projections apply the shared redaction boundary.
+
+## Terminal State And Evidence Verification
+
+An `AnalysisResult` body, its original claim declarations and native completion
+are separate inputs. Runtimes derive completion/output origin from SDK terminal
+records. Before copying the result, the product takes its private
+`RuntimeFinalizationContext` and calls the single `finalizeAnalysisResult()`
+boundary. It preserves the canonical body and original propositions. Actual
+machine sidecars may be hidden from chat; headings, error words and body length
+must not rewrite claims, infer success or mechanically rewrite the answer.
+
+`evidenceCapture.ts` issues original observations before display/transport
+truncation, and `evidenceReadView.ts` reads only the captures admitted for that
+finalization and still retained. `claim_verifier@2` combines finite proof with at
+most one no-tool semantic review. Review retains the pinned provider, original
+absolute deadline and product owner/authorization checks. Valid typed intent or
+claim JSON is not truth, and semantic agreement cannot replace observations.
+
+The current finite catalog supports `numeric.cell`, `interval.overlap` and
+`comparison.delta`; `SUPPORTED_DETERMINISTIC_CLAIM_RULES` is authoritative.
+Proof additionally requires exact references, trusted field semantics, units and
+applicable scope. This does not establish general causality. Unknown predicates,
+missing witnesses, units or coverage retain candidate/unknown/not-checked
+boundaries. Formatted values, inferred column names, Query Review, equal endpoints
+and restored snapshots cannot manufacture verification authority.
+
+Number/string reference type differences, non-unique row locations and bounded
+reads retain not-checked status and original literals, without conversion or
+value-based row selection. Explicitly missing or unauthorized references and
+same-type numeric contradictions still fail; finite mathematical proof checks
+the typed proposition independently. A numeric unit does not establish clock
+semantics or automatically verify an overlap candidate.
+
+Public `analysis_completed` events/results may carry `turnIntent`, `completion`,
+`outputOrigin`, `runtimeAppendix`, `reportAssessment` and `deliveryAssurance`;
+historical events may omit them. The body and structured metadata have separate
+projections, while reports, CLI artifacts and snapshots retain required
+provenance. Private contexts, provider closures, capture-read capabilities and
+original witnesses never enter JSON or generated frontend types. Historical
+reads/replay project stored results without rerunning semantic verification or
+issuing new proof; normal access authorization still applies.
 
 ## Analysis Receipt
 

@@ -19,6 +19,7 @@ import {produceStartupRelationCandidates} from './startupRelationCandidateProduc
 export interface AnalysisRelationPreparationInput {
   conclusionContract?: ConclusionContract | null;
   dataEnvelopes?: DataEnvelope[];
+  relationCandidates?: readonly EvidenceRelationCandidateV1[];
 }
 
 export interface AnalysisRelationPreparationResult {
@@ -31,12 +32,13 @@ export function prepareAnalysisRelations(
   input: AnalysisRelationPreparationInput,
 ): AnalysisRelationPreparationResult {
   const dataEnvelopes = input.dataEnvelopes || [];
-  const anrCandidates = produceAnrRelationCandidates(dataEnvelopes);
   const relationCandidates = [
+    ...(input.conclusionContract?.relationProposals ?? []),
+    ...(input.relationCandidates ?? []),
     ...produceStartupRelationCandidates(dataEnvelopes),
     ...produceScrollingRelationCandidates(dataEnvelopes),
     ...produceInputRelationCandidates(dataEnvelopes),
-    ...anrCandidates,
+    ...produceAnrRelationCandidates(dataEnvelopes),
   ];
   if (relationCandidates.length === 0) {
     return {conclusionContract: input.conclusionContract};
@@ -49,9 +51,7 @@ export function prepareAnalysisRelations(
     };
   }
   return {
-    ...bindRelationCandidatesToClaims(input.conclusionContract, relationCandidates, {
-      objectCellOnlyCandidateIds: new Set(anrCandidates.map(candidate => candidate.id)),
-    }),
+    ...bindRelationCandidatesToClaims(input.conclusionContract, relationCandidates),
     relationCandidates,
   };
 }
@@ -59,9 +59,13 @@ export function prepareAnalysisRelations(
 export function runPreparedAnalysisClaimVerification(
   input: ClaimVerificationRunnerInput,
 ): ClaimVerificationRunnerResult {
+  // Prepared evidence is bound to the exact contract and relation list. Even an
+  // invalid supplied handle belongs to the runner's rejection path, not a fallback.
+  if (input.preparedEvidence !== undefined) return runClaimVerification(input);
   const prepared = prepareAnalysisRelations({
     conclusionContract: input.conclusionContract,
     dataEnvelopes: input.dataEnvelopes,
+    relationCandidates: input.relationCandidates,
   });
   return runClaimVerification({...input, ...prepared});
 }

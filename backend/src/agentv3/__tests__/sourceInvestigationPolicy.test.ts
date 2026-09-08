@@ -114,7 +114,6 @@ describe('source investigation policy', () => {
     ]);
     const productionSource = [
       '../sourceInvestigationPolicy.ts',
-      '../scenePlanTemplates.ts',
       '../strategyLoader.ts',
     ].map(relativePath => fs.readFileSync(path.resolve(__dirname, relativePath), 'utf8'))
       .join('\n');

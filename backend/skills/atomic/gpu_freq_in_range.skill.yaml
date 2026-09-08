@@ -64,6 +64,9 @@ display:
       type: percentage
       format: percentage
 
+process_scope:
+  role: global_context
+
 sql: |
   WITH gpu_raw AS (
     SELECT gpu_id, gpu_freq, dur

@@ -23,7 +23,8 @@ import {
   getSnapshotRuntimeProviderSnapshotHash,
 } from '../agentv3/sessionStateSnapshot';
 import { readTraceMetadataForContext } from '../services/traceMetadataStore';
-import { applyFinalResultQualityGate } from '../services/finalResultQualityGate';
+import {copyAnalysisResultForSnapshot, projectPrivateAnalysisResult, sessionUsesPrivateKnowledge} from '../services/security/privateAnalysisProjection';
+import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import {
   requireAiEnabledForHttp,
   sendAiDisabledErrorIfPresent,
@@ -219,28 +220,16 @@ export function registerAgentResumeRoutes(
 
       const restoredTurns = restoredContext.getAllTurns();
       const latestTurn = restoredTurns.length > 0 ? restoredTurns[restoredTurns.length - 1] : null;
-      const recoveredResult = deps.buildRecoveredResultFromContext(sessionId, restoredContext);
-      if (recoveredResult) {
-        const qualityIssue = applyFinalResultQualityGate({
-          result: recoveredResult,
-          query: latestTurn?.query || persistedSession.question,
-        });
-        if (qualityIssue && typeof restoredContext.annotateLatestCompletedTurn === 'function') {
-          restoredContext.annotateLatestCompletedTurn({
-            success: recoveredResult.success,
-            findings: recoveredResult.findings,
-            message: recoveredResult.conclusion,
-            confidence: recoveredResult.confidence,
-            partial: recoveredResult.partial,
-            terminationReason: recoveredResult.terminationReason,
-            terminationMessage: recoveredResult.terminationMessage,
-            conclusionContract: recoveredResult.conclusionContract,
-            claimSupport: recoveredResult.claimSupport,
-            claimVerificationResult: recoveredResult.claimVerificationResult,
-            identityResolutions: recoveredResult.identityResolutions,
-          });
-        }
-      }
+      const snapshotRun = snapshot?.lastRun ?? snapshot?.activeRun;
+      const storedFinal = snapshot?.finalResult;
+      const storedFinalRunId = storedFinal?.completion?.runId ?? storedFinal?.analysisReceipt?.runId;
+      const matchingStoredFinal = storedFinal?.sessionId === sessionId && snapshotRun?.runId &&
+        (!storedFinalRunId || storedFinalRunId === snapshotRun.runId);
+      const recoveredResult = matchingStoredFinal
+        ? (sessionUsesPrivateKnowledge(snapshot!)
+            ? projectPrivateAnalysisResult(sessionId, storedFinal!, snapshot?.outputLanguage ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE))
+            : copyAnalysisResultForSnapshot(storedFinal!))
+        : deps.buildRecoveredResultFromContext(sessionId, restoredContext);
       const restoredRunSequence = Math.max(0, restoredTurns.length);
       const fallbackRestoredRun: AnalyzeSessionRunContext | undefined = restoredRunSequence > 0
         ? {

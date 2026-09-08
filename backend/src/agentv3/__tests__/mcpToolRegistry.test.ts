@@ -2,8 +2,14 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import {describe, it, expect} from '@jest/globals';
+import {describe, it, expect, jest} from '@jest/globals';
 import {z} from 'zod';
+import type {ClaudeSdkToolLike, RuntimeToolExtra} from '../../agentRuntime/runtimeToolSpec';
+import type {RuntimeToolInvocationEvent} from '../../agentRuntime/runtimeToolObserver';
+import * as runtimeToolSpec from '../../agentRuntime/runtimeToolSpec';
+import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
+import {recordPlanOrPrePlanToolCall} from '../planToolCallRecorder';
+import type {AnalysisPlanV3} from '../types';
 
 import {
   McpToolRegistry,
@@ -82,6 +88,114 @@ describe('McpToolRegistry — basic registration', () => {
 });
 
 describe('McpToolRegistry — allowedTools shape', () => {
+  it('gives every evidence-capable descriptor explicit attribution without guessing from active state', async () => {
+    const registry = new McpToolRegistry({requestScope: {sessionId: 's1', hasCodebaseAccess: true}});
+    const body = jest.fn(async () => createRuntimeToolResult({success: true}));
+    registry.registerSdk({name: 'read_codebase_file', description: 'Read source', inputSchema: {}, handler: body},
+      'read_codebase_file', 'requires_codebase_permission', {evidenceEffect: 'acquire'});
+    const definition = registry.list()[0];
+    expect(z.safeParse(definition.shared.inputSchema.planPhaseId, 'p2').success).toBe(true);
+    const descriptor = definition.tool;
+    if (!runtimeToolSpec.isClaudeSdkToolLike(descriptor)) throw new Error('Expected SDK descriptor');
+    const plan: AnalysisPlanV3 = {phases: [
+      {id: 'p1', name: 'Active', goal: 'Read', expectedTools: ['read_codebase_file'], status: 'in_progress'},
+      {id: 'p2', name: 'Pending', goal: 'Read', expectedTools: ['read_codebase_file'], status: 'pending'},
+    ], successCriteria: 'Resolve', submittedAt: 1, toolCallLog: []};
+    const tracker = {current: plan};
+    const implicit = await descriptor.handler({}, {});
+    expect(recordPlanOrPrePlanToolCall(tracker, {toolName: definition.name, resultFacts: readRuntimeToolResultFacts(implicit)})?.matchedPhaseId)
+      .toBeUndefined();
+    const input = {planPhaseId: 'p2'};
+    const explicit = await descriptor.handler(input, {});
+    expect(recordPlanOrPrePlanToolCall(tracker, {toolName: definition.name, input, resultFacts: readRuntimeToolResultFacts(explicit)})?.matchedPhaseId)
+      .toBe('p2');
+    expect(body).toHaveBeenCalledTimes(2);
+  });
+
+  it('freezes the bound scope and keeps all discovery views restrict-only', () => {
+    const scope = {sessionId: 's1', hasCodebaseAccess: false, allowNewEvidence: false};
+    const registry = new McpToolRegistry({requestScope: scope});
+    registry.registerSdk(stub('stored'), 'stored', 'public', {evidenceEffect: 'read_existing'});
+    registry.registerSdk(stub('guide'), 'guide', 'internal', {evidenceEffect: 'none'});
+    registry.registerSdk(stub('new'), 'new', 'public', {evidenceEffect: 'acquire'});
+    registry.registerSdk(stub('unknown'), 'unknown', 'public');
+    registry.registerSdk(stub('source'), 'source', 'requires_codebase_permission', {evidenceEffect: 'none'});
+    scope.allowNewEvidence = true;
+    scope.hasCodebaseAccess = true;
+
+    const expected = ['stored', 'guide'];
+    for (const viewScope of [undefined, scope]) {
+      expect(registry.listForRequest(viewScope).map(def => def.name)).toEqual(expected);
+      expect(registry.buildAllowedTools(viewScope)).toEqual(expected.map(name => MCP_NAME_PREFIX + name));
+      expect(registry.getAci(viewScope).map(def => def.toolName)).toEqual(expected);
+      const server = registry.buildSdkServer({scope: viewScope}) as unknown as {instance: {tools: Array<{name: string}>}};
+      expect(server.instance.tools.map(def => def.name.replace(MCP_NAME_PREFIX, ''))).toEqual(expected);
+    }
+    expect(registry.list().map(def => def.name)).toEqual(expected);
+    expect(registry.size()).toBe(expected.length);
+    expect(registry.buildPublicApiContract().tools.map(def => def.toolName)).toEqual(expected);
+    expect(registry.probeCapabilities(scope).codeAwareAvailable).toBe(false);
+  });
+
+  it('allows a supplied view scope to narrow a permissive bound scope', () => {
+    const registry = new McpToolRegistry({requestScope: {sessionId: 's1', hasCodebaseAccess: true}});
+    registry.registerSdk(stub('new'), 'new', 'public', {evidenceEffect: 'acquire'});
+    registry.registerSdk(stub('source'), 'source', 'requires_codebase_permission', {evidenceEffect: 'read_existing'});
+    registry.registerSdk(stub('stored'), 'stored', 'public', {evidenceEffect: 'read_existing'});
+    expect(registry.listForRequest({sessionId: 's1', hasCodebaseAccess: false, allowNewEvidence: false})
+      .map(def => def.name)).toEqual(['stored']);
+    expect(registry.list()).toHaveLength(3);
+  });
+
+  it('executes explicitly declared existing reads and controls without acquiring evidence', async () => {
+    const registry = new McpToolRegistry({
+      requestScope: {sessionId: 's1', hasCodebaseAccess: false, allowNewEvidence: false},
+    });
+    const result = createRuntimeToolResult({success: true, value: 'stored'});
+    const body = jest.fn(async () => result);
+    for (const evidenceEffect of ['none', 'read_existing'] as const) {
+      registry.registerShared({
+        name: evidenceEffect, description: 'Existing capability', exposure: 'public',
+        inputSchema: {}, handler: body, evidenceEffect,
+      });
+    }
+    for (const definition of registry.list()) {
+      expect(definition.shared.evidenceEffect).toBe(definition.evidenceEffect);
+      await expect(definition.shared.handler({}, {})).resolves.toBe(result);
+    }
+    expect(body).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['acquire', undefined] as const)('rejects held shared/SDK descriptors for effect=%s before executing the body', async evidenceEffect => {
+    const body = jest.fn(async () => createRuntimeToolResult({success: true}));
+    const events: RuntimeToolInvocationEvent[] = [];
+    const factory = jest.spyOn(runtimeToolSpec, 'createClaudeSdkToolFromSharedSpec');
+    try {
+      const registry = new McpToolRegistry({
+        requestScope: {sessionId: 's1', hasCodebaseAccess: true, allowNewEvidence: false},
+        toolObserver: event => {events.push(event);},
+      });
+      registry.registerSdk({name: 'held', description: 'Held tool', inputSchema: {}, handler: body},
+        'held', 'public', {evidenceEffect});
+      const shared = factory.mock.calls[0][0];
+      const descriptor = factory.mock.results[0].value;
+      if (!runtimeToolSpec.isClaudeSdkToolLike(descriptor)) throw new Error('Expected SDK descriptor');
+      for (const handler of [shared.handler, descriptor.handler]) {
+        const result = await handler({}, {allowNewEvidence: true});
+        expect(result.isError).toBe(true);
+        expect(readRuntimeToolResultFacts(result)).toEqual({success: false});
+      }
+      expect(registry.list()).toEqual([]);
+      expect(body).not.toHaveBeenCalled();
+      expect(events.map(event => event.phase)).toEqual(['started', 'completed', 'started', 'completed']);
+      for (const event of events) {
+        if (event.phase === 'completed') expect(readRuntimeToolResultFacts(event.result)).toEqual({success: false});
+      }
+    } finally {
+      factory.mockRestore();
+    }
+  });
+
   it('prefixes every short name with MCP_NAME_PREFIX', () => {
     const registry = new McpToolRegistry();
     registry.registerSdk(stub('a'), 'execute_sql', 'public');
@@ -298,5 +412,95 @@ describe('McpToolRegistry — buildSdkServer', () => {
     // a recognizable shape (the SDK's helper returns an object).
     expect(server).toBeTruthy();
     expect(typeof server).toBe('object');
+  });
+});
+
+describe('McpToolRegistry — invocation observation', () => {
+  it('observes actual shared and SDK handlers with one stable ID per identical invocation', async () => {
+    const events: RuntimeToolInvocationEvent[] = [];
+    const result = {content: [{type: 'text' as const, text: 'unstructured result'}]};
+    const handler = jest.fn(async (_params: Record<string, unknown>, _extra: RuntimeToolExtra) => result);
+    const registry = new McpToolRegistry({toolObserver: event => {events.push(event);}});
+    registry.registerShared({
+      name: 'execute_sql', description: 'Execute SQL', exposure: 'public', inputSchema: {}, handler,
+    });
+    const definition = registry.list()[0];
+    const sdkTool = definition.tool as ClaudeSdkToolLike;
+    const params = {sql: 'select 1'};
+
+    await expect(definition.shared.handler(params, {toolCallId: 'unknown'})).resolves.toBe(result);
+    await expect(sdkTool.handler(params, {toolCallId: 'unknown'})).resolves.toBe(result);
+    await expect(sdkTool.handler(params, {toolCallId: 'sdk-call-3'})).resolves.toBe(result);
+
+    expect(events.map(event => event.phase)).toEqual([
+      'started', 'completed', 'started', 'completed', 'started', 'completed',
+    ]);
+    const ids = events.filter(event => event.phase === 'started').map(event => event.toolCallId);
+    expect(new Set(ids).size).toBe(3);
+    expect(ids).not.toContain('unknown');
+    expect(ids[2]).toBe('sdk-call-3');
+    for (let invocation = 0; invocation < 3; invocation += 1) {
+      expect(events[invocation * 2 + 1]).toMatchObject({
+        phase: 'completed', toolCallId: ids[invocation], toolName: 'execute_sql', result,
+      });
+      expect(handler.mock.calls[invocation][0]).toBe(params);
+      expect(handler.mock.calls[invocation][1].toolCallId).toBe(ids[invocation]);
+    }
+  });
+
+  it.each(['sync', 'async'] as const)('preserves original results and thrown errors when the %s observer throws', async mode => {
+    const events: RuntimeToolInvocationEvent[] = [];
+    const result = {content: [{type: 'text' as const, text: 'ok'}]};
+    const failure = new Error('original handler failure');
+    const handler = jest.fn(async () => result).mockResolvedValueOnce(result).mockRejectedValueOnce(failure);
+    const registry = new McpToolRegistry({
+      toolObserver: event => {
+        events.push(event);
+        if (mode === 'async') return Promise.reject(new Error('observer failure'));
+        throw new Error('observer failure');
+      },
+    });
+    registry.registerSdk({
+      name: 'execute_sql', description: 'Execute SQL', inputSchema: {}, handler,
+    }, 'execute_sql', 'public');
+    const sdkTool = registry.list()[0].tool as ClaudeSdkToolLike;
+
+    await expect(sdkTool.handler({}, {})).resolves.toBe(result);
+    await expect(sdkTool.handler({}, {})).rejects.toBe(failure);
+    expect(events.map(event => event.phase)).toEqual(['started', 'completed', 'started', 'failed']);
+    expect(events[3]).toMatchObject({phase: 'failed', error: failure, toolCallId: events[2].toolCallId});
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it('observes only handlers admitted for execution and ignores calls cancelled while queued', async () => {
+    const events: RuntimeToolInvocationEvent[] = [];
+    let release!: () => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>(resolve => {signalStarted = resolve;});
+    const pending = new Promise<void>(resolve => {release = resolve;});
+    const handler = jest.fn(async () => {
+      signalStarted();
+      await pending;
+      return {content: [{type: 'text' as const, text: 'ok'}]};
+    });
+    const registry = new McpToolRegistry({toolObserver: event => {events.push(event);}});
+    registry.registerShared({
+      name: 'execute_sql', description: 'Execute SQL', exposure: 'public', inputSchema: {}, handler,
+    });
+    const sdkTool = registry.list()[0].tool as ClaudeSdkToolLike;
+    const first = sdkTool.handler({}, {toolCallId: 'first'});
+    await started;
+    const controller = new AbortController();
+    const second = sdkTool.handler({}, {toolCallId: 'queued', signal: controller.signal});
+    const rejected = expect(second).rejects.toThrow();
+    controller.abort();
+    await rejected;
+    release();
+    await first;
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(events.map(event => [event.phase, event.toolCallId])).toEqual([
+      ['started', 'first'], ['completed', 'first'],
+    ]);
   });
 });

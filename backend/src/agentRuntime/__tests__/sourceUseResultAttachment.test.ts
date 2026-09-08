@@ -6,11 +6,28 @@ import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import {createClaudeMcpServer} from '../../agentv3/claudeMcpServer';
 import {
   finalizeSourceAwareAnalysisResult,
+  finalizeSourceAwareAnalysisResultWithProjection,
+  verifySourceClaimBindings,
   type SourceUseDecisionReader,
 } from '../../services/codebase/sourceClaimVerifier';
 import type {SourceUseDecisionV1} from '../../services/codebase/sourceUseDecision';
 import {sanitizeSourceReference} from '../../services/codebase/sourceUseDecision';
 import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
+import {
+  clearAllCodeAwareOutputGuards,
+  clearCodeAwareOutputGuards,
+  createCodeAwareStreamingTextProjection,
+  registerCodeAwareCanary,
+  revokeCodeAwareOutputGuards,
+  sanitizeCodeAwareTextWithReceipt,
+} from '../../services/security/codeAwareOutputRegistry';
+import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisDeliveryContext} from '../../types/analysisDelivery';
+import {assessFinalResultQualityAssessment} from '../../services/finalResultQualityGate';
+import {runClaimVerification} from '../../services/verifier/claimVerificationRunner';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import {captureEvidenceTable} from '../../services/evidence/evidenceCapture';
+import {prepareClaimEvidence} from '../../services/evidence/claimEvidencePreparation';
+import {createDataEnvelope} from '../../types/dataContract';
 import {
   createRuntimeSourceFinalizationFixture,
   createSourceAuthoredAnalysisResult,
@@ -111,7 +128,7 @@ describe('runtime source finalization behavior', () => {
   });
 
   test.each(['pending', 'attempted'] as const)(
-    'blocks success while the actual source decision is %s',
+    'keeps %s source usage as audit state without overriding native completion',
     status => {
       const result = plainResult(`session-${status}`);
       const decision: SourceUseDecisionV1 = {
@@ -128,12 +145,13 @@ describe('runtime source finalization behavior', () => {
       finalizeSourceResult(result, {getSourceUseDecision: () => decision});
 
       expect(result).toMatchObject({
-        success: false,
-        partial: true,
-        terminationReason: 'plan_incomplete',
+        success: true,
         sourceUseDecision: expect.objectContaining({status}),
       });
+      expect(result.partial).toBeUndefined();
+      expect(result.terminationReason).toBeUndefined();
       expect(result.terminationMessage).toBeUndefined();
+      expect(result.sourceClaimVerificationResult?.status).not.toBe('passed');
     },
   );
 
@@ -213,5 +231,199 @@ describe('runtime source finalization behavior', () => {
     } finally {
       fixture.cleanup();
     }
+  });
+});
+
+describe('source finalization projection authority', () => {
+  afterEach(() => clearAllCodeAwareOutputGuards());
+
+  function sourceUse(): SourceUseDecisionReader {
+    return {getSourceUseDecision: () => ({schemaVersion: 'source_use_decision@1', codeAwareMode: 'provider_send',
+      selectedCodebaseIds: ['source-current'], status: 'not_needed', attemptedTools: [], queriedCodebaseIds: [],
+      usedCodebaseIds: [], references: []})};
+  }
+
+  function contextFor(result: AnalysisResult, status: AnalysisCompletion['status'] = 'completed'):
+    Extract<AnalysisDeliveryContext, {entry: 'new_finalization'}> {
+    const candidate = {candidateRef: 'native-a', runId: 'run-a', attemptId: 'attempt-a',
+      conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)};
+    return {entry: 'new_finalization', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
+      completion: {...candidate, schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status},
+      turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: 'registry-a',
+        taskKind: 'fact', sceneId: 'general', scope: 'bounded_question', recommendedComplexity: 'quick',
+        deliverable: 'answer', evidenceAccess: 'read_new'}};
+  }
+
+  test.each(['completed', 'incomplete', 'unknown'] as const)('redaction preserves native %s without upgrading it', status => {
+    const result = plainResult('receipt-redaction');
+    result.conclusion = 'Before PRIVATE_CANARY after';
+    registerCodeAwareCanary(result.sessionId, 'PRIVATE_CANARY');
+    const original = contextFor(result, status);
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse(), {context: original});
+    expect(finalized.result).toBe(result);
+    expect(finalized.conclusionProjection.disposition).toBe('redacted');
+    expect(finalized.deliveryContext?.entry).toBe('new_finalization');
+    if (finalized.deliveryContext?.entry !== 'new_finalization') throw new Error('Missing projected context');
+    expect(finalized.deliveryContext.completion?.status).toBe(status);
+    expect(finalized.deliveryContext.acceptedCandidate.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
+    expect(finalized.deliveryContext.acceptedCandidate.candidateRef).not.toBe(original.acceptedCandidate.candidateRef);
+    expect(assessFinalResultQualityAssessment({result, context: original}).assurance.completion).toBe('not_checked');
+    expect(assessFinalResultQualityAssessment({result, context: finalized.deliveryContext}).assurance.completion)
+      .toBe(status === 'completed' ? 'passed' : status === 'incomplete' ? 'failed' : 'not_checked');
+    expect(JSON.stringify(result)).not.toContain(finalized.conclusionProjection.inputFingerprint);
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_CANARY');
+  });
+
+  test.each(['', 'nonempty native answer'])('keeps actual streaming replacement incomplete for native body %j', nativeBody => {
+    const result = plainResult('receipt-native-replaced');
+    result.conclusion = nativeBody;
+    const context = contextFor(result, nativeBody ? 'completed' : 'unknown');
+    revokeCodeAwareOutputGuards(result.sessionId);
+    const priorProjection = createCodeAwareStreamingTextProjection(result.sessionId, 'answer').projectCompleteWithReceipt(nativeBody);
+    result.conclusion = priorProjection.text;
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse(), {priorProjection, context});
+    expect(finalized.conclusionProjection.disposition).toBe('replaced');
+    expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback'});
+    if (finalized.deliveryContext?.entry !== 'new_finalization') throw new Error('Missing projected context');
+    expect(finalized.deliveryContext.completion?.status).toBe('unknown');
+    expect(assessFinalResultQualityAssessment({result, context: finalized.deliveryContext}).assurance.completion).toBe('failed');
+  });
+
+  test('retains replacement across a preserved second stage without a source accessor', () => {
+    const result = plainResult('receipt-two-stage');
+    const context = contextFor(result);
+    revokeCodeAwareOutputGuards(result.sessionId);
+    const priorProjection = createCodeAwareStreamingTextProjection(result.sessionId, 'answer').projectCompleteWithReceipt(result.conclusion);
+    result.conclusion = priorProjection.text;
+    clearCodeAwareOutputGuards(result.sessionId);
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, undefined, {priorProjection, context});
+    expect(finalized.conclusionProjection.disposition).toBe('replaced');
+    expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback'});
+    expect(result.completion?.status).toBe('unknown');
+    const again = finalizeSourceAwareAnalysisResultWithProjection(result, undefined, {
+      priorProjection: finalized.conclusionProjection, context: finalized.deliveryContext,
+    });
+    expect(again.conclusionProjection.disposition).toBe('replaced');
+    expect(result.completion?.status).toBe('unknown');
+  });
+
+  test('does not renew native proof from a copied or unrelated projection receipt', () => {
+    const result = plainResult('receipt-untrusted');
+    const context = contextFor(result);
+    const issued = sanitizeCodeAwareTextWithReceipt(undefined, 'different safe body');
+    result.conclusion = issued.text;
+    const priorProjection = {...issued, disposition: 'redacted' as const,
+      inputFingerprint: context.acceptedCandidate.conclusionFingerprint};
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, undefined, {priorProjection, context});
+    expect(finalized.conclusionProjection.disposition).toBe('preserved');
+    expect(assessFinalResultQualityAssessment({result, context: finalized.deliveryContext}).assurance.completion).toBe('not_checked');
+  });
+
+  test('invalidates evidence proof when only structured claims are projected', () => {
+    const result = plainResult('receipt-claim-only');
+    result.conclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [],
+      clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+      claims: [{id: 'claim-a', text: 'PRIVATE_CLAIM_CANARY', references: []}]};
+    const context = contextFor(result);
+    context.evidenceFingerprint = 'evidence-a';
+    context.claimVerificationBinding = {candidate: context.acceptedCandidate, evidenceFingerprint: 'evidence-a',
+      claimsFingerprint: analysisDeliveryFingerprint(result.conclusionContract.claims), verificationFingerprint: 'verification-a'};
+    context.sourceVerificationBinding = {...context.claimVerificationBinding, sourceUseFingerprint: 'source-a',
+      conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract)};
+    context.evidenceRenderedProof = {kind: 'verified_facts', candidate: context.acceptedCandidate, claimIds: ['claim-a'],
+      claimsFingerprint: context.claimVerificationBinding.claimsFingerprint, verificationFingerprint: 'verification-a', evidenceFingerprint: 'evidence-a'};
+    context.reportAssessment = {schemaVersion: 1, status: 'checked', requirements: [], binding: {
+      ...context.acceptedCandidate, conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
+      evidenceFingerprint: 'evidence-a', registryFingerprint: 'registry-a', requirementsFingerprint: 'requirements-a',
+      intentFingerprint: analysisDeliveryFingerprint(context.turnIntent),
+    }};
+    result.reportAssessment = context.reportAssessment;
+    result.deliveryAssurance = {schemaVersion: 1, entry: 'new_finalization', completion: 'passed',
+      claims: 'passed', source: 'passed', identity: 'passed', report: 'passed'};
+    registerCodeAwareCanary(result.sessionId, 'PRIVATE_CLAIM_CANARY');
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse(), {context});
+    expect(finalized.conclusionProjection.disposition).toBe('preserved');
+    expect(finalized.deliveryContext).toMatchObject({completion: context.completion});
+    if (finalized.deliveryContext?.entry !== 'new_finalization') throw new Error('Missing projected context');
+    expect(finalized.deliveryContext.claimVerificationBinding).toBeUndefined();
+    expect(finalized.deliveryContext.sourceVerificationBinding).toBeUndefined();
+    expect(finalized.deliveryContext.evidenceRenderedProof).toBeUndefined();
+    expect(finalized.deliveryContext.reportAssessment).toBeUndefined();
+    expect(result.reportAssessment).toBeUndefined();
+    expect(result.deliveryAssurance).toBeUndefined();
+    expect(JSON.stringify(result.conclusionContract)).not.toContain('PRIVATE_CLAIM_CANARY');
+  });
+
+  test('keeps real failed verification observable after revoked output replaces its private message', async () => {
+    const result = plainResult('receipt-failed-verification');
+    result.conclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [],
+      clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], claims: [{id: 'claim-a', kind: 'numeric',
+        text: 'Measured duration is 999 ms.', references: [{evidenceRefId: 'data:a', rowIndex: 0, column: 'dur_ms', value: 999}]}]};
+    const envelope = createDataEnvelope({columns: ['dur_ms'], rows: [[12.5]]},
+      {type: 'sql_result', source: 'execute_sql', title: 'Duration', evidenceRefId: 'data:a',
+        traceId: 'trace-a', traceSide: 'current'});
+    const store = new ArtifactStore();
+    store.registerStandaloneEvidenceCapture(captureEvidenceTable(envelope.data, {
+      dur_ms: {unit: 'ms', origin: {kind: 'native_producer', definitionFingerprint: 'test-duration-v1'}},
+    }), {meta: envelope.meta, display: envelope.display});
+    const preparedEvidence = await prepareClaimEvidence({conclusionContract: result.conclusionContract,
+      bindingEligibility: 'eligible', evidenceReadView: store.createEvidenceReadView({
+        allowedTraces: [{traceId: 'trace-a', traceSide: 'current'}], ownerKey: result.sessionId,
+      })});
+    const verified = runClaimVerification({conclusionContract: result.conclusionContract,
+      dataEnvelopes: [envelope], preparedEvidence, bindingEligibility: 'eligible'});
+    result.claimVerificationResult = verified.claimVerificationResult;
+    result.claimSupport = verified.claimSupport;
+    expect(result.claimVerificationResult.status).toBe('failed');
+    result.claimVerificationResult.issues[0].message += ' PRIVATE_ISSUE_CANARY';
+    result.conclusionContract.sourceClaimBindings = [{claimId: 'claim-a', mechanismStatus: 'compatible',
+      sourceReferenceIds: ['fabricated-reference'], traceEvidenceRefIds: []}];
+    result.sourceClaimVerificationResult = verifySourceClaimBindings({conclusionContract: result.conclusionContract,
+      actualSourceUseDecision: sourceUse().getSourceUseDecision()});
+    expect(result.sourceClaimVerificationResult.status).toBe('failed');
+    result.sourceClaimVerificationResult.issues[0].message += ' PRIVATE_SOURCE_ISSUE_CANARY';
+    const context = contextFor(result);
+    revokeCodeAwareOutputGuards(result.sessionId);
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse(), {context});
+    expect(result.claimVerificationResult?.status).toBe('failed');
+    expect(result.claimVerificationResult?.claimResults[0].status).toBe('unsupported');
+    expect(result.claimVerificationResult?.issues[0].severity).toBe('error');
+    expect(result.sourceClaimVerificationResult?.status).toBe('failed');
+    expect(result.sourceClaimVerificationResult?.issues.some(issue => issue.severity === 'error')).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_ISSUE_CANARY');
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_SOURCE_ISSUE_CANARY');
+    expect(assessFinalResultQualityAssessment({result, context: finalized.deliveryContext}).assurance.claims).toBe('failed');
+  });
+
+  test('leaves a literal placeholder and source-free object unchanged without a guard replacement', () => {
+    const result = plainResult('receipt-literal');
+    result.conclusion = '[PRIVATE_OUTPUT_SUPPRESSED]';
+    const before = structuredClone(result);
+    const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, undefined);
+    expect(finalized.result).toBe(result);
+    expect(result).toEqual(before);
+    expect(finalized.conclusionProjection.disposition).toBe('preserved');
+  });
+
+  test.each(['no_accessor', 'changed_source_and_claims'] as const)('drops a failed source sidecar after %s', nextRun => {
+    const oldContract: NonNullable<AnalysisResult['conclusionContract']> = {
+      schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [], clusters: [],
+      evidenceChain: [], uncertainties: [], nextSteps: [], claims: [{id: 'old-claim', text: 'Old fact', references: []}],
+      sourceClaimBindings: [{claimId: 'old-claim', mechanismStatus: 'compatible',
+        sourceReferenceIds: ['unreturned-old-reference'], traceEvidenceRefIds: []}],
+    };
+    const failed = verifySourceClaimBindings({conclusionContract: oldContract,
+      actualSourceUseDecision: sourceUse().getSourceUseDecision()});
+    expect(failed.status).toBe('failed');
+    const result = plainResult(`receipt-stale-source-${nextRun}`);
+    result.sourceClaimVerificationResult = failed;
+    result.conclusionContract = {...oldContract, claims: [{id: 'new-claim', text: 'Current fact', references: []}],
+      sourceClaimBindings: []};
+    const newSource: SourceUseDecisionReader = {getSourceUseDecision: () => ({
+      ...sourceUse().getSourceUseDecision()!, selectedCodebaseIds: ['different-source'],
+    })};
+    finalizeSourceAwareAnalysisResultWithProjection(result, nextRun === 'no_accessor' ? undefined : newSource);
+    expect(result.sourceClaimVerificationResult).toBeUndefined();
+    expect(result.conclusionContract?.claims?.[0].id).toBe('new-claim');
   });
 });

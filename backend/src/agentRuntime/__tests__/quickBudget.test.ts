@@ -3,148 +3,58 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {describe, expect, it} from '@jest/globals';
-import {
-  buildQuickRunReceipt,
-  hasBroadDiagnosticIntent,
-  hasResolvedBoundedTarget,
-  resolveQuickRunProfile,
-  resolveQuickTurnBudget,
-} from '../quickBudget';
+import {buildQuickRunReceipt, resolveQuickRunProfile, resolveQuickTurnBudget} from '../quickBudget';
+import type {AnalysisTurnIntent} from '../analysisTurnIntent';
 
-const BUDGET = resolveQuickTurnBudget();
+const intent: AnalysisTurnIntent = {
+  schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: 'test',
+  taskKind: 'investigation', sceneId: 'general', scope: 'bounded_question',
+  recommendedComplexity: 'full', deliverable: 'answer', evidenceAccess: 'read_new',
+};
 
-function profileFor(query: string, conversationTurns = 0, extended = false) {
-  return resolveQuickRunProfile({query, conversationTurns, extended});
-}
+const budget = resolveQuickTurnBudget({targetTurns: 2, hardCapTurns: 4});
+const base = {requestedMode: 'auto' as const, budget, actualTurns: 1, elapsedMs: 10, stopReason: 'answered' as const};
 
-describe('hasBroadDiagnosticIntent', () => {
-  it('detects why/root-cause/optimization asks in both languages', () => {
-    expect(hasBroadDiagnosticIntent('为什么滑动卡')).toBe(true);
-    expect(hasBroadDiagnosticIntent('what is the root cause')).toBe(true);
-    expect(hasBroadDiagnosticIntent('怎么优化')).toBe(true);
+describe('typed quick run profile', () => {
+  it.each(['investigation', 'comparison'] as const)('labels a resolved scene-wide %s as triage', taskKind => {
+    expect(resolveQuickRunProfile({turnIntent: {...intent, taskKind, scope: 'scene_wide'}, extended: false})).toBe('triage');
   });
 
-  it('does not fire on a plain factual lookup', () => {
-    expect(hasBroadDiagnosticIntent('trace 时长是多少')).toBe(false);
-    expect(hasBroadDiagnosticIntent('前台应用的包名是什么')).toBe(false);
-  });
-});
-
-describe('hasResolvedBoundedTarget', () => {
-  it('accepts an identifier carried by the query itself', () => {
-    expect(hasResolvedBoundedTarget('frame 123 为什么卡顿', 0)).toBe(true);
-    expect(hasResolvedBoundedTarget('why is `RecyclerView#onBind` slow', 0)).toBe(true);
+  it('keeps a bounded investigation on the normal or extended budget track', () => {
+    expect(resolveQuickRunProfile({turnIntent: intent, extended: false})).toBe('normal');
+    expect(resolveQuickRunProfile({turnIntent: intent, extended: true})).toBe('extended');
   });
 
-  it('accepts an anaphor only when prior turns can resolve it', () => {
-    const query = '刚才那个最慢的帧，主线程哪个 slice 耗时最多？';
-    expect(hasResolvedBoundedTarget(query, 1)).toBe(true);
-    // Same words with no history are a dangling reference, not a boundary.
-    expect(hasResolvedBoundedTarget(query, 0)).toBe(false);
+  it('does not infer scope from missing or failed semantic decisions', () => {
+    for (const turnIntent of [undefined, {...intent, status: 'unavailable' as const, scope: 'scene_wide' as const}]) {
+      expect(resolveQuickRunProfile({turnIntent, extended: false})).toBe('normal');
+      expect(resolveQuickRunProfile({turnIntent, extended: true})).toBe('extended');
+    }
   });
 
-  it('does not treat a quoted scene word as a bounded target', () => {
-    // Quoting a topic is not naming an occurrence.
-    expect(hasResolvedBoundedTarget('why is "scrolling" slow', 0)).toBe(false);
-    expect(hasResolvedBoundedTarget('分析"滑动"为什么慢', 0)).toBe(false);
-    // A quoted symbol still counts.
-    expect(hasResolvedBoundedTarget('why is `CustomScrollAdapter_continuousLoad` slow', 0))
-      .toBe(true);
+  it('does not turn a whole-trace fact lookup into diagnostic triage', () => {
+    expect(resolveQuickRunProfile({turnIntent: {...intent, scope: 'scene_wide', taskKind: 'fact'}, extended: false})).toBe('normal');
   });
 
-  it('does not let a process or thread id bound a whole-run question', () => {
-    // A pid says which process, not how much of the run is in scope.
-    expect(hasResolvedBoundedTarget('process 123 为什么慢', 0)).toBe(false);
-    expect(hasResolvedBoundedTarget('thread 17 root cause', 0)).toBe(false);
+  it('uses the same typed scope despite quoted topics, negations or entity spelling in legacy query text', () => {
+    for (const query of ['为什么滑动卡', '不是滑动问题', 'why is "scrolling" slow', 'CustomScrollAdapter_continuousLoad', '']) {
+      for (const conversationTurns of [0, 4]) {
+        expect(buildQuickRunReceipt({...base, query, turnIntent: intent,
+          contextInjected: {conversationTurns}}).profile).toBe('normal');
+        expect(buildQuickRunReceipt({...base, query, turnIntent: {...intent, scope: 'scene_wide'},
+          contextInjected: {conversationTurns}}).profile).toBe('triage');
+      }
+    }
   });
 
-  it('rejects a question with no entity noun to scope to', () => {
-    expect(hasResolvedBoundedTarget('这个 trace 为什么卡', 3)).toBe(false);
-    expect(hasResolvedBoundedTarget('为什么滑动卡', 3)).toBe(false);
-  });
-});
-
-describe('resolveQuickRunProfile', () => {
-  it('marks scene-wide diagnostics as triage', () => {
-    expect(profileFor('这个 trace 为什么卡', 3)).toBe('triage');
-    expect(profileFor('为什么滑动卡', 0)).toBe('triage');
-    expect(profileFor('分析启动为什么慢', 0)).toBe('triage');
+  it('records actual budget extension independently from wording and scope', () => {
+    const receipt = buildQuickRunReceipt({...base, turnIntent: intent, actualTurns: 3});
+    expect(receipt).toMatchObject({profile: 'extended', targetTurns: 2, hardCapTurns: 4, actualTurns: 3});
+    expect(buildQuickRunReceipt({...base, actualTurns: 3}).profile).toBe('extended');
   });
 
-  it('treats a whole-run thread question as scene-wide, not bounded', () => {
-    // "主线程为什么慢" names an entity but scopes to the entire run.
-    expect(profileFor('主线程为什么慢', 0)).toBe('triage');
-  });
-
-  it('keeps a bounded drill out of triage even though it says 慢', () => {
-    // The real regression: a scoped follow-up was capped at the triage budget
-    // purely because the substring 慢 appeared, then failed the quality gate.
-    expect(profileFor('刚才那个最慢的帧，主线程具体在哪个 slice 上耗时最多？', 1))
-      .toBe('normal');
-    expect(profileFor('frame 123 为什么卡顿', 0)).toBe('normal');
-  });
-
-  it('keeps a quoted scene word in triage', () => {
-    expect(profileFor('why is "scrolling" slow', 0)).toBe('triage');
-  });
-
-  it('keeps a whole-process diagnosis in triage even with a pid', () => {
-    expect(profileFor('process 123 为什么慢', 0)).toBe('triage');
-    expect(profileFor('thread 17 root cause', 2)).toBe('triage');
-  });
-
-  it('falls back to triage when the same drill has no history to anchor to', () => {
-    expect(profileFor('刚才那个最慢的帧，主线程具体在哪个 slice 上耗时最多？', 0))
-      .toBe('triage');
-  });
-
-  it('lets an explicit completeness request outrank a bounded target', () => {
-    expect(profileFor('全面分析 frame 123', 1)).toBe('triage');
-    expect(profileFor('给 frame 123 做完整诊断', 1)).toBe('triage');
-    expect(profileFor('comprehensive analysis of frame 123', 1)).toBe('triage');
-  });
-
-  it('leaves non-diagnostic questions on the normal/extended track', () => {
-    expect(profileFor('trace 时长是多少', 0)).toBe('normal');
-    expect(profileFor('trace 时长是多少', 0, true)).toBe('extended');
-  });
-
-  it('ignores an empty or whitespace-only query', () => {
-    expect(profileFor('   ', 0)).toBe('normal');
-  });
-});
-
-describe('buildQuickRunReceipt profile resolution', () => {
-  const base = {
-    requestedMode: 'auto' as const,
-    budget: BUDGET,
-    actualTurns: 1,
-    elapsedMs: 10,
-    stopReason: 'answered' as const,
-  };
-
-  it('resolves the profile from the query and injected conversation turns', () => {
-    expect(buildQuickRunReceipt({
-      ...base,
-      query: '刚才那个最慢的帧，主线程哪个 slice 耗时最多？',
-      contextInjected: {conversationTurns: 2},
-    }).profile).toBe('normal');
-
-    expect(buildQuickRunReceipt({
-      ...base,
-      query: '刚才那个最慢的帧，主线程哪个 slice 耗时最多？',
-    }).profile).toBe('triage');
-  });
-
-  it('still honors an explicitly supplied profile', () => {
-    expect(buildQuickRunReceipt({
-      ...base,
-      profile: 'triage',
-      query: 'trace 时长是多少',
-    }).profile).toBe('triage');
-  });
-
-  it('defaults to normal when no query is supplied', () => {
+  it('preserves a backend supplied profile and defaults legacy receipts to normal', () => {
+    expect(buildQuickRunReceipt({...base, profile: 'triage'}).profile).toBe('triage');
     expect(buildQuickRunReceipt(base).profile).toBe('normal');
   });
 });

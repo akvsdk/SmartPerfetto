@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import {decodeRuntimeToolResult, readRuntimeToolResultFacts} from '../agentRuntime/runtimeToolResult';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, type OutputLanguage } from './outputLanguage';
 import type { TracePaneSide, TracePairContext, TraceSource } from './types';
 
@@ -603,111 +604,9 @@ export interface ToolResultNarrationInput {
   language?: OutputLanguage;
 }
 
-const MAX_RESULT_UNWRAP_DEPTH = 6;
-
-/**
- * Parse JSON that may be wrapped in prose.
- *
- * Several MCP tools deliberately surround their JSON with guidance text — the
- * skill notes prefix and reasoning nudge around `invoke_skill`, the active
- * phase reminder appended to `fetch_artifact` rows. A whole-string parse fails
- * on those, which is why row fetches produced no timeline line while summary
- * fetches did. Scan for the first balanced object or array instead.
- */
-function parseEmbeddedJson(value: string): unknown | undefined {
-  const text = value.trim();
-  if (!text) return undefined;
-
-  const start = text.search(/[{[]/);
-  if (start < 0) return undefined;
-
-  const opener = text[start];
-  const closer = opener === '{' ? '}' : ']';
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-
-  for (let i = start; i < text.length; i += 1) {
-    const char = text[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (char === '\\') {
-      escaped = true;
-      continue;
-    }
-    if (char === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (char === opener) depth += 1;
-    else if (char === closer) {
-      depth -= 1;
-      if (depth === 0) {
-        try {
-          return JSON.parse(text.slice(start, i + 1));
-        } catch {
-          return undefined;
-        }
-      }
-    }
-  }
-  return undefined;
-}
-
-function unwrapContentBlocks(value: unknown): unknown {
-  if (!Array.isArray(value)) return value;
-  for (const entry of value) {
-    const record = entry && typeof entry === 'object' ? entry as Record<string, unknown> : undefined;
-    if (record && typeof record.text === 'string') return record.text;
-  }
-  return value;
-}
-
-/**
- * Unwrap whatever envelope this runtime happens to use so the narrator sees the
- * tool's own object.
- *
- * The four runtimes deliver the same MCP result in three different shapes: the
- * content-block array itself, that array already serialized to a string, and
- * the `{content: [...]}` envelope. Handling only one of them silently produced
- * shapeless lines like "取回 artifact art-11" with no row or column count.
- *
- * Returns `{}` when nothing parses — including a payload truncated mid-JSON,
- * which is exactly why narration has to happen where the object is intact.
- */
+/** Decode the intact, already privacy-projected result before transport truncation. */
 function readToolResultBody(result: unknown): Record<string, unknown> {
-  let current: unknown = result;
-  for (let depth = 0; depth < MAX_RESULT_UNWRAP_DEPTH; depth += 1) {
-    if (typeof current === 'string') {
-      const parsed = parseEmbeddedJson(current);
-      if (parsed === undefined) return {};
-      current = parsed;
-      continue;
-    }
-    if (Array.isArray(current)) {
-      const unwrapped = unwrapContentBlocks(current);
-      if (unwrapped === current) {
-        // A bare array is the payload, not an envelope: `list_skills` in full
-        // mode returns the catalog directly. Expose it as a countable field.
-        return {items: current};
-      }
-      current = unwrapped;
-      continue;
-    }
-    if (current && typeof current === 'object') {
-      const record = current as Record<string, unknown>;
-      if (Array.isArray(record.content) || typeof record.content === 'string') {
-        current = record.content;
-        continue;
-      }
-      return record;
-    }
-    return {};
-  }
-  return {};
+  return decodeRuntimeToolResult(result).body ?? {};
 }
 
 function readCount(value: unknown): number | undefined {
@@ -746,13 +645,7 @@ function narrateToolFailure(
  */
 export function toolResultIsFailure(input: ToolResultNarrationInput): boolean {
   if (input.isError === true) return true;
-  const value = input.result;
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const record = value as Record<string, unknown>;
-    if (record.isError === true) return true;
-  }
-  const body = readToolResultBody(value);
-  return body.success === false || body.isError === true;
+  return readRuntimeToolResultFacts(input.result).success === false;
 }
 
 /**
@@ -773,7 +666,7 @@ export function toolResultIsFailure(input: ToolResultNarrationInput): boolean {
  */
 export function isPolicyRefusalResult(result: unknown): boolean {
   const body = readToolResultBody(result);
-  if (body.success !== false && body.isError !== true) return false;
+  if (readRuntimeToolResultFacts(result).success !== false) return false;
   return typeof body.action_required === 'string' && body.action_required.trim().length > 0;
 }
 
@@ -828,7 +721,7 @@ export function formatToolResultNarration(input: ToolResultNarrationInput): stri
   const args = asRecord(input.args);
   const body = readToolResultBody(input.result);
 
-  if (input.isError === true || body.success === false) {
+  if (toolResultIsFailure(input)) {
     return narrateToolFailure(toolName, body, language);
   }
 

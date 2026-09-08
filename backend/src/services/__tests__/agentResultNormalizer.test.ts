@@ -11,9 +11,15 @@ import {
   resolveConclusionOutputModeForTurn,
 } from '../agentResultNormalizer';
 import type { AnalysisResult } from '../../agent/core/orchestratorTypes';
-import type { ConclusionContract } from '../../agent/core/conclusionContract';
+import {parseConclusionContractDeclaration, type ConclusionContract, type ConclusionContractClaimItem} from '../../agent/core/conclusionContract';
+import {ArtifactStore} from '../../agentv3/artifactStore';
 import { runClaimVerification } from '../verifier/claimVerificationRunner';
 import type { DataEnvelope } from '../../types/dataContract';
+import { createDataEnvelope } from '../../types/dataContract';
+import { runPreparedAnalysisClaimVerification } from '../evidence/analysisRelationPreparation';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import {captureEvidenceTable} from '../evidence/evidenceCapture';
+import {prepareClaimEvidence} from '../evidence/claimEvidencePreparation';
 
 function makeResult(overrides: Partial<AnalysisResult> = {}): AnalysisResult {
   return {
@@ -98,7 +104,152 @@ describe('deriveConclusionContractForNarrative', () => {
 });
 
 describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
-  test('builds verifier-ready claims for rich reports that do not use contract headings', () => {
+  describe('original claim fidelity', () => {
+    const envelope = createDataEnvelope(
+      {columns: ['ttid_ms'], rows: [[1912]]},
+      {type: 'skill_result', source: 'startup_analysis', title: '启动概览',
+        skillId: 'startup_analysis', stepId: 'get_startups', executionStatus: 'observed',
+        evidenceRefId: 'data:startup-original', traceId: 'trace-original', traceSide: 'current'},
+    );
+    const originalContract = (claims: NonNullable<ConclusionContract['claims']>): ConclusionContract & {claims: NonNullable<ConclusionContract['claims']>} => ({
+      schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [{rank: 1, statement: '启动耗时待核验'}],
+      clusters: [], evidenceChain: [], claims, uncertainties: [], nextSteps: [],
+    });
+
+    const numericClaim = (id: string, value: number, text = `TTID=${value}ms`): ConclusionContractClaimItem => {
+      const reference = {evidenceRefId: 'data:startup-original', rowIndex: 0, column: 'ttid_ms', value};
+      return {id, text, kind: 'numeric', references: [reference],
+        semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed',
+          discourse: 'asserted', quantifier: 'one', modality: 'certain',
+          scope: {population: 'cited_rows', subjectRefs: [reference]}, numeric: {operator: 'eq', value, unit: 'ms'}}};
+    };
+    const parsedOriginal = (claims: NonNullable<ConclusionContract['claims']>): ConclusionContract => {
+      const parsed = parseConclusionContractDeclaration(originalContract(claims));
+      expect(parsed.issues).toEqual([]);
+      if (!parsed.contract) throw new Error('Expected a valid fixture declaration');
+      return parsed.contract;
+    };
+    const verifyCaptured = async (conclusionContract: ConclusionContract | null | undefined) => {
+      const store = new ArtifactStore();
+      store.registerStandaloneEvidenceCapture(captureEvidenceTable(envelope.data, {
+        ttid_ms: {unit: 'ms', origin: {kind: 'skill_literal', skillId: 'startup_analysis',
+          stepId: 'get_startups', definitionFingerprint: 'startup-original-fixture'}},
+      }), {meta: envelope.meta, display: envelope.display});
+      const preparedEvidence = await prepareClaimEvidence({conclusionContract,
+        evidenceReadView: store.createEvidenceReadView({ownerKey: 'original-claims',
+          allowedTraces: [{traceId: 'trace-original', traceSide: 'current'}]})});
+      return runPreparedAnalysisClaimVerification({conclusionContract, dataEnvelopes: [envelope], preparedEvidence});
+    };
+
+    test('keeps a contradicted claim failed when unrelated prose contains the true evidence value', async () => {
+      const original = parsedOriginal([numericClaim('wrong-ttid', 9999)]);
+      const normalized = deriveEvidenceBackedConclusionContractForNarrative(
+        '启动概览：TTID=9999ms，事件计数1912次。', [envelope], {existingContract: original},
+      );
+      const verified = await verifyCaptured(normalized);
+
+      expect(normalized).toBe(original);
+      expect(normalized?.claims).toEqual(original.claims);
+      expect(verified.claimVerificationResult.status).toBe('failed');
+      expect(verified.claimVerificationResult.claimResults[0].claimId).toBe('wrong-ttid');
+      expect(verified.claimVerificationResult.claimResults[0]).toMatchObject({status: 'unsupported',
+        referenceCells: [{status: 'value_mismatch'}],
+        deterministicProof: {status: 'candidate', reason: 'reference_cells_unresolved'}});
+    });
+
+    test('preserves mixed supported, contradicted and unreferenced claims through repeated normalization', async () => {
+      const original = parsedOriginal([
+        numericClaim('supported', 1912),
+        numericClaim('contradicted', 9999),
+        {id: 'no-reference', text: 'The delay may come from initialization.', kind: 'inference', references: []},
+      ]);
+      const result = makeResult({conclusion: '启动概览：TTID=9999ms，事件计数1912次。', conclusionContract: original});
+      const once = normalizeResultForReport(result, {dataEnvelopes: [envelope]});
+      const twice = normalizeResultForReport(once, {dataEnvelopes: [envelope]});
+      const verified = await verifyCaptured(twice.conclusionContract);
+
+      expect(twice.conclusionContract?.claims).toEqual(original.claims);
+      expect(verified.claimVerificationResult.status).toBe('failed');
+      expect(verified.claimVerificationResult.claimResults.map(claim => claim.claimId))
+        .toEqual(['supported', 'contradicted', 'no-reference']);
+      expect(verified.claimVerificationResult.claimResults).toMatchObject([
+        {status: 'partial', deterministicProof: {status: 'proved'}, propositionCoverage: {status: 'complete'}},
+        {status: 'unsupported', referenceCells: [{status: 'value_mismatch'}]},
+        {status: 'inference', referenceCells: []},
+      ]);
+    });
+
+    test('reads typed JSON before display conversion can discard causal kind or relation references', () => {
+      const original = originalContract([{
+        id: 'cause', text: 'No evidence yet proves that initialization caused the delay.', kind: 'causal',
+        relationRefs: ['relation-candidate'],
+        references: [{evidenceRefId: 'data:startup-original', rowIndex: 0, column: 'ttid_ms', value: 1912}],
+      }]);
+      const parsed = deriveConclusionContractForNarrative(JSON.stringify(original));
+      expect(parsed?.claims).toEqual(original.claims.map(claim => ({...claim, conclusionId: 'C1'})));
+    });
+
+    test('retains explicit JSON claims whose references are absent, malformed or relation-only', () => {
+      const raw = originalContract([
+        {id: 'missing', text: 'Initialization may be slow.', kind: 'inference', references: []},
+        {id: 'relation-only', text: 'The dependency blocks initialization.', kind: 'causal', references: [], relationRefs: ['relation-1']},
+        {id: 'malformed', text: 'TTID=9999ms', kind: 'numeric', references: [{}]},
+      ]);
+      const parsed = deriveConclusionContractForNarrative(JSON.stringify(raw));
+      expect(parsed?.claims?.map(claim => ({id: claim.id, text: claim.text, kind: claim.kind})))
+        .toEqual(raw.claims!.map(claim => ({id: claim.id, text: claim.text, kind: claim.kind})));
+      expect(parsed?.claims?.[1].relationRefs).toEqual(['relation-1']);
+      expect(runClaimVerification({conclusionContract: parsed, dataEnvelopes: [envelope]}).claimVerificationResult.passed).toBe(false);
+    });
+
+    test('retains explicit Markdown claims without references as unverified statements', () => {
+      const parsed = deriveConclusionContractForNarrative([
+        '## 逐句数据引用（结构化来源）',
+        '- Q-missing / C1: 初始化耗时尚未得到证据支持。',
+      ].join('\n'));
+      expect(parsed?.claims).toEqual([{id: 'Q-missing', conclusionId: 'C1', text: '初始化耗时尚未得到证据支持。', references: []}]);
+      expect(runClaimVerification({conclusionContract: parsed}).claimVerificationResult.passed).toBe(false);
+    });
+
+    test('does not create claims merely because narrative and evidence contain the same number', () => {
+      const normalized = deriveEvidenceBackedConclusionContractForNarrative('事件计数1912次。', [envelope]);
+      expect(normalized?.claims ?? []).toEqual([]);
+      const verified = runClaimVerification({conclusionContract: normalized, dataEnvelopes: [envelope]});
+      expect(verified.claimVerificationResult).toMatchObject({status: 'not_checked', passed: false, checkedClaimCount: 0});
+    });
+
+    test('does not silently truncate explicitly supplied claims before verification', async () => {
+      const claims = Array.from({length: 51}, (_, index) => numericClaim(
+        `Q${index + 1}`, index === 50 ? 9999 : 1912, `TTID observation ${index + 1}`,
+      ));
+      const parsed = deriveConclusionContractForNarrative(JSON.stringify(originalContract(claims)));
+      expect(parsed?.claims).toHaveLength(51);
+      expect(parsed?.claims?.map(({id, references, semantics}) => ({id, references, semantics})))
+        .toEqual(claims.map(({id, references, semantics}) => ({id, references, semantics})));
+      const verified = await verifyCaptured(parsed);
+      expect(verified.claimVerificationResult.status).toBe('failed');
+      expect(verified.claimVerificationResult.claimResults).toHaveLength(51);
+      expect(verified.claimVerificationResult.claimResults.slice(0, 50).every(claim =>
+        claim.status === 'partial' && claim.deterministicProof?.status === 'proved')).toBe(true);
+      expect(verified.claimVerificationResult.claimResults[50]).toMatchObject({claimId: 'Q51',
+        status: 'unsupported', referenceCells: [{status: 'value_mismatch'}]});
+    });
+
+    test.each([{}, {id: 'empty', references: []}, {text: '   ', references: []}])(
+      'does not fabricate a statement for an empty claim entry: %j',
+      entry => {
+        const parsed = deriveConclusionContractForNarrative(JSON.stringify({
+          ...originalContract([]), claims: [entry],
+        }));
+        expect(parsed?.claims ?? []).toEqual([]);
+        expect(runClaimVerification({conclusionContract: parsed, dataEnvelopes: [envelope]}).claimVerificationResult)
+          .toMatchObject({status: 'not_checked', passed: false, checkedClaimCount: 0});
+      },
+    );
+  });
+
+  test('keeps rich reports without explicit claims unverified despite matching evidence', () => {
     const envelopes: DataEnvelope[] = [
       {
         meta: {
@@ -166,20 +317,16 @@ describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
       mode: 'initial_report',
       sceneId: 'startup',
     });
-    expect(contract?.claims?.length).toBeGreaterThanOrEqual(2);
-    expect(contract?.metadata?.derivedFromNarrativeEvidenceMatch).toBe(true);
-    expect(contract?.metadata?.claimVerificationScope).toBe('sampled_narrative_evidence');
-    expect(contract?.claims?.some(claim =>
-      claim.references.some(ref => ref.evidenceRefId === 'art-2' || ref.evidenceRefId === 'data:skill:startup_analysis:get_startups:current:abc'),
-    )).toBe(true);
+    expect(contract?.claims ?? []).toEqual([]);
+    expect(contract?.metadata?.derivedFromNarrativeEvidenceMatch).not.toBe(true);
 
     const verification = runClaimVerification({
       conclusionContract: contract,
       dataEnvelopes: envelopes,
       policy: 'record_only',
     }).claimVerificationResult;
-    expect(verification.status).toBe('passed');
-    expect(verification.checkedClaimCount).toBeGreaterThan(0);
+    expect(verification.status).toBe('not_checked');
+    expect(verification.checkedClaimCount).toBe(0);
   });
 
   test('does not derive numeric claims from numbers embedded inside larger tokens', () => {
@@ -214,7 +361,7 @@ describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
     )).not.toBe(true);
   });
 
-  test('keeps fallback claims, evidence chain, and metadata from the same source', () => {
+  test('preserves producer evidence chain and metadata without deriving replacement claims', () => {
     const envelopes: DataEnvelope[] = [{
       meta: {
         type: 'skill_result',
@@ -257,16 +404,13 @@ describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
       { existingContract: parsed },
     );
 
-    expect(contract?.claims?.length).toBeGreaterThan(0);
-    expect(contract?.evidenceChain.some(item => item.text === 'legacy provider evidence chain')).toBe(false);
-    expect(contract?.evidenceChain.some(item =>
-      item.text.includes('data:skill:startup_analysis:startup_overview:current:abc'),
-    )).toBe(true);
-    expect(contract?.metadata?.claimDerivation).toBe('narrative_evidence_match');
-    expect(contract?.metadata?.claimVerificationScope).toBe('sampled_narrative_evidence');
+    expect(contract).toBe(parsed);
+    expect(contract?.claims ?? []).toEqual([]);
+    expect(contract?.evidenceChain).toEqual(parsed.evidenceChain);
+    expect(contract?.metadata).toEqual(parsed.metadata);
   });
 
-  test('replaces provider claims when every structured reference is unresolvable but narrative evidence matches data', () => {
+  test('preserves unresolvable references rather than replacing claims with matching data', () => {
     const envelopes: DataEnvelope[] = [{
       meta: {
         type: 'skill_result',
@@ -318,16 +462,16 @@ describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
       { existingContract: parsed },
     );
 
-    expect((contract?.metadata as any)?.replacedUnresolvableProviderClaims).toBe(true);
+    expect(contract).toBe(parsed);
     const verification = runClaimVerification({
       conclusionContract: contract,
       dataEnvelopes: envelopes,
       policy: 'record_only',
     }).claimVerificationResult;
-    expect(verification.status).toBe('passed');
+    expect(verification.passed).toBe(false);
   });
 
-  test('replaces partially resolvable provider claims when artifact ids conflict with source labels', () => {
+  test('preserves conflicting artifact references for the verifier to reject', () => {
     const envelopes: DataEnvelope[] = [
       {
         meta: {
@@ -416,20 +560,18 @@ describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
       { existingContract: parsed },
     );
 
-    expect((contract?.metadata as any)?.replacedUnresolvableProviderClaims).toBe(true);
-    expect(contract?.claims?.some(claim =>
-      claim.references.some(ref => ref.evidenceRefId === 'data:art-14'),
-    )).not.toBe(true);
+    expect(contract).toBe(parsed);
+    expect(contract?.claims).toEqual(parsed.claims);
 
     const verification = runClaimVerification({
       conclusionContract: contract,
       dataEnvelopes: envelopes,
       policy: 'record_only',
     }).claimVerificationResult;
-    expect(verification.status).toBe('passed');
+    expect(verification.passed).toBe(false);
   });
 
-  test('replaces row-only identity claims with verifier-ready process identity cells', () => {
+  test('does not invent cell expectations for row-only identity claims', () => {
     const envelopes: DataEnvelope[] = [{
       meta: {
         type: 'skill_result',
@@ -480,45 +622,52 @@ describe('deriveEvidenceBackedConclusionContractForNarrative', () => {
       { existingContract: parsed, mode: 'focused_answer' },
     );
 
-    expect(contract?.metadata?.replacedUnresolvableProviderClaims).toBe(true);
-    const columns = new Set(contract?.claims?.flatMap(claim =>
-      claim.references.map(ref => ref.column).filter(Boolean),
-    ));
-    expect(columns.has('process_name')).toBe(true);
-    expect(columns.has('pid')).toBe(true);
-    expect(columns.has('upid')).toBe(true);
+    expect(contract).toBe(parsed);
+    expect(contract?.claims).toEqual(parsed.claims);
 
     const verification = runClaimVerification({
       conclusionContract: contract,
       dataEnvelopes: envelopes,
       policy: 'record_only',
     }).claimVerificationResult;
-    expect(verification.status).toBe('passed');
+    expect(verification.status).toBe('not_checked');
   });
 });
 
 describe('normalizeResultForReport', () => {
-  test('derives delivery scope from the conversation turn instead of provider rounds', () => {
+  const answerIntent: NonNullable<AnalysisResult['turnIntent']> = {
+    schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: 'registry-current',
+    taskKind: 'fact', sceneId: 'general', scope: 'bounded_question', recommendedComplexity: 'quick',
+    deliverable: 'answer', evidenceAccess: 'existing_only',
+  };
+
+  test('uses typed deliverable rather than budget or turn ordinal', () => {
     expect(resolveConclusionOutputModeForTurn({
       existingMode: 'initial_report',
+      turnIntent: answerIntent,
       runSequence: 2,
       requestedAnalysisMode: 'auto',
     })).toBe('focused_answer');
-    expect(resolveConclusionOutputModeForTurn({
-      existingMode: 'initial_report',
-      runSequence: 2,
-      requestedAnalysisMode: 'full',
-    })).toBe('initial_report');
     expect(resolveConclusionOutputModeForTurn({
       existingMode: 'focused_answer',
+      turnIntent: answerIntent,
+      runSequence: 2,
+      requestedAnalysisMode: 'full',
+    })).toBe('focused_answer');
+    expect(resolveConclusionOutputModeForTurn({
+      existingMode: 'focused_answer',
+      turnIntent: {...answerIntent, deliverable: 'report'},
       runSequence: 1,
       requestedAnalysisMode: 'auto',
-    })).toBe('focused_answer');
+    })).toBe('initial_report');
     expect(resolveConclusionOutputModeForTurn({
       existingMode: 'need_input',
       runSequence: 2,
       requestedAnalysisMode: 'auto',
     })).toBe('need_input');
+    expect(resolveConclusionOutputModeForTurn({
+      existingMode: 'initial_report', runSequence: 20, requestedAnalysisMode: 'fast',
+    })).toBe('initial_report');
   });
 
   test('normalizes a one-provider-round continuation as a focused answer', () => {
@@ -528,10 +677,39 @@ describe('normalizeResultForReport', () => {
       conclusionContract: {mode: 'initial_report'} as any,
     });
     const out = normalizeResultForReport(r, {
+      turnIntent: answerIntent,
       runSequence: 2,
       requestedAnalysisMode: 'auto',
     });
     expect(out.conclusionContract?.mode).toBe('focused_answer');
+  });
+
+  test('does not use result metadata as the current server turn intent', () => {
+    const r = makeResult({conclusion: 'plain answer', conclusionContract: {mode: 'initial_report'} as any,
+      turnIntent: answerIntent});
+    expect(normalizeResultForReport(r).conclusionContract?.mode).toBe('initial_report');
+    expect(normalizeResultForReport(r, {turnIntent: answerIntent}).conclusionContract?.mode).toBe('focused_answer');
+  });
+
+  test.each(['body', 'contract'] as const)('invalidates bound verdicts when normalization changes the %s', changed => {
+    const r = makeResult({conclusion: changed === 'body' ? 'Measured frame (ev_deadbeef1234).' : 'Measured frame.',
+      conclusionContract: {mode: 'initial_report'} as any});
+    const candidate = {candidateRef: 'candidate-a', runId: 'run-a', attemptId: 'attempt-a',
+      conclusionFingerprint: analysisDeliveryFingerprint(r.conclusion)};
+    r.completion = {...candidate, schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'completed'};
+    r.reportAssessment = {schemaVersion: 1, status: 'checked', binding: {...candidate,
+      conclusionContractFingerprint: analysisDeliveryFingerprint(r.conclusionContract), evidenceFingerprint: 'evidence',
+      intentFingerprint: 'intent', registryFingerprint: 'registry', requirementsFingerprint: 'requirements'}, requirements: []};
+    r.deliveryAssurance = {schemaVersion: 1, entry: 'new_finalization', completion: 'passed', claims: 'passed',
+      source: 'passed', identity: 'passed', report: 'passed'};
+    const before = structuredClone(r);
+    const out = normalizeResultForReport(r, changed === 'contract' ? {turnIntent: answerIntent} : {});
+    expect(out.reportAssessment).toBeUndefined();
+    expect(out.deliveryAssurance).toBeUndefined();
+    if (changed === 'body') expect(out.completion).toBeUndefined();
+    else expect(out.completion).toBe(r.completion);
+    expect(r).toEqual(before);
+    expect(normalizeResultForReport(r, {entry: 'historical_restore', turnIntent: answerIntent})).toBe(r);
   });
 
   test('returns input identity when nothing would change', () => {
@@ -640,7 +818,7 @@ describe('normalizeResultForReport', () => {
     expect(out.conclusionContract?.claims?.[0]?.references?.[0]?.evidenceRefId).toBe('ev_deadbeef1234');
   });
 
-  test('uses captured DataEnvelopes to normalize rich report contracts for CLI/report paths', () => {
+  test('does not turn CLI/report evidence observations into producer claims', () => {
     const envelopes: DataEnvelope[] = [{
       meta: {
         type: 'skill_result',
@@ -670,10 +848,10 @@ describe('normalizeResultForReport', () => {
 
     const out = normalizeResultForReport(r, { dataEnvelopes: envelopes });
 
-    expect(out.conclusionContract?.metadata?.derivedFromNarrativeEvidenceMatch).toBe(true);
-    expect(out.conclusionContract?.claims?.some(claim =>
-      claim.references.some(ref => ref.column === 'ttid_ms' && ref.value === 1912),
-    )).toBe(true);
+    expect(out.conclusionContract?.claims ?? []).toEqual([]);
+    expect(out.conclusionContract?.metadata?.derivedFromNarrativeEvidenceMatch).not.toBe(true);
+    expect(runClaimVerification({conclusionContract: out.conclusionContract, dataEnvelopes: envelopes})
+      .claimVerificationResult.status).toBe('not_checked');
   });
 
   test('preserves sidecar metadata while normalizing report text', () => {

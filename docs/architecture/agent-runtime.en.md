@@ -11,7 +11,7 @@ or environment.
 
 | Runtime | SDK | Provider family | Notes |
 |---|---|---|---|
-| `claude-agent-sdk` | Claude Agent SDK | Anthropic, Bedrock, Vertex, DeepSeek, Anthropic-compatible gateways | Default runtime; supports local Claude Code auth fallback for source runs, MCP server, verifier, and sub-agent behavior |
+| `claude-agent-sdk` | Claude Agent SDK | Anthropic, Bedrock, Vertex, DeepSeek, Anthropic-compatible gateways | Default runtime; supports local Claude Code auth, MCP server and configurable sub-agents under shared completion and verification contracts |
 | `openai-agents-sdk` | OpenAI Agents SDK | OpenAI, Ollama, OpenAI-compatible gateways | Native OpenAI runtime; adapts the same SmartPerfetto tools as function tools |
 | `pi-agent-core` | Pi Agent Core | custom only | Optional public runtime; real model configurations reuse the shared SmartPerfetto prompt/tool/report pipeline, while fake-stream remains smoke-only; does not enable `.pi` discovery, package extensions, shell tools, or file tools |
 | `opencode` | OpenCode server / SDK | custom only | Optional public runtime; uses explicit OpenAI-compatible or OpenCode model configuration, request-scoped SmartPerfetto MCP tools, and a hardened isolated OpenCode server; does not read local OpenCode login/project state or enable built-in file/shell/web/edit tools |
@@ -107,12 +107,16 @@ for the user-visible contract.
 | `backend/src/agentRuntime/engines/opencode/openCodeRuntime.ts` | OpenCode server/runtime adapter and request-scoped MCP bridge |
 | `backend/src/agentRuntime/engines/qoder/qoderRuntime.ts` | Qoder SDK adapter, stream projection, and session isolation |
 | `backend/src/agentRuntime/runtimeExecutionGuard.ts` | Runtime/session single-active execution, cancellation, and stale-settle isolation |
+| `backend/src/agentRuntime/analysisTurnIntent.ts`, `runtimeTurnPolicy.ts` | Shared typed intent, budget, scope and evidence-access policy for all native engines |
+| `backend/src/agentRuntime/analysisFinalizationContext.ts`, `runtimeEvidenceContext.ts` | Private finalization context, original deadline, authorized capture reads and cross-turn leases |
 | `backend/src/agentRuntime/runtimeCandidateAdmission.ts` | Maintainer-owned concurrency-candidate admission boundary |
 | `backend/src/agentRuntime/runtimePerformance.ts` | Internal RunManifest phase, tool, and SQL queue/execution timing receipt |
 | `backend/src/agentRuntime/runtimeToolConcurrency.ts` | Request-scoped fair read/write scheduling with an exclusive default |
 | `backend/src/agentv3/claudeMcpServer.ts` | SmartPerfetto tool implementation and composition |
 | `backend/src/agentv3/mcpToolRegistry.ts` | Tool descriptors, exposure levels, and allowlists |
 | `backend/src/services/agentResultNormalizer.ts` | Shared final result, client projection, and report-data boundary |
+| `backend/src/services/canonicalAnalysisResult.ts`, `finalizeAnalysisResult.ts` | Original-proposition canonical results and the single product-owned asynchronous finalizer |
+| `backend/src/services/finalSemanticAssessment.ts`, `evidence/evidenceReadView.ts` | Bounded no-tool semantic review and original execution-capture reads |
 | `backend/src/services/finalReportContractGate.ts` | Strategy-owned `final_report_contract` validation |
 | `backend/src/services/providerManager/` | Provider configuration and runtime/protocol/env mapping |
 | `backend/src/agentv3/sessionStateSnapshot.ts` | Shared snapshot for SDK and Pi/OpenCode/Qoder runtime state |
@@ -121,8 +125,9 @@ for the user-visible contract.
 
 `backend/src/agentOpenAI/` and individual files such as
 `agentv3/claudeRuntime.ts` retain compatibility re-exports for old import paths.
-The MCP, strategy, planning, and verifier code under `agentv3/` remains the
-canonical shared layer.
+MCP, strategy and planning remain canonical shared layers. The `claudeVerifier`
+compatibility entry points to shared structured delivery diagnostics; the
+finalizer owns content meaning and claim support.
 
 ## Tool Layer
 
@@ -142,13 +147,15 @@ bridges request-scoped SmartPerfetto tools through a per-analysis MCP bridge;
 its built-in project discovery, file, shell, web, and edit tools are disabled
 or denied. Qoder uses the SDK's in-process MCP bridge with built-in SDK tools
 disabled and projects every answer token through the shared private-output
-guard before SSE emission. Runtime outputs normalize into the same SSE events,
-`AnalysisResult`, and HTML report contract, although their SDK/server resume
-and streaming mechanics differ.
+guard before SSE emission. Each engine uses its pinned provider's native no-tool
+transport for the same typed intent and hands its result to the same
+product-owned finalizer/report boundary. SDK/server resume, streaming, tool
+cadence and cost/timeout semantics still differ.
 
-The tool surface is not a fixed-size list. Quick/full mode, artifact store
-availability, codebase permission, `referenceTraceId`, comparison context, and
-runtime allowlists shape the request-visible set.
+The tool surface follows actual request scope, artifact-store availability,
+codebase permission, `referenceTraceId`, comparison context and evidence access.
+Budget mode neither grants permission nor silently removes authorized tools.
+`existing_only` strictly prohibits new acquisition.
 
 ## Concurrency, Observability, And Admission
 
@@ -236,18 +243,27 @@ from durable snapshots.
 ## Source-Aware Runtime Parity
 
 The five production runtimes do not implement separate source policies. They
-share the strategy-owned source-use prompt, actual `SourceUseDecisionV1` state
-from the common MCP registry/handlers, and
-`finalizeSourceAwareAnalysisResult` on success, partial, max-turn, and error
-terminal paths. Without a current-run accessor, model-authored source decisions
-or bindings are removed. A `pending` or `attempted` decision cannot be
-presented as a successful result.
+share the strategy-owned source-use prompt and actual `SourceUseDecisionV1`
+state from the common MCP registry/handlers. Runtimes attach actual source-use
+state for the product finalizer. Without a current-run accessor, model-authored
+decisions/bindings cannot become executed facts. `pending` or `attempted` alone
+does not force the whole run to fail; actual lookup, consent, reference and claim
+failures retain their own contract outcomes.
 
-In full analysis, selected source plus a queryable trace anchor requires a
-bounded lookup or a controlled non-use status recorded before lookup.
-Trace/Skill/SQL proves occurrence and `CodeRef` proves mechanism.
-`corroborated` requires verified same-claim trace occurrence plus
-`provider_send` body/indexed evidence; `metadata_only` is locate-only.
+Authorized source is accessed on demand. Fast/full does not insert a mandatory
+lookup, fixed plan or extra source pass, and `existing_only` cannot use source or
+RAG tools for new acquisition. Trace captures support referenced observations;
+source evidence provides mechanism-analysis background, while `CodeRef` metadata
+only locates code. `SourceUseDecision.status: corroborated` only audits an
+authorized body lookup with references in this run. It does not prove a Trace
+occurrence, mechanism or causal relationship, and is a different field from a
+claim binding's `mechanismStatus`.
+
+The shared finalizer uses `semanticsPolicy: declared`. Even with matched Trace
+references and source bodies, a model-declared `mechanismStatus: corroborated`
+is downgraded to `compatible` with `source_binding_mechanism_unverified`.
+This path has no native proof that establishes a general mechanism. Unknown
+mechanisms remain unverified/partial; a lookup-audit status cannot replace proof.
 
 One canonical safe projector carries the same decision and binding through
 initial and replayed SSE, HTML reports, CLI JSON/Markdown/HTML,
@@ -265,13 +281,18 @@ credentials are available. Unavailable authentication is reported as
 
 | Mode | Behavior |
 |---|---|
-| `fast` | Lightweight system prompt, core evidence tools, and a runtime-specific quick budget |
-| `full` | Full tools, plan gate, notes, artifacts, and quality gates |
-| `auto` | Non-negotiable context rules followed by the lightweight classifier; ambiguous requests use full analysis |
+| `fast` | Fixed quick budget with the request's authorized tools and shared finalization |
+| `full` | Fixed full budget without automatically requiring a report, plan or extra source lookup |
+| `auto` | Shared typed-intent complexity recommendation; an explicit fallback when unavailable, without keyword guessing |
 
-Reference traces, codebases, and private knowledge sources may require full
-context. An explicit quick request must not silently discard those required
-capabilities.
+Typed intent separates task kind, scene, scope, complexity recommendation,
+deliverable and evidence access. A scene must belong to the run's pinned registry.
+Schema validation does not establish semantic correctness or widen permission.
+`existing_only` reads retained evidence; `read_new` remains authorization-bound.
+Bounded/unavailable intent does not trigger automatic prefetch. Planning is on
+demand; completed phases require real successful evidence or an explicit valid
+disposition. Unfinished exploration plans and hypotheses retain their state;
+they neither trigger automatic continuation nor determine answer completeness alone.
 
 ## SSE Events
 
@@ -286,34 +307,50 @@ route layer:
 | `agent_response` | Tool result |
 | `answer_token` | Final-answer token |
 | `conclusion` | SDK conclusion arrived |
-| `analysis_completed` | HTML report generated; terminal event |
+| `analysis_completed` | Product-finalized terminal metadata and actual report outcome |
 | `error` | Failure |
 
-The route layer emits `analysis_completed` only after report generation, so the
-report path does not depend on a specific SDK.
+The product emits `analysis_completed` after finalization and report handling.
+Native completion, evidence/claims and report coverage retain separate states;
+a successful chat projection cannot hide report failure.
 
 ## Final Result And Quality Artifacts
 
-All runtimes normalize their raw output into a shared `AnalysisResult`, then
-run through the same quality and persistence chain:
+Each runtime returns its original `AnalysisResult` with a private finalization
+context for the same run:
 
 ```text
-runtime result
-  -> agentResultNormalizer
-  -> finalReportContractGate
-  -> evidence contract / claim verification / identity resolutions
+exact runtime result + private RuntimeFinalizationContext
+  -> product-owned finalizeAnalysisResult (once)
+  -> canonical body / original claim semantics
+  -> retained execution capture / finite proof / at most one no-tool semantic review
+  -> independent completion / claim / report / source / identity assessments
   -> HTML report / CLI turn files / analysis-result snapshot
   -> frontend visible projection
 ```
 
-`final_report_contract` comes from strategy frontmatter. Known verifier
-misdiagnosis rules also come from strategy frontmatter through
-`verifier_misdiagnosis_patterns`: runtime loads scene-aware patterns, global
-patterns can be shared across scenes, regexes must compile under
-`validate:strategies`, and severity is limited to `warning` or `info`. Claim
-verification and identity resolution depend on structured Skill/DataEnvelope
-evidence. The frontend may filter noise from the visible chat conclusion, but
-it must not remove provenance needed by reports, CLI artifacts, or snapshots.
+The product takes the context from the exact result before copying it. The
+context fixes the provider, original absolute deadline, trace identity and
+evidence-read scope. The owner checks current-run identity, cancellation and
+authorization across awaits. Semantic review runs at most once, has no tools,
+and has a separate 60-second limit bounded by the original deadline and user
+cancellation. A timeout records unavailable assurance while preserving the body
+and native completion; review does not rewrite the body or reduce causal
+propositions to numeric ones. Unknown review alone does not fail a focused answer;
+full reports still require their report-assessment contract. The body, native completion and original claims
+are independent inputs; valid JSON and model agreement alone are not proof.
+
+`final_report_contract` remains strategy frontmatter in the pinned registry.
+`claudeVerifier` supplies structured delivery diagnostics without an additional
+semantic LLM or misdiagnosis-word matching. The finite catalog is authoritative
+in `SUPPORTED_DETERMINISTIC_CLAIM_RULES`: currently `numeric.cell`,
+`interval.overlap` and `comparison.delta`. Missing original witnesses, trusted
+units/field semantics or coverage retain candidate/unknown states. Equal values
+or endpoints do not establish general causality. Complete claim status joins
+captured evidence with semantic review of the current proposition. Reports, CLI
+artifacts and snapshots keep provenance. Chat projects the body, machine
+sidecars and structured runtime appendix separately without mechanically editing
+natural-language conclusions.
 
 ## Sessions And Resume
 
@@ -333,6 +370,22 @@ Snapshots also carry final-result quality fields such as conclusion contracts,
 claim verification results, and identity resolutions so resume, report export,
 and analysis-result comparison can reuse them.
 
+Historical GET, report and snapshot replay only read/project stored state. They
+do not run a new finalizer, semantic review or evidence attestation; normal
+access authorization still applies. Restored display rows cannot recreate
+in-process execution witnesses.
+
+A logical Conversation session retains in-memory artifacts/captures under the
+exact trace pair, authorization fingerprint and tenant/workspace/user scope;
+physical session/run IDs remain unique. Issued bindings travel through internal
+options, cannot be forged by JSON, and cannot be replaced by a missing-binding
+fallback to a cached facade. The model receives a bounded locator catalog for
+retained artifact reads, without rows, coverage or proof authority. Each
+finalization fixes its admitted capture set; release the lease and clean up the
+physical session after it settles. Scope changes/disposal revoke the context,
+events are isolated by their producer run, and old cancellation/cleanup cannot
+affect the next turn.
+
 Raw trace comparison sessions must also persist `referenceTraceId`,
 `comparisonSource`, and `comparisonReportSection`. A comparison session cannot
 silently downgrade to single-trace mode or switch to a different reference
@@ -345,6 +398,10 @@ provider/runtime identity.
 - Source runs and the npm CLI require Node.js `>=24 <25`.
 - Portable packages bundle Node.js 24, backend runtime files, committed
   `frontend/`, and the pinned trace processor.
+- Typed-intent, claim-schema, semantic-review and Conversation evidence-context
+  templates are runtime assets. Changes require checking existing public Skill
+  export, npm CLI and Docker/portable bundled paths so distribution does not omit
+  templates available in source. Documentation cannot substitute for those gates.
 - Docker does not read host Claude Code local auth; use Provider Manager or env
   provider configuration.
 - Qoder is absent from default Docker/portable/npm installs until the optional

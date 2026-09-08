@@ -115,7 +115,7 @@ inputs:
     description: "掉帧原因说明，由 scrolling_analysis 生成的中文诊断"
 
 identity:
-  policy: required
+  policy: verify_if_present
   scope: process
   aliases: [package, process_name]
   rewriteTo: recommended_process_name_param
@@ -132,6 +132,8 @@ steps:
   # ===== 数据源检测：Monitor contention 表是否可用（可选）=====
   - id: monitor_contention_check
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "Monitor Contention 数据源检测"
     display: false
     sql: |
@@ -148,6 +150,8 @@ steps:
   # ===== 数据源检测：GC 表是否可用 =====
   - id: gc_table_check
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "GC 数据源检测"
     display: false
     sql: |
@@ -165,6 +169,8 @@ steps:
   # ===== 数据源检测：GPU 数据是否可用 =====
   - id: gpu_table_check
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "GPU 数据源检测"
     display: false
     sql: |
@@ -193,6 +199,8 @@ steps:
   # ===== 数据源检测：Binder 详细数据 =====
   - id: binder_table_check
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "Binder 数据源检测"
     display: false
     sql: |
@@ -211,6 +219,9 @@ steps:
   # 前端期望: [{ quadrant, name, dur_ms, percentage }]
   - id: quadrant_analysis
     type: atomic
+    process_scope:
+      role: target
+      binding: native_upid
     name: "四象限分析"
     optional: true
     sql_fragments:
@@ -294,6 +305,11 @@ steps:
   # 前端期望: [{ interface, dur_ms, count }]
   - id: binder_calls
     type: atomic
+    process_scope:
+      role: target
+      binding: native_upid
+      context_fields:
+        peer_context: [interface]
     name: "Binder 调用"
     display:
       level: detail
@@ -328,7 +344,8 @@ steps:
       FROM android_binder_txns
       WHERE client_ts >= ${start_ts}
         AND client_ts < ${end_ts}
-        AND (('${package}' = '' OR client_process = '${package}' OR client_process GLOB '${package}:*') OR '${package}' = '')
+        AND (${__process_scope.upid} IS NULL OR client_upid = ${__process_scope.upid})
+        AND (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR client_process = '${package}' OR client_process GLOB '${package}:*')
       GROUP BY server_process
       HAVING dur_ms > 0.5
       ORDER BY dur_ms DESC
@@ -346,6 +363,8 @@ steps:
 
   - id: cpu_freq_analysis
     type: atomic
+    process_scope:
+      role: global_context
     name: "CPU频率"
     display:
       level: detail
@@ -400,6 +419,11 @@ steps:
   # 前端期望: [{ name, dur_ms, ts }]
   - id: main_thread_slices
     type: atomic
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+    process_scope:
+      role: target
+      binding: effective_target_processes
     name: "主线程耗时操作"
     display:
       level: key
@@ -429,8 +453,8 @@ steps:
       WITH main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.tid = p.pid OR t.name GLOB '[0-9]*.ui')
       )
       SELECT
@@ -463,6 +487,11 @@ steps:
 
   - id: choreographer_resync_markers
     type: atomic
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+    process_scope:
+      role: target
+      binding: effective_target_processes
     name: "Choreographer resync 标记"
     display:
       level: detail
@@ -490,8 +519,8 @@ steps:
       WITH main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.tid = p.pid OR t.name GLOB '[0-9]*.ui')
       )
       SELECT
@@ -523,6 +552,11 @@ steps:
   # 前端期望: [{ name, dur_ms, ts }]
   - id: render_thread_slices
     type: atomic
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+    process_scope:
+      role: target
+      binding: effective_target_processes
     name: "RenderThread 耗时操作"
     display:
       level: key
@@ -556,8 +590,8 @@ steps:
       WITH render_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.name = 'RenderThread' OR t.name GLOB '[0-9]*.raster')
       )
       SELECT
@@ -591,6 +625,8 @@ steps:
 
   - id: cpu_freq_timeline
     type: atomic
+    process_scope:
+      role: global_context
     name: "CPU 频率变化时间线"
     display:
       level: detail
@@ -654,6 +690,11 @@ steps:
 
   - id: lock_contention
     type: atomic
+    process_scope:
+      role: target
+      binding: native_upid
+      context_fields:
+        peer_context: [blocking_method, blocking_thread_name, waiter_count]
     name: "锁竞争分析"
     display:
       level: detail
@@ -696,8 +737,10 @@ steps:
       FROM android_monitor_contention
       WHERE ts >= ${start_ts}
         AND ts < ${end_ts}
+        AND (${__process_scope.upid} IS NULL OR upid = ${__process_scope.upid})
         AND (
-          '${package}' = ''
+          ${__process_scope.upid} IS NOT NULL
+          OR '${package}' = ''
           OR process_name = '${package}'
           OR process_name GLOB '${package}:*'
         )
@@ -711,6 +754,11 @@ steps:
   # ===== GC 与帧重叠分析 =====
   - id: gc_in_frame
     type: atomic
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+    process_scope:
+      role: target
+      binding: effective_target_processes
     name: "GC 影响分析"
     display:
       level: detail
@@ -746,9 +794,8 @@ steps:
           MAX(gc.gc_ts, ${start_ts}) as overlap_start,
           MIN(gc.gc_ts + gc.gc_dur, ${end_ts}) as overlap_end
         FROM android_garbage_collection_events gc
-        JOIN thread t ON gc.tid = t.tid
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON gc.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND gc.gc_ts < ${end_ts}
           AND gc.gc_ts + gc.gc_dur > ${start_ts}
       )
@@ -769,6 +816,11 @@ steps:
   # ===== IO / page-cache 等待候选分析（D/DK + io_wait/blocked_function）=====
   - id: io_blocking
     type: atomic
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+    process_scope:
+      role: target
+      binding: effective_target_processes
     name: "IO/page-cache 等待候选分析"
     display:
       level: detail
@@ -802,8 +854,8 @@ steps:
       WITH target_threads AS (
         SELECT t.utid, t.tid, t.name as thread_name, p.pid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.tid = p.pid OR t.name = 'RenderThread' OR t.name GLOB '[0-9]*.raster' OR t.name GLOB '[0-9]*.ui')
       ),
       io_states AS (
@@ -973,7 +1025,16 @@ steps:
   - id: root_cause_summary
     type: atomic
     name: "根因分析"
+    process_scope:
+      role: target
+      binding: effective_target_processes
+      context_fields:
+        global_context: [frame_budget_ms, primary_cause, secondary_info]
+        peer_context: [deep_reason]
+      limitations:
+        - "根因分类结合目标线程、全局 CPU/VSync 资源及对端信息；混合解释文本不是目标进程的独立实测指标。"
     sql_fragments:
+      - fragments/effective_target_processes.sql
       - fragments/vsync_config.sql
       - fragments/target_threads.sql
       - fragments/thread_states_quadrant.sql
@@ -1075,13 +1136,9 @@ steps:
       -- 4. 获取最耗时的主线程操作
       main_thread_utid AS (
         SELECT t.utid
-        FROM thread t JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') AND (t.tid = p.pid OR t.name GLOB '[0-9]*.ui')
-      ),
-      main_thread_tid AS (
-        SELECT t.tid
-        FROM thread t JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') AND (t.tid = p.pid OR t.name GLOB '[0-9]*.ui')
+        FROM thread t JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+          AND (t.tid = p.pid OR t.name GLOB '[0-9]*.ui')
       ),
       top_slice AS (
         SELECT
@@ -1117,8 +1174,10 @@ steps:
         WHERE amc.ts < ${end_ts}
           AND amc.ts + amc.dur > ${start_ts}
           AND amc.is_blocked_thread_main = 1
+          AND (${__process_scope.upid} IS NULL OR amc.upid = ${__process_scope.upid})
           AND (
-            '${package}' = ''
+            ${__process_scope.upid} IS NOT NULL
+            OR '${package}' = ''
             OR amc.process_name = '${package}'
             OR amc.process_name GLOB '${package}:*'
           )
@@ -1355,8 +1414,8 @@ steps:
         FROM slice s
         JOIN thread_track tt ON s.track_id = tt.id
         JOIN thread t ON tt.utid = t.utid
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.name = 'RenderThread' OR t.name GLOB '[0-9]*.raster')
           AND s.ts >= ${start_ts} AND s.ts < ${end_ts}
           AND (s.name GLOB '*Fence*' OR s.name GLOB '*fence*'
@@ -1371,8 +1430,8 @@ steps:
         FROM slice s
         JOIN thread_track tt ON s.track_id = tt.id
         JOIN thread t ON tt.utid = t.utid
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.name = 'RenderThread' OR t.name GLOB '[0-9]*.raster')
           AND s.ts >= ${start_ts} AND s.ts < ${end_ts}
           AND (s.name GLOB '*shader*' OR s.name GLOB '*Shader*'
@@ -1420,9 +1479,8 @@ steps:
           ) / 1e6, 2), 0) as gc_overlap_ms,
           COUNT(*) as gc_count
         FROM android_garbage_collection_events gc
-        JOIN thread t ON gc.tid = t.tid
-        JOIN process p ON t.upid = p.upid
-        WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
+        JOIN effective_target_processes p ON gc.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND gc.gc_ts < ${end_ts}
           AND gc.gc_ts + gc.gc_dur > ${start_ts}
       ),
@@ -1433,7 +1491,7 @@ steps:
           bt.client_dur,
           bt.server_process
         FROM android_binder_txns bt
-        WHERE bt.client_tid IN (SELECT tid FROM main_thread_tid)
+        WHERE bt.client_utid IN (SELECT utid FROM main_thread_utid)
           AND bt.is_sync = 1
           AND bt.client_ts < ${end_ts}
           AND bt.client_ts + bt.client_dur > ${start_ts}

@@ -365,7 +365,7 @@ npx jest src/services/__tests__/agentResultNormalizer.test.ts src/services/__tes
 npx jest src/services/verifier/__tests__/claimVerificationRunner.test.ts src/services/__tests__/analysisResultSnapshotStore.test.ts
 npx jest src/cli-user/services/__tests__/cliAnalyzeService.runTurn.test.ts src/cli-user/services/__tests__/cliAnalyzeService.test.ts
 npx jest src/services/providerManager/__tests__/providerService.test.ts src/services/providerManager/__tests__/providerRoutes.test.ts
-npx jest src/agentv3/__tests__/queryComplexityClassifier.followup.test.ts
+npm run test:runtime-resilience
 ```
 
 Use the result-quality suites when changing final report contract enforcement,
@@ -381,7 +381,7 @@ branch. Run the focused default-off/admitted-on gate from `backend/`:
 ```bash
 npm run test:runtime-registry
 npx jest --runInBand --forceExit \
-  src/agentRuntime/__tests__/quickEvidenceDirectAnswer.test.ts \
+  src/scripts/__tests__/runQuickAgentE2eWrapper.test.ts \
   src/agentRuntime/__tests__/runtimeCandidateAdmission.test.ts \
   src/agentRuntime/__tests__/runtimeToolConcurrency.test.ts \
   src/agentRuntime/__tests__/runtimeToolConcurrencyAdapters.test.ts \

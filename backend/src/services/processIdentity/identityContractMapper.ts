@@ -124,10 +124,12 @@ export function buildIdentityResolutionFromProcessGate(
   );
   const resolution = input.resolution;
   const status = input.statusOverride || mapProcessIdentityStatus(resolution);
-  const processes = (resolution?.candidates || [])
+  const selectedCandidates = (resolution?.candidates || []).filter(candidate =>
+    status !== 'verified' || (candidate.upid !== undefined && resolution?.upids.includes(candidate.upid)));
+  const processes = selectedCandidates
     .map(processFromCandidate)
     .filter((item): item is ResolvedProcessIdentityV1 => Boolean(item));
-  const threads = (resolution?.candidates || [])
+  const threads = selectedCandidates
     .map(candidate => threadFromCandidate(candidate, input.target))
     .filter((item): item is ResolvedThreadIdentityV1 => Boolean(item));
   const warnings = [
@@ -140,7 +142,7 @@ export function buildIdentityResolutionFromProcessGate(
     recommendedParams.process_name = resolution.recommendedProcessNameParam;
     recommendedParams.package = resolution.recommendedProcessNameParam;
   }
-  if (resolution?.upids?.length) {
+  if (status === 'verified' && resolution?.upids?.length === 1) {
     recommendedParams.upid = resolution.upids[0];
   }
 

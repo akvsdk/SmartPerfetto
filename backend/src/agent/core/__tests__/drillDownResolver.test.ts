@@ -15,6 +15,8 @@ import {resolveRegisteredDrillDownSkillParams} from '../drillDownEntityResolver'
 import { EnhancedSessionContext } from '../../context/enhancedSessionContext';
 import type { Intent, ReferencedEntity } from '../../types';
 import type { FollowUpResolution } from '../followUpHandler';
+import Database from 'better-sqlite3';
+import {createEffectiveProcessScope} from '../../../services/processIdentity/effectiveProcessScope';
 
 describe('drillDownResolver', () => {
   let sessionContext: EnhancedSessionContext;
@@ -282,38 +284,35 @@ describe('drillDownResolver', () => {
           confidence: 0.5,
         };
 
-        const mockTps = {
-          executeQuery: jest.fn().mockResolvedValue({
-            columns: [
-              'startup_id',
-              'start_ts',
-              'end_ts',
-              'dur_ms',
-              'process_name',
-              'startup_type',
-              'ttid_ms',
-              'ttfd_ms',
-            ],
-            rows: [
-              [12, '1000000', '2800000', 1800, 'com.example.app', 'cold', 1500, 1900],
-            ],
-          }),
-        };
+        const db = new Database(':memory:');
+        try {
+          db.exec(`
+            CREATE TABLE android_startups(startup_id INTEGER, ts INTEGER, dur INTEGER, package TEXT, startup_type TEXT);
+            CREATE TABLE android_startup_time_to_display(startup_id INTEGER, time_to_initial_display INTEGER, time_to_full_display INTEGER);
+            CREATE TABLE android_startup_processes(startup_id INTEGER, upid INTEGER);
+            INSERT INTO android_startups VALUES (12, 1000000, 1800000, 'com.example.app', 'cold');
+            INSERT INTO android_startup_time_to_display VALUES (12, 1500000, 1900000);
+            INSERT INTO android_startup_processes VALUES (12, 42);
+          `);
+          const mockTps = {
+            executeQuery: jest.fn(async (_traceId: string, sql: string) => {
+              const statement = db.prepare<[], unknown[]>(sql);
+              return {columns: statement.columns().map(column => column.name), rows: statement.raw().all()};
+            }),
+          };
+          const result = await resolveDrillDown(intent, followUp, sessionContext, mockTps, 'trace-1');
 
-        const result = await resolveDrillDown(intent, followUp, sessionContext, mockTps, 'trace-1');
-
-        expect(result).not.toBeNull();
-        expect(result!.intervals).toHaveLength(1);
-        expect(result!.intervals[0].metadata?.startup_id).toBe('12');
-        expect(result!.traces[0].entityType).toBe('startup');
-        expect(result!.traces[0].used).toContain('enrichment');
-        expect(mockTps.executeQuery).toHaveBeenCalledWith(
-          'trace-1',
-          expect.not.stringContaining('$process_name'),
-        );
-        expect(mockTps.executeQuery.mock.calls[0]?.[1]).toContain(
-          "('' = '' OR s.package = '' OR s.package GLOB '' || ':*')",
-        );
+          expect(result).not.toBeNull();
+          expect(result!.intervals).toHaveLength(1);
+          expect(result!.intervals[0]).toMatchObject({startTs: '1000000', endTs: '2800000'});
+          expect(result!.intervals[0].metadata?.startup_id).toBe('12');
+          expect(result!.traces[0].entityType).toBe('startup');
+          expect(result!.traces[0].used).toContain('enrichment');
+          expect(mockTps.executeQuery).toHaveBeenCalledWith('trace-1', expect.any(String));
+          expect(mockTps.executeQuery.mock.calls[0]?.[1]).not.toMatch(/\$(?:process_name|upid|startup_id)\b/);
+        } finally {
+          db.close();
+        }
       });
 
       test('supports trace processor query(traceId, sql) API for enrichment', async () => {
@@ -654,5 +653,88 @@ describe('resolveRegisteredDrillDownSkillParams', () => {
       traceId: 'trace-1',
       traceProcessorService: {query},
     })).rejects.toThrow(/unable to resolve/i);
+  });
+});
+
+describe('drill-down exact process identity', () => {
+  it('enriches only startups owned by the exact UPID while preserving named and unscoped lookups', async () => {
+    const db = new Database(':memory:');
+    const scope = createEffectiveProcessScope('trace', 'current', {upid: 42}, {
+      status: 'verified', upids: [42], confidenceScore: 100, evidenceSources: ['upid'], warnings: [],
+      candidates: [{rank: 1, confidenceScore: 100, upid: 42, processName: 'com.example'}],
+    });
+    try {
+      db.exec(`
+        CREATE TABLE android_startups(startup_id INTEGER, ts INTEGER, dur INTEGER, package TEXT, startup_type TEXT);
+        CREATE TABLE android_startup_time_to_display(startup_id INTEGER, time_to_initial_display INTEGER, time_to_full_display INTEGER);
+        CREATE TABLE android_startup_processes(startup_id INTEGER, upid INTEGER);
+        INSERT INTO android_startups VALUES
+          (12, 100, 20, 'com.example', 'cold'),
+          (13, 200, 30, 'com.example', 'warm'),
+          (14, 300, 40, 'com.example:child', 'cold'),
+          (15, 400, 50, 'com.example.similar', 'cold');
+        INSERT INTO android_startup_processes VALUES (12,42), (13,43), (14,44), (15,45);
+      `);
+      const query = jest.fn(async (_traceId: string, sql: string) => {
+        const statement = db.prepare<[], unknown[]>(sql);
+        return {columns: statement.columns().map(column => column.name), rows: statement.raw().all()};
+      });
+      const resolve = (startupId: number, processScope = scope, packageName = 'com.example') =>
+        resolveRegisteredDrillDownSkillParams({skillId: 'startup_detail',
+          params: {startup_id: startupId, package: packageName}, traceId: 'trace',
+          traceProcessorService: {query}, processScope});
+
+      const exact = await resolve(12);
+      expect(exact.params).toMatchObject({startup_id: '12', start_ts: 100, end_ts: 120});
+      for (const startupId of [13, 14, 15]) {
+        await expect(resolve(startupId)).rejects.toThrow('Unable to resolve a complete startup interval');
+      }
+
+      const namedScope = createEffectiveProcessScope('trace', 'current', {requestedName: 'com.example'});
+      for (const [startupId, startTs, endTs] of [[12, 100, 120], [13, 200, 230], [14, 300, 340]]) {
+        const named = await resolve(startupId, namedScope);
+        expect(named.params).toMatchObject({start_ts: startTs, end_ts: endTs});
+      }
+      await expect(resolve(15, namedScope)).rejects.toThrow('Unable to resolve a complete startup interval');
+
+      const unscoped = await resolveRegisteredDrillDownSkillParams({skillId: 'startup_detail',
+        params: {startup_id: 15}, traceId: 'trace', traceProcessorService: {query}});
+      expect(unscoped.params).toMatchObject({startup_id: '15', start_ts: 400, end_ts: 450});
+      for (const [, sql] of query.mock.calls) {
+        expect(sql).not.toMatch(/\$(?:process_name|upid|startup_id)\b/);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('resolves the frame inside the trusted UPID and rejects cross-trace reuse before querying', async () => {
+    const Database = require('better-sqlite3');
+    const { createEffectiveProcessScope } = require('../../../services/processIdentity/effectiveProcessScope');
+    const db = new Database(':memory:');
+    const scope = createEffectiveProcessScope('trace', 'current', { upid: 42 }, {
+      status: 'verified', upids: [42], confidenceScore: 100, evidenceSources: ['upid'], warnings: [],
+      candidates: [{ rank: 1, confidenceScore: 100, upid: 42, processName: 'com.example' }],
+    });
+    try {
+      db.exec(`CREATE TABLE process(upid INTEGER, name TEXT);
+        CREATE TABLE actual_frame_timeline_slice(upid INTEGER, display_frame_token INTEGER,
+          surface_frame_token INTEGER, ts INTEGER, dur INTEGER, jank_type TEXT, layer_name TEXT);
+        INSERT INTO process VALUES (42,'com.example'),(43,'com.example');
+        INSERT INTO actual_frame_timeline_slice VALUES (42,7,NULL,100,20,'None','same'),
+          (43,7,NULL,10,900,'None','same');`);
+      const query = jest.fn(async (_trace: string, sql: string) => {
+        const statement = db.prepare(sql);
+        return { columns: statement.columns().map((column: {name: string}) => column.name), rows: statement.raw().all() };
+      });
+      const result = await resolveRegisteredDrillDownSkillParams({ skillId: 'frame_blocking_calls',
+        params: { frame_id: 7 }, traceId: 'trace', traceProcessorService: { query }, processScope: scope });
+      expect(result.params).toMatchObject({ start_ts: 100, end_ts: 120 });
+      expect(result.resolution?.row.upid).toBe(42);
+      await expect(resolveRegisteredDrillDownSkillParams({ skillId: 'frame_blocking_calls',
+        params: { frame_id: 7 }, traceId: 'reference', traceProcessorService: { query }, processScope: scope }))
+        .rejects.toThrow('different trace/side');
+      expect(query).toHaveBeenCalledTimes(1);
+    } finally { db.close(); }
   });
 });

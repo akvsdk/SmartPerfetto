@@ -6,7 +6,7 @@ import type {AnalysisOptions} from '../../agent/core/orchestratorTypes';
 import {loadStrategyYaml} from '../../agentv3/strategyLoader';
 
 const POLICY_ASSET_NAME = 'analysis-source-activation-policy';
-const POLICY_SCHEMA_VERSION = 'analysis_source_activation_policy@1' as const;
+const POLICY_SCHEMA_VERSION = 'analysis_source_activation_policy@2' as const;
 
 export type AnalysisSourceActivation =
   | 'dormant'
@@ -26,8 +26,6 @@ export interface AnalysisSourceActivationPolicy {
     readonly maxTurns: number;
     readonly maxCharsPerEntry: number;
   };
-  readonly explicitPatterns: readonly RegExp[];
-  readonly deepPatterns: readonly RegExp[];
 }
 
 interface AnalysisSourcePolicyInput {
@@ -53,27 +51,10 @@ function positiveInteger(value: unknown, errorCode: string): number {
   return Number(value);
 }
 
-function compilePatterns(
-  value: unknown,
-  errorCode: string,
-  flags = 'i',
-): readonly RegExp[] {
-  if (!Array.isArray(value) || value.length === 0) throw new Error(errorCode);
-  const patterns = value.map(entry => {
-    if (typeof entry !== 'string' || !entry.trim()) throw new Error(errorCode);
-    try {
-      return new RegExp(entry, flags);
-    } catch {
-      throw new Error(errorCode);
-    }
-  });
-  return Object.freeze(patterns);
-}
-
 export function parseAnalysisSourceActivationPolicy(value: unknown): AnalysisSourceActivationPolicy {
   if (
     !isRecord(value) ||
-    !exactKeys(value, ['schema_version', 'bounded_explicit', 'safe_replay', 'intent']) ||
+    !exactKeys(value, ['schema_version', 'bounded_explicit', 'safe_replay']) ||
     value.schema_version !== POLICY_SCHEMA_VERSION
   ) {
     throw new Error('analysis_source_activation_policy_invalid_root');
@@ -93,16 +74,6 @@ export function parseAnalysisSourceActivationPolicy(value: unknown): AnalysisSou
     !exactKeys(value.safe_replay, ['max_turns', 'max_chars_per_entry'])
   ) {
     throw new Error('analysis_source_activation_policy_invalid_safe_replay');
-  }
-  if (
-    !isRecord(value.intent) ||
-    !exactKeys(value.intent, [
-      'explicit_patterns',
-      'explicit_case_sensitive_patterns',
-      'deep_patterns',
-    ])
-  ) {
-    throw new Error('analysis_source_activation_policy_invalid_intent');
   }
   return Object.freeze({
     schemaVersion: POLICY_SCHEMA_VERSION,
@@ -130,21 +101,6 @@ export function parseAnalysisSourceActivationPolicy(value: unknown): AnalysisSou
         'analysis_source_activation_policy_invalid_safe_replay',
       ),
     }),
-    explicitPatterns: Object.freeze([
-      ...compilePatterns(
-        value.intent.explicit_patterns,
-        'analysis_source_activation_policy_invalid_explicit_patterns',
-      ),
-      ...compilePatterns(
-        value.intent.explicit_case_sensitive_patterns,
-        'analysis_source_activation_policy_invalid_explicit_patterns',
-        '',
-      ),
-    ]),
-    deepPatterns: compilePatterns(
-      value.intent.deep_patterns,
-      'analysis_source_activation_policy_invalid_deep_patterns',
-    ),
   });
 }
 
@@ -161,26 +117,15 @@ export function hasAuthorizedCodebase(input: Pick<
   AnalysisSourcePolicyInput,
   'hasAuthorizedCodebase' | 'codeAwareMode' | 'codebaseIds'
 >): boolean {
-  if (input.hasAuthorizedCodebase !== undefined) return input.hasAuthorizedCodebase;
-  return input.codeAwareMode !== undefined &&
-    input.codeAwareMode !== 'off' &&
+  return input.hasAuthorizedCodebase !== false &&
+    (input.codeAwareMode === 'metadata_only' || input.codeAwareMode === 'provider_send') &&
     Boolean(input.codebaseIds?.length);
 }
 
 export function resolveAnalysisSourceActivation(
   input: AnalysisSourcePolicyInput,
 ): AnalysisSourceActivation {
-  if (!hasAuthorizedCodebase(input)) return 'dormant';
-  const policy = loadAnalysisSourceActivationPolicy();
-  if (
-    input.analysisMode === 'full' &&
-    policy.deepPatterns.some(pattern => pattern.test(input.query))
-  ) {
-    return 'deep_supplement';
-  }
-  return policy.explicitPatterns.some(pattern => pattern.test(input.query))
-    ? 'bounded_explicit'
-    : 'dormant';
+  return hasAuthorizedCodebase(input) ? 'bounded_explicit' : 'dormant';
 }
 
 export function boundedAnalysisSourceUsePolicy(): NonNullable<AnalysisOptions['sourceUsePolicy']> {
@@ -192,20 +137,9 @@ export function boundedAnalysisSourceUsePolicy(): NonNullable<AnalysisOptions['s
 
 export function projectPrimaryAnalysisOptions<T extends AnalysisOptions>(
   options: T,
-  activation: AnalysisSourceActivation,
+  _activation: AnalysisSourceActivation,
 ): T {
-  if (!hasAuthorizedCodebase(options)) return options;
-  if (activation === 'bounded_explicit') {
-    return {
-      ...options,
-      sourceUsePolicy: boundedAnalysisSourceUsePolicy(),
-    };
-  }
-  return {
-    ...options,
-    codeAwareMode: 'off',
-    codebaseIds: undefined,
-    sourceUsePolicy: undefined,
-    analysisContextFingerprint: undefined,
-  };
+  // Source selection is caller authorization, independent of analysis wording or mode.
+  // Keep caller policy intact: adding a policy also changes the MCP tool surface.
+  return options;
 }

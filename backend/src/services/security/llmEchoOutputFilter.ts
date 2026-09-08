@@ -59,6 +59,10 @@ export class LLMEchoOutputStream {
 
   constructor(private readonly maxPatternLength = 2048) {}
 
+  get outputSuppressed(): boolean {
+    return this.overflowed;
+  }
+
   registerSnippet(snippet: string, ref: CodeRef): void {
     this.assertActive();
     this.registerDerivedPatterns(snippet, ref);

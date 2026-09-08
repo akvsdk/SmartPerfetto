@@ -22,6 +22,11 @@ meta:
   icon: "swap_horiz"
   tags: [sched, migration, kernel, composite]
 
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package]
+
 inputs:
   - name: start_ts
     type: timestamp
@@ -49,6 +54,11 @@ steps:
   # ========== 任务迁移分析 ==========
   - id: migration_analysis
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "大小核迁移分析"
     optional: true
     display:
@@ -80,8 +90,8 @@ steps:
       target_threads AS (
         SELECT t.utid, t.name as thread_name
         FROM thread t
-        JOIN process p ON t.upid = p.upid
-        WHERE (('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
           AND (t.tid = p.pid OR t.name = 'RenderThread')
       ),
       cpu_switches AS (

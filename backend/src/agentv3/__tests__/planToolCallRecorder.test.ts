@@ -11,11 +11,180 @@ import {
   recordPlanOrPrePlanToolCall,
   replayPrePlanToolCalls,
   resetPrePlanToolCallsForNewRun,
+  readToolResultFacts,
   type AnalysisPlanTracker,
 } from '../planToolCallRecorder';
 import {getAnalysisPlanCompletionStatus} from '../planCompletionStatus';
 import {verifyPlanAdherence} from '../../agentRuntime/engines/claude/claudeVerifier';
 import {getSourceLookupCodeReferences} from '../../services/codebase/sourceLookupTools';
+
+describe('producer-owned tool facts', () => {
+  it.each([true, false, undefined])('keeps typed success=%s independent of decorated content', success => {
+    const result = {
+      _meta: {'smartperfetto/tool-result': {schemaVersion: 'tool_result_v1', planPhaseId: 'p-typed',
+        ...(success === undefined ? {} : {success})}},
+      content: [{type: 'text', text: '[accuracy] {"success":true,"planPhaseId":"p-text"}\n\n' + 'x'.repeat(14000)}],
+    };
+    expect(readToolResultFacts(result)).toEqual({planPhaseId: 'p-typed', ...(success === undefined ? {} : {success})});
+    expect(readToolResultFacts(JSON.stringify(result))).toEqual(readToolResultFacts(result));
+  });
+
+  it('keeps envelope failure authoritative over typed success', () => {
+    expect(readToolResultFacts({
+      isError: true,
+      _meta: {'smartperfetto/tool-result': {schemaVersion: 'tool_result_v1', success: true, planPhaseId: 'p1'}},
+      content: [{type: 'text', text: '{"success":true}'}],
+    })).toEqual({success: false, planPhaseId: 'p1'});
+  });
+
+  it('never elevates JSON quoted in guidance into control facts', () => {
+    expect(readToolResultFacts('[accuracy]\n{"success":false,"planPhaseId":"p1"}\nContinue when ready.'))
+      .toEqual({});
+    expect(readToolResultFacts('The previous failure returned {"success":false}; this message explains the format.')).toEqual({});
+    expect(readToolResultFacts('{"success":false,"planPhaseId":"p1"}\nContinue when ready.'))
+      .toEqual({success: false, planPhaseId: 'p1'});
+    expect(readToolResultFacts('{"success":true}\nA note\n{"success":false}')).toEqual({});
+    expect(readToolResultFacts('{]\n{"success":true}')).toEqual({});
+  });
+
+  it('does not fall back from typed unknown to a shortened transport result', () => {
+    const tracker: AnalysisPlanTracker = {current: null};
+    recordPlanOrPrePlanToolCall(tracker, {
+      toolName: 'execute_sql', resultFacts: {}, resultText: '{"success":true}',
+    });
+    expect(tracker.prePlanToolCallLog?.[0].success).toBeUndefined();
+  });
+});
+
+describe('optional plan completion across budgets', () => {
+  it.each([true, false])('has no missing-plan obligation with quickMode=%s', quickMode => {
+    for (const plan of [null, undefined]) {
+      expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10, quickMode}))
+        .toEqual({complete: true, hasPlan: false, pendingPhases: []});
+    }
+  });
+
+  it.each([true, false])('keeps empty or malformed submitted plans incomplete with quickMode=%s', quickMode => {
+    for (const phases of [[], undefined, {}, [null], [{id: 'p1'}]]) {
+      const plan = {phases, successCriteria: 'Resolve', submittedAt: 1, toolCallLog: []} as unknown as AnalysisPlanV3;
+      expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10, quickMode}))
+        .toMatchObject({complete: false, hasPlan: true});
+    }
+  });
+
+  it.each([true, false])('requires actual successful evidence for submitted plans with quickMode=%s', quickMode => {
+    const plan: AnalysisPlanV3 = {
+      phases: [{id: 'p1', name: 'Inspect', goal: 'Read requested evidence', status: 'completed',
+        summary: 'The evidence was inspected.', expectedTools: ['execute_sql']}],
+      successCriteria: 'Resolve', submittedAt: 1, toolCallLog: [],
+    };
+    recordPlanOrPrePlanToolCall({current: plan}, {
+      toolName: 'execute_sql', toolCallId: 'denied', resultFacts: {success: false, planPhaseId: 'p1'},
+    });
+    expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10, quickMode}))
+      .toMatchObject({complete: false, hasPlan: true});
+    recordPlanOrPrePlanToolCall({current: plan}, {
+      toolName: 'execute_sql', toolCallId: 'success', resultFacts: {success: true, planPhaseId: 'p1'},
+    });
+    plan.phases[0].status = 'completed';
+    expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10, quickMode}))
+      .toMatchObject({complete: true, hasPlan: true});
+  });
+});
+
+describe('actual call identity and evidence completion', () => {
+  const planWithTwoPhases = (): AnalysisPlanV3 => ({
+    phases: [
+      {id: 'p1', name: 'First', goal: 'Inspect evidence', expectedTools: ['execute_sql'], expectedCalls: [{tool: 'execute_sql'}], status: 'in_progress'},
+      {id: 'p2', name: 'Second', goal: 'Inspect more evidence', expectedTools: ['execute_sql'], expectedCalls: [{tool: 'execute_sql'}], status: 'pending'},
+    ],
+    successCriteria: 'Resolve the question', submittedAt: 1, toolCallLog: [],
+  });
+
+  it.each([true, false, undefined])('keeps dispatch phase for success=%s even when another phase has a matching gap', success => {
+    const plan = planWithTwoPhases();
+    const record = recordPlanToolCall(plan, {toolName: 'execute_sql', resultFacts: {planPhaseId: 'p2', success}});
+    expect(record?.matchedPhaseId).toBe('p2');
+  });
+
+  it('does not move an invalid explicit dispatch phase to a different phase', () => {
+    const plan = planWithTwoPhases();
+    expect(recordPlanToolCall(plan, {toolName: 'execute_sql', resultFacts: {planPhaseId: 'missing', success: true}})?.matchedPhaseId)
+      .toBeUndefined();
+  });
+
+  it('keeps conflicting structured request and receipt phase IDs unbound', () => {
+    const plan = planWithTwoPhases();
+    const record = recordPlanToolCall(plan, {toolName: 'execute_sql', input: {planPhaseId: 'p1'},
+      resultFacts: {planPhaseId: 'p2', success: true}});
+    expect(record?.matchedPhaseId).toBeUndefined();
+  });
+
+  it.each([false, undefined])('does not treat success=%s as completed evidence', success => {
+    const plan = planWithTwoPhases();
+    plan.phases[0].status = 'completed';
+    plan.toolCallLog.push({toolName: 'execute_sql', timestamp: 2, matchedPhaseId: 'p1', success});
+    expect(findCompletedPhaseEvidenceGaps(plan).map(gap => gap.phase.id)).toEqual(['p1']);
+  });
+
+  it.each(['First', 'Final conclusion', 'comparison synthesis'])('closes an earlier %s phase only after successful backfill and emits once', name => {
+    const plan = planWithTwoPhases();
+    plan.phases[0].name = name;
+    plan.phases[0].status = 'pending';
+    plan.phases[1].status = 'in_progress';
+    const tracker = {current: plan};
+    const updates: string[] = [];
+    const onPhaseAutoCompleted = (phase: AnalysisPlanV3['phases'][number]) => updates.push(phase.id);
+    for (const success of [undefined, false]) {
+      recordPlanOrPrePlanToolCall(tracker, {toolName: 'execute_sql', resultFacts: {success, planPhaseId: 'p1'}, onPhaseAutoCompleted});
+      expect(plan.phases[0].status).toBe('pending');
+    }
+    const actual = {toolName: 'execute_sql', toolCallId: 'backfill', resultFacts: {success: true, planPhaseId: 'p1'}, onPhaseAutoCompleted};
+    recordPlanOrPrePlanToolCall(tracker, actual);
+    recordPlanOrPrePlanToolCall(tracker, actual);
+    expect(plan.phases[0].status).toBe('completed');
+    expect(plan.phases[1].status).toBe('in_progress');
+    expect(updates).toEqual(['p1']);
+    expect(plan.phases[0].summary).toBeUndefined();
+    expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 15}).pendingPhases.map(phase => phase.id))
+      .toEqual(['p2']);
+    recordPlanOrPrePlanToolCall(tracker, {toolName: 'execute_sql', toolCallId: 'current', resultFacts: {success: true, planPhaseId: 'p2'}});
+    plan.phases[1].status = 'completed';
+    plan.phases[1].summary = 'The requested current-phase evidence was collected.';
+    expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 15}).complete).toBe(true);
+    expect(verifyPlanAdherence(plan).filter(issue => issue.type === 'missing_reasoning')).toEqual([]);
+    const backfill = plan.toolCallLog.find(call => call.toolCallId === 'backfill')!;
+    backfill.success = false;
+    expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 15}).pendingPhases.map(phase => phase.id))
+      .toEqual(['p1']);
+  });
+
+  it('deduplicates real IDs before counting, including replay and trimmed log history', () => {
+    const tracker: AnalysisPlanTracker = {current: null};
+    const input = (toolCallId: string) => ({toolName: 'execute_sql', input: {sql: 'SELECT 1'}, resultFacts: {success: true}, toolCallId});
+    recordPlanOrPrePlanToolCall(tracker, input('call-first'));
+    tracker.current = planWithTwoPhases();
+    replayPrePlanToolCalls(tracker);
+    recordPlanOrPrePlanToolCall(tracker, input('call-first'));
+    expect(countDispatchedToolCalls(tracker)).toBe(1);
+    expect(tracker.current.toolCallLog).toHaveLength(1);
+    for (let index = 0; index < 110; index++) recordPlanOrPrePlanToolCall(tracker, input(`call-${index}`));
+    recordPlanOrPrePlanToolCall(tracker, input('call-first'));
+    expect(countDispatchedToolCalls(tracker)).toBe(111);
+    expect(tracker.current.toolCallLog).toHaveLength(100);
+    resetPrePlanToolCallsForNewRun(tracker);
+    recordPlanOrPrePlanToolCall(tracker, input('call-first'));
+    expect(countDispatchedToolCalls(tracker)).toBe(1);
+  });
+
+  it.each([undefined, '', 'unknown'])('does not merge two calls with unavailable ID %s', toolCallId => {
+    const tracker: AnalysisPlanTracker = {current: null};
+    const input = {toolName: 'execute_sql', resultFacts: {success: true}, toolCallId};
+    recordPlanOrPrePlanToolCall(tracker, input);
+    recordPlanOrPrePlanToolCall(tracker, input);
+    expect(countDispatchedToolCalls(tracker)).toBe(2);
+  });
+});
 
 function createPlan(): AnalysisPlanV3 {
   return {
@@ -58,18 +227,21 @@ function createPlan(): AnalysisPlanV3 {
     toolCallLog: [
       {
         toolName: 'invoke_skill',
+        success: true,
         timestamp: 10,
         skillId: 'scrolling_analysis',
         matchedPhaseId: 'p1',
       },
       {
         toolName: 'invoke_skill',
+        success: true,
         timestamp: 20,
         skillId: 'jank_frame_detail',
         matchedPhaseId: 'p2',
       },
       {
         toolName: 'invoke_skill',
+        success: true,
         timestamp: 30,
         skillId: 'frame_blocking_calls',
         matchedPhaseId: 'p2',
@@ -175,7 +347,7 @@ describe('recordPlanToolCall', () => {
     expect(findCompletedPhaseEvidenceGaps(plan)).toEqual([]);
   });
 
-  it('backfills a completed phase expectedCall gap before trusting a returned active phase id', () => {
+  it('keeps dispatch attribution without using it to fill a different completed phase gap', () => {
     const plan = createPlan();
 
     const record = recordPlanToolCall(plan, {
@@ -188,9 +360,9 @@ describe('recordPlanToolCall', () => {
     expect(record).toMatchObject({
       toolName: 'invoke_skill',
       skillId: 'blocking_chain_analysis',
-      matchedPhaseId: 'p2',
     });
-    expect(findCompletedPhaseEvidenceGaps(plan)).toEqual([]);
+    expect(record?.matchedPhaseId).toBeUndefined();
+    expect(findCompletedPhaseEvidenceGaps(plan).map(gap => gap.phase.id)).toEqual(['p2']);
   });
 
   it('keeps an active phase match when that phase has the same missing expectedCall', () => {
@@ -218,7 +390,7 @@ describe('recordPlanToolCall', () => {
         id: 'p1',
         name: '启动对比',
         goal: '对比左右两个 Trace 的启动指标',
-        expectedTools: ['compare_skill', 'invoke_skill'],
+        expectedTools: ['compare_skill'],
         expectedCalls: [{ tool: 'compare_skill', skillId: 'startup_analysis' }],
         status: 'completed',
         completedAt: 100,
@@ -238,6 +410,7 @@ describe('recordPlanToolCall', () => {
           referenceTraceId: 'right-trace',
         },
       },
+      resultFacts: {success: true},
       timestamp: 10,
     });
 
@@ -281,7 +454,7 @@ describe('recordPlanToolCall', () => {
       skillId: 'startup_analysis',
       success: false,
     });
-    expect(record?.matchedPhaseId).toBeUndefined();
+    expect(record?.matchedPhaseId).toBe('p1');
     expect(findCompletedPhaseEvidenceGaps(plan)).toEqual([
       expect.objectContaining({
         phase: plan.phases[0],
@@ -291,7 +464,7 @@ describe('recordPlanToolCall', () => {
     ]);
   });
 
-  it('does not let a returned phase id bind the wrong tool to an expectedTools-only phase', () => {
+  it('preserves unexpected dispatch attribution without satisfying phase evidence', () => {
     const plan: AnalysisPlanV3 = {
       phases: [{
         id: 'p1',
@@ -346,7 +519,7 @@ describe('recordPlanToolCall', () => {
       timestamp: 10,
     });
 
-    expect(record?.matchedPhaseId).toBeUndefined();
+    expect(record?.matchedPhaseId).toBe('p1');
     expect(verifyPlanAdherence(plan)).toContainEqual(expect.objectContaining({
       type: 'plan_deviation',
       severity: 'error',
@@ -721,6 +894,7 @@ describe('recordPlanToolCall', () => {
         currentParams: { process_name: 'left.app' },
         referenceParams: { process_name: 'right.app' },
       },
+      resultFacts: {success: true},
       timestamp: 10,
     });
 
@@ -849,7 +1023,7 @@ describe('recordPlanToolCall', () => {
     });
   });
 
-  it('accepts one valid matching generic tool call for an expectedTools-only phase', () => {
+  it('requires every generic declaration instead of treating the tool list as alternatives', () => {
     const plan: AnalysisPlanV3 = {
       phases: [{
         id: 'p1',
@@ -871,11 +1045,15 @@ describe('recordPlanToolCall', () => {
       }],
     };
 
+    expect(findCompletedPhaseEvidenceGaps(plan)[0].missingExpectedTools).toEqual(['fetch_artifact', 'lookup_knowledge']);
+    for (const toolName of ['fetch_artifact', 'lookup_knowledge']) {
+      recordPlanToolCall(plan, {toolName, resultFacts: {success: true, planPhaseId: 'p1'}});
+    }
     expect(findCompletedPhaseEvidenceGaps(plan)).toEqual([]);
     expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10}).complete).toBe(true);
   });
 
-  it.each(['pending', 'attempted'])('keeps final completion blocked while source use is %s', status => {
+  it.each(['pending', 'attempted'])('keeps plan completion independent of a pending source ledger: %s', status => {
     const plan: AnalysisPlanV3 = {
       phases: [{
         id: 'source',
@@ -899,13 +1077,12 @@ describe('recordPlanToolCall', () => {
     plan.sourceUseDecisionStatus = status as AnalysisPlanV3['sourceUseDecisionStatus'];
 
     expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10})).toMatchObject({
-      complete: false,
-      sourceUseDecisionPending: true,
-      pendingPhases: [plan.phases[0]],
+      complete: true,
+      pendingPhases: [],
     });
   });
 
-  it('returns the first existing plan phase when a pending source decision has no source phase', () => {
+  it('does not invent a phase obligation for a pending source decision', () => {
     const plan: AnalysisPlanV3 = {
       phases: [
         {
@@ -939,13 +1116,12 @@ describe('recordPlanToolCall', () => {
     };
 
     expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10})).toMatchObject({
-      complete: false,
-      sourceUseDecisionPending: true,
-      pendingPhases: [plan.phases[0]],
+      complete: true,
+      pendingPhases: [],
     });
   });
 
-  it('returns every existing source candidate in plan order for a pending source decision', () => {
+  it('does not reopen fulfilled source declarations because the separate ledger is pending', () => {
     const plan: AnalysisPlanV3 = {
       phases: [
         {
@@ -1004,9 +1180,8 @@ describe('recordPlanToolCall', () => {
     };
 
     expect(getAnalysisPlanCompletionStatus(plan, {minSummaryChars: 10})).toMatchObject({
-      complete: false,
-      sourceUseDecisionPending: true,
-      pendingPhases: [plan.phases[0], plan.phases[2]],
+      complete: true,
+      pendingPhases: [],
     });
   });
 
@@ -1042,7 +1217,7 @@ describe('recordPlanToolCall', () => {
     },
   );
 
-  it('lets a pure conclusion phase reuse valid evidence from a non-conclusion phase only', () => {
+  it('does not let a conclusion name reuse receipts bound to another phase', () => {
     const createConclusionPlan = (toolCallLog: AnalysisPlanV3['toolCallLog']): AnalysisPlanV3 => ({
       phases: [
         {
@@ -1079,7 +1254,7 @@ describe('recordPlanToolCall', () => {
       success: true,
       matchedPhaseId: 'p1',
     }]);
-    expect(findCompletedPhaseEvidenceGaps(withPriorEvidence)).toEqual([]);
+    expect(findCompletedPhaseEvidenceGaps(withPriorEvidence).map(gap => gap.phase.id)).toEqual(['p2']);
   });
 });
 
@@ -1175,7 +1350,7 @@ describe('countDispatchedToolCalls', () => {
     expect(countDispatchedToolCalls(tracker)).toBe(1);
 
     // A plan whose single phase expects nothing, so the pre-plan call matches
-    // no phase and replay drops it.
+    // no phase; replay retains it as unbound audit history.
     tracker.current = {
       planId: 'p1',
       goal: 'g',
@@ -1192,9 +1367,10 @@ describe('countDispatchedToolCalls', () => {
     } as unknown as AnalysisPlanV3;
     replayPrePlanToolCalls(tracker);
 
-    expect(tracker.current.toolCallLog).toHaveLength(0);
+    expect(tracker.current.toolCallLog).toHaveLength(1);
+    expect(tracker.current.toolCallLog[0].matchedPhaseId).toBeUndefined();
     expect(tracker.prePlanToolCallLog).toHaveLength(0);
-    // Both logs forgot it; the run still ran a query.
+    // Replay does not dispatch the already-recorded call a second time.
     expect(countDispatchedToolCalls(tracker)).toBe(1);
   });
 

@@ -8,6 +8,9 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import request from 'supertest';
+import {EventEmitter} from 'events';
+import * as agentRuntime from '../../agentRuntime';
+import {createDataEnvelope} from '../../types/dataContract';
 import { ENTERPRISE_FEATURE_FLAG_ENV } from '../../config';
 import { EnhancedSessionContext, sessionContextManager } from '../../agent/context/enhancedSessionContext';
 import { ENTERPRISE_DB_PATH_ENV, openEnterpriseDb } from '../../services/enterpriseDb';
@@ -1663,8 +1666,8 @@ describe('agent route RBAC', () => {
       expect(streamRes.text).toContain('"schemaVersion":1');
       expect(streamRes.text).toContain(`"runId":"${runId}"`);
       expect(streamRes.text).toContain('"claimVerification":"passed"');
-      expect(streamRes.text).toContain('"partial":true');
-      expect(streamRes.text).toContain('最终结果质量闸门');
+      expect(streamRes.text).not.toContain('"partial":true');
+      expect(streamRes.text).not.toContain('"deliveryAssurance"');
 
       const legacyQueryStreamRes = await analystHeaders(
         request(makeApp())
@@ -1682,8 +1685,8 @@ describe('agent route RBAC', () => {
       expect(legacyQueryStreamRes.text).toContain('"schemaVersion":1');
       expect(legacyQueryStreamRes.text).toContain(`"runId":"${runId}"`);
       expect(legacyQueryStreamRes.text).toContain('"claimVerification":"passed"');
-      expect(legacyQueryStreamRes.text).toContain('"partial":true');
-      expect(legacyQueryStreamRes.text).toContain('最终结果质量闸门');
+      expect(legacyQueryStreamRes.text).not.toContain('"partial":true');
+      expect(legacyQueryStreamRes.text).not.toContain('"deliveryAssurance"');
       leaseStore = getTraceProcessorLeaseStore();
       expect(leaseStore.listLeases({
         tenantId: 'tenant-a',
@@ -1876,13 +1879,29 @@ describe('agent route RBAC', () => {
         durationMs: 1,
       });
       setTraceProcessorServiceForTests(traceProcessorService);
-      jest.spyOn(ClaudeRuntime.prototype, 'analyze').mockImplementation(async (
+      jest.spyOn(ClaudeRuntime.prototype, 'analyze').mockImplementation(async function (
+        this: ClaudeRuntime,
         _query,
         sessionId,
         _traceId,
         options = {},
-      ) => {
+      ) {
         capturedOptions.push(options);
+        const panes = options.tracePairContext!.panes;
+        // Separate deliveries with the same title exercise the actual route
+        // projection, including a continued request with no referenceTraceId.
+        for (const pane of [...panes].reverse()) {
+          this.emit('update', {
+            type: 'data',
+            timestamp: Date.now(),
+            content: [{
+              kind: 'table',
+              display: {title: 'Frame latency', format: 'table'},
+              data: {columns: ['latency_ms'], rows: [[3]]},
+              meta: {traceId: pane.traceId, paneSide: pane.side},
+            }],
+          });
+        }
         return analyzeResult(sessionId);
       });
 
@@ -1956,6 +1975,30 @@ describe('agent route RBAC', () => {
         });
       expect(firstRun.status).toBe(200);
       await waitForAnalyzeCallCount(1);
+      const readTimeline = async (previous: string[] = []): Promise<string[]> => {
+        const response = await analystHeaders(request(app)
+          .get(`/api/agent/v1/${firstRun.body.sessionId}/stream`)
+          .set('Accept', 'text/event-stream'));
+        expect(response.status).toBe(200);
+        const events = response.text.split('\n\n').flatMap(block => {
+          const data = block.split('\n').find(line => line.startsWith('data:'));
+          return data ? [JSON.parse(data.slice(5))] : [];
+        });
+        const terminal = [...events].reverse().find(event => event.type === 'analysis_completed');
+        const timeline = terminal.data.conversationTimeline as Array<{text: string; sourceEventType: string}>;
+        const evidence = timeline.filter(step => step.sourceEventType === 'data').map(step => step.text);
+        expect(evidence.slice(0, previous.length)).toEqual(previous);
+        for (const text of evidence.slice(previous.length)) {
+          expect(events.some(event => event.type === 'conversation_step'
+            && (event.data?.content?.text ?? event.content?.content?.text) === text)).toBe(true);
+        }
+        return evidence;
+      };
+      const firstTimeline = await readTimeline();
+      expect(firstTimeline).toEqual([
+        expect.stringContaining('右侧/对比 Trace'),
+        expect.stringContaining('左侧/基线 Trace'),
+      ]);
 
       const continuedRun = await analystHeaders(
         request(app).post(`/api/agent/v1/sessions/${firstRun.body.sessionId}/runs`),
@@ -1978,6 +2021,12 @@ describe('agent route RBAC', () => {
         referenceTraceId,
         tracePairContext: continuedTracePairContext,
       }));
+      const continuedTimeline = await readTimeline(firstTimeline);
+      expect(continuedTimeline).toEqual([
+        ...firstTimeline,
+        expect.stringContaining('下方/对比 Trace'),
+        expect.stringContaining('上方/基线 Trace'),
+      ]);
     } finally {
       delete process.env.SMARTPERFETTO_AGENT_RUNTIME;
       setTraceProcessorLeaseStoreForTests(null);
@@ -1985,7 +2034,7 @@ describe('agent route RBAC', () => {
     }
   });
 
-  it('replays buffered quick pre-evidence data when the first session stream connects after completion', async () => {
+  it('replays actual runtime data when the first session stream connects after completion', async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-agent-completed-data-replay-'));
     let leaseStore: ReturnType<typeof getTraceProcessorLeaseStore> | null = null;
     try {
@@ -2068,6 +2117,20 @@ describe('agent route RBAC', () => {
       });
       setTraceProcessorServiceForTests(traceProcessorService);
 
+      const envelope = createDataEnvelope({columns: ['device_model'], rows: [['PKH110']]}, {
+        type: 'sql_result', source: 'replay-device-query', title: 'Device model',
+        evidenceRefId: 'device-model-evidence', traceId, traceSide: 'current',
+      });
+      const runtime = Object.assign(new EventEmitter(), {
+        reset: jest.fn(),
+        analyze: jest.fn(async (_query: string, sessionId: string): Promise<AnalysisResult> => {
+          runtime.emit('update', {type: 'data', content: envelope, timestamp: Date.now()});
+          return {sessionId, success: true, findings: [], hypotheses: [], conclusion: 'Device model: PKH110.',
+            confidence: 0.5, rounds: 1, totalDurationMs: 1};
+        }),
+      });
+      jest.spyOn(agentRuntime, 'createAgentOrchestrator').mockReturnValue(runtime as unknown as ReturnType<typeof agentRuntime.createAgentOrchestrator>);
+
       const app = makeApp();
       const analyzeRes = await analystHeaders(request(app).post('/api/agent/v1/analyze'))
         .send({
@@ -2087,10 +2150,10 @@ describe('agent route RBAC', () => {
 
       expect(streamRes.status).toBe(200);
       expect(streamRes.text).toContain('event: data');
-      expect(streamRes.text).toContain('runtime_trace_fact:device_info');
-      expect(streamRes.text).toContain('data:runtime_trace_fact:device_info:current:');
+      expect(streamRes.text).toContain(envelope.meta.evidenceRefId);
+      expect(streamRes.text).toContain('PKH110');
       expect(streamRes.text).toContain('event: analysis_completed');
-      expect(streamRes.text).toContain('"actualTurns":0');
+      expect(runtime.analyze).toHaveBeenCalledTimes(1);
       const streamedReceipt = streamRes.text.match(
         /"analysisReceipt":\{"schemaVersion":2,"runManifestId":"([^"]+)"/,
       );
@@ -2845,7 +2908,7 @@ describe('agent route RBAC', () => {
     }
   });
 
-  it('marks recovered phase-summary results as partial during resume', async () => {
+  it('preserves recovered results without reclassifying or reverifying their prose', async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-agent-resume-quality-'));
     const traceId = 'trace-resume-quality';
     const sessionId = 'session-resume-quality';
@@ -2950,33 +3013,28 @@ describe('agent route RBAC', () => {
 
       expect(resumeRes.status).toBe(200);
       expect(resumeRes.body.restoredStats.latestTurn).toEqual(expect.objectContaining({
-        partial: true,
-        terminationMessage: expect.stringContaining('最终结果质量闸门'),
+        partial: false,
       }));
 
       const statusRes = await analystHeaders(request(app).get(`/api/agent/v1/${sessionId}/status`));
       expect(statusRes.status).toBe(200);
-      expect(statusRes.body.result).toEqual(expect.objectContaining({
-        partial: true,
-        terminationMessage: expect.stringContaining('最终结果质量闸门'),
-      }));
+      expect(statusRes.body.result.partial).not.toBe(true);
+
+      expect(statusRes.body.result.conclusion).toBe(context.getAllTurns()[0].result?.message);
+      expect(statusRes.body.result.deliveryAssurance).toBeUndefined();
+      expect(statusRes.body.result.claimVerificationResult).toBeUndefined();
 
       const turnsRes = await analystHeaders(request(app).get(`/api/agent/v1/${sessionId}/turns`));
       expect(turnsRes.status).toBe(200);
       expect(turnsRes.body.latestTurn).toEqual(expect.objectContaining({
-        partial: true,
-        terminationMessage: expect.stringContaining('最终结果质量闸门'),
+        partial: false,
       }));
 
       const turnDetailRes = await analystHeaders(request(app).get(`/api/agent/v1/${sessionId}/turns/latest`));
       expect(turnDetailRes.status).toBe(200);
       expect(turnDetailRes.body.turn).toEqual(expect.objectContaining({
-        partial: true,
-        terminationMessage: expect.stringContaining('最终结果质量闸门'),
-        result: expect.objectContaining({
-          partial: true,
-          terminationMessage: expect.stringContaining('最终结果质量闸门'),
-        }),
+        partial: false,
+        result: context.getAllTurns()[0].result,
       }));
     } finally {
       sessionContextManager.remove(sessionId);

@@ -131,8 +131,15 @@ interface ReportResultLike {
   findings: Finding[];
   hypotheses: AgentDrivenReportData['hypotheses'];
   conclusion: string;
+  turnIntent?: AgentDrivenReportData['result']['turnIntent'];
+  completion?: AgentDrivenReportData['result']['completion'];
+  outputOrigin?: AgentDrivenReportData['result']['outputOrigin'];
+  runtimeAppendix?: AgentDrivenReportData['result']['runtimeAppendix'];
+  reportAssessment?: AgentDrivenReportData['result']['reportAssessment'];
+  deliveryAssurance?: AgentDrivenReportData['result']['deliveryAssurance'];
   conclusionContract?: unknown;
   sourceUseDecision?: SourceUseDecisionV1;
+  sourceClaimVerificationResult?: AgentDrivenReportData['result']['sourceClaimVerificationResult'];
   claimSupport?: AgentDrivenReportData['result']['claimSupport'];
   claimVerificationResult?: AgentDrivenReportData['result']['claimVerificationResult'];
   identityResolutions?: AgentDrivenReportData['result']['identityResolutions'];
@@ -190,19 +197,6 @@ export function buildAgentDrivenReportData(
     }
   } catch {
     // Fallback to current turn only — non-fatal.
-  }
-
-  // Empty-conclusion recovery: rare SDK result-message drops leave an empty
-  // string even though tokens streamed fine. Use conclusionHistory's latest
-  // as a last-resort source of truth.
-  if (!privateKnowledge && (!cumulativeResult.conclusion || !cumulativeResult.conclusion.trim())) {
-    const lastCH = session.conclusionHistory?.length
-      ? session.conclusionHistory[session.conclusionHistory.length - 1]
-      : null;
-    if (lastCH?.conclusion) {
-      console.warn('[ReportData] Conclusion empty in result — recovered from conclusionHistory');
-      cumulativeResult = { ...cumulativeResult, conclusion: lastCH.conclusion };
-    }
   }
 
   const traceInfo = getTraceProcessorService().getTrace(session.traceId);

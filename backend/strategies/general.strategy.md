@@ -3,6 +3,7 @@
 
 ---
 scene: general
+classification_description: "A specific question, trace fact, acknowledgement or analysis request without a more relevant specialized scene."
 priority: 99
 effort: high
 required_capabilities:

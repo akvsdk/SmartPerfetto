@@ -4,13 +4,25 @@
 
 import { describe, expect, it } from '@jest/globals';
 import type { AnalysisResult } from '../../agent/core/orchestratorTypes';
-import { createDataEnvelope } from '../../types/dataContract';
+import {parseConclusionContractDeclaration} from '../../agent/core/conclusionContract';
+import type {AnalysisTurnIntent} from '../../agentRuntime/analysisTurnIntent';
+import {attachFinalizationContext, takeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import {buildStrategyRegistrySnapshotFromDefinitions} from '../../agentv3/strategyLoader';
+import {analysisDeliveryFingerprint, type AnalysisDeliveryContext} from '../../types/analysisDelivery';
+import {createDataEnvelope, type DataEnvelope} from '../../types/dataContract';
 import { buildQuickRunReceipt, resolveQuickTurnBudget } from '../../agentRuntime/quickBudget';
+import type {SourceUseDecisionV1} from '../codebase/sourceUseDecision';
+import {captureEvidenceTable, type CapturedFieldSemantics} from '../evidence/evidenceCapture';
+import {prepareClaimEvidence} from '../evidence/claimEvidencePreparation';
+import type {EvidenceReadView} from '../evidence/evidenceReadView';
+import {finalizeAnalysisResult} from '../finalizeAnalysisResult';
 import { runClaimVerification } from '../verifier/claimVerificationRunner';
 import {
   applyFinalResultQualityGate,
   completeFinalResultComparisonIdentity,
   assessFinalResultQuality,
+  assessFinalResultQualityAssessment,
   hasDeliverableFinalReportHeading,
   looksLikePhaseSummaryFallback,
 } from '../finalResultQualityGate';
@@ -46,6 +58,58 @@ function result(overrides: Partial<AnalysisResult>): AnalysisResult {
     totalDurationMs: 1000,
     ...overrides,
   };
+}
+
+
+function resolvedIntent(overrides: Partial<AnalysisTurnIntent> = {}): AnalysisTurnIntent {
+  return {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: 'registry-test',
+    taskKind: 'investigation', sceneId: 'general', scope: 'bounded_question',
+    recommendedComplexity: 'quick', deliverable: 'answer', evidenceAccess: 'read_new', ...overrides};
+}
+
+function finalizationContext(target: AnalysisResult): AnalysisDeliveryContext {
+  const candidate = {candidateRef: 'candidate-test', runId: 'run-test', attemptId: 'attempt-test',
+    conclusionFingerprint: analysisDeliveryFingerprint(target.conclusion)};
+  return {entry: 'new_finalization', acceptedCandidate: candidate,
+    completion: {...candidate, schemaVersion: 1, runtimeKind: 'claude-agent-sdk', status: 'completed'},
+    outputOrigin: 'sdk_final', turnIntent: resolvedIntent()};
+}
+
+function assessUnreviewedReport(input: Parameters<typeof assessFinalResultQuality>[0]) {
+  const assessment = assessFinalResultQualityAssessment(input);
+  expect(assessment.assurance.report).toBe('not_checked');
+  return assessment.selectedIssue;
+}
+
+function capturedReadView(envelope: DataEnvelope, fields: Record<string, CapturedFieldSemantics>): EvidenceReadView {
+  const store = new ArtifactStore();
+  store.registerStandaloneEvidenceCapture(captureEvidenceTable(envelope.data, fields),
+    {meta: envelope.meta, display: envelope.display});
+  return store.createEvidenceReadView({ownerKey: 'quality-capture',
+    allowedTraces: [{traceId: 'trace-a', traceSide: 'current'}]});
+}
+
+async function finalizeWithConsistentSemanticFixture(target: AnalysisResult, envelope: DataEnvelope,
+  evidenceReadView: EvidenceReadView, sourceUse?: SourceUseDecisionV1) {
+  const runId = 'quality-finalization';
+  const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: runId});
+  const candidate = {runId, attemptId: 'attempt', candidateRef: 'candidate',
+    conclusionFingerprint: analysisDeliveryFingerprint(target.conclusion)};
+  attachFinalizationContext(target, {runId, sessionId: target.sessionId, deadlineMs: Date.now() + 10_000,
+    strategyRegistry: registry, traceIdentity: {currentTraceId: 'trace-a'},
+    turnIntent: resolvedIntent({registryFingerprint: registry.registryFingerprint, taskKind: 'fact', evidenceAccess: 'existing_only'}),
+    deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
+      completion: {...candidate, schemaVersion: 1, status: 'completed', runtimeKind: 'openai-agents-sdk'}},
+    evidenceReadView, sourceUse,
+    dispatchText: async () => ({status: 'ok', text: JSON.stringify({schemaVersion: 'final_semantic_response@1',
+      bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: target.conclusion.length}]},
+      claims: target.conclusionContract?.claims?.map(claim => ({claimId: claim.id, consistency: 'consistent',
+        contentLocations: [{start: 0, end: target.conclusion.length, text: target.conclusion}], issues: []})),
+      omissions: [], requirements: []})}),
+  });
+  return finalizeAnalysisResult({result: target, context: takeFinalizationContext(target),
+    owner: {runId, signal: new AbortController().signal, isCurrent: () => true, assertAuthorized: () => {}},
+    query: 'What does the captured trace show?', dataEnvelopes: [envelope]});
 }
 
 describe('final result quality gate', () => {
@@ -99,7 +163,7 @@ describe('final result quality gate', () => {
     expect(hasDeliverableFinalReportHeading('### Phase 1 关键发现记录\n\nTTID=1912ms。')).toBe(false);
   });
 
-  it('detects phase-summary fallback text as non-final output', () => {
+  it('keeps the legacy phase detector without using it as completion authority', () => {
     const fallback = [
       '## 综合结论',
       '',
@@ -116,7 +180,7 @@ describe('final result quality gate', () => {
     expect(assessFinalResultQuality({
       result: result({ conclusion: fallback }),
       query: '分析这个启动 trace',
-    })?.code).toBe('plan_summary_fallback');
+    })).toBeUndefined();
 
     expect(looksLikePhaseSummaryFallback([
       '## 综合结论',
@@ -285,6 +349,7 @@ describe('final result quality gate', () => {
 
     const issue = applyFinalResultQualityGate({
       result: target,
+      context: finalizationContext(target),
       query: '分析这个 trace',
     });
 
@@ -292,7 +357,7 @@ describe('final result quality gate', () => {
     expect(target.partial).toBe(true);
     expect(target.confidence).toBe(0.55);
     expect(target.terminationReason).toBe('quality_gate_failed');
-    expect(target.terminationMessage).toContain('最终结果质量闸门');
+    expect(target.terminationMessage).toContain('当前候选没有可交付的正文');
   });
 
   it('appends the same quality issue only once across repeated projections', () => {
@@ -304,6 +369,7 @@ describe('final result quality gate', () => {
 
     const issues = Array.from({length: 3}, () => applyFinalResultQualityGate({
       result: target,
+      context: finalizationContext(target),
       query: '分析 IO 根因',
     }));
 
@@ -313,7 +379,7 @@ describe('final result quality gate', () => {
     expect(target.terminationMessage!.split(issueMessage)).toHaveLength(2);
   });
 
-  it('flags process narration that leaked into the final conclusion', () => {
+  it('does not infer SDK completion from process-like wording', () => {
     const leaked = [
       '1. **冷启动**，dur=1338.65ms，原分类warm已被重分类为cold（R009）',
       '2. **TTID=1912.20ms > dur=1338.65ms**，差距573.55ms（R008触发）',
@@ -325,10 +391,10 @@ describe('final result quality gate', () => {
     expect(assessFinalResultQuality({
       result: result({ conclusion: leaked }),
       query: '分析启动性能',
-    })?.code).toBe('process_narration_conclusion');
+    })).toBeUndefined();
   });
 
-  it('flags structured interim markdown that has no deliverable final-report heading', () => {
+  it('does not infer SDK completion from missing final-report headings', () => {
     const interim = [
       '### Phase 1 关键发现记录',
       '',
@@ -343,7 +409,7 @@ describe('final result quality gate', () => {
     expect(assessFinalResultQuality({
       result: result({ conclusion: interim }),
       query: '分析启动性能',
-    })?.code).toBe('missing_final_report_heading');
+    })).toBeUndefined();
   });
 
   it('does not require a deliverable final-report heading for quick-run answers', () => {
@@ -484,12 +550,14 @@ describe('final result quality gate', () => {
 
     const issue = applyFinalResultQualityGate({
       result: target,
+      context: finalizationContext(target),
       query: '这条 trace 的滑动总帧数和 janky frame 数是多少？',
     });
 
-    expect(issue?.code).toBe('quick_verifier_failed');
+    expect(issue?.code).toBe('verifier_contradicted_claim');
     expect(target.partial).toBe(true);
-    expect(target.terminationMessage).toContain('未通过证据核对');
+    expect(issue?.message.trim()).toBeTruthy();
+    expect(target.terminationMessage).toBe(issue?.message);
   });
 
   it('blocks unverified causal relations in focused answers without requiring a full report', () => {
@@ -532,15 +600,16 @@ describe('final result quality gate', () => {
 
     const issue = applyFinalResultQualityGate({
       result: target,
+      context: finalizationContext(target),
       query: '分析这一帧为什么掉帧',
     });
 
     expect(issue?.code).toBe('causal_claim_unverified');
     expect(target.partial).toBe(true);
-    expect(target.terminationMessage).toContain('候选关系或推断');
+    expect(target.terminationMessage).toContain('尚未通过关系证据核验');
   });
 
-  it('marks over-expanded quick triage reports as partial', () => {
+  it('does not reject a deliverable based on quick budget or report headings', () => {
     const quickRun: NonNullable<AnalysisResult['quickRun']> = {
       requestedMode: 'fast',
       resolvedMode: 'quick',
@@ -592,12 +661,13 @@ describe('final result quality gate', () => {
 
     const issue = applyFinalResultQualityGate({
       result: target,
+      context: finalizationContext(target),
       query: '请完整诊断这次滑动卡顿的根因、优化方案和代码责任链',
     });
 
-    expect(issue?.code).toBe('quick_full_report_shape');
-    expect(target.partial).toBe(true);
-    expect(target.terminationMessage).toContain('快速模式');
+    expect(issue).toBeUndefined();
+    expect(target.partial).not.toBe(true);
+    expect(target.terminationMessage).toBeUndefined();
   });
 
   it('does not count carried prior-turn claims as current quick-report expansion', () => {
@@ -678,8 +748,8 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags sparse unverified analysis conclusions and keeps concise factual answers alone', () => {
-    expect(assessFinalResultQuality({
+  it('keeps report coverage unknown while rejecting explicitly unverified causal support', () => {
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -713,9 +783,9 @@ describe('final result quality gate', () => {
         } as any],
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toMatchObject({code: 'causal_claim_unverified', recoveryKind: 'correct_evidence'});
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -737,9 +807,9 @@ describe('final result quality gate', () => {
         },
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toBeUndefined();
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -780,9 +850,9 @@ describe('final result quality gate', () => {
         },
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toMatchObject({code: 'causal_claim_unverified', recoveryKind: 'correct_evidence'});
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -807,18 +877,18 @@ describe('final result quality gate', () => {
         },
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toMatchObject({code: 'causal_claim_unverified', recoveryKind: 'correct_evidence'});
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
         conclusionContract: undefined,
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toBeUndefined();
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -843,7 +913,7 @@ describe('final result quality gate', () => {
       // verifier has a result, and hiding it behind sparseness loses that.
     })?.code).toBe('verifier_contradicted_claim');
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: '应用包名是 com.example.demo。',
         findings: [],
@@ -852,7 +922,7 @@ describe('final result quality gate', () => {
       query: '这个 trace 的应用包名是什么？',
     })).toBeUndefined();
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: '最慢函数是 ChaosTask，self_ms=456ms。',
         findings: [],
@@ -861,7 +931,7 @@ describe('final result quality gate', () => {
       query: '哪个函数最慢？',
     })).toBeUndefined();
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -888,9 +958,9 @@ describe('final result quality gate', () => {
         },
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('scene_contract_incomplete');
+    })).toBeUndefined();
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: 'TTID=1912ms，主要是主线程模拟负载。',
         findings: [],
@@ -910,11 +980,14 @@ describe('final result quality gate', () => {
         },
       }),
       query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toBeUndefined();
   });
 
-  it('does not count a deterministically verified overlap as causal evidence', () => {
-    const conclusionContract = {
+  it('does not count a deterministically verified overlap as causal evidence', async () => {
+    const body = 'overlap causes the startup delay';
+    const subject = {evidenceRefId: 'data:overlap-only', rowIndex: 0};
+    const object = {evidenceRefId: 'data:overlap-only', rowIndex: 1};
+    const declaration = parseConclusionContractDeclaration({
       schemaVersion: 'conclusion_contract_v1',
       mode: 'focused_answer',
       conclusions: [],
@@ -923,18 +996,33 @@ describe('final result quality gate', () => {
       claims: [{
         id: 'claim-overlap-is-cause',
         kind: 'causal',
-        text: 'overlap causes the startup delay',
+        text: body,
         references: [{
           evidenceRefId: 'data:overlap-only',
           rowIndex: 0,
           column: 'blocked_ms',
           value: 120,
         }],
-        relationRefs: ['relation:overlap-only'],
+        relationRefs: ['proposal:overlap-only'],
+        // A valid causal declaration is expressible without a native rule that proves it.
+        semantics: {schemaVersion: 'claim_semantics@1', predicate: 'causal.mechanism',
+          polarity: 'affirmed', discourse: 'asserted', quantifier: 'one', modality: 'certain',
+          scope: {population: 'cited_rows', subjectRefs: [subject], objectRefs: [object]}},
+      }],
+      relationProposals: [{
+        schemaVersion: 'evidence_relation_candidate@1',
+        id: 'proposal:overlap-only',
+        kind: 'overlap',
+        direction: 'symmetric',
+        subject,
+        object,
       }],
       uncertainties: [],
       nextSteps: [],
-    } as any;
+    });
+    expect(declaration.issues).toEqual([]);
+    const conclusionContract = declaration.contract;
+    if (!conclusionContract) throw new Error('Expected a valid overlap declaration');
     const envelope = createDataEnvelope({
       columns: ['ts', 'dur', 'blocked_ms'],
       rows: [[100, 50, 120], [125, 20, 0]],
@@ -946,35 +1034,38 @@ describe('final result quality gate', () => {
       traceId: 'trace-a',
       traceSide: 'current',
     });
+    const origin = {kind: 'native_producer' as const, definitionFingerprint: 'overlap-fixture'};
+    const evidenceReadView = capturedReadView(envelope, {
+      ts: {unit: 'ns', timeRole: 'start', clock: 'trace_monotonic', origin},
+      dur: {unit: 'ns', timeRole: 'duration', clock: 'trace_monotonic', origin},
+      blocked_ms: {unit: 'ms', origin},
+    });
+    const relationCandidates = conclusionContract.relationProposals;
+    const preparedEvidence = await prepareClaimEvidence({conclusionContract, relationCandidates, evidenceReadView});
     const verified = runClaimVerification({
       conclusionContract,
       dataEnvelopes: [envelope],
-      relationCandidates: [{
-        schemaVersion: 'evidence_relation_candidate@1',
-        id: 'relation:overlap-only',
-        kind: 'overlap',
-        direction: 'symmetric',
-        subject: {evidenceRefId: 'data:overlap-only', rowIndex: 0},
-        object: {evidenceRefId: 'data:overlap-only', rowIndex: 1},
-      }],
+      relationCandidates,
+      preparedEvidence,
     });
 
     expect(verified.evidenceContract.relations[0].verificationStatus).toBe('verified');
     expect(verified.claimSupport[0].relationEvaluation).toBe('candidate');
-    expect(verified.claimVerificationResult.claimResults[0].status).toBe('inference');
-    expect(assessFinalResultQuality({
-      result: result({
-        conclusion: 'Main-thread work overlaps the slow startup window.',
-        findings: [],
-        conclusionContract,
-        claimSupport: verified.claimSupport,
-        claimVerificationResult: verified.claimVerificationResult,
-      }),
-      query: '分析这个启动 trace',
-    })?.code).toBe('sparse_unverified_conclusion');
+    expect(verified.claimVerificationResult.claimResults[0]).toMatchObject({status: 'inference',
+      deterministicProof: {kind: 'none', status: 'candidate', reason: 'unsupported_predicate'}});
+    // Even a complete, agreeing semantic response cannot turn an overlap into a causal proof.
+    const finalized = await finalizeWithConsistentSemanticFixture(result({
+      conclusion: body, conclusionContract,
+    }), envelope, evidenceReadView);
+    expect(finalized.semanticAssessment?.coverage).toMatchObject({body: 'complete', claims: 'complete'});
+    expect(finalized.result.claimSupport?.[0].relationEvaluation).toBe('candidate');
+    expect(finalized.result.claimVerificationResult).toMatchObject({schemaVersion: 'claim_verifier@2', passed: false,
+      status: 'partial', claimResults: [{claimId: 'claim-overlap-is-cause', status: 'partial',
+        deterministicProof: {kind: 'none', status: 'candidate', reason: 'unsupported_predicate'}}]});
+    expect(finalized.result.deliveryAssurance?.claims).toBe('coverage_incomplete');
   });
 
-  it('flags jank reports that pass evidence checks but omit scene-required sections', () => {
+  it('does not infer report coverage from legacy prose: flags jank reports that pass evidence checks but omit scene-required sections', () => {
     const shortJankReport = [
       '## 综合结论',
       '',
@@ -990,7 +1081,7 @@ describe('final result quality gate', () => {
       '- 将 CustomScroll_longFrameLoad 异步化或分帧执行。',
     ].join('\n');
 
-    expect(assessFinalResultQuality({
+    expect(assessUnreviewedReport({
       result: result({
         conclusion: shortJankReport,
         findings: [{
@@ -1011,7 +1102,7 @@ describe('final result quality gate', () => {
         },
       }),
       query: '分析滑动性能',
-    })?.code).toBe('scene_contract_incomplete');
+    })).toBeUndefined();
   });
 
   it('does not apply scene final-report contracts to factual scrolling questions', () => {
@@ -1072,18 +1163,19 @@ describe('final result quality gate', () => {
 
   it('records a quality-specific termination reason for a quality-only downgrade', () => {
     const qualityOnly = result({
-      conclusion: '分析完成。',
+      conclusion: '',
       terminationReason: undefined,
     });
     expect(applyFinalResultQualityGate({
       result: qualityOnly,
+      context: finalizationContext(qualityOnly),
       query: '分析这个 trace',
     })).toBeDefined();
     expect(qualityOnly.partial).toBe(true);
     expect(qualityOnly.terminationReason).toBe('quality_gate_failed');
   });
 
-  it('defers only a pre-finalized focused sparse check until historical evidence is attached', () => {
+  it('keeps pre-finalization drafts unmutated without a prose-length gate', () => {
     const pending = result({
       conclusion: '基于 120Hz，每帧预算约为 8.33ms。',
       conclusionContract: {
@@ -1102,6 +1194,7 @@ describe('final result quality gate', () => {
 
     expect(applyFinalResultQualityGate({
       result: pending,
+      context: {entry: 'runtime_draft'},
       query: '只基于上一条回答，不要重新分析',
       deferFocusedEvidenceFinalization: true,
     })).toBeUndefined();
@@ -1109,11 +1202,12 @@ describe('final result quality gate', () => {
 
     expect(applyFinalResultQualityGate({
       result: pending,
+      context: {entry: 'runtime_draft'},
       query: '只基于上一条回答，不要重新分析',
-    })?.code).toBe('sparse_unverified_conclusion');
+    })).toBeUndefined();
   });
 
-  it('does not accept empty mentions as satisfying scene-required sections', () => {
+  it('does not infer report coverage from legacy prose: does not accept empty mentions as satisfying scene-required sections', () => {
     const hollowReport = [
       '## 综合结论',
       '',
@@ -1128,7 +1222,7 @@ describe('final result quality gate', () => {
       '- process_slice_cpu_hotspots 显示 CPU效率98.4%。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: hollowReport,
         findings: [{ severity: 'critical', title: '长任务', description: 'CPU heavy', evidence: ['98.4%'] } as any],
@@ -1136,13 +1230,11 @@ describe('final result quality gate', () => {
       query: '分析滑动性能',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('掉帧与根因分布');
-    expect(issue?.message).toContain('代表帧分析');
+    expect(issue).toBeUndefined();
   });
 
-  it('uses conclusion contract scene metadata when the query is generic', () => {
-    const issue = assessFinalResultQuality({
+  it('does not infer report coverage from legacy prose: uses conclusion contract scene metadata when the query is generic', () => {
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: [
           '## 综合结论',
@@ -1168,7 +1260,7 @@ describe('final result quality gate', () => {
       query: '分析这个 trace',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts jank reports that keep root-cause distribution and representative-frame sections', () => {
@@ -1274,7 +1366,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags pipeline reports that omit rendering-stage and BufferQueue/Fence boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags pipeline reports that omit rendering-stage and BufferQueue/Fence boundaries', () => {
     const hollowPipelineReport = [
       '# 渲染管线分析报告',
       '',
@@ -1287,7 +1379,7 @@ describe('final result quality gate', () => {
       '- 需要补充同步证据。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: hollowPipelineReport,
         findings: [{ severity: 'warning', title: '管线边界缺失', description: 'no details', evidence: ['BufferQueue'] } as any],
@@ -1296,9 +1388,7 @@ describe('final result quality gate', () => {
       sceneType: 'pipeline',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('渲染/显示阶段拆分');
-    expect(issue?.message).toContain('BufferQueue/Fence 边界');
+    expect(issue).toBeUndefined();
   });
 
   it('does not require BufferQueue/Fence sections for generic pipeline-identification reports', () => {
@@ -1327,7 +1417,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('routes pure graphics-memory pipeline gaps to the graphics boundary instead of BufferQueue/Fence', () => {
+  it('does not infer report coverage from legacy prose: routes pure graphics-memory pipeline gaps to the graphics boundary instead of BufferQueue/Fence', () => {
     const graphicsReportWithoutBoundary = [
       '# 渲染管线分析报告',
       '',
@@ -1345,18 +1435,16 @@ describe('final result quality gate', () => {
       '- GraphicBuffer 数量偏多，需要进一步确认。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({ conclusion: graphicsReportWithoutBoundary }),
       query: 'GraphicBuffer dma-buf 图形内存证据怎么分析',
       sceneType: 'pipeline',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('图形内存/刷新策略边界');
-    expect(issue?.message).not.toContain('BufferQueue/Fence 边界');
+    expect(issue).toBeUndefined();
   });
 
-  it('flags HWC/SF overlay pipeline reports that omit the conditional boundary', () => {
+  it('does not infer report coverage from legacy prose: flags HWC/SF overlay pipeline reports that omit the conditional boundary', () => {
     const reportWithoutPolicyBoundary = [
       '# 渲染管线分析报告',
       '',
@@ -1371,15 +1459,13 @@ describe('final result quality gate', () => {
       '| HWC/display | HWC overlay 命中，presentDisplay 5.1ms | display 阶段正常 |',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({ conclusion: reportWithoutPolicyBoundary }),
       query: 'HWC overlay 怎么分析',
       sceneType: 'pipeline',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('图形内存/刷新策略边界');
-    expect(issue?.message).not.toContain('BufferQueue/Fence 边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts graphics-memory pipeline reports without a BufferQueue/Fence section when no fence evidence is requested', () => {
@@ -1474,7 +1560,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags network reports that omit request-stage evidence boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags network reports that omit request-stage evidence boundaries', () => {
     const shortNetworkReport = [
       '# 网络分析报告',
       '',
@@ -1487,7 +1573,7 @@ describe('final result quality gate', () => {
       '- network_analysis 显示网络包较多。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortNetworkReport,
         findings: [{
@@ -1501,12 +1587,10 @@ describe('final result quality gate', () => {
       sceneType: 'network',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('请求阶段证据边界');
-    expect(issue?.message).not.toContain('网络栈/版本策略边界');
+    expect(issue).toBeUndefined();
   });
 
-  it('flags generic slow-network reports that omit packet-vs-request boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags generic slow-network reports that omit packet-vs-request boundaries', () => {
     const shortNetworkReport = [
       '# 网络分析报告',
       '',
@@ -1519,7 +1603,7 @@ describe('final result quality gate', () => {
       '- network_analysis 显示 packet activity 存在。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortNetworkReport,
         findings: [{
@@ -1533,11 +1617,10 @@ describe('final result quality gate', () => {
       sceneType: 'network',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('请求阶段证据边界');
+    expect(issue).toBeUndefined();
   });
 
-  it('rejects hollow network request-stage boundary mentions', () => {
+  it('does not infer report coverage from legacy prose: rejects hollow network request-stage boundary mentions', () => {
     const hollowReport = [
       '# 网络分析报告',
       '',
@@ -1546,7 +1629,7 @@ describe('final result quality gate', () => {
       '这里缺少 DNS/TLS/TTFB 的证据边界。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: hollowReport,
         findings: [{
@@ -1560,8 +1643,7 @@ describe('final result quality gate', () => {
       sceneType: 'network',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('请求阶段证据边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts network request-stage reports without requiring stack-policy sections', () => {
@@ -1591,7 +1673,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags network stack-policy reports that omit version and config boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags network stack-policy reports that omit version and config boundaries', () => {
     const shortStackReport = [
       '# 网络分析报告',
       '',
@@ -1600,7 +1682,7 @@ describe('final result quality gate', () => {
       'Android 17 ECH 和 local network permission 导致请求失败。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortStackReport,
         findings: [{
@@ -1614,9 +1696,7 @@ describe('final result quality gate', () => {
       sceneType: 'network',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('网络栈/版本策略边界');
-    expect(issue?.message).not.toContain('请求阶段证据边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts network stack-policy reports without requiring request-stage sections', () => {
@@ -1697,7 +1777,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags power reports that omit Job/Work/FGS governance boundaries for job quota questions', () => {
+  it('does not infer report coverage from legacy prose: flags power reports that omit Job/Work/FGS governance boundaries for job quota questions', () => {
     const shortPowerReport = [
       '# 功耗分析报告',
       '',
@@ -1710,7 +1790,7 @@ describe('final result quality gate', () => {
       '- android_job_scheduler_events 显示后台任务运行窗口较长。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortPowerReport,
         findings: [{
@@ -1724,9 +1804,7 @@ describe('final result quality gate', () => {
       sceneType: 'power',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('Job/Work/FGS 治理边界');
-    expect(issue?.message).not.toContain('Alarm/Wakeup/Vitals 边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts Job/Work/FGS power reports without requiring alarm or Vitals sections', () => {
@@ -1756,7 +1834,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags power reports that omit Alarm/Wakeup/Vitals boundaries for alarm and wakelock questions', () => {
+  it('does not infer report coverage from legacy prose: flags power reports that omit Alarm/Wakeup/Vitals boundaries for alarm and wakelock questions', () => {
     const shortWakeupReport = [
       '# 功耗分析报告',
       '',
@@ -1769,7 +1847,7 @@ describe('final result quality gate', () => {
       '- wakeup_frequency_summary 显示 wakeups/min 偏高。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortWakeupReport,
         findings: [{
@@ -1783,9 +1861,7 @@ describe('final result quality gate', () => {
       sceneType: 'power',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('Alarm/Wakeup/Vitals 边界');
-    expect(issue?.message).not.toContain('Job/Work/FGS 治理边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts Alarm/Wakeup/Vitals power reports without requiring Job/Work/FGS sections', () => {
@@ -1842,7 +1918,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags memory reports that omit evidence scope and memory-type boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags memory reports that omit evidence scope and memory-type boundaries', () => {
     const shortMemoryReport = [
       '# 内存分析报告',
       '',
@@ -1851,7 +1927,7 @@ describe('final result quality gate', () => {
       'PSS 持续上涨，可能存在泄漏，需要优化内存。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortMemoryReport,
         findings: [{
@@ -1865,10 +1941,7 @@ describe('final result quality gate', () => {
       sceneType: 'memory',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('内存证据范围');
-    expect(issue?.message).toContain('内存类型拆分');
-    expect(issue?.message).toContain('置信度与缺失证据');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts memory reports that separate evidence source, memory type, and missing proof', () => {
@@ -1905,8 +1978,8 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags startup reports that omit user-requested diagnostic API boundaries', () => {
-    const issue = assessFinalResultQuality({
+  it('does not infer report coverage from legacy prose: flags startup reports that omit user-requested diagnostic API boundaries', () => {
+    const issue = assessUnreviewedReport({
       result: result({
         claimVerificationResult: {
           schemaVersion: 'claim_verifier@1',
@@ -1923,8 +1996,7 @@ describe('final result quality gate', () => {
       sceneType: 'startup',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('启动诊断 API/外部指标边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts startup reports that separate ApplicationStartInfo and external metrics from trace proof', () => {
@@ -1962,7 +2034,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags memory reports that omit user-requested diagnostic API boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags memory reports that omit user-requested diagnostic API boundaries', () => {
     const richWithoutDiagnosticBoundary = [
       '# 内存分析报告',
       '',
@@ -1983,14 +2055,13 @@ describe('final result quality gate', () => {
       '- 证据不足：需要区分高内存与泄漏，missing heap graph 时 confidence 为中等，不能把缺失证据写成没有问题。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({ conclusion: richWithoutDiagnosticBoundary }),
       query: '用 ApplicationExitInfo REASON_LOW_MEMORY 和 ProfilingManager heap dump 分析 OOM',
       sceneType: 'memory',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('内存诊断 API/剖析产物边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts memory reports that separate ApplicationExitInfo and profiling artifacts', () => {
@@ -2027,7 +2098,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags ANR reports that omit user-requested diagnostic API boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags ANR reports that omit user-requested diagnostic API boundaries', () => {
     const shortAnrReport = [
       '# ANR 分析报告',
       '',
@@ -2036,7 +2107,7 @@ describe('final result quality gate', () => {
       'ANR 发生在 5000ms 输入窗口，main thread Q4 Sleeping=82%，direct_blocker 是 Binder wait 1200ms。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortAnrReport,
         claimVerificationResult: {
@@ -2054,8 +2125,7 @@ describe('final result quality gate', () => {
       sceneType: 'anr',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('ANR 诊断 API/外部聚合边界');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts ANR reports that separate diagnostic APIs, profiling artifacts, and Vitals', () => {
@@ -2141,7 +2211,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags io reports that turn fsync into database root cause without boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags io reports that turn fsync into database root cause without boundaries', () => {
     const shortIoReport = [
       '# I/O 分析报告',
       '',
@@ -2150,7 +2220,7 @@ describe('final result quality gate', () => {
       '主线程 fsync 很慢，所以数据库是根因，需要优化 DB。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortIoReport,
         findings: [{
@@ -2164,10 +2234,7 @@ describe('final result quality gate', () => {
       sceneType: 'io',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('I/O 证据类型');
-    expect(issue?.message).toContain('文件/数据库/Provider 边界');
-    expect(issue?.message).toContain('置信度与补证');
+    expect(issue).toBeUndefined();
   });
 
   it('flags reports that treat epoll or poll blocked_function as IO root cause', () => {
@@ -2831,7 +2898,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('flags interaction reports that omit ACK, focus/window, and display boundaries', () => {
+  it('does not infer report coverage from legacy prose: flags interaction reports that omit ACK, focus/window, and display boundaries', () => {
     const shortInteractionReport = [
       '# 点击响应分析报告',
       '',
@@ -2840,7 +2907,7 @@ describe('final result quality gate', () => {
       '点击响应慢，主要是输入延迟 180ms，需要优化主线程。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortInteractionReport,
         findings: [{
@@ -2854,10 +2921,7 @@ describe('final result quality gate', () => {
       sceneType: 'interaction',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('输入阶段拆分');
-    expect(issue?.message).toContain('ACK/焦点/窗口边界');
-    expect(issue?.message).toContain('置信度与缺失证据');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts interaction reports that separate input stages, queues, and present evidence', () => {
@@ -2888,8 +2952,8 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('uses click_response conclusion metadata as the interaction final-report contract', () => {
-    const issue = assessFinalResultQuality({
+  it('does not infer report coverage from legacy prose: uses click_response conclusion metadata as the interaction final-report contract', () => {
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: [
           '# 点击响应分析报告',
@@ -2913,11 +2977,10 @@ describe('final result quality gate', () => {
       query: '分析这个 trace',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('interaction 场景 Final Report Contract');
+    expect(issue).toBeUndefined();
   });
 
-  it('flags scroll response reports that omit latency scope and frame-linkage confidence', () => {
+  it('does not infer report coverage from legacy prose: flags scroll response reports that omit latency scope and frame-linkage confidence', () => {
     const shortScrollResponseReport = [
       '# 滑动响应分析报告',
       '',
@@ -2926,7 +2989,7 @@ describe('final result quality gate', () => {
       '滑动从 ACTION_MOVE 到首帧 120ms，端到端上屏慢，需要优化。',
     ].join('\n');
 
-    const issue = assessFinalResultQuality({
+    const issue = assessUnreviewedReport({
       result: result({
         conclusion: shortScrollResponseReport,
         findings: [{
@@ -2940,10 +3003,7 @@ describe('final result quality gate', () => {
       sceneType: 'scroll_response',
     });
 
-    expect(issue?.code).toBe('scene_contract_incomplete');
-    expect(issue?.message).toContain('响应延迟口径');
-    expect(issue?.message).toContain('输入目标与队列边界');
-    expect(issue?.message).toContain('FrameTimeline/上屏置信度');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts scroll response reports that state scope, queue boundaries, and frame confidence', () => {
@@ -2974,7 +3034,7 @@ describe('final result quality gate', () => {
     })).toBeUndefined();
   });
 
-  it('does not override runtime results that are already marked partial', () => {
+  it('still checks empty conclusions in results already marked partial', () => {
     expect(assessFinalResultQuality({
       result: result({
         conclusion: '   ',
@@ -2982,7 +3042,7 @@ describe('final result quality gate', () => {
         terminationMessage: 'runtime already degraded this result',
       }),
       query: '分析这个 trace',
-    })).toBeUndefined();
+    })?.code).toBe('empty_conclusion');
   });
 
   it('still enforces kernel blocking claim boundaries for partial runtime results', () => {
@@ -3018,7 +3078,7 @@ describe('final result quality gate', () => {
     expect(issue?.code).toBe('kernel_blocking_claim_boundary');
   });
 
-  it('requires every known dual-trace package identity in the deliverable conclusion', () => {
+  it('does not require package strings as a substitute for identity evidence', () => {
     const issue = assessFinalResultQuality({
       result: result({
         conclusion: [
@@ -3036,8 +3096,7 @@ describe('final result quality gate', () => {
       },
     });
 
-    expect(issue?.code).toBe('comparison_identity_incomplete');
-    expect(issue?.message).toContain('com.example.demo');
+    expect(issue).toBeUndefined();
   });
 
   it('accepts a dual-trace conclusion that explicitly names both package identities', () => {
@@ -3095,7 +3154,7 @@ describe('final result quality gate', () => {
     })).toBe(conclusion);
   });
 
-  it('surfaces source-binding downgrades without deleting verified trace conclusions', () => {
+  it('surfaces source-binding downgrades without deleting verified trace conclusions', async () => {
     const sourceReference = {
       id: 'source-ref-v1-aaaaaaaaaaaaaaaaaaaaaaaa',
       referenceId: 'lookup-1',
@@ -3103,78 +3162,71 @@ describe('final result quality gate', () => {
       filePath: 'src/main/Foo.kt',
       lookupKind: 'metadata' as const,
     };
-    const sourceBoundResult = result({
-      conclusion: 'compact verified trace conclusion',
-      conclusionContract: {
-        schemaVersion: 'conclusion_contract_v1',
-        mode: 'focused_answer',
-        conclusions: [{rank: 1, statement: 'Foo.run 与 trace 阻塞事件一致'}],
-        clusters: [],
-        evidenceChain: [],
-        claims: [{
-          id: 'claim-1',
-          text: 'Foo.run 与 trace 阻塞事件一致',
-          references: [{evidenceRefId: 'data:trace-1'}],
-        }],
-        sourceUseDecision: {
-          schemaVersion: 'source_use_decision@1',
-          codeAwareMode: 'metadata_only',
-          selectedCodebaseIds: ['app-source'],
-          status: 'located',
-          attemptedTools: ['search_codebase'],
-          queriedCodebaseIds: ['app-source'],
-          usedCodebaseIds: ['app-source'],
-          references: [sourceReference],
-        },
-        sourceReferences: [sourceReference],
-        sourceClaimBindings: [{
-          claimId: 'claim-1',
-          mechanismStatus: 'corroborated',
-          sourceReferenceIds: [sourceReference.id],
-          traceEvidenceRefIds: ['data:trace-1'],
-        }],
-        uncertainties: [],
-        nextSteps: [],
-      },
-      claimSupport: [{
-        claimId: 'claim-1',
-        kind: 'causal',
-        text: 'Foo.run 与 trace 阻塞事件一致',
-        anchors: [],
-        supportLevel: 'verified',
+    const sourceUse: SourceUseDecisionV1 = {
+      schemaVersion: 'source_use_decision@1',
+      codeAwareMode: 'metadata_only',
+      selectedCodebaseIds: ['app-source'],
+      status: 'located',
+      attemptedTools: ['search_codebase'],
+      queriedCodebaseIds: ['app-source'],
+      usedCodebaseIds: ['app-source'],
+      references: [sourceReference],
+    };
+    const body = 'The trace reports 120 ms blocked.';
+    const reference = {evidenceRefId: 'data:trace-1', rowIndex: 0, column: 'blocked_ms', value: 120};
+    const declaration = parseConclusionContractDeclaration({
+      schemaVersion: 'conclusion_contract_v1',
+      mode: 'focused_answer',
+      conclusions: [{rank: 1, statement: body}],
+      clusters: [],
+      evidenceChain: [],
+      claims: [{
+        id: 'claim-1',
+        kind: 'numeric',
+        text: body,
+        references: [reference],
+        semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed',
+          discourse: 'asserted', quantifier: 'one', modality: 'certain',
+          scope: {population: 'cited_rows', subjectRefs: [reference]},
+          numeric: {operator: 'eq', value: 120, unit: 'ms'}},
       }],
-      claimVerificationResult: {
-        schemaVersion: 'claim_verifier@1',
-        status: 'passed',
-        policy: 'record_only',
-        passed: true,
-        checkedClaimCount: 1,
-        unsupportedClaimCount: 0,
-        claimResults: [{
-          claimId: 'claim-1',
-          status: 'verified',
-          referenceResults: [{evidenceRefId: 'data:trace-1', status: 'matched'}],
-        }],
-        issues: [],
-      },
+      sourceUseDecision: sourceUse,
+      sourceReferences: [sourceReference],
+      sourceClaimBindings: [{
+        claimId: 'claim-1',
+        mechanismStatus: 'corroborated',
+        sourceReferenceIds: [sourceReference.id],
+        traceEvidenceRefIds: ['data:trace-1'],
+      }],
+      uncertainties: [],
+      nextSteps: [],
     });
-    sourceBoundResult.sourceUseDecision = sourceBoundResult.conclusionContract!.sourceUseDecision;
-    sourceBoundResult.sourceReferences = sourceBoundResult.conclusionContract!.sourceReferences;
-
-    const issue = applyFinalResultQualityGate({
-      result: sourceBoundResult,
-      query: 'what is Foo.run?',
+    expect(declaration.issues).toEqual([]);
+    const sourceBoundResult = result({conclusion: body, conclusionContract: declaration.contract});
+    const envelope = createDataEnvelope({columns: ['blocked_ms'], rows: [[120]]}, {
+      type: 'sql_result', source: 'execute_sql', title: 'Trace blocking duration',
+      evidenceRefId: 'data:trace-1', traceId: 'trace-a', traceSide: 'current', executionStatus: 'observed',
     });
+    const evidenceReadView = capturedReadView(envelope, {
+      blocked_ms: {unit: 'ms', origin: {kind: 'native_producer', definitionFingerprint: 'blocking-fixture'}},
+    });
+    const finalized = await finalizeWithConsistentSemanticFixture(sourceBoundResult, envelope, evidenceReadView, sourceUse);
+    const verifiedResult = finalized.result;
 
-    expect(issue?.code).toBe('source_claim_binding_invalid');
-    expect(sourceBoundResult.partial).toBe(true);
-    expect(sourceBoundResult.conclusion).toBe('compact verified trace conclusion');
-    expect(sourceBoundResult.claimSupport).toHaveLength(1);
-    expect(sourceBoundResult.claimVerificationResult?.status).toBe('passed');
+    expect(finalized.qualityIssue?.code).toBe('source_claim_binding_invalid');
+    expect(verifiedResult.partial).toBe(true);
+    expect(verifiedResult.conclusion).toBe(body);
+    expect(verifiedResult.claimSupport).toHaveLength(1);
+    expect(verifiedResult.claimVerificationResult).toMatchObject({schemaVersion: 'claim_verifier@2', status: 'passed',
+      passed: true, claimResults: [{claimId: 'claim-1', status: 'verified', deterministicProof: {status: 'proved'}}]});
+    expect(verifiedResult.deliveryAssurance).toMatchObject({claims: 'passed', source: 'coverage_incomplete'});
+    expect(verifiedResult.conclusionContract?.claims).toEqual(sourceBoundResult.conclusionContract?.claims);
     expect(sourceBoundResult.conclusionContract?.sourceClaimBindings?.[0]?.mechanismStatus)
-      .toBe('compatible');
-    expect(sourceBoundResult.sourceClaimVerificationResult?.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({code: 'source_binding_strength_downgraded'}),
+      .toBe('corroborated');
+    expect(verifiedResult.conclusionContract?.sourceClaimBindings?.[0]?.mechanismStatus).toBe('corroborated');
+    expect(verifiedResult.sourceClaimVerificationResult?.bindings[0]?.mechanismStatus).toBe('compatible');
+    expect(verifiedResult.sourceClaimVerificationResult?.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({code: 'source_binding_mechanism_unverified'}),
     ]));
   });
 });
@@ -3200,10 +3252,11 @@ describe('quick-run triage budget follows the question boundary', () => {
     '  - evidence_ref_id=data:sql_table:current:abc123:def456:aaa111; column=dur_ms; value=24.82',
   ].join('\n');
 
-  function quickReceiptFor(query: string, conversationTurns: number) {
+  function quickReceiptFor(query: string, conversationTurns: number, scope: 'bounded_question' | 'scene_wide' = 'bounded_question') {
     return buildQuickRunReceipt({
       requestedMode: 'auto',
       query,
+      turnIntent: resolvedIntent({scope}),
       budget: resolveQuickTurnBudget(),
       actualTurns: 3,
       elapsedMs: 1200,
@@ -3228,20 +3281,20 @@ describe('quick-run triage budget follows the question boundary', () => {
     })?.code).not.toBe('quick_full_report_shape');
   });
 
-  it('still caps a scene-wide quick ask at the triage budget', () => {
-    expect(quickReceiptFor(SCENE_WIDE, 2).profile).toBe('triage');
+  it('keeps scene-wide triage telemetry separate from output acceptance', () => {
+    expect(quickReceiptFor(SCENE_WIDE, 2, 'scene_wide').profile).toBe('triage');
     expect(assessFinalResultQuality({
       result: result({
         conclusion: boundedAnswer,
-        quickRun: quickReceiptFor(SCENE_WIDE, 2),
+        quickRun: quickReceiptFor(SCENE_WIDE, 2, 'scene_wide'),
       }),
       query: SCENE_WIDE,
       sceneType: 'scrolling',
-    })?.code).toBe('quick_full_report_shape');
+    })).toBeUndefined();
   });
 
-  it('treats the same follow-up wording without history as scene-wide', () => {
-    expect(quickReceiptFor(BOUNDED_FOLLOW_UP, 0).profile).toBe('triage');
+  it('does not infer scene-wide scope from missing conversation history', () => {
+    expect(quickReceiptFor(BOUNDED_FOLLOW_UP, 0).profile).toBe('normal');
   });
 });
 
@@ -3309,6 +3362,84 @@ describe('a contradicted claim degrades full mode, not only quick mode', () => {
 
     expect(issue?.code).toBe('verifier_contradicted_claim');
     expect(issue?.message).toContain('未找到');
+  });
+
+  function failedDiagnostic(overrides: Record<string, unknown>): string {
+    const issue = assessFinalResultQuality({result: result({claimVerificationResult: verification(overrides) as never})});
+    expect(issue?.code).toBe('verifier_contradicted_claim');
+    return issue!.message;
+  }
+
+  it.each(['Evidence rows are missing', '引用值与证据不符', 'بيانات غير متاحة'])(
+    'describes rejected declarations from typed state rather than diagnostic prose: %s', message => {
+      const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', checkedClaimCount: 0, unsupportedClaimCount: 0,
+        claimResults: [{claimId: 'declaration', status: 'not_checked',
+          referenceCells: [{status: 'missing', message}],
+          deterministicProof: {kind: 'none', status: 'rejected', reason: 'binding_ineligible', anchorIds: [], evidenceRefIds: []}}],
+        issues: [{claimId: 'declaration', severity: 'error', code: 'binding_ineligible', message}]});
+      expect(text).toBe('1 条断言的声明或绑定无效，相关断言未通过核验准入；不能作为已核验结论交付。');
+    },
+  );
+
+  it('distinguishes a rejected proposition from absent or mismatched reference cells', () => {
+    const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', claimResults: [{claimId: 'numeric', status: 'unsupported',
+      referenceCells: [{status: 'matched'}],
+      deterministicProof: {kind: 'numeric_cell', status: 'rejected', reason: 'numeric_operator_rejected', anchorIds: [], evidenceRefIds: []}}],
+      issues: [{claimId: 'numeric', severity: 'error', code: 'numeric_operator_rejected', message: 'arbitrary provider wording'}]});
+    expect(text).toBe('1 条断言的命题未通过确定性证明；不能作为已核验结论交付。');
+  });
+
+  it.each(['proof', 'reference'])('recognizes a typed binding rejection from %s without prose or issue hints', source => {
+    const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', unsupportedClaimCount: 0, checkedClaimCount: 0,
+      claimResults: [{claimId: 'binding', status: 'not_checked',
+        referenceCells: [{status: source === 'reference' ? 'ineligible' : 'missing'}],
+        ...(source === 'proof' ? {deterministicProof: {kind: 'none', status: 'rejected', reason: 'binding_ineligible',
+          anchorIds: [], evidenceRefIds: []}} : {})}], issues: []});
+    expect(text).toBe('1 条断言的声明或绑定无效，相关断言未通过核验准入；不能作为已核验结论交付。');
+  });
+
+  it.each(['', 'unassociated-claim'])('does not let global binding issue %s hide another claim failure', claimId => {
+    const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', claimResults: [
+      {claimId: 'absent', status: 'unsupported', referenceCells: [{status: 'missing'}]},
+      {claimId: 'different', status: 'unsupported', referenceCells: [{status: 'value_mismatch'}]},
+    ], issues: [{claimId, severity: 'error', code: 'binding_ineligible', message: 'Rows are missing'}]});
+    expect(text).toContain('声明或绑定校验存在未关联到具体断言的错误');
+    expect(text).toContain('1 条断言的引用未找到所需证据');
+    expect(text).toContain('1 条断言的引用值与证据不符');
+    expect(text).not.toContain('条断言的声明或绑定无效');
+  });
+
+  it('suppresses only the bound claim compatibility missing status and preserves genuine mismatches', () => {
+    const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', claimResults: [
+      {claimId: 'bound', status: 'not_checked', referenceCells: [{status: 'missing'}, {status: 'value_mismatch'}]},
+      {claimId: 'absent', status: 'unsupported', referenceCells: [{status: 'missing'}]},
+    ], issues: [{claimId: 'bound', severity: 'error', code: 'binding_ineligible', message: 'arbitrary'}]});
+    expect(text).toContain('1 条断言的声明或绑定无效');
+    expect(text).toContain('1 条断言的引用未找到所需证据');
+    expect(text).toContain('1 条断言的引用值与证据不符');
+    expect(text).not.toContain('2 条断言');
+  });
+
+  it.each([{referenceCells: []}, {referenceCells: [{status: 'matched'}]}])(
+    'prefers present v2 referenceCells $referenceCells over compatibility aliases', ({referenceCells}) => {
+      const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', claimResults: [{claimId: 'numeric', status: 'unsupported',
+        referenceCells, referenceResults: [{status: 'missing'}, {status: 'value_mismatch'}],
+        deterministicProof: {kind: 'numeric_cell', status: 'rejected', reason: 'numeric_operator_rejected', anchorIds: [], evidenceRefIds: []}}],
+        issues: [{claimId: 'numeric', severity: 'error', code: 'numeric_operator_rejected', message: 'arbitrary'}]});
+      expect(text).toBe('1 条断言的命题未通过确定性证明；不能作为已核验结论交付。');
+    },
+  );
+
+  it('falls back to absent v2 referenceCells and counts claim IDs without duplicate reference inflation', () => {
+    const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', claimResults: [{claimId: 'numeric', status: 'unsupported',
+      referenceResults: [{status: 'value_mismatch'}, {status: 'value_mismatch'}]}]});
+    expect(text).toBe('1 条断言的引用值与证据不符；不能作为已核验结论交付。');
+  });
+
+  it('describes unclassified failure without inventing a count or missing evidence', () => {
+    const text = failedDiagnostic({schemaVersion: 'claim_verifier@2', checkedClaimCount: 0, unsupportedClaimCount: 9,
+      claimResults: [], issues: [{claimId: '', severity: 'error', code: 'unknown_error_code', message: '引用的证据行或列未找到'}]});
+    expect(text).toBe('断言核验存在未通过的检查，具体原因尚未归类；不能作为已核验结论交付。');
   });
 
   it('leaves a passing verification alone', () => {

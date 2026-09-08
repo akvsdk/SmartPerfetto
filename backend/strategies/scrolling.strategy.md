@@ -3,6 +3,7 @@
 
 ---
 scene: scrolling
+classification_description: "Scroll smoothness, frame pacing, missed deadlines and rendering performance while content moves."
 priority: 3
 effort: medium
 required_capabilities:
@@ -89,8 +90,8 @@ final_report_contract:
     - id: case_recommendations
       label: 相似案例引用
       description: '当 typed caseRecommendations 中存在 strong 匹配时，报告需引用对应 case_id，并说明它是证据验证后的相似案例。'
-      trigger_patterns:
-        - 'case recommendation|caseRecommendations|相似案例|案例引用'
+      condition:
+        kind: strong_case_retrieval
       pattern_groups:
         - ['case_id', '相似案例', '案例引用', 'case recommendation', 'case[-\s]?based']
 
@@ -102,10 +103,8 @@ phase_hints:
     critical: false
   - id: root_cause_drill
     keywords: ['根因', 'root cause', '诊断', 'diagnos', '深钻', 'deep', 'drill', '代表帧', 'representative', '逐帧']
-    constraints: '对占比 >15% 且绝对帧数 >3 的 reason_code，先读已有 direct evidence，再只选择能补齐当前证据缺口的深钻工具：RT/slice/unknown 用 jank_frame_detail，Binder/锁/IO 用 frame_blocking_calls，未解释的 Q4/wakeup 链才用 blocking_chain_analysis。无信息增益的工具必须跳过并说明，禁止机械执行三件套。workload_heavy 必须最后兜底。只有能命名一个尚缺字段时才允许最多一次定向 SQL；失败后标注证据边界并收口。'
+    constraints: '对占比 >15% 且绝对帧数 >3 的 reason_code，先读已有 direct evidence，再只选择能补齐当前证据缺口的深钻工具：RT/slice/unknown 用 jank_frame_detail，Binder/锁/IO 用 frame_blocking_calls，未解释的 Q4/wakeup 链才用 blocking_chain_analysis。无信息增益的工具必须跳过并说明，禁止机械执行三件套。workload_heavy 必须最后兜底。围绕尚缺的证据选择定向 SQL；查询失败时可以在本轮资源范围内修正，无法取得数据时说明证据边界。'
     critical_tools: []
-    max_tool_calls:
-      execute_sql: 1
     critical: true
   - id: frame_metrics_overlay
     keywords: ['overrun', 'per_frame', 'ui time', 'cpu time', 'work period', 'mali', '帧内', '帧阻塞', '阻塞调用', 'Binder', 'futex', 'GPU', '功耗', '频率']
@@ -124,10 +123,8 @@ phase_hints:
     critical: false
   - id: architecture_specific_jank
     keywords: ['TextureView', 'SurfaceTexture', 'WebView', 'DrawFunctor', 'React Native', 'RN', 'Fabric', 'JSI', 'GLSurfaceView', 'NativeActivity', 'OpenGL', 'Compose', 'Flutter', 'mixed', '混合', '架构', '生产端']
-    constraints: '只执行当前 plan/gate 已激活的架构专属 Skill；runner-up 和静态工具列表不触发调用。aggregate/direct evidence 与已声明架构 Skill 已回答阶段目标时，立即 completed。只有能命名一个尚缺字段时才允许最多一次定向 SQL；失败后标注证据边界并收口，禁止 schema lookup + SQL 探索循环。用户显式要求额外 SQL/源码，或新 direct evidence 激活第二链路时，再用 revise_plan 最小补充。'
+    constraints: '只执行当前 plan/gate 已激活的架构专属 Skill；runner-up 和静态工具列表不触发调用。aggregate/direct evidence 与已声明架构 Skill 已回答阶段目标时，立即 completed。围绕尚缺的证据选择 SQL 和 schema 查询；每次调用应解决具体问题，失败时允许修正，无法取得数据时说明边界。用户显式要求额外 SQL/源码，或新 direct evidence 激活第二链路时，再用 revise_plan 最小补充。'
     critical_tools: []
-    max_tool_calls:
-      execute_sql: 1
     critical: false
   - id: display_pipeline_boundary
     keywords: ['BufferQueue', 'BLAST', 'dequeueBuffer', 'queueBuffer', 'SurfaceFlinger', 'HWC', 'acquire fence', 'present fence', 'release fence', 'refresh rate', '刷新率', 'ARR', 'VRR', 'FrameTimeline', 'sf_backpressure', 'gpu_fence_wait', 'resync', 'resynced', 'App Resynced Jitter']

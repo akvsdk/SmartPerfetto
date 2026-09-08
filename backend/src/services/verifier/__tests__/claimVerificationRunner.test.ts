@@ -122,7 +122,7 @@ describe('runClaimVerification', () => {
     ]));
   });
 
-  it('only promotes verified mechanism relations and keeps verified overlap at inference', () => {
+  it('keeps replayed mechanism bindings and inferred overlap ranges at candidate causal support', () => {
     const relationContract = (relationRefs: string[]): ConclusionContract => ({
       schemaVersion: 'conclusion_contract_v1',
       mode: 'focused_answer',
@@ -207,12 +207,21 @@ describe('runClaimVerification', () => {
     } as any);
 
     expect(verified.claimSupport[0]).toEqual(expect.objectContaining({
-      relationEvaluation: 'verified',
-      supportLevel: 'verified',
+      relationEvaluation: 'candidate',
+      supportLevel: 'inference',
     }));
-    expect(verified.claimVerificationResult.status).toBe('passed');
-    expect(verified.claimVerificationResult.claimResults[0].status).toBe('verified');
-    expect(overlap.evidenceContract.relations[0].verificationStatus).toBe('verified');
+    expect(verified.evidenceContract.relations[0]).toEqual(expect.objectContaining({
+      verificationStatus: 'candidate', reasonCode: 'proof_binding_missing',
+    }));
+    expect(verified.claimVerificationResult.status).toBe('partial');
+    expect(verified.claimVerificationResult.claimResults[0]).toEqual(expect.objectContaining({
+      status: 'inference',
+      referenceCells: [expect.objectContaining({status: 'not_checked'})],
+      deterministicProof: expect.objectContaining({status: 'not_checked', reason: 'semantics_not_declared'}),
+    }));
+    expect(overlap.evidenceContract.relations[0]).toEqual(expect.objectContaining({
+      verificationStatus: 'candidate', reasonCode: 'overlap_range_missing',
+    }));
     expect(overlap.claimSupport[0]).toEqual(expect.objectContaining({
       relationEvaluation: 'candidate',
       supportLevel: 'inference',
@@ -227,13 +236,16 @@ describe('runClaimVerification', () => {
       expect.objectContaining({code: 'causal_relation_candidate', severity: 'warning'}),
     ]));
     expect(rejected.claimSupport[0]).toEqual(expect.objectContaining({
-      relationEvaluation: 'rejected',
-      supportLevel: 'unsupported',
+      relationEvaluation: 'candidate',
+      supportLevel: 'inference',
     }));
-    expect(rejected.claimVerificationResult.status).toBe('failed');
-    expect(rejected.claimVerificationResult.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({code: 'causal_relation_rejected', severity: 'error'}),
-    ]));
+    // The legacy range is retained for audit, but its column aliases do not
+    // establish a clock on which to accept or reject interval overlap.
+    const disjointObject = rejected.evidenceContract.anchors.find(anchor =>
+      anchor.anchorId === rejected.evidenceContract.relations[0].objectAnchorId);
+    expect(disjointObject?.timeRange).toEqual({startTs: '300', endTs: '320', unit: 'ns', source: 'row'});
+    expect(rejected.evidenceContract.relations[0].reasonCode).toBe('overlap_range_missing');
+    expect(rejected.claimVerificationResult.status).toBe('partial');
 
     const mixed = runClaimVerification({
       conclusionContract: relationContract(['relation:mechanism', 'relation:overlap']),
@@ -246,7 +258,7 @@ describe('runClaimVerification', () => {
       dataEnvelopes: [envelope],
       relationCandidates: [mechanism, relation('relation:rejected', 'rejected')],
     } as any);
-    expect(mixedRejected.claimSupport[0].relationEvaluation).toBe('rejected');
+    expect(mixedRejected.claimSupport[0].relationEvaluation).toBe('candidate');
     const derived = runClaimVerification({
       conclusionContract: relationContract(['relation:derived']),
       dataEnvelopes: [envelope],
@@ -272,7 +284,7 @@ describe('runClaimVerification', () => {
     ]));
   });
 
-  it('keeps a verified comparison delta at candidate causal support', () => {
+  it('keeps a replayed arithmetic delta at candidate causal support without metric authority', () => {
     const current = createDataEnvelope({columns: ['blocked_ms'], rows: [[150]]}, {
       type: 'sql_result',
       source: 'execute_sql_on',
@@ -328,7 +340,9 @@ describe('runClaimVerification', () => {
       }],
     });
 
-    expect(checked.evidenceContract.relations[0].verificationStatus).toBe('verified');
+    expect(checked.evidenceContract.relations[0]).toEqual(expect.objectContaining({
+      verificationStatus: 'candidate', reasonCode: 'comparison_metric_missing', value: 50,
+    }));
     expect(checked.claimSupport[0].relationEvaluation).toBe('candidate');
     expect(checked.claimVerificationResult.claimResults[0].status).toBe('inference');
   });
@@ -393,10 +407,13 @@ describe('runClaimVerification', () => {
     }));
     expect(unchanged.claimSupport[0]).not.toHaveProperty('relationEvaluation');
     expect(unchanged.claimSupport[0]).not.toHaveProperty('relations');
-    expect(unchanged.claimVerificationResult.status).toBe('passed');
+    expect(unchanged.claimVerificationResult.status).toBe('not_checked');
+    expect(unchanged.claimVerificationResult.claimResults[0].referenceCells).toEqual([
+      expect.objectContaining({status: 'not_checked'}),
+    ]);
   });
 
-  it('builds claim support and passes deterministic verifier for matching cells', () => {
+  it('preserves matching replay cells and identity sidecars without issuing execution proof', () => {
     const identityResolution: IdentityResolutionV1 = {
       version: 'identity_contract@1',
       identityRefId: 'identity:test',
@@ -430,13 +447,19 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport).toHaveLength(1);
-    expect(result.claimSupport[0].supportLevel).toBe('verified');
+    expect(result.claimSupport[0].supportLevel).toBe('partial');
     expect(result.claimSupport[0].anchors[0].identity?.identityRefId).toBe('identity:test');
-    expect(result.claimVerificationResult.status).toBe('passed');
+    expect(result.claimSupport[0].anchors[0].cells).toEqual([
+      expect.objectContaining({column: 'blocked_ms', value: 120, actualValue: 120}),
+    ]);
+    expect(result.claimVerificationResult).toEqual(expect.objectContaining({
+      schemaVersion: 'claim_verifier@2', status: 'not_checked', passed: false,
+    }));
+    expect(result.claimVerificationResult.claimResults[0].deterministicProof?.status).toBe('not_checked');
     expect(result.identityResolutions).toHaveLength(1);
   });
 
-  it('treats small floating point drift as a verified numeric reference', () => {
+  it('preserves floating point differences without treating replay values as an epsilon-matched proof', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[120.0000000001]],
@@ -457,11 +480,15 @@ describe('runClaimVerification', () => {
       dataEnvelopes: [envelope],
     });
 
-    expect(result.claimSupport[0].supportLevel).toBe('verified');
-    expect(result.claimVerificationResult.status).toBe('passed');
+    expect(result.claimSupport[0].anchors[0].cells).toEqual([
+      expect.objectContaining({value: 120, actualValue: 120.0000000001}),
+    ]);
+    expect(result.claimSupport[0].supportLevel).toBe('partial');
+    expect(result.claimVerificationResult.status).toBe('not_checked');
+    expect(result.claimVerificationResult.claimResults[0].referenceCells?.[0].status).toBe('not_checked');
   });
 
-  it('fails deterministic verifier when a cited cell value does not match the claim reference', () => {
+  it('retains conflicting replay values for audit without claiming an executed comparison', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[12]],
@@ -482,15 +509,16 @@ describe('runClaimVerification', () => {
       dataEnvelopes: [envelope],
     });
 
-    expect(result.claimVerificationResult.status).toBe('failed');
-    expect(result.claimSupport[0].supportLevel).toBe('unsupported');
-    expect(result.claimVerificationResult.issues[0]).toEqual(expect.objectContaining({
-      code: 'claim_reference_value_mismatch',
-      severity: 'error',
+    expect(result.claimSupport[0].anchors[0].cells).toEqual([
+      expect.objectContaining({column: 'blocked_ms', value: 120, actualValue: 12}),
+    ]);
+    expect(result.claimVerificationResult.status).toBe('not_checked');
+    expect(result.claimVerificationResult.claimResults[0].referenceCells?.[0]).toEqual(expect.objectContaining({
+      status: 'not_checked', message: 'immutable execution capture is unavailable',
     }));
   });
 
-  it('checks references even when claim kind is omitted', () => {
+  it('retains numeric reference values for audit when claim kind is omitted', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[12]],
@@ -512,13 +540,13 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].kind).toBe('numeric');
-    expect(result.claimVerificationResult.status).toBe('failed');
-    expect(result.claimVerificationResult.issues[0]).toEqual(expect.objectContaining({
-      code: 'claim_reference_value_mismatch',
-    }));
+    expect(result.claimSupport[0].anchors[0].cells).toEqual([
+      expect.objectContaining({value: 120, actualValue: 12}),
+    ]);
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
-  it('checks references even when the model labels a cited claim as inference', () => {
+  it('retains numeric reference values despite a model inference label', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[12]],
@@ -542,13 +570,13 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].kind).toBe('numeric');
-    expect(result.claimVerificationResult.status).toBe('failed');
-    expect(result.claimVerificationResult.issues[0]).toEqual(expect.objectContaining({
-      code: 'claim_reference_value_mismatch',
-    }));
+    expect(result.claimSupport[0].anchors[0].cells).toEqual([
+      expect.objectContaining({value: 120, actualValue: 12}),
+    ]);
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
-  it('fails when the cited column exists but has no actual value', () => {
+  it('keeps an absent replay cell unavailable without inventing an actual value', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[]],
@@ -573,12 +601,8 @@ describe('runClaimVerification', () => {
       value: 120,
     }));
     expect(result.claimSupport[0].anchors[0].cells?.[0]).not.toHaveProperty('actualValue');
-    expect(result.claimVerificationResult.status).toBe('failed');
-    // Nothing was compared, so the reason is a missing value rather than a
-    // numeric disagreement; the verdict is unsupported either way.
-    expect(result.claimVerificationResult.issues[0]).toEqual(expect.objectContaining({
-      code: 'claim_reference_missing',
-    }));
+    expect(result.claimVerificationResult.status).toBe('not_checked');
+    expect(result.claimVerificationResult.claimResults[0].referenceCells?.[0].status).toBe('not_checked');
   });
 
   it('marks out-of-range rows as missing instead of matching the claimed value', () => {
@@ -765,7 +789,10 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].anchors[0].missing).toBeUndefined();
-    expect(result.claimVerificationResult.status).toBe('passed');
+    expect(result.claimSupport[0].anchors[0].cells).toEqual([
+      expect.objectContaining({sourceRef: '表 1', value: 120, actualValue: 120}),
+    ]);
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
   it('treats artifact ids in evidence_ref_id as aliases and accepts display-title source refs', () => {
@@ -804,7 +831,8 @@ describe('runClaimVerification', () => {
 
     expect(result.claimSupport[0].anchors[0].evidenceRefId).toBe('data:skill:startup_events_in_range');
     expect(result.claimSupport[0].anchors[0].context.artifactId).toBe('art-2');
-    expect(result.claimVerificationResult.status).toBe('passed');
+    expect(result.claimSupport[0].anchors[0].cells?.[0].actualValue).toBe('冷启动');
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
   it('treats ev_art ids as artifact aliases from narrative claim refs', () => {
@@ -842,10 +870,11 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].anchors[0].context.artifactId).toBe('art-6');
-    expect(result.claimVerificationResult.status).toBe('passed');
+    expect(result.claimSupport[0].anchors[0].cells?.[0].actualValue).toBe(6);
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
-  it('does not fully verify matched cells when trace provenance is missing', () => {
+  it('retains missing trace provenance without turning replay cells into matched evidence', () => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[120]],
@@ -865,13 +894,9 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].supportLevel).toBe('partial');
-    expect(result.claimVerificationResult.status).toBe('partial');
-    expect(result.claimVerificationResult.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        code: 'evidence_trace_unknown',
-        severity: 'warning',
-      }),
-    ]));
+    expect(result.claimSupport[0].anchors[0].context).toEqual(expect.objectContaining({traceId: 'unknown', traceSide: 'unknown'}));
+    expect(result.claimVerificationResult.status).toBe('not_checked');
+    expect(result.claimVerificationResult.claimResults[0].referenceCells?.[0].status).toBe('not_checked');
   });
 
   it('requires verified identity sidecars for identity claims', () => {
@@ -909,13 +934,10 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].supportLevel).toBe('partial');
-    expect(result.claimVerificationResult.status).toBe('partial');
-    expect(result.claimVerificationResult.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        code: 'identity_not_verified',
-        severity: 'warning',
-      }),
-    ]));
+    expect(result.claimSupport[0].anchors[0].identity).toEqual(expect.objectContaining({processName: 'com.example'}));
+    expect(result.claimSupport[0].anchors[0].identity?.status).not.toBe('verified');
+    expect(result.claimSupport[0].anchors[0].identity?.identityRefId).toBeUndefined();
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
   it('downgrades ambiguous identity sidecars for identity claims', () => {
@@ -955,13 +977,14 @@ describe('runClaimVerification', () => {
     });
 
     expect(result.claimSupport[0].supportLevel).toBe('partial');
-    expect(result.claimVerificationResult.status).toBe('partial');
-    expect(result.claimVerificationResult.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'identity_not_verified' }),
-    ]));
+    expect(result.claimSupport[0].anchors[0].identity).toEqual(expect.objectContaining({
+      processName: 'com.example', status: 'ambiguous', identityRefId: 'identity:ambiguous',
+    }));
+    expect(result.identityResolutions[0].status).toBe('ambiguous');
+    expect(result.claimVerificationResult.status).toBe('not_checked');
   });
 
-  it('ignores model-produced supportLevel when deterministic evidence disagrees', () => {
+  it.each(['unsupported', 'verified'] as const)('ignores model-produced %s support without an execution witness', supportLevel => {
     const envelope = createDataEnvelope({
       columns: ['blocked_ms'],
       rows: [[120]],
@@ -977,21 +1000,18 @@ describe('runClaimVerification', () => {
       traceSide: 'current',
     });
     const c = contract(120);
-    c.claims![0].supportLevel = 'unsupported';
+    c.claims![0].supportLevel = supportLevel;
 
     const result = runClaimVerification({
       conclusionContract: c,
       dataEnvelopes: [envelope],
     });
 
-    expect(result.claimSupport[0].supportLevel).toBe('verified');
-    expect(result.claimVerificationResult.status).toBe('passed');
-    expect(result.matchedTraceEvidenceRefIdsByClaimId).toEqual({
-      'claim-main-thread-blocked': ['data:skill:test'],
-    });
-    expect(result.verifiedTraceOccurrenceRefIdsByClaimId).toEqual({
-      'claim-main-thread-blocked': ['data:skill:test'],
-    });
+    expect(result.claimSupport[0].supportLevel).toBe('partial');
+    expect(result.claimSupport[0].anchors[0].cells?.[0]).toEqual(expect.objectContaining({value: 120, actualValue: 120}));
+    expect(result.claimVerificationResult.status).toBe('not_checked');
+    expect(result.matchedTraceEvidenceRefIdsByClaimId).toEqual({});
+    expect(result.verifiedTraceOccurrenceRefIdsByClaimId).toEqual({});
   });
 
   it('separates partial matched membership from verified Trace occurrences', () => {
@@ -1014,5 +1034,36 @@ describe('runClaimVerification', () => {
       'claim-main-thread-blocked': ['data:skill:test'],
     });
     expect(collectVerifiedTraceOccurrenceRefIdsByClaimId(verification)).toEqual({});
+    for (const schemaVersion of ['claim_verifier@1', 'claim_verifier@2'] as const) {
+      const numericOnly: ClaimVerificationResult = {
+        ...verification, schemaVersion,
+        claimResults: [{
+          ...verification.claimResults[0], status: 'verified',
+          deterministicProof: {kind: 'numeric_cell', status: 'proved', reason: 'numeric_operator_proved',
+            anchorIds: ['anchor:numeric'], evidenceRefIds: ['data:skill:test']},
+          propositionCoverage: {status: 'complete', covered: ['numeric'], uncovered: [], reason: 'stored_numeric_proof'},
+        }],
+      };
+      expect(collectVerifiedTraceOccurrenceRefIdsByClaimId(numericOnly)).toEqual({});
+    }
   });
+
+  it.each(['partial', 'unsupported', 'inference', 'not_checked', 'verified'] as const)(
+    'requires the joined claim verdict before publishing an interval occurrence: %s', status => {
+      const verification: ClaimVerificationResult = {
+        schemaVersion: 'claim_verifier@2', status: 'partial', policy: 'record_only', passed: false,
+        checkedClaimCount: 1, unsupportedClaimCount: status === 'unsupported' ? 1 : 0, issues: [],
+        claimResults: [{
+          claimId: 'interval', status,
+          referenceCells: [{evidenceRefId: 'trace:overlap', status: 'matched'}],
+          deterministicProof: {kind: 'interval_overlap', status: 'proved', reason: 'captured_interval_overlap',
+            anchorIds: ['anchor:left', 'anchor:right'], evidenceRefIds: ['trace:right', 'trace:left', 'trace:left']},
+          propositionCoverage: {status: 'complete', covered: ['interval'], uncovered: [], reason: 'typed_interval_covered'},
+        }],
+      };
+      expect(collectVerifiedTraceOccurrenceRefIdsByClaimId(verification)).toEqual(
+        status === 'verified' ? {interval: ['trace:left', 'trace:right']} : {},
+      );
+    },
+  );
 });

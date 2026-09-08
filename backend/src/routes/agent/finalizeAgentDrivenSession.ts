@@ -7,12 +7,8 @@ import type {
   Hypothesis,
   StreamingUpdate,
 } from '../../agent';
-import type {OutputLanguage} from '../../agentv3/outputLanguage';
 import type {AnalysisSourceActivation} from '../../services/codebase/analysisSourceActivationPolicy';
-import {
-  completeFinalResultComparisonIdentity,
-  type FinalResultComparisonIdentity,
-} from '../../services/finalResultQualityGate';
+import type {FinalResultQualityIssue} from '../../services/finalResultQualityGate';
 
 type SessionStatus = 'pending' | 'running' | 'awaiting_user' | 'completed' | 'failed' | 'cancelled' | 'quota_exceeded';
 
@@ -46,12 +42,6 @@ interface FinalizeSessionLike {
 }
 
 export interface FinalizeAgentDrivenSessionDeps<TSession extends FinalizeSessionLike> {
-  applyFinalResultQualityGate(input: {
-    result: AgentRuntimeAnalysisResult;
-    query: string;
-    sceneType?: string;
-    comparisonIdentity?: FinalResultComparisonIdentity;
-  }): { code: string; message: string } | null | undefined;
   isRunCurrent(session: TSession, runId?: string): boolean;
   broadcast(sessionId: string, update: StreamingUpdate, runId?: string): void;
   buildConversationStepUpdate(session: TSession, update: StreamingUpdate, runId?: string): StreamingUpdate | null;
@@ -64,12 +54,7 @@ export interface FinalizeAgentDrivenSessionDeps<TSession extends FinalizeSession
     sessionId: string;
     traceId: string;
     query: string;
-    result: {
-      conclusion: string;
-      totalDurationMs: number;
-      partial?: boolean;
-      terminationMessage?: string;
-    };
+    result: AgentRuntimeAnalysisResult;
     logger: TSession['logger'];
     logComponent: string;
   }): void;
@@ -78,12 +63,7 @@ export interface FinalizeAgentDrivenSessionDeps<TSession extends FinalizeSession
     sessionId: string;
     traceId: string;
     query: string;
-    result: {
-      conclusion: string;
-      totalDurationMs: number;
-      partial?: boolean;
-      terminationMessage?: string;
-    };
+    result: AgentRuntimeAnalysisResult;
     logger: TSession['logger'];
     logComponent: string;
   }): void;
@@ -107,18 +87,16 @@ export function finalizeAgentDrivenSession<TSession extends FinalizeSessionLike>
   result: AgentRuntimeAnalysisResult;
   runId?: string;
   logComponent: string;
-  outputLanguage?: OutputLanguage;
-  comparisonIdentity?: FinalResultComparisonIdentity;
+  qualityIssue?: FinalResultQualityIssue;
+  assertCurrent?: () => void;
 }, deps: FinalizeAgentDrivenSessionDeps<TSession>): void {
   const {
     sessionId,
     query,
     traceId,
-    sceneType,
     session,
     result,
     runId,
-    comparisonIdentity,
   } = input;
   const { logger } = session;
   const completedRunId = getCompletedResultRunId(session, runId);
@@ -130,11 +108,11 @@ export function finalizeAgentDrivenSession<TSession extends FinalizeSessionLike>
     return;
   }
 
-  result.conclusion = completeFinalResultComparisonIdentity({
-    conclusion: result.conclusion,
-    identity: comparisonIdentity,
-    outputLanguage: input.outputLanguage ?? 'zh-CN',
-  });
+  const assertCurrent = () => {
+    input.assertCurrent?.();
+    if (!deps.isRunCurrent(session, runId)) throw new Error('analysis_run_superseded');
+  };
+  assertCurrent();
   session.result = result;
   if (completedRunId) {
     delete session.completedAnalysisFinalArtifactsByRunId?.[completedRunId];
@@ -144,12 +122,7 @@ export function finalizeAgentDrivenSession<TSession extends FinalizeSessionLike>
   delete session.completedAnalysisSseEvents;
   delete session.completedAnalysisSseEventsQualityGateVersion;
 
-  const finalQualityIssue = deps.applyFinalResultQualityGate({
-    result,
-    query,
-    sceneType: sceneType ?? result.conclusionContract?.metadata?.sceneId,
-    ...(comparisonIdentity ? {comparisonIdentity} : {}),
-  });
+  const finalQualityIssue = input.qualityIssue;
   if (finalQualityIssue) {
     const update: StreamingUpdate = {
       type: 'degraded',
@@ -163,10 +136,14 @@ export function finalizeAgentDrivenSession<TSession extends FinalizeSessionLike>
       timestamp: Date.now(),
     };
     deps.broadcast(sessionId, update, runId);
+    assertCurrent();
     const conversationStep = deps.buildConversationStepUpdate(session, update, runId);
+    assertCurrent();
     if (conversationStep) {
       deps.appendConversationStep(session, conversationStep);
+      assertCurrent();
       deps.broadcast(sessionId, conversationStep, runId);
+      assertCurrent();
     }
   }
 
@@ -193,13 +170,17 @@ export function finalizeAgentDrivenSession<TSession extends FinalizeSessionLike>
     });
   }
 
+  assertCurrent();
   deps.annotateLatestCompletedTurn(sessionId, traceId, result);
+  assertCurrent();
 
   const terminalRunStatus = deps.terminalRunStatusForResult(result);
+  assertCurrent();
   session.status = terminalRunStatus === 'quota_exceeded'
     ? 'quota_exceeded'
     : result.success ? 'completed' : 'failed';
   deps.markSessionRunStatus(session, terminalRunStatus, undefined, runId);
+  assertCurrent();
 
   logger.info(input.logComponent, 'Agent-driven result finalized', {
     confidence: result.confidence,
@@ -220,27 +201,29 @@ export function finalizeAgentDrivenSession<TSession extends FinalizeSessionLike>
     sessionId,
     traceId,
     query,
-    result: {
-      conclusion: result.conclusion,
-      totalDurationMs: result.totalDurationMs,
-      partial: result.partial,
-      terminationMessage: result.terminationMessage,
-    },
+    result,
     logger,
     logComponent: input.logComponent,
   };
+  assertCurrent();
   deps.persistAgentTurn(persistenceInput);
+  assertCurrent();
 
   deps.ensureCompletedAnalysisSseEvents(session, completedRunId);
+  assertCurrent();
   deps.refreshPersistedAgentSnapshot(persistenceInput);
+  assertCurrent();
   const clientCount = session.sseClients.length;
   session.sseClients.forEach((client, index) => {
+    assertCurrent();
     try {
       logger.info('AgentRoutes', `Sending finalized result to client ${index + 1}/${clientCount}`);
+      assertCurrent();
       deps.sendAgentDrivenResult(client, session, runId);
     } catch (e: any) {
       logger.error('AgentRoutes', `Error sending finalized result to client ${index + 1}`, e);
     }
   });
+  assertCurrent();
   logger.close();
 }

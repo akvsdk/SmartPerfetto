@@ -33,6 +33,12 @@ export interface DerivedTimelineStep {
   text: string;
 }
 
+export interface TimelineProjectionContext {
+  comparisonActive?: boolean;
+  currentTraceId?: string;
+  referenceTraceId?: string;
+}
+
 export function sanitizeConversationText(value: unknown, maxLen = 240): string {
   return String(value ?? '')
     .replace(/\s+/g, ' ')
@@ -66,8 +72,8 @@ function timelineTraceRoleLabel(
   language: ReturnType<typeof parseOutputLanguage>,
 ): string {
   return traceSide === 'reference'
-    ? localize(language, '参考', 'reference')
-    : localize(language, '当前', 'current');
+    ? localize(language, '对比 Trace', 'comparison trace')
+    : localize(language, '基线 Trace', 'baseline trace');
 }
 
 function timelinePaneLabel(
@@ -89,17 +95,25 @@ function timelinePaneLabel(
 function timelineTraceLocationLabel(
   envelope: Record<string, any>,
   language: ReturnType<typeof parseOutputLanguage>,
-): string | undefined {
-  const traceSide = normalizeTimelineTraceSide(
-    envelope?.meta?.traceSide || envelope?.traceSide || envelope?.traceProvenance?.traceSide,
-  );
+  context: TimelineProjectionContext,
+): {traceSide: 'current' | 'reference'; paneSide?: string; label: string; roleLabel: string} | undefined {
+  const provenance = envelope.meta?.traceProvenance ?? envelope.traceProvenance;
+  let traceSide = normalizeTimelineTraceSide(envelope.meta?.traceSide)
+    ?? normalizeTimelineTraceSide(envelope.traceSide)
+    ?? normalizeTimelineTraceSide(provenance?.traceSide);
+  if (!traceSide) {
+    const traceId = envelope.meta?.traceId ?? envelope.traceId ?? provenance?.traceId;
+    const current = typeof traceId === 'string' && traceId === context.currentTraceId;
+    const reference = typeof traceId === 'string' && traceId === context.referenceTraceId;
+    if (current !== reference) traceSide = current ? 'current' : 'reference';
+  }
   if (!traceSide) return undefined;
 
-  const paneSide = normalizeTimelinePaneSide(
-    envelope?.meta?.paneSide || envelope?.paneSide || envelope?.traceProvenance?.paneSide,
-  );
+  const paneSide = normalizeTimelinePaneSide(envelope.meta?.paneSide)
+    ?? normalizeTimelinePaneSide(envelope.paneSide)
+    ?? normalizeTimelinePaneSide(provenance?.paneSide);
   const roleLabel = timelineTraceRoleLabel(traceSide, language);
-  return paneSide ? `${timelinePaneLabel(paneSide, language)}/${roleLabel}` : roleLabel;
+  return {traceSide, paneSide, label: paneSide ? `${timelinePaneLabel(paneSide, language)}/${roleLabel}` : roleLabel, roleLabel};
 }
 
 /**
@@ -140,45 +154,67 @@ function summarizeTimelineResult(content: Record<string, any>): string {
 export function summarizeDataEnvelopeForTimeline(
   update: StreamingUpdate,
   language: ReturnType<typeof parseOutputLanguage>,
+  context: TimelineProjectionContext = {},
 ): string {
   const envelopes = (Array.isArray(update.content) ? update.content : [update.content]).filter(
-    (entry) => entry && typeof entry === 'object',
+    entry => entry && typeof entry === 'object',
   ) as Array<Record<string, any>>;
   if (envelopes.length === 0) return '';
 
-  const allTitles = envelopes
-    .map((env) => sanitizeConversationText(env?.display?.title || env?.meta?.stepId || env?.meta?.source))
-    .filter(Boolean);
-  const titles = allTitles.slice(0, 4);
-  const omittedTitleCount = Math.max(0, allTitles.length - titles.length);
-  const titleText = titles.length > 0
-    ? localize(
-        language,
-        `：${titles.join(' / ')}${omittedTitleCount > 0 ? ` 等 ${allTitles.length} 项` : ''}`,
-        `: ${titles.join(' / ')}${omittedTitleCount > 0 ? ` and ${omittedTitleCount} more` : ''}`,
-      )
-    : '';
+  const locations = envelopes.map(envelope => timelineTraceLocationLabel(envelope, language, context));
+  const showLocations = context.comparisonActive === true
+    || new Set(locations.map(location => location?.label).filter(Boolean)).size > 1;
+  type SourceGroup = {label: string; titles: string[]};
+  const groupTitles = (includePane: boolean) => {
+    const groups = new Map<string, SourceGroup>();
+    envelopes.forEach((envelope, index) => {
+      const title = sanitizeConversationText(envelope.display?.title || envelope.meta?.stepId || envelope.meta?.source);
+      if (!title) return;
+      const source = locations[index];
+      const label = showLocations
+        ? (includePane ? source?.label : source?.roleLabel)
+          ?? localize(language, 'Trace 来源未标注', 'unlabelled trace') : '';
+      const key = !showLocations ? 'single' : source
+        ? `${source.traceSide}:${includePane ? source.paneSide ?? '' : ''}` : 'unknown';
+      const group = groups.get(key) ?? {label, titles: []};
+      if (!group.titles.includes(title)) group.titles.push(title);
+      groups.set(key, group);
+    });
+    return groups;
+  };
+  let groups = groupTitles(true);
 
-  // Only meaningful while a comparison is running; in a single-trace analysis
-  // every envelope is from the current trace and saying so is noise.
-  const traceLocations = [
-    ...new Set(envelopes.map(env => timelineTraceLocationLabel(env, language)).filter((label): label is string => !!label)),
-  ];
-  const traceText = traceLocations.length > 1
-    ? localize(language, `，Trace: ${traceLocations.join('/')}`, `, trace: ${traceLocations.join('/')}`)
-    : '';
+  const phaseWarnings = [...new Set(envelopes
+    .map(envelope => sanitizeConversationText(envelope.meta?.planPhaseWarning, 120)).filter(Boolean))];
+  const warning = phaseWarnings.length > 0
+    ? localize(language, `阶段归因需核对: ${phaseWarnings[0]}`, `Phase attribution needs review: ${phaseWarnings[0]}`) : '';
+  if (groups.size === 0) return warning;
 
-  // A caveat about which phase this evidence belongs to changes how it should
-  // be read, so it stays.
-  const phaseWarnings = [
-    ...new Set(envelopes.map((env) => sanitizeConversationText(env?.meta?.planPhaseWarning, 120)).filter(Boolean)),
-  ];
-  const phaseWarningText = phaseWarnings.length > 0
-    ? localize(language, `，阶段归因需核对: ${phaseWarnings[0]}`, `, phase attribution needs review: ${phaseWarnings[0]}`)
-    : '';
-
-  return localize(language, `收到 ${envelopes.length} 份证据`, `Received ${envelopes.length} evidence outputs`) +
-    `${titleText}${traceText}${phaseWarningText}`;
+  // The stored timeline has a 240-character ceiling. Allocate title space
+  // across sources before truncating, so a long first title cannot hide the
+  // other trace. Complete provenance remains on the envelopes themselves.
+  const limit = 240;
+  const prefix = localize(language, '已获得 ', 'Received ');
+  const separator = localize(language, '；', '; ');
+  const headerSize = (sourceGroups: Map<string, SourceGroup>) => prefix.length
+    + [...sourceGroups.values()].reduce((sum, group) => sum + (group.label ? group.label.length + 2 : 0), 0)
+    + Math.max(0, sourceGroups.size - 1) * separator.length;
+  // A replay batch can span several historical pane positions. If their
+  // labels crowd out the evidence, retain trace roles in this short line;
+  // every original pane remains available on its source envelope.
+  if (headerSize(groups) + groups.size * 16 > limit) groups = groupTitles(false);
+  const entries = [...groups.values()].map(({label, titles}) => ({
+    label: label ? `${label}: ` : '',
+    title: `${titles.slice(0, 4).join(' / ')}${titles.length > 4 ? ' …' : ''}`,
+  }));
+  const overhead = headerSize(groups);
+  const warningBudget = Math.max(0, limit - overhead - entries.length * 16 - separator.length);
+  const warningText = warning ? sanitizeConversationText(warning, warningBudget) : '';
+  const titleBudget = Math.max(0, Math.floor((limit - overhead - (warningText ? warningText.length + separator.length : 0)) / entries.length));
+  const truncate = (title: string) => title.length <= titleBudget ? title
+    : titleBudget > 0 ? `${title.slice(0, Math.max(0, titleBudget - 1)).trimEnd()}…` : '';
+  return prefix + entries.map(entry => entry.label + truncate(entry.title)).join(separator)
+    + (warningText ? separator + warningText : '');
 }
 
 /**
@@ -192,6 +228,7 @@ export function summarizeDataEnvelopeForTimeline(
 export function deriveTimelineStep(
   update: StreamingUpdate,
   language: OutputLanguage,
+  context: TimelineProjectionContext = {},
 ): DerivedTimelineStep | null {
   if (update.type === 'conversation_step') return null;
 
@@ -299,7 +336,7 @@ export function deriveTimelineStep(
     case 'data': {
       phase = 'result';
       role = 'system';
-      text = summarizeDataEnvelopeForTimeline(update, language);
+      text = summarizeDataEnvelopeForTimeline(update, language, context);
       break;
     }
     case 'conclusion':

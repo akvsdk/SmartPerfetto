@@ -16,10 +16,6 @@ import type { ArchitectureInfo } from '../agent/detectors/types';
 import type { DetectedFocusApp } from './focusAppDetector';
 import { formatDurationNs } from './focusAppDetector';
 import {
-  buildPlanTemplateTriggerContext,
-  resolveActiveConditionalPlanRequirements,
-} from './scenePlanTemplates';
-import {
   getFinalReportContract,
   getStrategyContent,
   loadPromptTemplate,
@@ -34,6 +30,9 @@ import {
   QUICK_TRIAGE_MAX_CLAIMS,
   QUICK_TRIAGE_MAX_FACT_BULLETS,
 } from './quickAnswerContract';
+import {resolveRuntimeTurnPolicy} from '../agentRuntime/runtimeTurnPolicy';
+import {CONCLUSION_CONTRACT_SIDECAR_MARKER} from '../agent/core/conclusionContract';
+import {SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../services/verifier/deterministicClaimVerifier';
 
 /**
  * Rough token estimate for mixed Chinese/English text.
@@ -57,17 +56,6 @@ export function estimatePromptTokens(text: string): number {
 export const MAX_PROMPT_TOKENS = 12_000;
 /** M2 hard gate: always-injected scene strategy core budget. */
 export const MAX_SCENE_CORE_TOKENS = 4_000;
-/**
- * Budget for the non-droppable architecture plan-requirement section. It is
- * paid on every full-mode run of an affected scene, so it has to stay small
- * enough not to evict the droppable context sections.
- *
- * Sized against the widest real branch set — Flutter TextureView activates two
- * required skills — with calls rendered in their literal `expectedCalls` shape.
- * The shorthand form is cheaper but induces `skillId` on tools that reject it,
- * which costs a whole plan round trip.
- */
-export const MAX_PLAN_ARCHITECTURE_REQUIREMENT_TOKENS = 240;
 
 function buildOutputLanguageSection(language: OutputLanguage): string {
   const templateName = language === 'en' ? 'prompt-language-en' : 'prompt-language-zh';
@@ -156,7 +144,7 @@ function buildFinalReportContractSection(sceneType: SceneType | undefined): stri
       .filter(requirement => requirement.required !== false)
       .map((requirement, index) => {
         const description = requirement.description ? `：${requirement.description}` : '';
-        const triggerNote = requirement.triggerPatterns.length > 0 ? '（条件触发）' : '';
+        const triggerNote = requirement.condition ? '（条件触发）' : '';
         return `${index + 1}. ${requirement.label}${triggerNote}${description}`;
       })
       .join('\n');
@@ -617,48 +605,6 @@ export interface SystemPromptBuildOptions {
 }
 
 /**
- * Build the assembled prompt + structured segment metadata.
- * `buildSystemPrompt()` is now a thin wrapper around this.
- */
-
-/**
- * Tell the model which architecture-conditional calls its plan must declare,
- * before it submits — the requirement is fully determined by the detected
- * architecture plus strategy frontmatter, so learning it from a plan rejection
- * costs a guaranteed provider round trip on every such run.
- *
- * The mapping itself is never restated here; it comes from the same resolver
- * the plan gate uses.
- */
-function buildPlanArchitectureRequirementSection(
-  sceneType: SceneType | undefined,
-  architecture: ArchitectureInfo | undefined,
-  userQuery: string | undefined,
-): string {
-  if (!sceneType) return '';
-  const requirements = resolveActiveConditionalPlanRequirements(
-    sceneType,
-    buildPlanTemplateTriggerContext(userQuery, architecture),
-  );
-  if (requirements.length === 0) return '';
-  const template = loadPromptTemplate('plan-architecture-requirements');
-  if (!template) return '';
-  const lines = requirements.map(requirement => {
-    // Render the literal expectedCalls shape. A shorthand like
-    // `invoke_skill(id)` invites the model to attach skillId to tools that do
-    // not accept one, which the gate then rejects on its own rule.
-    const calls = requirement.requiredExpectedCalls
-      .map(call => (call.skillId
-        ? `{"tool":"${call.tool}","skillId":"${call.skillId}"}`
-        : `{"tool":"${call.tool}"}`))
-      .join(' ');
-    const mandatory = requirement.waivable ? '' : '（不可豁免）';
-    return `- ${requirement.aspectId}${mandatory}: ${calls}`;
-  });
-  return renderTemplate(template, { requirements: lines.join('\n') });
-}
-
-/**
  * Drop developer-facing HTML comments before a section becomes prompt text.
  *
  * Template headers carry SPDX, copyright, and "which variables exist" notes.
@@ -678,11 +624,203 @@ export function stripTemplateComments(content: string): string {
     .trim();
 }
 
+type TypedTurnPromptContext = Partial<ClaudeAnalysisContext> & {
+  runtimeEvidenceContext?: string;
+  quickMemoryContext?: string;
+};
+
+/**
+ * The typed path has one presentation contract for every runtime budget. Scene
+ * prose, quick-answer recipes, and lexical plan triggers belong to the legacy
+ * path only. Identity and authorization are separate from trimmable context.
+ */
+function buildTypedTurnSystemPromptParts(
+  context: TypedTurnPromptContext,
+  maxTokens = MAX_PROMPT_TOKENS,
+): SystemPromptParts {
+  const intent = context.turnIntent;
+  const registry = context.strategyRegistry;
+  if (!intent || !registry) throw new Error('[SystemPrompt] Missing typed turn intent or strategy registry pin');
+  if (intent.registryFingerprint !== registry.registryFingerprint) {
+    throw new Error('[SystemPrompt] Turn intent and strategy registry pin disagree');
+  }
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    throw new Error('[SystemPrompt] Invalid prompt token budget');
+  }
+  const strategy = registry.getStrategy(intent.sceneId);
+  if (intent.status === 'resolved' && (!strategy || strategy.strategyKind === 'contract_only')) {
+    throw new Error('[SystemPrompt] Resolved scene is absent from the pinned strategy registry');
+  }
+  const policy = resolveRuntimeTurnPolicy(intent);
+  const onDemandContext = policy.onDemandContext || context.onDemandContext === true;
+  const language = context.outputLanguage ?? DEFAULT_OUTPUT_LANGUAGE;
+  const segments: PromptSegment[] = [];
+  const push = (tier: PromptTier, label: string, content: string, droppable = false, truncatable = false) => {
+    if (!content) return;
+    segments.push({tier, label, content, droppable, truncatable,
+      charCount: content.length, estimatedTokens: estimatePromptTokens(content)});
+  };
+  const data = (tier: PromptTier, label: string, value: unknown, droppable = false, truncatable = false) => {
+    if (value !== undefined) push(tier, label, JSON.stringify({context: label, data: value}), droppable, truncatable);
+  };
+  const requiredAsset = (name: string) => {
+    const content = stripTemplateComments(loadPromptTemplate(name) ?? '');
+    if (!content) throw new Error(`[SystemPrompt] Missing required typed-turn prompt template: ${name}`);
+    return content;
+  };
+
+  push(1, 'turn_protocol', requiredAsset('prompt-turn-policy'));
+  // Inject protocol syntax after authoring comments are removed. Applying the
+  // comment stripper to the rendered asset would delete its sidecar example.
+  push(1, 'conclusion_declaration', renderTemplate(requiredAsset('prompt-conclusion-contract-schema'), {
+    sidecarOpeningMarker: CONCLUSION_CONTRACT_SIDECAR_MARKER,
+    supportedProofRules: JSON.stringify(SUPPORTED_DETERMINISTIC_CLAIM_RULES),
+  }));
+  push(1, 'output_language', requiredAsset(language === 'en' ? 'prompt-language-en' : 'prompt-language-zh'));
+  push(1, 'retrieved_context_safety', requiredAsset('retrieved-context-safety'));
+  data(3, 'turn_policy', {
+    schemaVersion: intent.schemaVersion, status: intent.status, taskKind: intent.taskKind,
+    scope: intent.scope, deliverable: intent.deliverable, evidenceAccess: intent.evidenceAccess,
+    sceneId: intent.sceneId, registryFingerprint: registry.registryFingerprint, onDemandContext,
+  });
+  data(3, 'source_authorization', {
+    mode: context.codeAwareMode ?? 'off', codebaseIds: context.codebaseIds ?? [],
+    evidenceAccess: intent.evidenceAccess,
+  });
+
+  if (!onDemandContext && strategy) {
+    data(3, 'scene_context', {
+      sceneId: strategy.scene, description: strategy.classificationDescription,
+      requiredCapabilities: strategy.requiredCapabilities, optionalCapabilities: strategy.optionalCapabilities,
+    });
+  }
+  if (intent.status === 'resolved' && policy.requiresReport) {
+    const contract = getFinalReportContract(intent.sceneId, registry);
+    data(3, 'report_requirements', {
+      sceneId: intent.sceneId, registryFingerprint: registry.registryFingerprint,
+      requirements: (contract?.requiredSections ?? []).map(({id, label, description, required, condition}) =>
+        ({id, label, description, required, ...(condition ? {condition} : {})})),
+    });
+  }
+
+  if (context.codeAwareMode && context.codeAwareMode !== 'off' && context.codebaseIds?.length) {
+    if (policy.allowNewEvidence) {
+      const sourceUseDecision = loadSourceUseDecisionPrompt({
+        codeAwareMode: context.codeAwareMode, codebaseIds: context.codebaseIds, outputLanguage: language,
+      });
+      if (sourceUseDecision) push(3, 'source_use_decision', stripTemplateComments(sourceUseDecision));
+    }
+    push(3, 'code_reference_contract', requiredAsset(language === 'en'
+      ? 'prompt-code-reference-contract-en' : 'prompt-code-reference-contract-zh'));
+  }
+
+  // No architecture guidance, focus-app default target, or probe suggestion is
+  // inferred from missing data. These are facts/hints already supplied by the run.
+  data(2, 'trace_context', {
+    packageName: context.packageName, architecture: context.architecture,
+    focusApps: context.focusApps, focusMethod: context.focusMethod,
+    traceOs: context.traceOs, traceFormat: context.traceFormat,
+  }, true);
+  data(2, 'trace_completeness', context.traceCompleteness, true);
+  data(2, 'knowledge_base', context.knowledgeBaseContext, true);
+  data(3, 'available_agents', context.availableAgents, true);
+
+  // Selection and both sides of a comparison are atomic, non-droppable data.
+  // A large description on one side can never evict the other trace's identity.
+  data(4, 'selection_context', context.selectionContext);
+  if (context.comparison) {
+    const comparison = context.comparison;
+    const pair = comparison.tracePairContext;
+    data(4, 'comparison_identity', {
+      referenceTraceId: comparison.referenceTraceId,
+      tracePairContext: pair && {
+        schemaVersion: pair.schemaVersion, layout: pair.layout,
+        primarySide: pair.primarySide, referenceSide: pair.referenceSide, activeSide: pair.activeSide,
+        aliases: pair.aliases,
+        panes: pair.panes.map(({side, traceSide, traceId, traceFingerprint, active, visualState}) =>
+          ({side, traceSide, traceId, traceFingerprint, active, visualState})),
+      },
+      compareAnchor: comparison.compareAnchor,
+      capabilityProbeStatus: comparison.capabilityProbeStatus ?? 'not_checked',
+    });
+    data(4, 'comparison_details', {
+      currentPackageName: context.packageName, referencePackageName: comparison.referencePackageName,
+      referenceArchitecture: comparison.referenceArchitecture, referenceFocusApps: comparison.referenceFocusApps,
+      commonCapabilities: comparison.commonCapabilities, capabilityDiff: comparison.capabilityDiff,
+      traceNames: pair?.panes.map(({traceSide, traceName}) => ({traceSide, traceName})),
+      workspaceOpen: pair?.workspaceOpen, splitPercent: pair?.splitPercent,
+      maximizedTraceSide: pair?.maximizedTraceSide, minimizedTraceSides: pair?.minimizedTraceSides,
+    }, true);
+  }
+
+  // Keep the supplied history intact unless the actual prompt budget requires a
+  // visibly incomplete preview. Never silently turn a missing preview into proof.
+  const history = {
+    previousFindings: context.previousFindings, analysisNotes: context.analysisNotes,
+    conversationSummary: context.conversationSummary, entityContext: context.entityContext,
+    previousPlan: context.previousPlan, planHistory: context.planHistory,
+    quickMemoryContext: context.quickMemoryContext,
+  };
+  if (Object.values(history).some(value => value !== undefined)) data(4, 'conversation_context', history, false, true);
+  data(4, 'runtime_evidence', context.runtimeEvidenceContext, false, true);
+  data(4, 'sql_error_pairs', context.sqlErrorFixPairs, true);
+  data(4, 'pattern_context', context.patternContext, true);
+  data(4, 'negative_pattern_context', context.negativePatternContext, true);
+  data(4, 'case_background_context', context.caseBackgroundContext, true);
+
+  const droppedLabels: string[] = [];
+  const truncatedLabels: string[] = [];
+  const tokenCount = () => estimatePromptTokens(joinSegments(segments));
+  for (let index = segments.length - 1; index >= 0 && tokenCount() > maxTokens; index -= 1) {
+    if (!segments[index].droppable) continue;
+    droppedLabels.push(segments[index].label);
+    segments.splice(index, 1);
+  }
+  for (let index = segments.length - 1; index >= 0 && tokenCount() > maxTokens; index -= 1) {
+    const segment = segments[index];
+    if (!segment.truncatable) continue;
+    const original = segment.content;
+    const preview = (length: number) => JSON.stringify({context: segment.label, data: {
+      truncated: true, originalCharCount: original.length, preview: original.slice(0, length),
+    }});
+    if (estimatePromptTokens(preview(0)) >= segment.estimatedTokens) continue;
+    let low = 0;
+    let high = original.length;
+    let best = preview(0);
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = preview(middle);
+      if (estimatePromptTokens(joinSegmentsWithReplacement(segments, index, candidate)) <= maxTokens) {
+        best = candidate;
+        low = middle + 1;
+      } else high = middle - 1;
+    }
+    segment.originalCharCount = segment.charCount;
+    segment.originalEstimatedTokens = segment.estimatedTokens;
+    segment.content = best;
+    segment.charCount = best.length;
+    segment.estimatedTokens = estimatePromptTokens(best);
+    segment.truncated = true;
+    truncatedLabels.push(segment.label);
+  }
+  if (tokenCount() > maxTokens) {
+    throw new Error(`[SystemPrompt] Typed turn context exceeds hard budget: ~${tokenCount()} tokens (budget: ${maxTokens})`);
+  }
+  // Preserve cache order as well as segment metadata in both public builders.
+  segments.sort((a, b) => a.tier - b.tier);
+  return {
+    stablePrefix: joinSegments(segments, segment => segment.tier <= 3),
+    volatileSuffix: joinSegments(segments, segment => segment.tier === 4),
+    fullPrompt: joinSegments(segments), segments, droppedLabels, truncatedLabels,
+  };
+}
+
 export function buildSystemPromptParts(
   context: ClaudeAnalysisContext,
   maxTokens?: number,
   options: SystemPromptBuildOptions = {},
 ): SystemPromptParts {
+  if (context.turnIntent) return buildTypedTurnSystemPromptParts(context, maxTokens);
   const effectiveMaxTokens = maxTokens ?? MAX_PROMPT_TOKENS;
   const shouldTruncateSceneCore = options.truncateSceneCore ?? true;
   const segments: PromptSegment[] = [];
@@ -772,14 +910,6 @@ export function buildSystemPromptParts(
   } else if (context.packageName) {
     push(2, 'architecture', `## 当前 Trace 信息\n\n- **包名**: ${context.packageName}\n- **架构**: 未检测（建议先调用 detect_architecture）`);
   }
-
-  // Not droppable and not truncatable: if the budget silently removed it, the
-  // first submit_plan would go back to being rejected by construction.
-  push(2, 'plan_architecture_requirements', buildPlanArchitectureRequirementSection(
-    context.sceneType,
-    context.architecture,
-    context.query,
-  ));
 
   if (context.focusApps && context.focusApps.length > 0) {
     push(2, 'focus_apps', buildFocusAppSection(context.focusApps, context.focusMethod));
@@ -1083,33 +1213,23 @@ export function buildSystemPromptParts(
 }
 
 /**
- * Build the assembled system prompt string. Thin wrapper around
- * {@link buildSystemPromptParts} that returns just the joined prompt —
- * 100% byte-compatible with the pre-Phase-1.2 implementation.
+ * Build the assembled system prompt string using the same sections and budget
+ * checks as the structured prompt API.
  */
 export function buildSystemPrompt(context: ClaudeAnalysisContext, maxTokens?: number): string {
   return buildSystemPromptParts(context, maxTokens).fullPrompt;
 }
 
 /**
- * Build a minimal system prompt for quick (factual) queries.
- * Loads the prompt-quick template and injects architecture + focus app context.
- * Target: ~1500 tokens — much smaller than the full 4500-token prompt.
+ * Typed turns share the full builder's policy, evidence, and delivery contract.
+ * Calls without a turn intent retain the legacy quick-template adapter while
+ * runtime migration is in progress.
  */
-export function buildQuickSystemPrompt(opts: {
-  architecture?: ArchitectureInfo;
-  packageName?: string;
-  focusApps?: DetectedFocusApp[];
-  focusMethod?: 'battery_stats' | 'oom_adj' | 'frame_timeline' | 'none';
-  selectionContext?: SelectionContext;
+export function buildQuickSystemPrompt(opts: Partial<ClaudeAnalysisContext> & {
   runtimeEvidenceContext?: string;
   quickMemoryContext?: string;
-  /** Perfetto SQL definitions matched to the question; keeps quick SQL targeted. */
-  knowledgeBaseContext?: string;
-  outputLanguage?: OutputLanguage;
-  codeAwareMode?: ClaudeAnalysisContext['codeAwareMode'];
-  codebaseIds?: string[];
-}): string {
+}, maxTokens?: number): string {
+  if (opts.turnIntent) return buildTypedTurnSystemPromptParts(opts, maxTokens).fullPrompt;
   const template = loadPromptTemplate('prompt-quick');
   if (!template) {
     return '你是 Android 性能 trace 分析专家。请简洁直接地回答用户的问题。';

@@ -18,11 +18,13 @@ sessions, and cross-session learning must not add either domain implicitly.
 | None | Present | Exact `knowledgeSourceIds` and active generations; external prose is background, never current-trace evidence |
 | Present | Present | Both allowlists apply and validate independently, then share the private projection and report boundary |
 
-Except for the lightweight Conversation surface, selecting source, external
-RAG, or a reference trace requires tools unavailable in the lightweight
-runtime, so `fast` / `auto` resolves to `full`. Conversation keeps the fast
-executor and returns only bounded references; source/RAG deep evidence requires
-a handoff to a new full analysis. Smart Profile
+`fast` / `full` selects a budget independently from authorization for source,
+external RAG, or a reference trace. It neither silently removes those capabilities
+nor requires a full report. The five native runtimes use tools on demand under
+typed scope and evidence-access constraints: `existing_only` prohibits new
+acquisition, and `read_new` cannot widen authorization. Conversation shares these
+on-demand capabilities without automatically starting another source-analysis
+pass. Smart Profile
 preview only inventories scenes. A deep dive must pass the source mode,
 `codebaseIds`, `knowledgeSourceIds`, output language, and preview identity into
 the real run unchanged instead of relying on implicit UI-global state.
@@ -44,6 +46,15 @@ context snapshots left by an older version before refusing restoration. Final
 conclusions, deterministic trace evidence, and bounded provenance pass through
 the shared projection before chat, report, CLI artifact, and analysis-result
 snapshot surfaces receive them.
+
+A logical Conversation session may retain in-process artifacts and original
+captures while every physical session/run ID remains unique. A privately issued
+binding fixes the exact trace pair, authorization fingerprint and owner scope;
+JSON, historical prose and snapshots cannot recreate that capability. The bounded
+model catalog only locates retained artifacts and carries neither rows nor
+verification authority. Authorization/scope changes and product disposal revoke
+the context. Old cancellation, late callbacks and cleanup cannot affect a later
+run. Each finalization read view fixes its admitted capture set.
 
 ## Registration And Deletion Lifecycle
 

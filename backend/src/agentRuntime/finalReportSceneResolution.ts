@@ -19,7 +19,7 @@ export function resolveRuntimeFinalReportSceneType(input: {
   plan?: AnalysisPlanV3 | null;
 }): SceneType {
   const skillIds = (input.plan?.toolCallLog ?? [])
-    .filter(record => (
+    .filter(record => record.success === true && (
       expectedCallMatchesRecord({tool: 'invoke_skill'}, record) ||
       expectedCallMatchesRecord({tool: 'compare_skill'}, record)
     ))

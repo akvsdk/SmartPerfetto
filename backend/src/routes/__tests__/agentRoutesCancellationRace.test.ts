@@ -4,6 +4,23 @@
 
 import { afterEach, describe, expect, it, jest } from '@jest/globals';
 import express from 'express';
+import {EventEmitter} from 'events';
+import {attachFinalizationContext, takeFinalizationContext, type RuntimeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
+import {buildStrategyRegistrySnapshotFromDefinitions} from '../../agentv3/strategyLoader';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import {createDataEnvelope} from '../../types/dataContract';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import type {IdentityResolutionV1} from '../../types/identityContract';
+import {captureEvidenceTable} from '../../services/evidence/evidenceCapture';
+import type {EvidenceReadView} from '../../services/evidence/evidenceReadView';
+import * as finalization from '../../services/finalizeAnalysisResult';
+import * as persistence from '../../services/persistAgentSession';
+import * as summary from '../../services/managedTraceSummary';
+import * as comparison from '../../services/comparisonAppendixService';
+import * as sourceSupplement from '../../services/codebase/analysisSourceSupplement';
+import * as contextAuthorization from '../../services/resolvedAnalysisContext';
+import * as reports from '../reportRoutes';
+import * as snapshots from '../../services/analysisResultSnapshotPipeline';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -659,5 +676,250 @@ describe('agent analyze cancellation races', () => {
       setTraceProcessorLeaseStoreForTests(null);
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('HTTP shared finalization ownership', () => {
+  function fixture(id: string) {
+    process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'false';
+    const runId = `${id}:run`;
+    const run = {runId, requestId: `${id}:request`, sequence: 1, query: 'fact', startedAt: Date.now(), status: 'running'};
+    const emitter = new EventEmitter();
+    const native: AnalysisResult = {sessionId: id, success: false, conclusion: 'exact\r\nbody',
+      findings: [], hypotheses: [], confidence: 0.2, rounds: 1, totalDurationMs: 1};
+    const analyze = jest.fn(async (_query: string, _sessionId: string, _traceId: string,
+      _options?: import('../../agent/core/orchestratorTypes').AnalysisOptions) => native);
+    const orchestrator = Object.assign(emitter, {analyze, abortSession: jest.fn(), cleanupSession: jest.fn()});
+    const session = {sessionId: id, traceId: 'trace-a', query: 'fact', createdAt: Date.now(), lastActivityAt: Date.now(),
+      status: 'running', activeRun: run, lastRun: run, runRegistry: {[runId]: run}, runSequence: 1,
+      sseClients: [], sseEventSeq: 0, sseEventBuffer: [], dataEnvelopes: [], hypotheses: [],
+      conclusionHistory: [], conversationSteps: [], agentDialogue: [], agentResponses: [], orchestrator,
+      logger: {info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn(), close: jest.fn(),
+        timed: async <T>(_component: string, _label: string, operation: () => Promise<T>) => operation()},
+    } as any;
+    agentRoutesCancellationTestSeam.setSession(id, session);
+    jest.spyOn(contextAuthorization, 'buildAnalysisContextAuthorizationFingerprint').mockReturnValue('fixed-auth');
+    jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => undefined);
+    jest.spyOn(persistence, 'persistAgentTurn').mockImplementation(() => undefined);
+    jest.spyOn(persistence, 'refreshPersistedAgentSnapshot').mockImplementation(() => undefined);
+    const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'http-finalizer'});
+    const attach = (input: {evidenceAccess?: 'read_new' | 'existing_only'; unavailable?: boolean; deadlineMs?: number;
+      runId?: string; referenceTraceId?: string; evidenceReadView?: EvidenceReadView} = {}) => {
+      const ownedId = input.runId ?? runId;
+      const candidate = {runId: ownedId, attemptId: 'attempt', candidateRef: 'candidate',
+        conclusionFingerprint: analysisDeliveryFingerprint(native.conclusion)};
+      attachFinalizationContext(native, {runId: ownedId, sessionId: id, deadlineMs: input.deadlineMs ?? Date.now() + 5000,
+        strategyRegistry: registry, traceIdentity: {currentTraceId: 'trace-a', referenceTraceId: input.referenceTraceId},
+        evidenceReadView: input.evidenceReadView,
+        turnIntent: {schemaVersion: 1, status: input.unavailable ? 'unavailable' : 'resolved',
+          source: input.unavailable ? 'fallback' : 'semantic', registryFingerprint: registry.registryFingerprint,
+          taskKind: 'fact', sceneId: 'general', scope: 'scene_wide', recommendedComplexity: 'full',
+          deliverable: 'answer', evidenceAccess: input.evidenceAccess ?? 'existing_only'},
+        deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate,
+          completion: {...candidate, schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'completed'}, outputOrigin: 'sdk_final'},
+      });
+    };
+    return {session, native, runId, analyze, orchestrator, attach};
+  }
+
+  it.each(['existing_only', 'unavailable', 'missing_context', 'expired'] as const)(
+    'takes the exact result once and skips all hidden acquisition for %s', async mode => {
+      const id = `http-native-${mode}`;
+      const f = fixture(id);
+      if (mode !== 'missing_context') f.attach({unavailable: mode === 'unavailable',
+        evidenceAccess: mode === 'expired' ? 'read_new' : 'existing_only',
+        deadlineMs: mode === 'expired' ? Date.now() - 1 : undefined});
+      const raw = createDataEnvelope({columns: ['value'], rows: [[42]]},
+        {type: 'sql_result', source: 'query', title: 'fact', evidenceRefId: 'data:http:raw'});
+      f.analyze.mockImplementation(async () => {
+        f.orchestrator.emit('update', {type: 'data', content: raw, timestamp: Date.now()});
+        return f.native;
+      });
+      const summarySpy = jest.spyOn(summary, 'executeManagedTraceSummaryV1');
+      const comparisonSpy = jest.spyOn(comparison, 'buildRawTraceComparisonReportSection');
+      const sourceSpy = jest.spyOn(sourceSupplement, 'runAnalysisSourceSupplement');
+      const query = jest.fn();
+      const finalize = jest.spyOn(finalization, 'finalizeAnalysisResult').mockImplementation(async input => {
+        expect(input.result).toBe(f.native);
+        expect(takeFinalizationContext(f.native)).toBeUndefined();
+        expect(input.owner.runId).toBe(f.runId);
+        expect(input.comparisonIdentity).toBeUndefined();
+        expect(input.dataEnvelopes).toContain(raw);
+        expect(input.caseRetrieval).toEqual({status: 'not_checked', recommendations: []});
+        input.owner.assertAuthorized();
+        input.context?.dispose();
+        return {result: input.result};
+      });
+      try {
+        await agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, 'fact', 'trace-a', {
+          runContext: f.session.activeRun, traceProcessorService: {query}, executeStateTimeline: true,
+          generateTracks: false,
+        });
+        expect(finalize).toHaveBeenCalledTimes(1);
+        expect(f.analyze.mock.calls[0][3]?.runId).toBe(f.runId);
+        expect(summarySpy).not.toHaveBeenCalled();
+        expect(comparisonSpy).not.toHaveBeenCalled();
+        expect(sourceSpy).not.toHaveBeenCalled();
+        expect(query).not.toHaveBeenCalled();
+        expect(persistence.persistAgentTurn).toHaveBeenCalledWith(expect.objectContaining({result: f.native}));
+        expect(f.session.result.conclusion).toBe('exact\r\nbody');
+        expect(f.session.status).toBe('failed');
+        const completedEvent = f.session.sseEventBuffer.find((event: any) => event.eventType === 'analysis_completed');
+        expect(JSON.parse(completedEvent.eventData).data).toMatchObject({success: false, terminalRunStatus: 'failed'});
+      } finally {agentRoutesCancellationTestSeam.deleteSession(id);}
+    });
+
+  it.each(['captured', 'uncaptured', 'conflicting'] as const)(
+    'passes %s comparison identities through the actual shared finalizer without new acquisition', async mode => {
+      const id = `http-comparison-${mode}`;
+      const f = fixture(id);
+      const store = new ArtifactStore();
+      const capturedIdentities: IdentityResolutionV1[] = [];
+      const envelopes = (mode === 'conflicting' ? [1, 2, 3] : [1, 2]).map(upid => {
+        const side = upid === 2 ? 'reference' : 'current';
+        const traceId = side === 'current' ? 'trace-a' : 'trace-b';
+        const identity: IdentityResolutionV1 = {version: 'identity_contract@1', identityRefId: `identity:${upid}`,
+          status: 'verified', target: {traceId, traceSide: side, upid, source: 'skill_param'},
+          processes: [{upid, packageName: `app.${side}`, confidence: 1, matchSources: ['upid']}], threads: [], warnings: []};
+        const data = {columns: ['value'], rows: [[42]]};
+        const envelope = createDataEnvelope(data, {type: 'skill_result', source: 'native', title: side,
+          traceId, traceSide: side, evidenceRefId: `evidence:${upid}`, identityResolution: identity,
+          scopeProvenance: {version: 'process_scope_evidence@1', entries: [{role: 'target', fields: ['value'],
+            scope: {mode: 'exact_upid', traceId, traceSide: side, upid, identityRefId: identity.identityRefId}}]}});
+        if (mode !== 'uncaptured') store.registerStandaloneEvidenceCapture(captureEvidenceTable(data), {
+          meta: envelope.meta, display: envelope.display,
+        });
+        capturedIdentities.push(identity);
+        // Transport metadata cannot replace the frozen native record.
+        if (mode === 'captured') envelope.meta.identityResolution = {...identity, status: 'ambiguous', processes: []};
+        return envelope;
+      });
+      f.attach({referenceTraceId: 'trace-b', evidenceReadView: store.createEvidenceReadView({ownerKey: f.runId,
+        allowedTraces: [{traceId: 'trace-a', traceSide: 'current'}, {traceId: 'trace-b', traceSide: 'reference'}]})});
+      f.analyze.mockImplementation(async () => {
+        for (const envelope of envelopes) f.orchestrator.emit('update', {type: 'data', content: envelope, timestamp: Date.now()});
+        return f.native;
+      });
+      const finalize = jest.spyOn(finalization, 'finalizeAnalysisResult');
+      const query = jest.fn();
+      const comparisonSpy = jest.spyOn(comparison, 'buildRawTraceComparisonReportSection');
+      try {
+        await agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, 'Compare', 'trace-a', {
+          runContext: f.session.activeRun, referenceTraceId: 'trace-b', traceProcessorService: {query}, generateTracks: false,
+        });
+        expect(finalize).toHaveBeenCalledTimes(1);
+        expect(f.session.result.deliveryAssurance.identity).toBe(mode === 'captured' ? 'passed' : 'not_checked');
+        if (mode === 'captured') expect(f.session.result.identityResolutions).toEqual(capturedIdentities);
+        expect(f.session.result.conclusion).toBe(f.native.conclusion);
+        expect(query).not.toHaveBeenCalled();
+        expect(comparisonSpy).not.toHaveBeenCalled();
+      } finally {agentRoutesCancellationTestSeam.deleteSession(id);}
+    },
+  );
+
+  it('does not retire or delete a replacement session after authorization cleanup yields', async () => {
+    const id = 'http-authorization-replacement'; const f = fixture(id); f.attach();
+    const replacement = {...f.session, activeRun: {...f.session.activeRun, runId: 'replacement-run'}};
+    const replacementOwner = agentRoutesCancellationTestSeam.createHttpFinalizationRun(
+      replacement, 'replacement-run', {}, {}, 'fixed-auth',
+    );
+    f.orchestrator.cleanupSession.mockImplementation(() => {
+      agentRoutesCancellationTestSeam.setSession(id, replacement);
+      return Promise.resolve();
+    });
+    jest.spyOn(finalization, 'finalizeAnalysisResult').mockImplementation(async input => {
+      input.context?.dispose(); throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
+    });
+    try {
+      await agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, 'fact', 'trace-a', {
+        runContext: f.session.activeRun, generateTracks: false,
+      });
+      expect(replacementOwner.owner.isCurrent()).toBe(true);
+      expect(replacement.status).toBe('running');
+      expect(persistence.persistAgentTurn).not.toHaveBeenCalled();
+    } finally {replacementOwner.release(); agentRoutesCancellationTestSeam.deleteSession(id);}
+  });
+
+  it('does not launch an automatic source supplement for a legacy deep_supplement activation', async () => {
+    const id = 'http-no-automatic-source-supplement'; const f = fixture(id);
+    f.native.success = true; f.attach({evidenceAccess: 'read_new'});
+    f.session.sourceActivation = 'deep_supplement'; f.session.sourceAuthorization = {codeAwareMode: 'metadata_only', codebaseIds: ['source']};
+    const supplement = jest.spyOn(sourceSupplement, 'runAnalysisSourceSupplement');
+    jest.spyOn(reports, 'persistReport').mockImplementation(() => undefined);
+    jest.spyOn(snapshots, 'persistCompletedAnalysisResultSnapshot').mockReturnValue(null);
+    jest.spyOn(finalization, 'finalizeAnalysisResult').mockImplementation(async input => {
+      input.context?.dispose(); return {result: input.result};
+    });
+    try {
+      await agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, '审查源码中的阻塞原因', 'trace-a', {
+        runContext: f.session.activeRun, generateTracks: false,
+      });
+      expect(supplement).not.toHaveBeenCalled();
+      expect(f.session.analysisSourceEnrichment).toBeUndefined();
+      expect(f.analyze).toHaveBeenCalledTimes(1);
+    } finally {agentRoutesCancellationTestSeam.deleteSession(id);}
+  });
+
+  it('takes and disposes context before an outer native-settlement callback cancels the run', async () => {
+    const id = 'http-cancel-after-native';
+    const f = fixture(id); f.attach();
+    let taken: RuntimeFinalizationContext | undefined;
+    const finalize = jest.spyOn(finalization, 'finalizeAnalysisResult');
+    f.session.logger.timed = async (_component: string, _label: string, operation: () => Promise<AnalysisResult>) => {
+      const result = await operation();
+      expect(takeFinalizationContext(result)).toBeUndefined();
+      agentRoutesCancellationTestSeam.abortHttpFinalizationRuns(f.session, f.runId);
+      return result;
+    };
+    try {
+      await expect(agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, 'fact', 'trace-a', {
+        runContext: f.session.activeRun, generateTracks: false,
+      })).rejects.toMatchObject({name: 'AbortError'});
+      expect(finalize).not.toHaveBeenCalled();
+      expect(persistence.persistAgentTurn).not.toHaveBeenCalled();
+      expect(f.session.result).toBeUndefined();
+      expect(taken).toBeUndefined();
+    } finally {agentRoutesCancellationTestSeam.deleteSession(id);}
+  });
+
+  it('rejects a runtime context belonging to a different run without adopting its identity', async () => {
+    const id = 'http-wrong-context';
+    const f = fixture(id); f.attach({runId: 'runtime-other-run'});
+    const finalize = jest.spyOn(finalization, 'finalizeAnalysisResult');
+    try {
+      await expect(agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, 'fact', 'trace-a', {
+        runContext: f.session.activeRun, generateTracks: false,
+      })).rejects.toThrow('finalization_run_identity_mismatch');
+      expect(finalize).not.toHaveBeenCalled();
+      expect(persistence.persistAgentTurn).not.toHaveBeenCalled();
+      expect(f.session.result).toBeUndefined();
+    } finally {agentRoutesCancellationTestSeam.deleteSession(id);}
+  });
+
+  it('keeps finalizer cancellation alive after native settlement and cannot commit a late result', async () => {
+    const id = 'http-cancel-in-finalizer';
+    const f = fixture(id); f.attach();
+    let notifyStarted!: () => void;
+    const started = new Promise<void>(resolve => {notifyStarted = resolve;});
+    const finalize = jest.spyOn(finalization, 'finalizeAnalysisResult').mockImplementation(async input => {
+      notifyStarted();
+      try {await new Promise<never>((_resolve, reject) => {
+        input.owner.signal.addEventListener('abort', () => reject(input.owner.signal.reason), {once: true});
+      });} finally {input.context?.dispose();}
+      return {result: input.result};
+    });
+    try {
+      const pending = agentRoutesCancellationTestSeam.runAgentDrivenAnalysis(id, 'fact', 'trace-a', {
+        runContext: f.session.activeRun, generateTracks: false,
+      });
+      await started;
+      await agentRoutesCancellationTestSeam.cancelSessionRun(id, f.runId, 'cancel finalization');
+      await pending;
+      expect(finalize).toHaveBeenCalledTimes(1);
+      expect(persistence.persistAgentTurn).not.toHaveBeenCalled();
+      expect(f.session.result).toBeUndefined();
+      expect(f.session.conclusionHistory).toEqual([]);
+    } finally {agentRoutesCancellationTestSeam.deleteSession(id);}
   });
 });

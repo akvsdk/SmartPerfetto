@@ -3,6 +3,7 @@
 
 ---
 scene: scroll_response
+classification_description: "The initial response to starting a scroll gesture, including time to the first visual update."
 priority: 3
 effort: medium
 required_capabilities:

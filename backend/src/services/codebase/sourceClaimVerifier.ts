@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import type {ConclusionContract} from '../../agent/core/conclusionContract';
+import {parseClaimSemanticsDeclaration, type ConclusionContract} from '../../agent/core/conclusionContract';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import {
   sanitizeSourceClaimBindings,
@@ -18,7 +18,17 @@ import {
   collectMatchedTraceEvidenceRefIdsByClaimId,
   collectVerifiedTraceOccurrenceRefIdsByClaimId,
 } from '../verifier/claimVerificationRunner';
-import {sanitizeCodeAwareStructuredText} from '../security/codeAwareOutputRegistry';
+import {randomUUID} from 'node:crypto';
+import {
+  composeCodeAwareTextProjectionReceipts,
+  isIssuedCodeAwareTextProjectionReceipt,
+  projectCodeAwareStructuredText,
+  sanitizeCodeAwareStructuredText,
+  sanitizeCodeAwareStructuredTextWithReceipt,
+  sanitizeCodeAwareTextWithReceipt,
+  type CodeAwareTextProjectionReceipt,
+} from '../security/codeAwareOutputRegistry';
+import {analysisDeliveryFingerprint, type AnalysisDeliveryContext} from '../../types/analysisDelivery';
 
 export type SourceClaimVerificationStatus = 'passed' | 'failed' | 'partial' | 'not_checked';
 
@@ -33,6 +43,8 @@ export interface SourceClaimVerificationIssue {
     | 'source_binding_trace_cross_claim'
     | 'source_binding_trace_occurrence_not_verified'
     | 'source_absence_requires_complete_search'
+    | 'source_claim_semantics_unchecked'
+    | 'source_binding_mechanism_unverified'
     | 'source_binding_strength_downgraded';
   message: string;
   sourceReferenceId?: string;
@@ -248,9 +260,16 @@ export function verifySourceClaimBindings(input: {
   actualSourceUseDecision?: SourceUseDecisionV1;
   matchedTraceEvidenceRefIdsByClaimId?: Record<string, string[]>;
   verifiedTraceOccurrenceRefIdsByClaimId?: Record<string, string[]>;
+  /** Current @2 verification never classifies source assertions by their prose. */
+  semanticsPolicy?: 'declared' | 'legacy';
 }): SourceClaimVerificationResult {
   const contract = input.conclusionContract;
   const actualSourceUseDecision = sanitizeSourceUseDecision(input.actualSourceUseDecision);
+  if (contract && !actualSourceUseDecision && input.semanticsPolicy === 'declared' &&
+    (contract.sourceClaimBindings?.length || contract.sourceReferences?.length || contract.sourceUseDecision)) {
+    return {schemaVersion: 'source_claim_verifier@1', status: 'partial', bindings: [], issues: [{severity: 'warning',
+      code: 'source_claim_semantics_unchecked', message: 'declared source evidence has no current authorized execution ledger'}]};
+  }
   if (!contract || !actualSourceUseDecision) {
     return {schemaVersion: 'source_claim_verifier@1', status: 'not_checked', bindings: [], issues: []};
   }
@@ -262,7 +281,11 @@ export function verifySourceClaimBindings(input: {
     return {schemaVersion: 'source_claim_verifier@1', status: 'not_checked', bindings: [], issues: []};
   }
 
-  const claims = new Map((contract.claims || []).map((claim, index) => [claim.id || `Q${index + 1}`, claim]));
+  const declaredClaims = contract.claims || [];
+  const claims = input.semanticsPolicy === 'declared'
+    ? new Map(declaredClaims.filter(claim => typeof claim.id === 'string' && claim.id.trim() &&
+      declaredClaims.filter(other => other.id === claim.id).length === 1).map(claim => [claim.id!, claim]))
+    : new Map(declaredClaims.map((claim, index) => [claim.id || `Q${index + 1}`, claim]));
   const actualReferences = new Map(context.references.map(reference => [reference.id, reference]));
   const declaredReferences = new Map(context.declaredReferences.map(reference => [reference.id, reference]));
   const selectedCodebaseIds = new Set(context.decision.selectedCodebaseIds);
@@ -284,13 +307,25 @@ export function verifySourceClaimBindings(input: {
     if (!claim) {
       issues.push({
         claimId: candidate.claimId,
-        severity: 'error',
-        code: 'source_claim_missing',
+        severity: input.semanticsPolicy === 'declared' ? 'warning' : 'error',
+        code: input.semanticsPolicy === 'declared' ? 'source_claim_semantics_unchecked' : 'source_claim_missing',
         message: 'source binding claimId does not exist in the structured claims',
       });
       continue;
     }
-    if (context.decision.status === 'search_incomplete' && negativeSourceAbsenceClaim(claim.text)) {
+    if (input.semanticsPolicy === 'declared') {
+      const semantics = parseClaimSemanticsDeclaration(claim.semantics).semantics;
+      if (!semantics || claim.semanticsParseIssues?.length || claim.rawSemantics !== undefined ||
+        contract.bindingEligibility === 'ineligible') {
+        issues.push({claimId: candidate.claimId, severity: 'warning', code: 'source_claim_semantics_unchecked',
+          message: 'source references do not establish the meaning of an unchecked claim declaration'});
+      } else if (semantics.predicate === 'source.existence' && semantics.polarity === 'negated' &&
+        semantics.discourse === 'asserted') {
+        // A search ledger's completion flag is not an exhaustive versioned-codebase proof.
+        issues.push({claimId: candidate.claimId, severity: 'warning', code: 'source_absence_requires_complete_search',
+          message: 'a negative source-existence proposition requires an explicit complete absence proof'});
+      }
+    } else if (context.decision.status === 'search_incomplete' && negativeSourceAbsenceClaim(claim.text)) {
       issues.push({
         claimId: candidate.claimId,
         severity: 'error',
@@ -351,7 +386,11 @@ export function verifySourceClaimBindings(input: {
     if (rejected) continue;
 
     let mechanismStatus = candidate.mechanismStatus;
-    if (mechanismStatus === 'corroborated') {
+    if (mechanismStatus === 'corroborated' && input.semanticsPolicy === 'declared') {
+      mechanismStatus = 'compatible';
+      issues.push({claimId: candidate.claimId, severity: 'warning', code: 'source_binding_mechanism_unverified',
+        message: 'source text and a trace interval do not establish a native execution mechanism'});
+    } else if (mechanismStatus === 'corroborated') {
       const hasProviderBody = context.decision.codeAwareMode === 'provider_send' &&
         bindingReferences.some(reference => reference.lookupKind === 'body' || reference.lookupKind === 'indexed');
       const verifiedOccurrenceIds = new Set(
@@ -400,6 +439,7 @@ export function verifySourceClaimBindingsForResult(
   return verifySourceClaimBindings({
     conclusionContract: result.conclusionContract,
     actualSourceUseDecision,
+    semanticsPolicy: result.claimVerificationResult.schemaVersion === 'claim_verifier@2' ? 'declared' : 'legacy',
     matchedTraceEvidenceRefIdsByClaimId: collectMatchedTraceEvidenceRefIdsByClaimId(
       result.claimVerificationResult,
     ),
@@ -439,65 +479,147 @@ export function finalizeSourceAwareAnalysisResult(
   result: AnalysisResult,
   sourceUse: SourceUseDecisionReader | undefined,
 ): AnalysisResult {
+  return finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse).result;
+}
+
+export interface SourceAwareAnalysisProjection {
+  result: AnalysisResult;
+  conclusionProjection: CodeAwareTextProjectionReceipt;
+  deliveryContext?: AnalysisDeliveryContext;
+}
+
+/** Final callers must consume the returned context instead of the pre-projection one. */
+export function finalizeSourceAwareAnalysisResultWithProjection(
+  result: AnalysisResult,
+  sourceUse: SourceUseDecisionReader | undefined,
+  options: {priorProjection?: CodeAwareTextProjectionReceipt; context?: AnalysisDeliveryContext} = {},
+): SourceAwareAnalysisProjection {
+  const structure = () => ({
+    conclusionContract: result.conclusionContract, claimSupport: result.claimSupport,
+    claimVerificationResult: result.claimVerificationResult, sourceUseDecision: result.sourceUseDecision,
+    sourceReferences: result.sourceReferences, sourceClaimVerificationResult: result.sourceClaimVerificationResult,
+  });
+  const before = projectCodeAwareStructuredText(undefined, structure());
+  const beforeFingerprint = analysisDeliveryFingerprint(before.value);
+  const originalClaimVerification = result.claimVerificationResult;
   const actualDecision = sanitizeSourceUseDecision(sourceUse?.getSourceUseDecision());
+  const hasPriorProjection = isIssuedCodeAwareTextProjectionReceipt(options.priorProjection) &&
+    options.priorProjection.outputFingerprint === analysisDeliveryFingerprint(result.conclusion);
+  const shouldProject = Boolean(actualDecision || hasPriorProjection);
   attachSourceUseToAnalysisResult(
     result,
     actualDecision
       ? {getSourceUseDecision: () => actualDecision}
       : undefined,
   );
-  if (!actualDecision) return result;
+  // Recompute against this run's accessor before privacy projection changes text.
+  // An archived or provider-authored sidecar cannot establish current source failure.
+  const currentSourceVerification = actualDecision ? verifySourceClaimBindingsForResult(result) : undefined;
+  const directProjection = shouldProject
+    ? sanitizeCodeAwareStructuredTextWithReceipt(result.sessionId, result.conclusion)
+    : sanitizeCodeAwareTextWithReceipt(undefined, result.conclusion);
+  const conclusionProjection = composeCodeAwareTextProjectionReceipts(options.priorProjection, directProjection);
+  result.conclusion = conclusionProjection.text;
+  if (shouldProject) {
+    result.findings = sanitizeCodeAwareStructuredText(result.sessionId, result.findings);
+    result.hypotheses = sanitizeCodeAwareStructuredText(result.sessionId, result.hypotheses);
+    if (result.terminationMessage !== undefined) {
+      result.terminationMessage = sanitizeCodeAwareStructuredText(result.sessionId, result.terminationMessage);
+    }
+    if (result.conclusionContract !== undefined) {
+      result.conclusionContract = sanitizeCodeAwareStructuredText(result.sessionId, result.conclusionContract);
+    }
+    if (result.claimSupport !== undefined) {
+      result.claimSupport = sanitizeCodeAwareStructuredText(result.sessionId, result.claimSupport);
+    }
+    if (result.claimVerificationResult !== undefined) {
+      result.claimVerificationResult = sanitizeCodeAwareStructuredText(result.sessionId, result.claimVerificationResult);
+      // Privacy projection must not turn known machine failures into unknown strings.
+      if ((originalClaimVerification?.schemaVersion === 'claim_verifier@1' ||
+        originalClaimVerification?.schemaVersion === 'claim_verifier@2') && result.claimVerificationResult) {
+        result.claimVerificationResult.schemaVersion = originalClaimVerification.schemaVersion;
+        if (originalClaimVerification.status === 'failed') result.claimVerificationResult.status = 'failed';
+        if (originalClaimVerification.passed === false) result.claimVerificationResult.passed = false;
+        originalClaimVerification.issues.forEach((issue, index) => {
+          if (issue.severity === 'error' && result.claimVerificationResult?.issues?.[index]) {
+            result.claimVerificationResult.issues[index].severity = 'error';
+          }
+        });
+        originalClaimVerification.claimResults.forEach((claim, index) => {
+          if (claim.status === 'unsupported' && result.claimVerificationResult?.claimResults?.[index]) {
+            result.claimVerificationResult.claimResults[index].status = 'unsupported';
+          }
+        });
+      }
+    }
+    if (result.identityResolutions !== undefined) {
+      result.identityResolutions = sanitizeCodeAwareStructuredText(result.sessionId, result.identityResolutions);
+    }
+    if (result.smartScenePreview !== undefined) {
+      result.smartScenePreview = sanitizeCodeAwareStructuredText(result.sessionId, result.smartScenePreview);
+    }
+    if (result.uiActionProposals !== undefined) {
+      result.uiActionProposals = sanitizeCodeAwareStructuredText(result.sessionId, result.uiActionProposals);
+    }
+  }
+  if (currentSourceVerification?.status === 'failed') {
+    result.sourceClaimVerificationResult = sanitizeCodeAwareStructuredText(result.sessionId, currentSourceVerification);
+    if (result.sourceClaimVerificationResult) {
+      result.sourceClaimVerificationResult.schemaVersion = 'source_claim_verifier@1';
+      result.sourceClaimVerificationResult.status = 'failed';
+      currentSourceVerification.issues.forEach((issue, index) => {
+        if (issue.severity === 'error' && result.sourceClaimVerificationResult?.issues?.[index]) {
+          result.sourceClaimVerificationResult.issues[index].severity = 'error';
+        }
+      });
+    }
+  }
 
-  result.conclusion = sanitizeCodeAwareStructuredText(result.sessionId, result.conclusion);
-  result.findings = sanitizeCodeAwareStructuredText(result.sessionId, result.findings);
-  result.hypotheses = sanitizeCodeAwareStructuredText(result.sessionId, result.hypotheses);
-  if (result.terminationMessage !== undefined) {
-    result.terminationMessage = sanitizeCodeAwareStructuredText(
-      result.sessionId,
-      result.terminationMessage,
-    );
+  const after = projectCodeAwareStructuredText(undefined, structure());
+  const structureChanged = before.changed || after.changed || beforeFingerprint !== analysisDeliveryFingerprint(after.value);
+  const bodyChanged = conclusionProjection.disposition !== 'preserved';
+  let deliveryContext = options.context;
+  if (bodyChanged || structureChanged) {
+    delete result.reportAssessment;
+    delete result.deliveryAssurance;
+    if (bodyChanged) delete result.completion;
+    if (deliveryContext && deliveryContext.entry !== 'historical_restore') {
+      deliveryContext = {...deliveryContext, claimVerificationBinding: undefined, sourceVerificationBinding: undefined,
+        reportAssessment: undefined, evidenceRenderedProof: undefined};
+      if (bodyChanged) {
+        const original = deliveryContext.acceptedCandidate;
+        const nativeCompletion = deliveryContext.completion;
+        const candidateMatches = original && [original.candidateRef, original.runId, original.attemptId]
+          .every(id => typeof id === 'string' && id.trim()) &&
+          isIssuedCodeAwareTextProjectionReceipt(conclusionProjection) &&
+          (original.conclusionFingerprint === conclusionProjection.inputFingerprint ||
+            original.conclusionFingerprint === directProjection.inputFingerprint);
+        const completionMatches = candidateMatches && nativeCompletion?.schemaVersion === 1 &&
+          nativeCompletion.candidateRef === original.candidateRef && nativeCompletion.runId === original.runId &&
+          nativeCompletion.attemptId === original.attemptId && nativeCompletion.conclusionFingerprint === original.conclusionFingerprint;
+        if (candidateMatches) {
+          const candidate = {...original, candidateRef: `projection-${randomUUID()}`,
+            conclusionFingerprint: conclusionProjection.outputFingerprint};
+          deliveryContext = {...deliveryContext, acceptedCandidate: candidate,
+            completion: completionMatches ? {...nativeCompletion, ...candidate,
+              ...(conclusionProjection.disposition === 'replaced' ? {status: 'unknown' as const} : {})} : undefined,
+            outputOrigin: conclusionProjection.disposition === 'replaced' ? 'runtime_fallback' : deliveryContext.outputOrigin};
+          result.completion = deliveryContext.completion;
+          result.outputOrigin = deliveryContext.outputOrigin;
+        } else {
+          deliveryContext = {...deliveryContext, completion: undefined, outputOrigin: undefined};
+          delete result.outputOrigin;
+        }
+      }
+    }
   }
-  if (result.conclusionContract !== undefined) {
-    result.conclusionContract = sanitizeCodeAwareStructuredText(
-      result.sessionId,
-      result.conclusionContract,
-    );
-  }
-  if (result.claimSupport !== undefined) {
-    result.claimSupport = sanitizeCodeAwareStructuredText(result.sessionId, result.claimSupport);
-  }
-  if (result.claimVerificationResult !== undefined) {
-    result.claimVerificationResult = sanitizeCodeAwareStructuredText(
-      result.sessionId,
-      result.claimVerificationResult,
-    );
-  }
-  if (result.identityResolutions !== undefined) {
-    result.identityResolutions = sanitizeCodeAwareStructuredText(
-      result.sessionId,
-      result.identityResolutions,
-    );
-  }
-  if (result.smartScenePreview !== undefined) {
-    result.smartScenePreview = sanitizeCodeAwareStructuredText(
-      result.sessionId,
-      result.smartScenePreview,
-    );
-  }
-  if (result.uiActionProposals !== undefined) {
-    result.uiActionProposals = sanitizeCodeAwareStructuredText(
-      result.sessionId,
-      result.uiActionProposals,
-    );
-  }
-
-  if (
-    result.success &&
-    (actualDecision.status === 'pending' || actualDecision.status === 'attempted')
-  ) {
+  if (conclusionProjection.disposition === 'replaced') {
+    result.outputOrigin = 'runtime_fallback';
     result.success = false;
     result.partial = true;
-    result.terminationReason = 'plan_incomplete';
+    if (deliveryContext && deliveryContext.entry !== 'historical_restore') {
+      deliveryContext = {...deliveryContext, outputOrigin: 'runtime_fallback'};
+    }
   }
-  return result;
+  return {result, conclusionProjection, ...(deliveryContext ? {deliveryContext} : {})};
 }

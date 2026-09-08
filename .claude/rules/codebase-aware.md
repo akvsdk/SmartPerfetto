@@ -15,13 +15,13 @@ Use these rules before touching code-aware analysis, codebase registry, source i
 
 - Register and preview paths through `PathSecurityGate`; never trust a client-supplied root directly.
 - A live registered root is sufficient for bounded `search_codebase` and `read_codebase_file`; an active index is optional acceleration, not an analysis prerequisite.
-- In full analysis, selected source plus a queryable trace anchor requires bounded lookup or a structured pre-lookup terminal decision. Quantitative-only questions may record `not_needed`; an incomplete search cannot support a source-absence claim.
+- Explicit source selection makes authorized tools available to the primary run. The AI decides whether source lookup is needed within the runtime evidence policy and caller budgets; completion does not require a lookup or `record_source_use_decision` call. An incomplete search cannot support a source-absence claim.
 - On-demand access must enforce the registered path filters, extension/size limits, provider consent, bounded results/line ranges, secret redaction, and the private-output projection. Never return an absolute root.
 - Code-aware chunks must carry `codebaseId` and `registryOrigin='codebase_registry'`.
 - `app_source`, `kernel_source`, or registry-origin chunks missing codebase metadata must fail closed with `invalid_codebase_metadata`.
 - Indexed lookup handlers must pass through `LookupResponseFilter`; on-demand handlers must pass through `OnDemandSourceAccessService` and the same external-surface projection boundary before results leave the runtime.
 - SSE/log/snapshot/report/export paths must use projected/sanitized payloads, not raw MCP tool results.
-- `SourceUseDecisionV1` is actual current-run MCP state, not model-authored prose. It records selected/queried/used IDs, status, structured reason code, coverage, and safe references. `pending` or `attempted` cannot finish as success.
+- `SourceUseDecisionV1` is actual current-run MCP state, not model-authored prose. It records selected/queried/used IDs, status, structured reason code, coverage, and safe references. `pending` and `attempted` are audit states and do not override native completion or make the answer partial by themselves. Unchecked source claims remain unverified; actual invalid bindings and private-output projection failures retain their separate verification and delivery consequences.
 - `SourceClaimBindingV1` must bind only references returned by the current selected partition to verified trace evidence for the same claim. `corroborated` requires verified trace occurrence plus `provider_send` body/indexed evidence; `metadata_only` is locate-only.
 - Initial/replayed SSE, HTML reports, CLI JSON/Markdown/HTML, analysis-result snapshots, and report/snapshot APIs must share the canonical safe projector. The Web receipt is stricter and retains no CodeRefs. Never retain roots, snippets, queries, or free-text binding reasons on these surfaces.
 - Keep prompt content in `backend/strategies/` and Skills in `backend/skills/`; do not hardcode code-aware prompting in TypeScript.

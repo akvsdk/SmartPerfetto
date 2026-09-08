@@ -3,11 +3,61 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import { describe, expect, it, jest } from '@jest/globals';
-import { createSseBridge, isSdkToolResultFailure } from '../claudeSseBridge';
+import { createSseBridge, extractSdkToolResultBlocks, isSdkToolResultFailure } from '../claudeSseBridge';
+import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
 import {__testing as claudeRuntimeTesting} from '../../agentRuntime/engines/claude/claudeRuntime';
 import type { StreamingUpdate } from '../../agent/types';
 
 describe('createSseBridge', () => {
+  it('does not guess tool identity for unknown results or emit duplicate responses', () => {
+    const updates: StreamingUpdate[] = [];
+    const bridge = createSseBridge(update => updates.push(update));
+    const dispatch = {type: 'assistant', message: {content: [
+      {type: 'tool_use', id: 'call-a', name: 'read_codebase_file', input: {}},
+      {type: 'tool_use', id: 'call-b', name: 'execute_sql', input: {}},
+    ]}};
+    bridge.handleMessage(dispatch);
+    bridge.handleMessage(dispatch);
+    expect(updates.filter(update => update.type === 'agent_task_dispatched')).toHaveLength(2);
+    bridge.handleMessage({type: 'user', tool_use_result: {raw: 'UNKNOWN_SOURCE_CANARY'}});
+    bridge.handleMessage({type: 'user', message: {content: [
+      {type: 'tool_result', tool_use_id: 'missing', content: 'UNKNOWN_SOURCE_CANARY'},
+    ]}});
+    expect(updates.filter(update => update.type === 'agent_response')).toEqual([]);
+    const result = {type: 'user', message: {content: [
+      {type: 'tool_result', tool_use_id: 'call-b', content: [{type: 'text', text: '{"success":true}'}]},
+    ]}};
+    bridge.handleMessage(result);
+    bridge.handleMessage(result);
+    bridge.handleMessage(dispatch);
+    expect(updates.filter(update => update.type === 'agent_response')).toHaveLength(1);
+    expect(updates.filter(update => update.type === 'agent_task_dispatched')).toHaveLength(2);
+    expect(JSON.stringify(updates)).not.toContain('UNKNOWN_SOURCE_CANARY');
+    bridge.dispose();
+  });
+  it('does not turn quoted failure fields inside successful data into a failed call', () => {
+    expect(isSdkToolResultFailure({content: [{type: 'text', text: JSON.stringify({
+      success: true, example: {success: false}, note: 'The previous invocation had "success": false.',
+    })}]})).toBe(false);
+  });
+
+  it.each([
+    ['object', (value: unknown) => value],
+    ['serialized object', (value: unknown) => JSON.stringify(value)],
+  ])('associates a complete SDK receipt in %s form with its own tool call', (_label, wrap) => {
+    const complete = createRuntimeToolResult({success: false, planPhaseId: 'p1'});
+    const block = {type: 'tool_result', tool_use_id: 'call1', content: 'shortened'};
+    const one = extractSdkToolResultBlocks({message: {content: [block]}, tool_use_result: wrap(complete)});
+    expect(readRuntimeToolResultFacts(one[0].result)).toEqual({success: false, planPhaseId: 'p1'});
+    const mismatched = extractSdkToolResultBlocks({message: {content: [block]}, tool_use_result: wrap({...complete, tool_use_id: 'call2'})});
+    expect(readRuntimeToolResultFacts(mismatched[0].result)).toEqual({});
+    const missingContent = extractSdkToolResultBlocks({message: {content: [{...block, content: undefined}]}, tool_use_result: wrap({...complete, tool_use_id: 'call2'})});
+    expect(readRuntimeToolResultFacts(missingContent[0].result)).toEqual({});
+    const multiple = extractSdkToolResultBlocks({message: {content: [block, {...block, tool_use_id: 'call2'}]}, tool_use_result: wrap(complete)});
+    expect(multiple.map(item => readRuntimeToolResultFacts(item.result))).toEqual([{}, {}]);
+    const bound = extractSdkToolResultBlocks({message: {content: [block, {...block, tool_use_id: 'call2'}]}, tool_use_result: wrap({...complete, tool_use_id: 'call2'})});
+    expect(bound.map(item => readRuntimeToolResultFacts(item.result))).toEqual([{}, {success: false, planPhaseId: 'p1'}]);
+  });
   it('detects plain and string-escaped MCP failures for metrics', () => {
     expect(isSdkToolResultFailure({success: false})).toBe(true);
     expect(isSdkToolResultFailure('{"success":false}')).toBe(true);
@@ -328,7 +378,7 @@ describe('createSseBridge', () => {
     expect(serialized).toContain('snippetHash');
   });
 
-  it('projects replayed private wiki results even without a local tool-use mapping', () => {
+  it('does not republish an unassociated replay result as a new tool response', () => {
     const updates: StreamingUpdate[] = [];
     const bridge = createSseBridge((update) => updates.push(update));
     const privateResult = JSON.stringify({result: {
@@ -356,7 +406,7 @@ describe('createSseBridge', () => {
 
     const serialized = JSON.stringify(updates);
     expect(serialized).not.toContain('CLAUDE_REPLAY_PRIVATE_WIKI_CANARY');
-    expect(serialized).toContain('snippetHash');
+    expect(updates).toEqual([]);
   });
 
   it('projects private wiki results before recording Claude plan evidence', () => {

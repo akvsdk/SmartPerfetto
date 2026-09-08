@@ -18,6 +18,8 @@ import type {
 import type { IdentityResolutionV1 } from '../../types/identityContract';
 import { buildEvidenceContract } from '../evidence/evidenceContractBuilder';
 import { runDeterministicClaimVerifier } from './deterministicClaimVerifier';
+import type {PreparedClaimEvidence} from '../evidence/claimEvidencePreparation';
+import type {ConclusionBindingEligibility} from '../../agent/core/conclusionContract';
 
 export interface ClaimVerificationRunnerInput {
   conclusionContract?: ConclusionContract | null;
@@ -26,6 +28,8 @@ export interface ClaimVerificationRunnerInput {
   relationCandidates?: EvidenceRelationCandidateV1[];
   relationActivationClaimIds?: string[];
   policy?: ClaimVerificationPolicy;
+  preparedEvidence?: PreparedClaimEvidence;
+  bindingEligibility?: ConclusionBindingEligibility;
 }
 
 export interface ClaimVerificationRunnerResult {
@@ -64,10 +68,15 @@ export function collectMatchedTraceEvidenceRefIdsByClaimId(
 export function collectVerifiedTraceOccurrenceRefIdsByClaimId(
   verification: ClaimVerificationResult,
 ): Record<string, string[]> {
-  return collectMatchedTraceEvidenceRefIds(
-    verification,
-    new Set<ClaimVerificationClaimStatus>(['verified']),
-  );
+  if (verification.schemaVersion !== 'claim_verifier@2') return {};
+  const result: Record<string, string[]> = {};
+  for (const claim of verification.claimResults) {
+    const proof = claim.deterministicProof;
+    if (claim.status !== 'verified' || proof?.status !== 'proved' || proof.kind !== 'interval_overlap'
+      || claim.propositionCoverage?.status !== 'complete') continue;
+    if (proof.evidenceRefIds.length) result[claim.claimId] = [...new Set(proof.evidenceRefIds)].sort();
+  }
+  return result;
 }
 
 function isIdentityResolution(value: unknown): value is IdentityResolutionV1 {
@@ -149,6 +158,8 @@ export function runClaimVerification(input: ClaimVerificationRunnerInput): Claim
     comparisonReportSection: input.comparisonReportSection,
     relationCandidates: input.relationCandidates,
     relationActivationClaimIds: input.relationActivationClaimIds,
+    preparedEvidence: input.preparedEvidence,
+    bindingEligibility: input.bindingEligibility,
   });
   const claimVerificationResult = runDeterministicClaimVerifier({
     claimSupport: evidenceContract.claimSupport,

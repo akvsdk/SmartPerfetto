@@ -137,8 +137,8 @@ describe('normalizeAnalyzeOptions', () => {
     ['neither', {}, 'auto', undefined, undefined, undefined],
     ['source metadata', {codeAwareMode: 'metadata_only', codebaseIds: ['app']}, 'auto', 'metadata_only', ['app'], undefined],
     ['source provider send', {codeAwareMode: 'provider_send', codebaseIds: ['app']}, 'auto', 'provider_send', ['app'], undefined],
-    ['RAG only', {knowledgeSourceIds: ['wiki']}, 'full', undefined, undefined, ['wiki']],
-    ['source plus RAG', {codeAwareMode: 'provider_send', codebaseIds: ['app'], knowledgeSourceIds: ['wiki']}, 'full', 'provider_send', ['app'], ['wiki']],
+    ['RAG only', {knowledgeSourceIds: ['wiki']}, 'auto', undefined, undefined, ['wiki']],
+    ['source plus RAG', {codeAwareMode: 'provider_send', codebaseIds: ['app'], knowledgeSourceIds: ['wiki']}, 'auto', 'provider_send', ['app'], ['wiki']],
   ])('normalizes the Smart context matrix: %s', (
     _label,
     context,
@@ -239,11 +239,11 @@ describe('normalizeAnalyzeOptions', () => {
       {
         preset: 'smart',
         smartAction: 'analyze',
-        knowledgeSourceIds: ['wiki-a', 'wiki-a', 'wiki-b'],
+      knowledgeSourceIds: ['wiki-a', 'wiki-a', 'wiki-b'],
       },
       { endpoint: '/analyze', hasReferenceTraceId: false },
     )).toEqual({
-      analysisMode: 'full',
+      analysisMode: 'auto',
       preset: 'smart',
       smartAction: 'analyze',
       smartSelection: { scope: 'all' },
@@ -287,7 +287,7 @@ describe('normalizeAnalyzeOptions', () => {
     )).toThrow(/仅支持新会话/);
   });
 
-  it('forces full analysis when explicit source context would be unavailable in fast mode', () => {
+  it('preserves fast mode and authorized source context for comparison', () => {
     expect(normalizeAnalyzeOptions(
       {
         analysisMode: 'fast',
@@ -297,7 +297,7 @@ describe('normalizeAnalyzeOptions', () => {
       },
       { endpoint: '/sessions/:id/runs', hasReferenceTraceId: true },
     )).toEqual({
-      analysisMode: 'full',
+      analysisMode: 'fast',
       codeAwareMode: 'metadata_only',
       codebaseIds: ['a', 'b'],
       knowledgeSourceIds: ['wiki-a', 'wiki-b'],
@@ -332,15 +332,15 @@ describe('normalizeAnalyzeOptions', () => {
     )).toThrow('codebaseIds require codeAwareMode');
   });
 
-  it('forces auto source context and comparison requests onto full analysis', () => {
+  it('preserves auto mode with source context and comparison', () => {
     expect(normalizeAnalyzeOptions(
       {analysisMode: 'auto', knowledgeSourceIds: ['wiki-a']},
       {endpoint: '/analyze', hasReferenceTraceId: false},
-    ).analysisMode).toBe('full');
+    ).analysisMode).toBe('auto');
     expect(normalizeAnalyzeOptions(
       {analysisMode: 'auto'},
       {endpoint: '/analyze', hasReferenceTraceId: true, traceId: 'a', referenceTraceId: 'b'},
-    ).analysisMode).toBe('full');
+    ).analysisMode).toBe('auto');
   });
 
   it('keeps fast mode when code-aware analysis is explicitly off without source ids', () => {

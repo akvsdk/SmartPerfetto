@@ -8,11 +8,13 @@ import type { ClaimSupportV1, EvidenceSupportLevel } from '../types/evidenceCont
 import type { IdentityResolutionV1 } from '../types/identityContract';
 import type {CapabilityManifestAttributionV1} from '../types/capabilityManifest';
 import type {AdaptiveRoutingReceiptV1} from '../types/adaptiveRouting';
+import type {AnalysisAssuranceStatus} from '../types/analysisDelivery';
 import {parseAdaptiveRoutingReceipt} from '../agentRuntime/adaptiveEvidenceRouter';
 import {sanitizeStoredCapabilityManifestAttribution} from './capabilityManifest';
 import {sanitizeStoredTraceSummaryAttribution} from './traceSummaryAttribution';
 import type {
   AnalysisReceipt,
+  AnalysisReceiptGateStatus,
   AnalysisReceiptRuntime,
   AnalysisReceiptV1,
   AnalysisReceiptV2,
@@ -159,7 +161,11 @@ function buildAnalysisReceiptBody(
       strategyHintCount: countStrategyHints(quickRun),
     },
     claimAudit,
-    qualityGates: {
+    qualityGates: result.deliveryAssurance ? {
+      finalReportContract: projectAssuranceGate(result.deliveryAssurance.report),
+      claimVerification: projectAssuranceGate(result.deliveryAssurance.claims),
+      identityResolution: projectAssuranceGate(result.deliveryAssurance.identity),
+    } : {
       finalReportContract: finalReportGate({
         result,
         session,
@@ -323,6 +329,11 @@ function countConversationContext(quickRun?: QuickRunReceipt, conversationSteps?
 
 function countStrategyHints(quickRun?: QuickRunReceipt): number {
   return quickRun?.contextInjected.sqlPitfallPairs || 0;
+}
+
+/** The receipt's legacy summary cannot replace the finalizer's exact assurance. */
+function projectAssuranceGate(status: AnalysisAssuranceStatus): AnalysisReceiptGateStatus {
+  return status === 'passed' || status === 'not_applicable' ? status : 'partial';
 }
 
 function finalReportGate(input: {

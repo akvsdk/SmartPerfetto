@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import {runInNewContext} from 'node:vm';
 import type {ConclusionContract} from '../../../agent/core/conclusionContract';
 import type {EvidenceRelationCandidateV1} from '../../../types/evidenceContract';
 import {bindRelationCandidatesToClaims} from '../relationCandidateClaimBinder';
@@ -58,76 +59,148 @@ function candidate(): EvidenceRelationCandidateV1 {
 }
 
 describe('relationCandidateClaimBinder', () => {
-  it('clones and binds only causal object-row references to producer-authored ids', () => {
+  it('preserves the original contract without attaching candidates from matching cells or causal prose', () => {
     const original = contract();
     const before = structuredClone(original);
-
     const bound = bindRelationCandidatesToClaims(original, [candidate()]);
 
     expect(original).toEqual(before);
     expect(bound.conclusionContract).not.toBe(original);
+    expect(bound.conclusionContract).toEqual(before);
+    expect(bound.relationActivationClaimIds).toEqual([]);
+  });
+
+  it.each([
+    'Binder caused the startup delay',
+    '启动延迟由 Binder 引起',
+    'Binder did not cause the startup delay',
+    'This row records one Binder interval',
+  ])('does not infer a relation from the sentence: %s', text => {
+    const original = contract();
+    original.claims![0].text = text;
+    delete original.claims![0].kind;
+    expect(bindRelationCandidatesToClaims(original, [candidate()])).toEqual({
+      conclusionContract: original, relationActivationClaimIds: [],
+    });
+  });
+
+  it('activates only an explicit relation reference without rewriting claim labels, cells, or refs', () => {
+    const original = contract();
+    original.claims![0].relationRefs = [candidate().id, 'unknown-model-reference'];
+    original.claims![0].kind = 'numeric';
+    original.claims![0].references = [{evidenceRefId: 'different-evidence', rowIndex: 99, column: 'different-cell'}];
+    const before = structuredClone(original);
+
+    const bound = bindRelationCandidatesToClaims(original, [candidate()]);
+
+    // Activation requests verification; endpoint/semantic validity belongs to the proof verifier.
     expect(bound.relationActivationClaimIds).toEqual(['object-row']);
-    expect(bound.conclusionContract.claims?.[0].relationRefs).toEqual([
-      'model-invented-relation',
-      candidate().id,
-    ]);
-    for (const index of [1, 2, 3, 4]) {
-      expect(bound.conclusionContract.claims?.[index].relationRefs).toBeUndefined();
+    expect(bound.conclusionContract).toEqual(before);
+    expect(original).toEqual(before);
+  });
+
+  it('keeps unknown explicit refs visible without activating a different candidate', () => {
+    const original = contract();
+    const bound = bindRelationCandidatesToClaims(original, [candidate()]);
+    expect(bound.relationActivationClaimIds).toEqual([]);
+    expect(bound.conclusionContract.claims![0].relationRefs).toEqual(['model-invented-relation']);
+  });
+
+  it('does not invent IDs for otherwise explicit claims', () => {
+    const original = contract();
+    original.claims![0].relationRefs = [candidate().id];
+    delete original.claims![0].id;
+    const bound = bindRelationCandidatesToClaims(original, [candidate()]);
+    expect(bound.relationActivationClaimIds).toEqual([]);
+    expect(bound.conclusionContract).toEqual(original);
+    expect(bound.conclusionContract.claims![0]).not.toHaveProperty('id');
+  });
+
+  it('accepts identical repeated declarations but refuses any conflicting candidate with the same ID', () => {
+    const original = contract();
+    original.claims![0].relationRefs = [candidate().id];
+    const same = [candidate(), structuredClone(candidate())];
+    expect(bindRelationCandidatesToClaims(original, same).relationActivationClaimIds).toEqual(['object-row']);
+    const conflicting = [...same, {...candidate(), object: {evidenceRefId: 'other', rowIndex: 3}}];
+    expect(bindRelationCandidatesToClaims(original, conflicting)).toEqual({
+      conclusionContract: original, relationActivationClaimIds: [],
+    });
+    expect(conflicting).toHaveLength(3);
+  });
+
+  it('accepts equal JSON declarations across realms and property insertion orders', () => {
+    const original = contract(); original.claims![0].relationRefs = [candidate().id];
+    const first = {...candidate(), metadata: {label: 'captured', nested: {a: 1, b: [null, true, 'value']}}};
+    const reordered = {...candidate(), metadata: {nested: {b: [null, true, 'value'], a: 1}, label: 'captured'}};
+    const foreign = runInNewContext('JSON.parse(input)', {input: JSON.stringify(reordered)}) as typeof first;
+    expect(bindRelationCandidatesToClaims(original, [first, foreign, structuredClone(first)]).relationActivationClaimIds)
+      .toEqual(['object-row']);
+  });
+
+  it.each([
+    [{nested: {unknown: 'left'}}, {nested: {unknown: 'right'}}],
+    [{unknown: undefined}, {}],
+    [{unknown: NaN}, {unknown: null}],
+    [{unknown: Infinity}, {unknown: null}],
+    [{unknown: -0}, {unknown: 0}],
+    [{unknown: [1, 2]}, {unknown: [2, 1]}],
+    [{unknown: Array(1)}, {unknown: [undefined]}],
+  ])('preserves conflicts in all unknown declaration metadata (%j / %j)', (left, right) => {
+    const original = contract(); original.claims![0].relationRefs = [candidate().id];
+    const declarations = [{...candidate(), metadata: left}, {...candidate(), metadata: right}];
+    expect(bindRelationCandidatesToClaims(original, declarations).relationActivationClaimIds).toEqual([]);
+    expect(declarations[0].metadata).toBe(left); expect(declarations[1].metadata).toBe(right);
+  });
+
+  it('does not ignore array subclasses or custom object prototypes', () => {
+    class FirstArray extends Array<number> {}
+    class SecondArray extends Array<number> {}
+    class Metadata {value = 1;}
+    const original = contract(); original.claims![0].relationRefs = [candidate().id];
+    const pairs = [[FirstArray.of(1), [1]], [FirstArray.of(1), SecondArray.of(1)], [new Metadata(), {value: 1}]];
+    for (const [left, right] of pairs) {
+      const declarations = [{...candidate(), metadata: left}, {...candidate(), metadata: right}];
+      expect(bindRelationCandidatesToClaims(original, declarations)
+        .relationActivationClaimIds).toEqual([]);
     }
   });
 
-  it('returns a clone with no activation when candidates do not match an object row', () => {
-    const original = contract();
-    const unmatched = {...candidate(), object: {evidenceRefId: 'data:binder', rowIndex: 4}};
-
-    const bound = bindRelationCandidatesToClaims(original, [unmatched]);
-
-    expect(bound.conclusionContract).not.toBe(original);
-    expect(bound.relationActivationClaimIds).toEqual([]);
-    expect(bound.conclusionContract).toEqual(original);
+  it('keeps extra array, symbol, and non-enumerable metadata visible to conflict detection', () => {
+    const original = contract(); original.claims![0].relationRefs = [candidate().id];
+    const symbol = Symbol('metadata');
+    const pairs = [
+      [Object.assign([1], {extra: 'first'}), Object.assign([1], {extra: 'second'})],
+      [{[symbol]: 1}, {[symbol]: 2}],
+      [Object.defineProperty({}, 'hidden', {value: 1}), Object.defineProperty({}, 'hidden', {value: 2})],
+    ];
+    for (const [left, right] of pairs) {
+      const declarations = [{...candidate(), metadata: left}, {...candidate(), metadata: right}];
+      expect(bindRelationCandidatesToClaims(original, declarations)
+        .relationActivationClaimIds).toEqual([]);
+    }
   });
 
-  it('requires every stable endpoint identifier to match', () => {
-    const original = contract();
-    original.claims![0].references[0].sourceToolCallId = 'invoke_skill:wrong';
-    const identifiedCandidate = {
-      ...candidate(),
-      object: {
-        evidenceRefId: 'data:binder',
-        sourceToolCallId: 'invoke_skill:binder',
-        rowIndex: 3,
-      },
-    };
-
-    const bound = bindRelationCandidatesToClaims(original, [identifiedCandidate]);
-
-    expect(bound.relationActivationClaimIds).toEqual([]);
-    expect(bound.conclusionContract.claims?.[0].relationRefs).toEqual(['model-invented-relation']);
+  it('does not evaluate accessors or accept separate cyclic declarations as JSON duplicates', () => {
+    const original = contract(); original.claims![0].relationRefs = [candidate().id];
+    let reads = 0;
+    const accessor = () => Object.defineProperty({}, 'value', {enumerable: true, get() {reads++; return 1;}});
+    const accessors = [{...candidate(), metadata: accessor()}, {...candidate(), metadata: accessor()}];
+    expect(bindRelationCandidatesToClaims(original, accessors)
+      .relationActivationClaimIds).toEqual([]);
+    expect(reads).toBe(0);
+    const left: {self?: unknown} = {}; left.self = left;
+    const right: {self?: unknown} = {}; right.self = right;
+    const cycles = [{...candidate(), metadata: left}, {...candidate(), metadata: right}];
+    expect(bindRelationCandidatesToClaims(original, cycles)
+      .relationActivationClaimIds).toEqual([]);
   });
 
-  it('can require selected candidates to bind only their object cell', () => {
+  it('does not activate ambiguous duplicate claim IDs', () => {
     const original = contract();
-    original.claims![0].references = [
-      {evidenceRefId: 'data:binder', rowIndex: 3, column: 'dur_str'},
-    ];
-
-    const broad = bindRelationCandidatesToClaims(original, [candidate()]);
-    const strict = bindRelationCandidatesToClaims(original, [candidate()], {
-      objectCellOnlyCandidateIds: new Set([candidate().id]),
+    original.claims![0].relationRefs = [candidate().id];
+    original.claims![1].id = original.claims![0].id;
+    expect(bindRelationCandidatesToClaims(original, [candidate()])).toEqual({
+      conclusionContract: original, relationActivationClaimIds: [],
     });
-
-    expect(broad.relationActivationClaimIds).toEqual(['object-row']);
-    expect(strict.relationActivationClaimIds).toEqual([]);
-    expect(strict.conclusionContract.claims?.[0].relationRefs).toEqual(['model-invented-relation']);
-
-    original.claims![0].references = [
-      {evidenceRefId: 'data:binder', rowIndex: 3, column: 'server_process'},
-    ];
-    const objectCell = bindRelationCandidatesToClaims(original, [{
-      ...candidate(), object: {...candidate().object!, column: 'server_process'},
-    }], {
-      objectCellOnlyCandidateIds: new Set([candidate().id]),
-    });
-    expect(objectCell.relationActivationClaimIds).toEqual(['object-row']);
   });
 });

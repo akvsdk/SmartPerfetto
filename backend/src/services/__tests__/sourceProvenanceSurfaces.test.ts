@@ -8,7 +8,11 @@ import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
 
-import type {ConclusionContract} from '../../agent/core/conclusionContract';
+import {parseConclusionContractDeclaration, type ConclusionContract} from '../../agent/core/conclusionContract';
+import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
+import {attachFinalizationContext, takeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
+import {ArtifactStore} from '../../agentv3/artifactStore';
+import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes} from '../../agentv3/strategyLoader';
 import type {RunTurnOutput} from '../../cli-user/services/cliAnalyzeService';
 import {commitTurnOutputs} from '../../cli-user/services/turnPersistence';
 import {computePaths, ensureLayout, ensureSessionLayout, sessionPaths} from '../../cli-user/io/paths';
@@ -30,7 +34,12 @@ import reportRoutes, {persistReport, reportStore} from '../../routes/reportRoute
 import {backendLogPath} from '../../runtimePaths';
 import {buildAgentDrivenReportData} from '../agentReportData';
 import {persistCompletedAnalysisResultSnapshot} from '../analysisResultSnapshotPipeline';
-import {sanitizeSourceReference} from '../codebase/sourceUseDecision';
+import {sanitizeSourceReference, sanitizeSourceUseDecision, type SourceUseDecisionV1} from '../codebase/sourceUseDecision';
+import {createDataEnvelope, type DataEnvelope} from '../../types/dataContract';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import {captureEvidenceTable} from '../evidence/evidenceCapture';
+import {finalizeAnalysisResult} from '../finalizeAnalysisResult';
+import {copyAnalysisDeliveryFields} from '../security/analysisDeliveryProjection';
 import {HTMLReportGenerator} from '../htmlReportGenerator';
 
 const originalDbPath = process.env.SMARTPERFETTO_ENTERPRISE_DB_PATH;
@@ -80,6 +89,37 @@ function analysisResultApp(): express.Express {
   return app;
 }
 
+async function finalizeCurrentSurfaceFixture(draft: AnalysisResult, envelope: DataEnvelope, sourceUse: SourceUseDecisionV1) {
+  const runId = 'run-source-surfaces';
+  const traceId = 'trace-source-surfaces';
+  const store = new ArtifactStore();
+  store.registerStandaloneEvidenceCapture(captureEvidenceTable(envelope.data, {
+    blocked_ms: {unit: 'ms', origin: {kind: 'native_producer', definitionFingerprint: 'source-surface-fixture'}},
+  }), {meta: envelope.meta, display: envelope.display});
+  const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: getRegisteredScenes(), overlayGeneration: runId});
+  const candidate = {runId, attemptId: 'attempt-1', candidateRef: 'source-surfaces:1',
+    conclusionFingerprint: analysisDeliveryFingerprint(draft.conclusion)};
+  attachFinalizationContext(draft, {runId, sessionId: draft.sessionId, deadlineMs: Date.now() + 10_000,
+    strategyRegistry: registry, traceIdentity: {currentTraceId: traceId}, sourceUse,
+    turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', taskKind: 'fact', sceneId: 'general',
+      scope: 'bounded_question', recommendedComplexity: 'quick', deliverable: 'answer', evidenceAccess: 'existing_only',
+      registryFingerprint: registry.registryFingerprint},
+    deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
+      completion: {...candidate, schemaVersion: 1, status: 'completed', runtimeKind: 'openai-agents-sdk'}},
+    evidenceReadView: store.createEvidenceReadView({ownerKey: runId,
+      allowedTraces: [{traceId, traceSide: 'current'}]}),
+    // Deterministic semantic transport fixture; the real finalizer still requires captured proof.
+    dispatchText: async () => ({status: 'ok', text: JSON.stringify({schemaVersion: 'final_semantic_response@1',
+      bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: draft.conclusion.length}]},
+      claims: [{claimId: 'claim-1', consistency: 'consistent',
+        contentLocations: [{start: 0, end: draft.conclusion.length, text: draft.conclusion}], issues: []}],
+      omissions: [], requirements: []})}),
+  });
+  return finalizeAnalysisResult({result: draft, context: takeFinalizationContext(draft),
+    owner: {runId, signal: new AbortController().signal, isCurrent: () => true, assertAuthorized: () => {}},
+    query: 'What does the captured trace report?', dataEnvelopes: [envelope]});
+}
+
 describe('source provenance output surface matrix', () => {
   it('keeps one canonical current-run decision and binding across SSE, report, CLI, snapshot, and API readback', async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-source-surfaces-'));
@@ -110,17 +150,22 @@ describe('source provenance output surface matrix', () => {
         query: 'SECRET_QUERY_CANARY',
       } as any],
     };
-    const contract: ConclusionContract = {
+    const body = 'The trace reports 120 ms blocked.';
+    const traceReference = {evidenceRefId: 'trace-evidence-1', rowIndex: 0, column: 'blocked_ms', value: 120};
+    const declaration = parseConclusionContractDeclaration({
       schemaVersion: 'conclusion_contract_v1',
       mode: 'focused_answer',
-      conclusions: [{rank: 1, statement: 'Foo.run is compatible with the trace.'}],
+      conclusions: [{rank: 1, statement: body}],
       clusters: [],
       evidenceChain: [],
       claims: [{
         id: 'claim-1',
-        kind: 'causal',
-        text: 'Foo.run is compatible with the trace.',
-        references: [{evidenceRefId: 'trace-evidence-1'}],
+        kind: 'numeric',
+        text: body,
+        references: [traceReference],
+        semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed',
+          discourse: 'asserted', quantifier: 'one', modality: 'certain',
+          scope: {population: 'cited_rows', subjectRefs: [traceReference]}, numeric: {operator: 'eq', value: 120, unit: 'ms'}},
       }],
       sourceUseDecision,
       sourceReferences: sourceUseDecision.references,
@@ -133,30 +178,16 @@ describe('source provenance output surface matrix', () => {
       }],
       uncertainties: [],
       nextSteps: [],
-    };
-    const result = {
+    });
+    const draft: AnalysisResult = {
       sessionId: 'session-source-surfaces',
       success: true,
       findings: [],
       hypotheses: [],
-      conclusion: 'Foo.run is compatible with the trace.',
-      conclusionContract: contract,
+      conclusion: body,
+      conclusionContract: declaration.contract ?? undefined,
       sourceUseDecision,
       sourceReferences: sourceUseDecision.references,
-      claimVerificationResult: {
-        schemaVersion: 'claim_verifier@1' as const,
-        status: 'passed' as const,
-        policy: 'record_only' as const,
-        passed: true,
-        checkedClaimCount: 1,
-        unsupportedClaimCount: 0,
-        claimResults: [{
-          claimId: 'claim-1',
-          status: 'verified' as const,
-          referenceResults: [{evidenceRefId: 'trace-evidence-1', status: 'matched' as const}],
-        }],
-        issues: [],
-      },
       confidence: 0.8,
       rounds: 1,
       totalDurationMs: 20,
@@ -164,15 +195,34 @@ describe('source provenance output surface matrix', () => {
     const reportId = `source-surfaces-${Date.now()}`;
 
     try {
+      expect(declaration.issues).toEqual([]);
+      if (!declaration.contract) throw new Error('Expected a valid source-surface declaration');
+      const envelope = createDataEnvelope({columns: ['blocked_ms'], rows: [[120]]}, {
+        type: 'sql_result', source: 'execute_sql', title: 'Observed blocking duration',
+        evidenceRefId: 'trace-evidence-1', traceId: 'trace-source-surfaces', traceSide: 'current', executionStatus: 'observed',
+      });
+      // The runtime-owned ledger is separate from the model's source declarations.
+      const actualSourceUse = sanitizeSourceUseDecision(sourceUseDecision)!;
+      const finalized = await finalizeCurrentSurfaceFixture(draft, envelope, actualSourceUse);
+      const result = finalized.result;
+      const contract = result.conclusionContract!;
+      expect(finalized.semanticAssessment?.coverage).toMatchObject({body: 'complete', claims: 'complete'});
+      expect(result.completion).toMatchObject({status: 'completed', candidateRef: 'source-surfaces:1',
+        conclusionFingerprint: analysisDeliveryFingerprint(body)});
+      expect(result.claimVerificationResult).toMatchObject({schemaVersion: 'claim_verifier@2', status: 'passed', passed: true,
+        claimResults: [{claimId: 'claim-1', status: 'verified', deterministicProof: {status: 'proved'}}]});
+      expect(result.sourceClaimVerificationResult?.bindings).toEqual([expect.objectContaining({
+        claimId: 'claim-1', mechanismStatus: 'compatible', sourceReferenceIds: [reference.id], traceEvidenceRefIds: ['trace-evidence-1'],
+      })]);
+      expect(result.conclusion).toBe(body);
+      expect(JSON.stringify(result)).not.toContain('SECRET_');
+      expect(JSON.stringify(result)).not.toContain('/Users/chris/private-source');
+      // JSON surfaces omit optional undefined fields; derive their expected shape
+      // from the canonical result, never from another surface's projection.
+      const wireResult = JSON.parse(JSON.stringify(result)) as AnalysisResult;
       const initialSseData = agentRoutesPrivacyProjectionTestSeam.analysisCompletedData({
+        ...result,
         privateProjectionVersion: 1,
-        conclusion: result.conclusion,
-        conclusionContract: contract,
-        findings: [],
-        hypotheses: [],
-        confidence: result.confidence,
-        rounds: result.rounds,
-        totalDurationMs: result.totalDurationMs,
       }, result.sourceUseDecision);
       const sseEvent = agentRoutesPrivacyProjectionTestSeam.sanitizePersistedAnalysisCompletedEvent(
         {
@@ -181,29 +231,23 @@ describe('source provenance output surface matrix', () => {
           traceId: 'trace-source-surfaces',
           codeAwareMode: 'provider_send',
           codebaseIds: ['safe-app'],
-          dataEnvelopes: [],
-          result: {sourceUseDecision: result.sourceUseDecision},
+          dataEnvelopes: [envelope],
+          result,
         } as any,
         {
           eventType: 'analysis_completed',
           eventData: JSON.stringify({
             type: 'analysis_completed',
-            data: {
-              privateProjectionVersion: 1,
-              conclusion: result.conclusion,
-              conclusionContract: initialSseData.conclusionContract,
-              findings: [],
-              hypotheses: [],
-              confidence: result.confidence,
-              rounds: result.rounds,
-              totalDurationMs: result.totalDurationMs,
-            },
+            data: initialSseData,
             timestamp: 1,
           }),
           createdAt: 1,
         } as any,
       );
-      const sseContract = JSON.parse(sseEvent.eventData).data.conclusionContract;
+      const sseResult = JSON.parse(sseEvent.eventData).data;
+      const sseContract = sseResult.conclusionContract;
+      expect(sseResult).toMatchObject({success: true, conclusion: body,
+        completion: wireResult.completion, claimVerificationResult: wireResult.claimVerificationResult});
       expect(JSON.stringify(initialSseData)).not.toContain('/Users/chris/private-source');
       expect(JSON.stringify(initialSseData)).not.toContain('SECRET_');
 
@@ -219,7 +263,7 @@ describe('source provenance output surface matrix', () => {
           hypotheses: [],
           agentDialogue: [],
           conversationSteps: [],
-          dataEnvelopes: [],
+          dataEnvelopes: [envelope],
           agentResponses: [],
           runSequence: 1,
           _lastSnapshot: {
@@ -239,6 +283,7 @@ describe('source provenance output surface matrix', () => {
         } as any,
         result,
       });
+      expect(reportData.result.claimVerificationResult).toEqual(result.claimVerificationResult);
       const html = new HTMLReportGenerator().generateAgentDrivenHTML(reportData);
       persistReport(reportId, {
         html,
@@ -256,6 +301,7 @@ describe('source provenance output surface matrix', () => {
         sessionId: result.sessionId,
         traceId: 'trace-source-surfaces',
         codeAwareMode: 'provider_send',
+        privateKnowledge: true,
         reportHtml: html,
         result,
       };
@@ -276,7 +322,7 @@ describe('source provenance output surface matrix', () => {
           lastTurnAt: 2,
           turnCount: 1,
         },
-        turnMarkdown: '# Turn 1\n\n## Conclusion\n\nFoo.run is compatible with the trace.\n',
+        turnMarkdown: '# Turn 1\n\n## Conclusion\n\n' + body + '\n',
         indexEntry: {
           sessionId: result.sessionId,
           createdAt: 1,
@@ -296,6 +342,8 @@ describe('source provenance output surface matrix', () => {
         path.join(sp.turnsDir, '001.source-claim-bindings.json'),
         'utf8',
       ));
+      const cliVerification = JSON.parse(fs.readFileSync(path.join(sp.turnsDir, '001.claim-verification.json'), 'utf8'));
+      expect(cliVerification).toEqual(wireResult.claimVerificationResult);
 
       const snapshot = persistCompletedAnalysisResultSnapshot({
         tenantId: DEFAULT_TENANT_ID,
@@ -308,12 +356,22 @@ describe('source provenance output surface matrix', () => {
         query: 'analyze Foo.run',
         conclusion: result.conclusion,
         conclusionContract: contract,
-        sourceUseDecision,
+        ...copyAnalysisDeliveryFields(result),
+        sourceUseDecision: result.sourceUseDecision,
+        sourceClaimVerificationResult: result.sourceClaimVerificationResult,
+        success: result.success,
+        claimSupport: result.claimSupport,
         claimVerificationResult: result.claimVerificationResult,
+        identityResolutions: result.identityResolutions,
+        dataEnvelopes: [envelope],
+        privateKnowledge: true,
+        outputLanguage: 'en',
         confidence: result.confidence,
       });
       expect(snapshot).not.toBeNull();
       const snapshotContract = snapshot!.conclusionContract as ConclusionContract;
+      expect(snapshot!.claimVerificationResult).toEqual(wireResult.claimVerificationResult);
+      expect(snapshot!.summary.completion).toEqual(wireResult.completion);
 
       const reportResponse = await request(express().use('/api/reports', reportRoutes))
         .get(`/api/reports/${reportId}`)
@@ -323,9 +381,13 @@ describe('source provenance output surface matrix', () => {
         .set('x-tenant-id', DEFAULT_TENANT_ID)
         .expect(200);
       const apiContract = snapshotResponse.body.snapshot.conclusionContract;
+      expect(snapshotResponse.body.snapshot.claimVerificationResult).toEqual(wireResult.claimVerificationResult);
+      expect(snapshotResponse.body.snapshot.summary.completion).toEqual(wireResult.completion);
 
-      const expectedDecision = normalizedDecision(cliDecision);
-      const expectedBindings = normalizedBindings(cliBindings);
+      const expectedDecision = normalizedDecision(wireResult.sourceUseDecision);
+      const expectedBindings = normalizedBindings(wireResult.conclusionContract?.sourceClaimBindings);
+      expect(expectedBindings).toEqual([{claimId: 'claim-1', mechanismStatus: 'compatible',
+        sourceReferenceIds: [reference.id], traceEvidenceRefIds: ['trace-evidence-1']}]);
       const surfaces = [
         {name: 'sse', decision: sseContract.sourceUseDecision, bindings: sseContract.sourceClaimBindings},
         {
@@ -356,10 +418,13 @@ describe('source provenance output surface matrix', () => {
       expect(cliHtml).toContain(reference.id);
 
       const durableArtifacts = JSON.stringify({
+        sseResult,
         sseContract,
+        reportResult: reportData.result,
         sourceContext: reportData.sourceContext,
         cliDecision,
         cliBindings,
+        cliVerification,
         snapshotContract,
         apiContract,
         reportHtml: reportResponse.text,

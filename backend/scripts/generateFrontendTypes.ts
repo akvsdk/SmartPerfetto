@@ -19,6 +19,9 @@ import {
   externalIssueReportingFragment,
   identityContractFragment,
   verbatimContractFragment,
+  ANALYSIS_COMPLETED_PUBLIC_TYPE_PATHS,
+  analysisCompletedPublicTypeFragment,
+  analysisCompletedContractFragment,
 } from './frontendContractFragments';
 
 // Paths
@@ -85,6 +88,9 @@ function extractConstArrayValues(content: string, constName: string): string[] {
 // Read backend contract
 console.log('Reading backend data contract...');
 const backendContent = fs.readFileSync(backendContractPath, 'utf-8');
+const analysisCompletedPublicTypes = analysisCompletedPublicTypeFragment(backendContent,
+  ANALYSIS_COMPLETED_PUBLIC_TYPE_PATHS.map(sourcePath =>
+    fs.readFileSync(path.join(projectRoot, 'backend/src', sourcePath), 'utf-8')));
 const conclusionContractContent = conclusionContractFragment(
   fs.readFileSync(conclusionContractPath, 'utf-8'),
 );
@@ -112,33 +118,7 @@ const displayLayers = extractConstArrayValues(backendContent, 'VALID_DISPLAY_LAY
 const displayLevels = extractConstArrayValues(backendContent, 'VALID_DISPLAY_LEVELS');
 const displayFormats = extractConstArrayValues(backendContent, 'VALID_DISPLAY_FORMATS');
 
-function extractAnalysisCompletedContract(content: string): string {
-  const startMarker = 'export interface AnalysisCompletedFinding {';
-  const endMarker = '/**\n * Union type for all SSE events';
-  const start = content.indexOf(startMarker);
-  const end = content.indexOf(endMarker, start);
-  if (start < 0 || end < 0) {
-    throw new Error('Unable to extract AnalysisCompletedEvent from backend data contract');
-  }
-  return content.slice(start, end)
-    .trim()
-    .replace("import('../agent/core/conclusionContract').ConclusionContract", 'ConclusionContract')
-    .replace("import('./evidenceContract').ClaimSupportV1", 'ClaimSupportV1')
-    .replace("import('./claimVerification').ClaimVerificationResult", 'ClaimVerificationResult')
-    .replace("import('./identityContract').IdentityResolutionV1", 'IdentityResolutionV1')
-    .replace("import('../agent/core/orchestratorTypes').QuickRunReceipt", 'QuickRunReceipt')
-    .replace("import('../agent/scene/types').SmartScenePreviewPayload", 'Record<string, unknown>')
-    .replace(
-      "import('../assistant/contracts/assistantResultContract').AssistantResultContract",
-      'Record<string, unknown>',
-    )
-    .replace(
-      /Omit<\s*import\('\.\.\/agentv3\/sessionStateSnapshot'\)\.ComparisonReportSection,\s*'html'\s*>\s*&\s*\{html\?: string\}/g,
-      'Record<string, unknown>',
-    );
-}
-
-const analysisCompletedFrontendContent = extractAnalysisCompletedContract(backendContent);
+const analysisCompletedFrontendContent = analysisCompletedContractFragment(backendContent);
 
 // Build the frontend content
 const parts: string[] = [];
@@ -934,6 +914,8 @@ export type UiActionProposalV1 =
   | UiActionProposalBase<'navigate_range', UiNavigateRangePayload>
   | UiActionProposalBase<'open_evidence_table', UiOpenEvidenceTablePayload>
   | UiActionProposalBase<'pin_evidence', UiPinEvidencePayload>;
+
+${analysisCompletedPublicTypes}
 
 ${analysisCompletedFrontendContent}
 

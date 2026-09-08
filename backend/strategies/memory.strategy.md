@@ -3,6 +3,7 @@
 
 ---
 scene: memory
+classification_description: "Memory usage, allocation, garbage collection, pressure, leaks and memory-related process termination."
 priority: 4
 effort: medium
 required_capabilities:
@@ -59,9 +60,9 @@ final_report_contract:
     - id: memory_diagnostic_api_boundary
       label: 内存诊断 API/剖析产物边界
       description: '当用户主动提到 ApplicationExitInfo、ProfilingManager、ProfilingTrigger、heap dump/profile、KOOM 或 APM 时，区分当前 trace 内存证据、退出记录、剖析产物、外部聚合和缺失证据。'
-      trigger_patterns:
-        - 'ApplicationExitInfo|getHistoricalProcessExitReasons|REASON_LOW_MEMORY|REASON_FREEZER|REASON_EXCESSIVE_RESOURCE_USAGE'
-        - 'ProfilingManager|ProfilingTrigger|heap dump|heap profile|Java heap dump|KOOM|APM'
+      condition:
+        kind: semantic
+        description: '当问题要求使用进程退出记录、堆转储或剖析结果、内存监控平台等外部诊断材料解释内存现象时适用。'
       pattern_groups:
         - ['内存诊断 API/剖析产物边界', 'memory diagnostic API', 'profiling artifact', 'ApplicationExitInfo', 'ProfilingManager', 'ProfilingTrigger', 'heap dump', 'heap profile']
         - ['diagnostic_api', 'profiling_artifact', 'external_aggregate', 'ApplicationExitInfo', 'getHistoricalProcessExitReasons', 'REASON_LOW_MEMORY', 'REASON_FREEZER', 'REASON_EXCESSIVE_RESOURCE_USAGE', 'ProfilingManager', 'ProfilingTrigger', 'KOOM', 'APM']

@@ -16,6 +16,9 @@ import type { Finding, Intent } from '../../types';
 import type { SharedAgentContext } from '../../types/agentProtocol';
 import type { ProgressEmitter } from '../orchestratorTypes';
 import type { ModelRouter } from '../modelRouter';
+import {parseConclusionContractSidecar, parseTypedConclusionContractJson, renderConclusionContractSidecar,
+  type ConclusionContract, type ClaimSemanticsV1,
+} from '../conclusionContract';
 
 describe('conclusionGenerator', () => {
   let mockModelRouter: jest.Mocked<Partial<ModelRouter>>;
@@ -1371,5 +1374,328 @@ analysis_metadata:
     expect(renderConclusionContractMarkdown(parsed!)).toBe(
       renderConclusionContractMarkdown(deriveConclusionContract(JSON.stringify(baseContract))!),
     );
+  });
+});
+
+
+describe('versioned conclusion declaration sidecar', () => {
+  function semantics(): ClaimSemanticsV1 {
+    return {schemaVersion: 'claim_semantics@1', predicate: 'future.metric@7', polarity: 'affirmed',
+      discourse: 'asserted', quantifier: 'some', modality: 'possible', conditions: ['condition'],
+      scope: {population: 'selected_interval', timeRangeNs: {start: '9007199254740993', end: '9007199254741993'},
+        subjectRefs: [{artifactId: 'art-1', rowSelector: {code: '001'}, column: 'value', value: '001'}]},
+      numeric: {operator: 'gt', value: '2.00', unit: 'ms'}};
+  }
+
+  function contract(): ConclusionContract {
+    return {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [{rank: 1, statement: 'Original statement'}], clusters: [], evidenceChain: [],
+      claims: [{id: 'claim:original', conclusionId: 'C-original', text: 'Original claim', kind: 'numeric',
+        references: [{artifactId: 'art-1', sourceToolCallId: 'call-1', rowSelector: {code: '001'}, column: 'value', value: '001'}],
+        artifactRefs: [{artifactId: 'art-1', rowIndex: 501}], relationRefs: ['proposal:relation-1'], semantics: semantics()}],
+      relationProposals: [{schemaVersion: 'evidence_relation_candidate@1', id: 'proposal:relation-1', kind: 'overlap',
+        direction: 'symmetric', subject: {artifactId: 'art-1', rowIndex: 501, column: 'ts', value: '9007199254740993'},
+        object: {artifactId: 'art-2', rowIndex: 0, column: 'ts', value: '9007199254740993'}}],
+      uncertainties: [], nextSteps: []};
+  }
+
+  function rawSidecar(raw: unknown): string {
+    return '<!-- smartperfetto:conclusion-contract@1\n```json\n' + JSON.stringify(raw) + '\n```\n-->';
+  }
+
+  it('round-trips typed declarations, exact scalar types and proposal IDs without proof', () => {
+    const original = contract();
+    const markdown = renderConclusionContractMarkdown(original, {includeMachineSidecar: true});
+    const result = parseConclusionContractSidecar(markdown);
+    expect(result.status).toBe('valid');
+    expect(result.bindingEligibility).toBe('eligible');
+    expect(result.contract?.claims).toEqual(original.claims);
+    expect(result.contract?.relationProposals).toEqual(original.relationProposals);
+    expect(result.contract?.claims?.[0].semantics?.numeric?.value).toBe('2.00');
+    expect(result.contract?.claims?.[0].references[0].value).toBe('001');
+    expect(result.contract).not.toHaveProperty('verified');
+    expect(deriveConclusionContract(markdown)?.claims).toEqual(original.claims);
+    expect(deriveConclusionContract(JSON.stringify(original))?.claims).toEqual(original.claims);
+    expect(deriveConclusionContract('```json\n' + JSON.stringify(original) + '\n```')?.claims).toEqual(original.claims);
+  });
+
+  it('keeps machine emission opt-in even when a caller supplies new declaration fields', () => {
+    expect(parseConclusionContractSidecar(renderConclusionContractMarkdown(contract())).status).toBe('absent');
+  });
+
+  it('accepts an unknown predicate declaration without inferring or verifying it', () => {
+    const result = parseConclusionContractSidecar(rawSidecar(contract()));
+    expect(result.status).toBe('valid');
+    expect(result.contract?.claims?.[0].semantics?.predicate).toBe('future.metric@7');
+    expect(result.contract?.claims?.[0]).not.toHaveProperty('supportLevel');
+  });
+
+  it.each(['uncertainties', 'nextSteps'] as const)(
+    'rejects object-valued %s while valid strings preserve the same original declarations', field => {
+      const claims: NonNullable<ConclusionContract['claims']> = [
+        {id: 'c1', text: 'The app identity was inferred from the available activity.', kind: 'identity',
+          references: [{evidenceRefId: 'data:processes', column: 'process_name', value: 'example.app'}]},
+        {id: 'c2', text: 'The main process has the highest observed activity.', kind: 'comparison',
+          references: [{evidenceRefId: 'data:activity', column: 'slice_count', value: 164643}]},
+      ];
+      const base: ConclusionContract = {...contract(), claims, relationProposals: []};
+      const entry = {topic: 'Identity inference', detail: 'A canonical identity resolver was not used.'};
+      const invalidDeclaration = {...base, [field]: [entry]};
+      const raw = rawSidecar(invalidDeclaration);
+      const invalid = parseConclusionContractSidecar(raw);
+      expect(invalid).toMatchObject({status: 'invalid', bindingEligibility: 'ineligible',
+        issues: [{code: 'invalid_contract', path: '$'}], rawPayload: invalidDeclaration});
+      expect(invalid.contract).toBeUndefined();
+      expect(normalizeConclusionOutput(raw)).toBe(raw);
+      const validDeclaration = {...base, [field]: [`${entry.topic}: ${entry.detail}`]};
+      const valid = parseConclusionContractSidecar(rawSidecar(validDeclaration));
+      expect(valid).toMatchObject({status: 'valid', bindingEligibility: 'eligible', issues: []});
+      expect(valid.contract?.claims).toEqual(claims);
+      expect(valid.contract?.[field]).toEqual(validDeclaration[field]);
+      expect(valid.contract?.claims?.every(claim => claim.semantics === undefined && claim.supportLevel === undefined)).toBe(true);
+    },
+  );
+
+  it.each(['Simple answer', '# Arbitrary title\nNo required heading', 'A prose answer with no final punctuation'])(
+    'keeps body formatting independent of binding: %s', body => {
+      const original = body + '\r\n\r\n' + renderConclusionContractSidecar(contract()).replace(/\n/g, '\r\n');
+      const result = parseConclusionContractSidecar(original);
+      expect(result.status).toBe('valid');
+      expect(result.narrative).toBe(body + '\r\n\r\n');
+      expect(normalizeConclusionOutput(original)).toBe(original);
+      expect(deriveConclusionContract(original)?.claims?.[0].id).toBe('claim:original');
+    },
+  );
+
+  it('does not activate markers inside fences, blockquotes, indented code, comments or JSON strings', () => {
+    const marker = renderConclusionContractSidecar(contract());
+    const examples = [
+      '````text\n' + marker + '\n````',
+      '~~~example\n' + marker + '\n~~~',
+      marker.split('\n').map(line => '> ' + line).join('\n'),
+      marker.split('\n').map(line => '    ' + line).join('\n'),
+      '<!-- example\n' + marker + '\n-->',
+      JSON.stringify({text: marker}),
+    ];
+    for (const example of examples) expect(parseConclusionContractSidecar(example).status).toBe('absent');
+    expect(parseConclusionContractSidecar(examples[0] + '\n\n' + marker).status).toBe('valid');
+  });
+
+  it.each(['missing-close', 'missing-json-fence', 'tail-garbage', 'wrong-version', 'duplicate'])(
+    'blocks legacy extraction after invalid machine framing: %s', variant => {
+      const marker = renderConclusionContractSidecar(contract());
+      const broken = variant === 'missing-close' ? marker.slice(0, -3) :
+        variant === 'missing-json-fence' ? marker.replace('```json\n', '') :
+        variant === 'tail-garbage' ? marker.replace('\n```\n-->', '\n{"other":true}\n```\n-->') :
+        variant === 'wrong-version' ? marker.replace('contract@1', 'contract@2') : marker + '\n' + marker;
+      const input = '## 结论（按可能性排序）\n1. Legacy fallback must not win\n\n' + broken;
+      const result = parseConclusionContractSidecar(input);
+      expect(result.status).toBe('invalid');
+      expect(result.bindingEligibility).toBe('ineligible');
+      expect(result.contract).toBeUndefined();
+      expect(deriveConclusionContract(input)).toBeNull();
+      expect(normalizeConclusionOutput(input)).toBe(input);
+    },
+  );
+
+  it('returns exact nonoverlapping machine spans for valid, duplicate and interrupted declarations', () => {
+    const marker = renderConclusionContractSidecar(contract());
+    const input = '前缀😀\r\n' + marker.replace(/\n/g, '\r\n') + '\r\n中间\r\n' + marker + '\n结尾';
+    const result = parseConclusionContractSidecar(input);
+    expect(result.status).toBe('invalid');
+    expect(result.machineSegments).toHaveLength(2);
+    expect(result.machineSegments.map(segment => input.slice(segment.start, segment.end))).toEqual([
+      marker.replace(/\n/g, '\r\n'), marker,
+    ]);
+    expect(result.narrative).toBe('前缀😀\r\n\r\n中间\r\n\n结尾');
+    const interrupted = 'Body\n' + marker.slice(0, -3);
+    const partial = parseConclusionContractSidecar(interrupted);
+    expect(partial.machineSegments).toEqual([{start: 5, end: interrupted.length}]);
+    expect(partial.narrative).toBe('Body\n');
+    const nested = marker.replace('\n```\n-->', '\n' + marker + '\n```\n-->');
+    const duplicate = parseConclusionContractSidecar(nested);
+    expect(duplicate.status).toBe('invalid');
+    expect(duplicate.issues[0].code).toBe('duplicate_marker');
+    expect(duplicate.machineSegments).toHaveLength(1);
+  });
+
+  it('retains invalid semantics and parser issues across render and parse', () => {
+    const original = contract();
+    const invalid = {...original, claims: [{...original.claims![0], semantics: {...semantics(), polarity: ['affirmed']}}]};
+    const parsed = parseConclusionContractSidecar(rawSidecar(invalid));
+    expect(parsed.status).toBe('invalid');
+    expect(parsed.contract?.claims?.[0].semantics).toBeUndefined();
+    expect(parsed.contract?.claims?.[0].rawSemantics).toEqual(invalid.claims[0].semantics);
+    expect(parsed.issues).toContainEqual({code: 'invalid_semantics', path: 'claims[0].semantics'});
+    const derived = deriveConclusionContract(rawSidecar(invalid));
+    expect(derived?.bindingEligibility).toBe('ineligible');
+    expect(derived?.claims?.[0].text).toBe(invalid.claims[0].text);
+    const roundTrip = parseConclusionContractSidecar(renderConclusionContractMarkdown(derived!, {includeMachineSidecar: true}));
+    expect(roundTrip.status).toBe('invalid');
+    expect(roundTrip.contract?.claims?.[0].rawSemantics).toEqual(invalid.claims[0].semantics);
+  });
+
+  it('preserves duplicate claim and proposal items without assigning replacement IDs', () => {
+    const original = contract();
+    original.claims!.push({...original.claims![0], text: 'Second distinct original claim'});
+    original.relationProposals!.push({...original.relationProposals![0], unit: 'ns'});
+    const result = parseConclusionContractSidecar(rawSidecar(original));
+    expect(result.status).toBe('invalid');
+    expect(result.contract?.claims?.map(claim => [claim.id, claim.text])).toEqual(original.claims!.map(claim => [claim.id, claim.text]));
+    expect(result.contract?.relationProposals).toEqual(original.relationProposals);
+    expect(result.issues.map(issue => issue.code)).toEqual(['duplicate_claim_id', 'duplicate_proposal_id']);
+    const roundTrip = parseConclusionContractSidecar(renderConclusionContractMarkdown(result.contract!, {includeMachineSidecar: true}));
+    expect(roundTrip.issues.map(issue => issue.code)).toEqual(['duplicate_claim_id', 'duplicate_proposal_id']);
+  });
+
+  it('keeps invalid citations and proposals visible as raw declarations, never valid bindings', () => {
+    const original = contract();
+    const invalid = {...original, claims: [{...original.claims![0], references: [{column: 'value', value: '999'}]}],
+      relationProposals: [{...original.relationProposals![0], id: 'backend-proof-id'}]};
+    const result = parseConclusionContractSidecar(rawSidecar(invalid));
+    expect(result.status).toBe('invalid');
+    expect(result.contract?.claims?.[0].text).toBe('Original claim');
+    expect(result.contract?.claims?.[0].rawReferences).toEqual(invalid.claims[0].references);
+    expect(result.contract?.rawRelationProposals).toEqual(invalid.relationProposals);
+    expect(result.contract?.relationProposals).toEqual([]);
+    const roundTrip = parseConclusionContractSidecar(renderConclusionContractMarkdown(result.contract!, {includeMachineSidecar: true}));
+    expect(roundTrip.contract?.claims?.[0].rawReferences).toEqual(invalid.claims[0].references);
+    expect(roundTrip.contract?.rawRelationProposals).toEqual(invalid.relationProposals);
+  });
+
+  it('cannot take parser state from model-controlled metadata', () => {
+    const original = contract();
+    const result = parseConclusionContractSidecar(rawSidecar({...original, parseIssues: [], bindingEligibility: 'eligible', verified: true,
+      claims: [{...original.claims![0], semantics: {predicate: 'incomplete'}, semanticsParseIssues: []}]}));
+    expect(result.status).toBe('invalid');
+    expect(result.bindingEligibility).toBe('ineligible');
+    expect(result.contract).not.toHaveProperty('verified');
+    expect(result.issues).toEqual(expect.arrayContaining([
+      {code: 'untrusted_parser_metadata', path: '$'}, {code: 'invalid_semantics', path: 'claims[0].semantics'},
+    ]));
+  });
+
+  it.each(['parseIssues', 'bindingEligibility', 'verified', 'rawDeclaration'])(
+    'does not launder a root parser-owned field through machine rendering: %s', key => {
+      const input = {...contract(), [key]: key === 'parseIssues' ? [] : key === 'rawDeclaration' ? contract() : true};
+      const first = parseConclusionContractSidecar(rawSidecar(input));
+      expect(first.status).toBe('invalid');
+      expect(first.issues).toEqual([{code: 'untrusted_parser_metadata', path: '$'}]);
+      expect(first.contract?.rawDeclaration).toEqual(input);
+      const rendered = renderConclusionContractMarkdown(first.contract!, {includeMachineSidecar: true});
+      const second = parseConclusionContractSidecar(rendered);
+      expect(second.status).toBe('invalid');
+      expect(second.bindingEligibility).toBe('ineligible');
+      expect(second.issues).toEqual(first.issues);
+      expect(second.rawPayload).toEqual(input);
+    },
+  );
+
+  it.each(['semanticsParseIssues', 'parseIssues', 'rawDeclaration'])(
+    'preserves a claim-only parser metadata rejection without a second invalid field: %s', key => {
+      const original = contract();
+      const input = {...original, claims: [{...original.claims![0], [key]: []}]};
+      const first = parseConclusionContractSidecar(rawSidecar(input));
+      expect(first.status).toBe('invalid');
+      expect(first.issues).toEqual([{code: 'untrusted_parser_metadata', path: 'claims[0]'}]);
+      expect(first.contract?.claims?.[0].semantics).toEqual(original.claims![0].semantics);
+      expect(first.contract?.rawClaims).toEqual(input.claims);
+      const second = parseConclusionContractSidecar(renderConclusionContractMarkdown(first.contract!, {includeMachineSidecar: true}));
+      expect(second.status).toBe('invalid');
+      expect(second.bindingEligibility).toBe('ineligible');
+      expect(second.issues).toEqual(first.issues);
+      expect(second.rawPayload).toEqual(input);
+    },
+  );
+
+  it.each([
+    ['root', 'verified'], ['root', 'parseIssues'], ['root', 'rawDeclaration'],
+    ['claim', 'semanticsParseIssues'], ['claim', 'rawReferences'], ['claim', 'rawDeclaration'],
+    ['claim', 'parseIssues'], ['claim', 'bindingEligibility'], ['claim', 'verified'],
+  ])('detects reserved %s.%s without other typed declaration signals', (level, key) => {
+    const base = contract();
+    delete base.relationProposals;
+    delete base.claims![0].semantics;
+    const input = level === 'root' ? {...base, [key]: []} :
+      {...base, claims: [{...base.claims![0], [key]: []}]};
+    const json = JSON.stringify(input);
+    for (const text of [json, '```json\n' + json + '\n```']) {
+      const parsed = parseTypedConclusionContractJson(text);
+      expect(parsed.status).toBe('invalid');
+      expect(parsed.issues).toEqual([{code: 'untrusted_parser_metadata', path: level === 'root' ? '$' : 'claims[0]'}]);
+      const derived = deriveConclusionContract(text);
+      expect(derived?.bindingEligibility).toBe('ineligible');
+      expect(derived?.parseIssues).toEqual(parsed.issues);
+      expect(normalizeConclusionOutput(text)).toBe(text);
+      const roundTrip = parseConclusionContractSidecar(renderConclusionContractMarkdown(derived!, {includeMachineSidecar: true}));
+      expect(roundTrip.status).toBe('invalid');
+      expect(roundTrip.rawPayload).toEqual(input);
+    }
+  });
+
+  it.each(['invalid-mode', 'missing-uncertainties'])(
+    'blocks typed JSON shell failures before legacy headings can discard claims: %s', defect => {
+      const input: Record<string, unknown> = {...contract(), conclusion: 'Original narrative'};
+      if (defect === 'invalid-mode') input.mode = 'invalid';
+      else delete input.uncertainties;
+      const json = JSON.stringify(input);
+      for (const text of [json, '```json\n' + json + '\n```', '```json\r\n' + json + '\r\n```']) {
+        const parsed = parseTypedConclusionContractJson(text);
+        expect(parsed.status).toBe('invalid');
+        expect(parsed.bindingEligibility).toBe('ineligible');
+        expect(parsed.issues).toEqual([{code: 'invalid_contract', path: '$'}]);
+        expect(parsed.raw).toBe(text);
+        expect(parsed.rawPayload).toEqual(input);
+        expect(parsed.contract).toBeUndefined();
+        expect(deriveConclusionContract(text)).toBeNull();
+        expect(normalizeConclusionOutput(text)).toBe(text);
+      }
+    },
+  );
+
+  it('does not let the legacy first-object extractor repair typed JSON framing', () => {
+    const invalid = {...contract(), mode: 'invalid', conclusion: 'Original narrative'};
+    for (const json of [JSON.stringify(contract()), JSON.stringify(invalid)]) {
+      for (const text of [json + '\ntrailing text', '```json\n' + json + '\n```\ntrailing text']) {
+        expect(deriveConclusionContract(text)).toBeNull();
+        expect(normalizeConclusionOutput(text)).toBe(text);
+      }
+    }
+  });
+
+  it('keeps non-typed legacy JSON aliases on the compatibility parser', () => {
+    const legacy = JSON.stringify({schema_version: 'conclusion_contract_v1', conclusion: 'Legacy statement',
+      evidence_chain: [], claims: [{claim_id: 'legacy-claim', statement: 'Legacy statement', references: []}],
+      uncertainties: [], next_steps: []});
+    expect(parseTypedConclusionContractJson(legacy).status).toBe('absent');
+    expect(deriveConclusionContract(legacy)?.claims?.[0]).toMatchObject({id: 'legacy-claim', text: 'Legacy statement'});
+  });
+
+  it('escapes comment closers and preserves decoded quotes, fences and multiline values', () => {
+    const original = contract();
+    const value = 'literal --> & <tag> "quote"\n```json\nline\n```\n<!-- smartperfetto:conclusion-contract@1';
+    original.claims![0].text = value;
+    original.claims![0].semantics!.conditions = [value];
+    original.claims![0].references[0].value = value;
+    const rendered = renderConclusionContractMarkdown(original, {includeMachineSidecar: true});
+    const result = parseConclusionContractSidecar(rendered);
+    expect(result.status).toBe('valid');
+    expect(result.contract?.claims?.[0].text).toBe(value);
+    expect(result.contract?.claims?.[0].semantics?.conditions).toEqual([value]);
+    expect(result.contract?.claims?.[0].references[0].value).toBe(value);
+    const unescaped = rawSidecar(original);
+    expect(parseConclusionContractSidecar(unescaped).status).toBe('invalid');
+  });
+
+  it('leaves plain legacy contracts on their existing visible rendering', () => {
+    const original = contract();
+    delete original.relationProposals;
+    delete original.claims![0].semantics;
+    delete original.claims![0].kind;
+    delete original.claims![0].artifactRefs;
+    delete original.claims![0].relationRefs;
+    const rendered = renderConclusionContractMarkdown(original);
+    expect(parseConclusionContractSidecar(rendered).status).toBe('absent');
+    expect(deriveConclusionContract(JSON.stringify(original))?.claims?.[0].text).toBe('Original claim');
   });
 });

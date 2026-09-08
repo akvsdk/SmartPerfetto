@@ -8,6 +8,47 @@ import {LayeredResult} from '../skillExecutor';
 import {SkillRegistry} from '../skillLoader';
 
 describe('SkillAnalysisAdapter layered conversion', () => {
+  it('preserves per-step global scope through layered display and section conversion', () => {
+    const adapter = new SkillAnalysisAdapter({ query: jest.fn() } as any);
+    const scopeProvenance = { version: 'process_scope_evidence@1', entries: [{ role: 'global_context',
+      scope: { mode: 'unscoped', traceId: 'trace', traceSide: 'current' } }] };
+    const display = (adapter as any).convertLayeredResultToDisplayResults({
+      layers: { overview: { frequency: { stepId: 'frequency', stepType: 'atomic', success: true,
+        data: [{ mhz: 1200 }], executionTimeMs: 1, scopeProvenance,
+        display: { show: true, level: 'summary', format: 'table' } } } },
+      defaultExpanded: [], metadata: { skillName: 'scope_test', version: '1', executedAt: '' },
+    });
+    expect(display[0].scopeProvenance).toEqual(scopeProvenance);
+    expect(display[0].evidenceRole).toBe('global_context');
+    expect(display[0].appliedProcessScope).toBeUndefined();
+    expect((adapter as any).convertDisplayResultsToSections(display).frequency.scopeProvenance).toEqual(scopeProvenance);
+  });
+
+  it.each([false, true])('preserves explicit selectors with layered=%s when packageName is a default', async layered => {
+    const registry = new SkillRegistry();
+    const definition = { name: 'selector_test', version: '1', type: 'atomic',
+      meta: { display_name: 'Selector', description: 'Selector' }, sql: 'SELECT 1' };
+    (registry as any).skills.set(definition.name, definition);
+    (registry as any).skillOrigins.set(definition.name, {
+      origin: 'external_pack',
+      packId: 'test-pack',
+    });
+    (registry as any).initialized = true;
+    const adapter = new SkillAnalysisAdapter({ query: jest.fn() } as any, undefined, { registry });
+    jest.spyOn(adapter, 'detectVendor').mockResolvedValue({ vendor: 'aosp', confidence: 1 });
+    jest.spyOn(adapter as any, 'hasLayeredOutput').mockReturnValue(layered);
+    const executor = (adapter as any).executor;
+    const execute = jest.spyOn(executor, layered ? 'executeCompositeSkill' : 'execute').mockResolvedValue(layered ? {
+      layers: { overview: {}, list: {}, session: {}, deep: {}, diagnosis: {} },
+      defaultExpanded: [], stepResults: [], metadata: { skillName: 'selector_test', version: '1', executedAt: '' },
+    } : { success: true, displayResults: [], diagnostics: [], executionTimeMs: 0 });
+    for (const params of [{ upid: 42 }, { pid: 4242 }, { process_name: 'com.explicit' }, { package: 'com.explicit' }]) {
+      await adapter.analyze({ traceId: 'trace', skillId: definition.name, packageName: 'com.default', params });
+      const lastCall = execute.mock.calls[execute.mock.calls.length - 1];
+      expect(lastCall[layered ? 1 : 2]).toEqual(params);
+    }
+  });
+
   const createAdapter = () => {
     const traceProcessorMock = {
       query: jest.fn(),

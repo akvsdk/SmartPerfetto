@@ -697,6 +697,15 @@ export interface SubAgentResult {
   suggestions?: string[];
   data?: any;
   message?: string;
+  /** Stored final-turn metadata; presence does not authorize another turn. */
+  turnIntent?: import('../agentRuntime/analysisTurnIntent').AnalysisTurnIntent;
+  completion?: import('../types/analysisDelivery').AnalysisCompletion;
+  outputOrigin?: import('../types/analysisDelivery').AnalysisOutputOrigin;
+  runtimeAppendix?: import('../types/analysisDelivery').AnalysisRuntimeAppendix;
+  reportAssessment?: import('../types/analysisDelivery').FinalReportAssessment;
+  deliveryAssurance?: import('../types/analysisDelivery').AnalysisDeliveryAssurance;
+  sourceUseDecision?: import('../services/codebase/sourceUseDecision').SourceUseDecisionV1;
+  sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;
   conclusionContract?: unknown;
   claimSupport?: ClaimSupportV1[];
   claimVerificationResult?: ClaimVerificationResult;

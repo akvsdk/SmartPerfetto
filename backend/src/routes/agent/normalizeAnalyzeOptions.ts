@@ -143,8 +143,7 @@ export function normalizeAnalyzeOptions(
   }
   if (codeAwareMode) normalized.codeAwareMode = codeAwareMode;
 
-  // Source authorization is independent from per-run source activation. Only
-  // comparison and private RAG remain intrinsically full-analysis contexts.
+  // Source and comparison context preserve the caller's requested budget mode.
   normalized.analysisMode = resolveEffectiveAnalysisMode(normalized.analysisMode, {
     referenceTraceId: ctx.hasReferenceTraceId ? ctx.referenceTraceId ?? 'reference' : undefined,
     knowledgeSourceIds,

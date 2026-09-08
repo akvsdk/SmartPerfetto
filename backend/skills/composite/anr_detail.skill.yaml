@@ -50,6 +50,11 @@ prerequisites:
     - linux.cpu.frequency
     - android.monitor_contention
 
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [process_name]
+
 inputs:
   - name: anr_ts
     type: timestamp
@@ -65,7 +70,8 @@ inputs:
     description: "进程名"
   - name: pid
     type: integer
-    required: true
+    required: false
+    default: 0
     description: "进程 ID"
   - name: upid
     type: integer
@@ -118,6 +124,8 @@ steps:
   # ============================================================================
   - id: anr_info
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "ANR 基本信息"
     display:
       level: key
@@ -164,9 +172,9 @@ steps:
           type: string
     sql: |
       SELECT
-        '${process_name}' as process_name,
-        ${pid} as pid,
-        ${upid} as upid,
+        COALESCE((SELECT name FROM process WHERE upid = ${__process_scope.upid}), '${process_name}') as process_name,
+        (SELECT pid FROM process WHERE upid = ${__process_scope.upid}) as pid,
+        ${__process_scope.upid} as upid,
         '${anr_type}' as anr_type,
         '${error_id}' as error_id,
         ROUND(COALESCE(${anr_dur_ms}, 0), 2) as anr_dur_ms,
@@ -195,6 +203,11 @@ steps:
   # ============================================================================
   - id: main_thread_quadrant
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "主线程四象限分析"
     optional: true
     display:
@@ -237,9 +250,10 @@ steps:
       main_thread AS (
         SELECT t.utid, t.tid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -324,8 +338,6 @@ steps:
     params:
       start_ts: "${anr_ts - timeout_ns}"
       end_ts: "${anr_ts}"
-      upid: "${upid}"
-      pid: "${pid}"
       package: "${process_name}"
       top_k: 10
     save_as: blocking
@@ -335,6 +347,11 @@ steps:
   # ============================================================================
   - id: render_thread_analysis
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "RenderThread 分析"
     display:
       level: key
@@ -359,9 +376,10 @@ steps:
       WITH render_thread AS (
         SELECT t.utid, t.tid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -487,6 +505,13 @@ steps:
   # ============================================================================
   - id: lock_contention
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+      context_fields:
+        peer_context: [blocking_method, blocking_thread_name, waiter_count]
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "锁竞争检测"
     display:
       level: key
@@ -539,11 +564,12 @@ steps:
           waiter_count,
           MIN(CASE WHEN dur < 0 THEN aw.end_ts ELSE ts + dur END, aw.end_ts)
             - MAX(ts, aw.start_ts) AS clipped_ns
-        FROM android_monitor_contention
+        FROM android_monitor_contention amc
+        JOIN effective_target_processes target ON amc.upid = target.upid
         CROSS JOIN anr_window aw
         WHERE ts < aw.end_ts
           AND (CASE WHEN dur < 0 THEN aw.end_ts ELSE ts + dur END) > aw.start_ts
-          AND ('${process_name}' = '' OR process_name = '${process_name}')
+          AND (${__process_scope.upid} IS NOT NULL OR '${process_name}' = '' OR process_name = '${process_name}')
           AND is_blocked_thread_main = 1
           AND (
             MIN(CASE WHEN dur < 0 THEN aw.end_ts ELSE ts + dur END, aw.end_ts)
@@ -576,6 +602,11 @@ steps:
   # ============================================================================
   - id: app_freeze_check
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "应用冻结检测"
     optional: true
     display:
@@ -609,11 +640,12 @@ steps:
             WHEN t.name = 'RenderThread' THEN 'RenderThread'
             WHEN t.name LIKE 'Binder:%' THEN 'Binder'
             ELSE 'Other'
-          END as thread_type
+        END as thread_type
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -669,6 +701,13 @@ steps:
   # ============================================================================
   - id: wakeup_chain
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+      context_fields:
+        peer_context: [waker_thread, waker_process]
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "唤醒链分析"
     display:
       level: detail
@@ -704,9 +743,10 @@ steps:
       WITH main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -757,8 +797,6 @@ steps:
     params:
       start_ts: "${anr_ts - timeout_ns}"
       end_ts: "${anr_ts}"
-      upid: "${upid}"
-      pid: "${pid}"
       package: "${process_name}"
       min_dur_ns: 1000000
       top_k: 15
@@ -770,6 +808,8 @@ steps:
   # ============================================================================
   - id: thread_evidence_availability
     type: atomic
+    process_scope:
+      role: global_context
     name: "线程证据可用性"
     optional: true
     display:
@@ -792,6 +832,8 @@ steps:
 
   - id: direct_blocker_evidence_gap
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "直接阻塞点证据缺口"
     optional: true
     display:
@@ -837,6 +879,11 @@ steps:
 
   - id: direct_blocker_classification
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "直接阻塞点候选"
     optional: true
     display:
@@ -880,9 +927,10 @@ steps:
       main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -1044,6 +1092,8 @@ steps:
 
   - id: direct_blocker_slice_evidence_gap
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "Slice 直接阻塞点证据缺口"
     optional: true
     display:
@@ -1089,6 +1139,11 @@ steps:
 
   - id: direct_blocker_slice_classification
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
     name: "Slice 直接阻塞点候选"
     optional: true
     condition: "thread_evidence_availability.data[0]?.has_thread_track === 1 && thread_evidence_availability.data[0]?.has_slice === 1"
@@ -1132,9 +1187,10 @@ steps:
       main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -1146,9 +1202,10 @@ steps:
       render_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
-            (${upid} > 0 AND p.upid = ${upid})
+            ${__process_scope.upid} IS NOT NULL
+            OR (${upid} > 0 AND p.upid = ${upid})
             OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
                 AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
             OR (${upid} <= 0 AND ${pid} <= 0
@@ -1247,6 +1304,8 @@ steps:
   # ============================================================================
   - id: logcat_availability
     type: atomic
+    process_scope:
+      role: global_context
     name: "Logcat 表可用性"
     display:
       level: hidden
@@ -1261,6 +1320,8 @@ steps:
 
   - id: anr_logcat_evidence_gap
     type: atomic
+    process_scope:
+      role: identity_metadata
     name: "当前 ANR 日志证据缺口"
     optional: true
     condition: "logcat_availability.data[0]?.has_android_logs !== 1"
@@ -1295,6 +1356,10 @@ steps:
 
   - id: anr_logcat_context
     type: atomic
+    process_scope:
+      role: global_context
+      limitations:
+        - Logcat rows are correlated by event identifiers or message text and do not establish an exact process instance.
     name: "当前 ANR 日志上下文"
     optional: true
     condition: "logcat_availability.data[0]?.has_android_logs === 1"

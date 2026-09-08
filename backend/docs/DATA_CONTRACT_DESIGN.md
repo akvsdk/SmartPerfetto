@@ -46,6 +46,7 @@ interface DataEnvelope<T = DataPayload> {
 - `observed`：查询成功并观察到结果；
 - `empty`：查询成功但没有匹配行；
 - `optional_error`：可选查询不可用或执行失败。
+- `unavailable`：当前数据不可取得，不能作为成功观测。
 
 不要把 `empty` 和 `optional_error` 合并成“没有问题”。对比模式还会在 `meta` 中保留
 `traceSide`、pane、trace id、query hash 和 evidence ref。进程/线程相关数据可以携带
@@ -126,6 +127,35 @@ Skill 时，`display.layer`、`display.level`、列 schema、执行状态和 syn
 理解“查询做了什么”，但不能单独支持诊断 claim，也不能替代 `evidenceRefId`。完整对象
 随 DataEnvelope/Artifact 进入报告；给模型的 compact projection 不包含可执行 SQL；私有
 分析上下文对外投影时还必须经过统一脱敏。
+
+## 终态与证据验证
+
+`AnalysisResult` 的正文、原始 claim 声明和 native completion 是不同输入。运行时从
+SDK 终态记录生成 completion/output origin，产品层在复制结果前取出私有
+`RuntimeFinalizationContext`，再调用唯一的 `finalizeAnalysisResult()`。它保留 canonical
+正文及原命题；真实 machine sidecar 可以从聊天中隐藏，不能靠标题、错误词或正文长度
+改写命题、推断成功或机械重写答案。
+
+原始采集由 `evidenceCapture.ts` 在显示/传输截断前签发，`evidenceReadView.ts` 只读取
+本次 finalize 已接纳且仍保留的记录。`claim_verifier@2` 将有限证明与最多一次无工具
+语义审核结合；审核沿用 pinned provider、原 absolute deadline 和产品 owner/授权检查。
+合法的 typed intent/claim JSON 不是真值，语义一致也不能替代原始观测。
+
+当前有限目录支持 `numeric.cell`、`interval.overlap`、`comparison.delta`，以
+`SUPPORTED_DETERMINISTIC_CLAIM_RULES` 为权威。证明还要求精确引用、受信字段语义、单位
+及适用范围；一般因果关系不因此成为确定性证明。未知 predicate、缺失 witness、单位
+或覆盖信息必须保留 candidate/unknown/not-checked 边界。格式化数值、推断列名、Query
+Review、相等端点和 snapshot 恢复不能补造验证权。
+
+引用的 number/string 类型不一致、不能定位唯一行或读取受限时，保留未核实状态和原始
+literal，不转换数值或按声明值挑选数据行。明确缺失、越权和同类型数值矛盾仍然失败；
+有限数学证明独立检查 typed 命题。数值单位不等于时钟语义，重叠候选不会因此自动通过验证。
+
+公开的 `analysis_completed` / result 可携带 `turnIntent`、`completion`、`outputOrigin`、
+`runtimeAppendix`、`reportAssessment` 和 `deliveryAssurance`，历史事件允许缺省。正文与
+这些结构化元数据分层投影，报告、CLI 和 snapshot 保留必要 provenance。私有 context、
+provider 调用闭包、可读取 capture 的能力和原始 witness 不进入 JSON 或生成的前端类型。
+历史读取/重放只投影已有结果，不重新执行语义验证或签发证明；正常访问授权仍然生效。
 
 ## Analysis Receipt
 

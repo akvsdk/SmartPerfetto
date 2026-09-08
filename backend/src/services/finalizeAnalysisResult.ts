@@ -1,0 +1,281 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+import {randomUUID} from 'node:crypto';
+import type {AnalysisResult} from '../agent/core/orchestratorTypes';
+import type {ConclusionBindingEligibility, ConclusionContract} from '../agent/core/conclusionContract';
+import type {RuntimeFinalizationContext} from '../agentRuntime/analysisFinalizationContext';
+import type {ComparisonReportSection} from '../agentv3/sessionStateSnapshot';
+import {getFinalReportContract} from '../agentv3/strategyLoader';
+import type {DataEnvelope} from '../types/dataContract';
+import {analysisDeliveryFingerprint, reportRequirementsFingerprint, sameAnalysisCandidate,
+  type AnalysisCandidateIdentity, type AnalysisCaseRetrievalState, type AnalysisDeliveryContext,
+  type FinalReportAssessment, type PinnedAnalysisReportRequirements} from '../types/analysisDelivery';
+import type {ClaimVerificationResult, ClaimVerificationClaimResult, ClaimVerificationIssue} from '../types/claimVerification';
+import {canonicalizeAnalysisResult, isIssuedCanonicalAnalysisProjection} from './canonicalAnalysisResult';
+import {attachSourceUseToAnalysisResult, verifySourceClaimBindings} from './codebase/sourceClaimVerifier';
+import {prepareAnalysisRelations} from './evidence/analysisRelationPreparation';
+import {prepareClaimEvidence, preparedClaimEvidenceSnapshot, preparedIdentityResolutions} from './evidence/claimEvidencePreparation';
+import {runClaimVerification, collectMatchedTraceEvidenceRefIdsByClaimId,
+  collectVerifiedTraceOccurrenceRefIdsByClaimId} from './verifier/claimVerificationRunner';
+import {assessFinalSemantics, type FinalSemanticAssessment, type FinalSemanticSnapshot} from './finalSemanticAssessment';
+import {applyFinalResultQualityGate, type FinalResultComparisonIdentity, type FinalResultQualityIssue} from './finalResultQualityGate';
+import {projectCodeAwareStructuredText} from './security/codeAwareOutputRegistry';
+
+export interface AnalysisFinalizationOwner {
+  runId: string;
+  signal: AbortSignal;
+  isCurrent(): boolean;
+  assertAuthorized(): void;
+  /** Original selection pin, captured before analyze(), not a mutable session value. */
+  analysisContextFingerprint?: string;
+}
+
+export interface FinalizeAnalysisResultInput {
+  result: AnalysisResult;
+  context?: RuntimeFinalizationContext;
+  owner: AnalysisFinalizationOwner;
+  query: string;
+  dataEnvelopes?: readonly DataEnvelope[];
+  comparisonReportSection?: ComparisonReportSection;
+  comparisonIdentity?: FinalResultComparisonIdentity;
+  caseRetrieval?: AnalysisCaseRetrievalState;
+  conversation?: NonNullable<Parameters<typeof canonicalizeAnalysisResult>[1]>['conversation'];
+}
+
+export interface FinalizedAnalysisResult {
+  result: AnalysisResult;
+  qualityIssue?: FinalResultQualityIssue;
+  conversationOutcome?: ReturnType<typeof canonicalizeAnalysisResult>['conversationOutcome'];
+  /** Diagnostic receipt stays private; persistence consumes result only. */
+  semanticAssessment?: FinalSemanticAssessment;
+}
+
+const consumedContexts = new WeakSet<RuntimeFinalizationContext>();
+
+function frozenSnapshot<T>(input: T): T {
+  const snapshot = structuredClone(input);
+  const seen = new WeakSet<object>();
+  const freeze = (value: unknown): void => {
+    if (value === null || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    Object.values(value).forEach(freeze);
+    Object.freeze(value);
+  };
+  freeze(snapshot);
+  return snapshot;
+}
+
+function assertOwner(owner: AnalysisFinalizationOwner): void {
+  owner.signal.throwIfAborted();
+  if (!owner.isCurrent()) throw new DOMException('Analysis run is no longer current', 'AbortError');
+  owner.assertAuthorized();
+}
+
+function pinnedRequirements(context: RuntimeFinalizationContext): PinnedAnalysisReportRequirements | undefined {
+  if (context.turnIntent.status !== 'resolved' || context.turnIntent.deliverable !== 'report') return undefined;
+  const contract = getFinalReportContract(context.turnIntent.sceneId, context.strategyRegistry);
+  if (!contract) return undefined;
+  return {sceneId: context.turnIntent.sceneId, registryFingerprint: context.strategyRegistry.registryFingerprint,
+    requirements: contract.requiredSections.map(({id, label, description, required, condition}) => ({
+      id, label, description, required, condition,
+    }))};
+}
+
+/** Finite proof never promotes itself; the full current proposition must agree with the body. */
+function joinClaimVerification(input: {
+  contract?: ConclusionContract;
+  draft: ClaimVerificationResult;
+  semantic?: FinalSemanticAssessment;
+  candidate: AnalysisCandidateIdentity;
+  body: string;
+  bindingEligibility: ConclusionBindingEligibility;
+}): ClaimVerificationResult {
+  const {draft, semantic, contract, candidate, body} = input;
+  const declarations = contract?.claims ?? [];
+  const eligible = input.bindingEligibility !== 'ineligible' && contract?.bindingEligibility !== 'ineligible';
+  const bound = Boolean(eligible && semantic && ['checked', 'coverage_incomplete'].includes(semantic.status) &&
+    sameAnalysisCandidate(semantic.binding?.canonicalCandidate, candidate, body));
+  const complete = Boolean(bound && semantic &&
+    semantic.coverage.body === 'complete' && semantic.coverage.claims === 'complete' &&
+    sameAnalysisCandidate(semantic.binding?.canonicalCandidate, candidate, body));
+  const issues: ClaimVerificationIssue[] = [...draft.issues];
+  const claimResults: ClaimVerificationClaimResult[] = declarations.map(claim => {
+    const id = claim.id ?? '';
+    const drafts = draft.claimResults.filter(item => item.claimId === id);
+    const reviews = semantic?.claims.filter(item => item.claimId === id) ?? [];
+    const prior = drafts.length === 1 ? drafts[0] : undefined;
+    const review = reviews.length === 1 ? reviews[0] : undefined;
+    const unique = id.length > 0 && declarations.filter(item => item.id === id).length === 1;
+    if (!unique || !prior || !eligible) return {...prior, claimId: id, status: 'not_checked'};
+    if (prior.status === 'unsupported' || prior.deterministicProof?.status === 'rejected') {
+      return {...prior, status: 'unsupported'};
+    }
+    if (bound && review?.consistency === 'inconsistent') {
+      for (const issue of review.issues) issues.push({claimId: id, severity: 'error',
+        code: `semantic_${issue.code}`, message: `Claim ${id}: ${issue.code}`});
+      return {...prior, status: 'unsupported'};
+    }
+    if (!complete || review?.consistency !== 'consistent') return {...prior, status: 'partial'};
+    const semantics = claim.semantics;
+    if (semantics && (semantics.discourse !== 'asserted' || semantics.modality !== 'certain' ||
+      claim.kind === 'inference' || claim.kind === 'recommendation')) {
+      return {...prior, status: 'inference'};
+    }
+    return {...prior, status: prior.deterministicProof?.status === 'proved' &&
+      prior.propositionCoverage?.status === 'complete' ? 'verified' : 'partial'};
+  });
+  if (bound && semantic?.omissions.length) issues.push({claimId: '', severity: 'error',
+    code: 'semantic_undeclared_claim', message: 'The answer contains assertions missing from its declared claims.'});
+  const unsupportedClaimCount = claimResults.filter(claim => claim.status === 'unsupported').length;
+  const failed = unsupportedClaimCount > 0 || issues.some(issue => issue.severity === 'error');
+  const passed = !failed && complete && semantic?.omissions.length === 0 &&
+    claimResults.every(claim => claim.status === 'verified' || claim.status === 'inference');
+  const status = failed ? 'failed' : passed ? 'passed' : declarations.length || semantic ? 'partial' : 'not_checked';
+  return {schemaVersion: 'claim_verifier@2', policy: 'record_only', status, passed,
+    checkedClaimCount: claimResults.filter(claim => claim.status !== 'not_checked').length,
+    unsupportedClaimCount, claimResults, issues,
+    ...(!passed && !failed ? {notCheckedReason: semantic?.reason ?? 'complete_proposition_review_unavailable'} : {})};
+}
+
+function semanticReportAssessment(input: {
+  candidate: AnalysisCandidateIdentity; result: AnalysisResult; context: RuntimeFinalizationContext;
+  evidenceFingerprint: string; requirements?: PinnedAnalysisReportRequirements;
+  caseRetrieval?: AnalysisCaseRetrievalState; semantic: FinalSemanticAssessment;
+}): FinalReportAssessment | undefined {
+  const {requirements, semantic, candidate, context, result} = input;
+  if (!requirements) return undefined;
+  const bound = sameAnalysisCandidate(semantic.binding?.canonicalCandidate, candidate, result.conclusion);
+  return {schemaVersion: 1, binding: {...candidate,
+    conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
+    evidenceFingerprint: input.evidenceFingerprint,
+    requirementsFingerprint: reportRequirementsFingerprint(requirements),
+    registryFingerprint: context.strategyRegistry.registryFingerprint,
+    intentFingerprint: analysisDeliveryFingerprint(context.turnIntent),
+    caseRetrievalFingerprint: analysisDeliveryFingerprint(input.caseRetrieval)},
+    status: !bound ? 'not_checked' : semantic.status === 'checked' || semantic.status === 'coverage_incomplete'
+      ? semantic.coverage.report === 'incomplete' ? 'coverage_incomplete' : 'checked'
+      : semantic.status,
+    requirements: bound ? semantic.requirements : []};
+}
+
+/** The only asynchronous final-verification boundary; all acquisition belongs to the run. */
+export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput): Promise<FinalizedAnalysisResult> {
+  const {context, owner} = input;
+  try {
+    assertOwner(owner);
+    if (context) {
+      if (context.runId !== owner.runId || context.sessionId !== input.result.sessionId || consumedContexts.has(context)) {
+        throw new Error('finalization_run_identity_mismatch');
+      }
+      consumedContexts.add(context);
+    }
+    const query = input.query;
+    const providerQuery = context?.getProviderQuery(owner.signal);
+    if (providerQuery?.analysisContextFingerprint !== undefined &&
+      providerQuery.analysisContextFingerprint !== owner.analysisContextFingerprint) {
+      throw new Error('finalization_authorization_fingerprint_mismatch');
+    }
+    const original = frozenSnapshot(input.result);
+    const conversation = frozenSnapshot(input.conversation);
+    const comparisonReportSection = frozenSnapshot(input.comparisonReportSection);
+    const suppliedIdentity = frozenSnapshot(input.comparisonIdentity);
+    const expectedPair = context?.traceIdentity;
+    const pairConflict = suppliedIdentity && expectedPair && (
+      (suppliedIdentity.currentTraceId !== undefined && suppliedIdentity.currentTraceId !== expectedPair.currentTraceId) ||
+      (suppliedIdentity.referenceTraceId !== undefined && suppliedIdentity.referenceTraceId !== expectedPair.referenceTraceId));
+    const comparisonIdentity = expectedPair && (expectedPair.referenceTraceId || suppliedIdentity)
+      ? {...(pairConflict ? {} : suppliedIdentity), currentTraceId: expectedPair.currentTraceId,
+        referenceTraceId: expectedPair.referenceTraceId} : suppliedIdentity;
+    const caseRetrieval = frozenSnapshot(input.caseRetrieval ?? (context?.deliveryContext.entry !== 'historical_restore'
+      ? context?.deliveryContext.caseRetrieval : undefined));
+    const canonical = canonicalizeAnalysisResult(original, {context: context?.deliveryContext, conversation});
+    if (!isIssuedCanonicalAnalysisProjection(canonical.projection)) throw new Error('unissued_canonical_projection');
+    const result = canonical.result;
+    const candidate = canonical.projection.candidate ?? {runId: owner.runId,
+      attemptId: 'unconfirmed', candidateRef: `unconfirmed-${randomUUID()}`,
+      conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)};
+    let delivery: AnalysisDeliveryContext = {entry: 'new_finalization', acceptedCandidate: candidate};
+    if (canonical.projection.candidate && canonical.deliveryContext?.entry !== 'historical_restore') {
+      delivery = {...canonical.deliveryContext, entry: 'new_finalization', acceptedCandidate: candidate,
+        turnIntent: context?.turnIntent};
+    }
+    const sourceUse = context?.sourceUse;
+    const sourceReader = sourceUse ? {getSourceUseDecision: () => sourceUse} : undefined;
+    attachSourceUseToAnalysisResult(result, sourceReader);
+    const dataEnvelopes = frozenSnapshot(input.dataEnvelopes ?? []) as DataEnvelope[];
+    const relations = prepareAnalysisRelations({conclusionContract: canonical.validationContract, dataEnvelopes});
+    const validationContract = frozenSnapshot(relations.conclusionContract ?? undefined);
+    const prepared = await prepareClaimEvidence({conclusionContract: validationContract,
+      relationCandidates: relations.relationCandidates, bindingEligibility: canonical.bindingEligibility,
+      identityDataEnvelopes: dataEnvelopes, identityTracePin: context?.traceIdentity,
+      evidenceReadView: context ? {resolveReferences: (requests, signal) => context.resolveReferences(requests, signal ?? owner.signal)} : undefined,
+      signal: owner.signal});
+    assertOwner(owner);
+    const evidenceSnapshot = preparedClaimEvidenceSnapshot(prepared);
+    const evidenceFingerprint = analysisDeliveryFingerprint(evidenceSnapshot);
+    const draft = runClaimVerification({conclusionContract: validationContract, dataEnvelopes,
+      comparisonReportSection, relationCandidates: relations.relationCandidates,
+      relationActivationClaimIds: relations.relationActivationClaimIds, preparedEvidence: prepared,
+      bindingEligibility: canonical.bindingEligibility, policy: 'record_only'});
+    const requirements = context ? pinnedRequirements(context) : undefined;
+    let semantic: FinalSemanticAssessment | undefined;
+    if (context) {
+      const diagnostics = canonical.protocolDiagnostics;
+      const snapshot: FinalSemanticSnapshot = {inputCoverage: 'complete', declarationBindingEligibility: canonical.bindingEligibility,
+        query: providerQuery?.text ?? query,
+        body: result.conclusion, conclusionContract: validationContract, evidenceSnapshot, sourceUse,
+        capabilitySnapshot: context.capabilityEvidence, reportRequirements: requirements, caseRetrieval,
+        protocolDiagnostics: diagnostics ? {sidecar: {status: diagnostics.sidecar.status,
+          issues: diagnostics.sidecar.issues, bindingEligibility: diagnostics.sidecar.bindingEligibility,
+          rawPayload: diagnostics.sidecar.rawPayload},
+          conversation: diagnostics.conversation ? {status: diagnostics.conversation.status,
+            issues: diagnostics.conversation.issues} : undefined} : undefined};
+      // This query was accepted as provider input in the same run. The echo guard
+      // still protects it in output and in every other role in this snapshot.
+      const projected = projectCodeAwareStructuredText(result.sessionId,
+        providerQuery ? {...snapshot, query: ''} : snapshot);
+      if (providerQuery && projected.value) projected.value.query = providerQuery.text;
+      const safeSnapshot: FinalSemanticSnapshot = projected.changed
+        ? {...snapshot, inputCoverage: 'incomplete', query: '', body: result.conclusion,
+          conclusionContract: undefined, protocolDiagnostics: undefined, evidenceSnapshot: null,
+          sourceUse: undefined, capabilitySnapshot: undefined, caseRetrieval: undefined}
+        : projected.value;
+      assertOwner(owner);
+      semantic = await assessFinalSemantics({context, canonicalCandidate: candidate, snapshot: safeSnapshot, signal: owner.signal});
+      assertOwner(owner);
+    }
+    result.claimVerificationResult = joinClaimVerification({contract: validationContract, draft: draft.claimVerificationResult,
+      semantic, candidate, body: result.conclusion, bindingEligibility: canonical.bindingEligibility});
+    const statusByClaim = new Map(result.claimVerificationResult.claimResults.map(claim => [claim.claimId, claim.status]));
+    result.claimSupport = draft.claimSupport.map(support => {
+      const status = statusByClaim.get(support.claimId);
+      return {...support, supportLevel: status === 'verified' || status === 'unsupported' || status === 'inference'
+        ? status : 'partial'};
+    });
+    result.identityResolutions = preparedIdentityResolutions(prepared);
+    result.sourceClaimVerificationResult = verifySourceClaimBindings({conclusionContract: validationContract,
+      actualSourceUseDecision: sourceUse, semanticsPolicy: 'declared',
+      matchedTraceEvidenceRefIdsByClaimId: collectMatchedTraceEvidenceRefIdsByClaimId(result.claimVerificationResult),
+      verifiedTraceOccurrenceRefIdsByClaimId: collectVerifiedTraceOccurrenceRefIdsByClaimId(result.claimVerificationResult)});
+    const claimsFingerprint = analysisDeliveryFingerprint(result.conclusionContract?.claims ?? []);
+    const sourceUseFingerprint = analysisDeliveryFingerprint(result.sourceUseDecision);
+    delivery = {...delivery, evidenceFingerprint, sourceUseFingerprint,
+      claimVerificationBinding: {candidate, claimsFingerprint, evidenceFingerprint,
+        verificationFingerprint: analysisDeliveryFingerprint(result.claimVerificationResult)},
+      sourceVerificationBinding: result.sourceClaimVerificationResult ? {candidate, claimsFingerprint, evidenceFingerprint,
+        sourceUseFingerprint, conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
+        verificationFingerprint: analysisDeliveryFingerprint(result.sourceClaimVerificationResult)} : undefined,
+      reportRequirements: requirements, caseRetrieval,
+      reportAssessment: context && semantic ? semanticReportAssessment({candidate, result, context,
+        evidenceFingerprint, requirements, caseRetrieval, semantic}) : undefined};
+    assertOwner(owner);
+    const qualityIssue = applyFinalResultQualityGate({result, query, context: delivery, comparisonIdentity});
+    assertOwner(owner);
+    return {result, qualityIssue, semanticAssessment: semantic,
+      ...(canonical.conversationOutcome ? {conversationOutcome: {...canonical.conversationOutcome, message: result.conclusion}} : {})};
+  } finally {
+    context?.dispose();
+  }
+}

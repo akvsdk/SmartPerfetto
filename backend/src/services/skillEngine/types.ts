@@ -14,7 +14,16 @@
  */
 
 import type { ColumnDefinition } from '../../types/dataContract';
-import type { IdentityResolutionV1 } from '../../types/identityContract';
+import type { IdentityResolutionV1, EvidenceScopeMetadata, EvidenceScopeProvenanceV1, EvidenceScopeRole } from '../../types/identityContract';
+import type { EffectiveProcessScope } from '../processIdentity/effectiveProcessScope';
+
+export interface SqlProcessScopeDeclaration {
+  role: EvidenceScopeRole;
+  binding?: 'native_upid' | 'effective_target_processes';
+  context_fields?: Partial<Record<Exclude<EvidenceScopeRole, 'target'>, string[]>>;
+  exact_unavailable?: string;
+  limitations?: string[];
+}
 
 // =============================================================================
 // 基础类型
@@ -178,6 +187,12 @@ export interface DiagnosticFallback {
 /**
  * 原子步骤 - 执行单个 SQL
  */
+export interface ExactSqlSource {
+  sql: string;
+  sql_fragments?: string[];
+  process_scope: SqlProcessScopeDeclaration;
+}
+
 export interface AtomicStep {
   id: string;
   type: 'atomic';
@@ -186,6 +201,8 @@ export interface AtomicStep {
   sql: string;
   /** SQL fragment paths relative to skills/ (e.g., ['fragments/target_threads.sql']) */
   sql_fragments?: string[];
+  process_scope?: SqlProcessScopeDeclaration;
+  exact_sql?: ExactSqlSource;
   display?: DisplayConfig | boolean;
   save_as?: string;
   optional?: boolean;
@@ -428,6 +445,9 @@ export interface SkillDefinition {
 
   // 原子 skill 的 SQL（atomic 使用）
   sql?: string;
+  sql_fragments?: string[];
+  process_scope?: SqlProcessScopeDeclaration;
+  exact_sql?: ExactSqlSource;
 
   // 数据来源。默认 trace；comparison skills 使用 analysis_result_snapshot。
   source?: SkillSource;
@@ -475,6 +495,8 @@ export interface SkillDefinition {
 
 export interface SkillExecutionContext {
   traceId: string;
+  /** Passed separately from user-controlled expression namespaces. */
+  readonly processScope?: EffectiveProcessScope;
   packageName?: string;
   vendor?: string;
   signal?: AbortSignal;
@@ -492,13 +514,14 @@ export interface SkillExecutionContext {
 
   // 保存的变量（save_as）
   variables: Record<string, any>;
+  variableScopes?: Record<string, EvidenceScopeProvenanceV1 | undefined>;
 
   // 当前迭代项（iterator 中使用）
   currentItem?: any;
   currentItemIndex?: number;
 }
 
-export interface StepResult {
+export interface StepResult extends EvidenceScopeMetadata {
   stepId: string;
   stepType: SkillType | 'skill' | 'parallel';
   success: boolean;
@@ -509,6 +532,8 @@ export interface StepResult {
   emptyMessage?: string;
   executionTimeMs: number;
   display?: DisplayConfig;
+  sql?: string;
+  scopeLimitations?: string[];
 }
 
 // =============================================================================
@@ -540,12 +565,15 @@ export interface SkillExecutionResult {
 
   // Identity Contract sidecar produced by the process/thread identity gate.
   identityResolution?: IdentityResolutionV1;
+  scopeProvenance?: EvidenceScopeProvenanceV1;
+  scopeLimitations?: string[];
+  partial?: boolean;
 
   executionTimeMs: number;
   error?: string;
 }
 
-export interface DisplayResult {
+export interface DisplayResult extends EvidenceScopeMetadata {
   stepId: string;
   title: string;
   level: DisplayLevel;
@@ -564,6 +592,7 @@ export interface DisplayResult {
       result: {
         success: boolean;
         sections?: Record<string, any>;
+        scopeProvenance?: EvidenceScopeProvenanceV1;
         error?: string;
       };
     }>;
@@ -580,7 +609,7 @@ export interface DisplayResult {
     };
   };
   /** Public execution state; keeps successful-empty distinct from optional query failure. */
-  executionStatus?: 'observed' | 'empty' | 'optional_error';
+  executionStatus?: 'observed' | 'empty' | 'optional_error' | 'unavailable';
   executionMessage?: string;
   executionError?: string;
   highlight?: HighlightRule[];
@@ -614,7 +643,7 @@ export interface DisplayResult {
   }>;
 }
 
-export interface DiagnosticResult {
+export interface DiagnosticResult extends EvidenceScopeMetadata {
   id: string;
   diagnosis: string;
   confidence: number;

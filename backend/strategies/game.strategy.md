@@ -3,6 +3,7 @@
 
 ---
 scene: game
+classification_description: "Game workload frame pacing, CPU/GPU performance and sustained rendering behavior."
 priority: 4
 effort: medium
 required_capabilities:

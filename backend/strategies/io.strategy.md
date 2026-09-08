@@ -3,6 +3,7 @@
 
 ---
 scene: io
+classification_description: "Storage and filesystem activity, disk latency, synchronization and page-fault-related waits."
 priority: 5
 effort: medium
 required_capabilities: []

@@ -20,6 +20,11 @@ meta:
   icon: "memory"
   tags: [memory, page_fault, reclaim, atomic]
 
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package]
+
 inputs:
   - name: start_ts
     type: timestamp
@@ -57,12 +62,18 @@ display:
       type: duration
       format: duration_ms
 
+process_scope:
+  role: target
+  binding: effective_target_processes
+sql_fragments:
+  - fragments/effective_target_processes.sql
+
 sql: |
   WITH target_threads AS (
     SELECT t.utid, t.name as thread_name
     FROM thread t
-    JOIN process p ON t.upid = p.upid
-    WHERE (('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
+    JOIN effective_target_processes p ON t.upid = p.upid
+    WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
       AND (t.tid = p.pid OR t.name = 'RenderThread' OR t.name LIKE '%Binder%')
   ),
   memory_events AS (

@@ -3,6 +3,7 @@
 
 ---
 scene: runtime_correctness
+classification_description: "Application runtime failures and correctness, including crashes, process termination and failures involving memory or blocking."
 priority: 5
 effort: medium
 required_capabilities:

@@ -11,6 +11,7 @@ import {buildAgentDrivenReportData} from '../agentReportData';
 import {HTMLReportGenerator} from '../htmlReportGenerator';
 import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../security/codeAwareOutputRegistry';
 import {sanitizeSourceReference} from '../codebase/sourceUseDecision';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 
 describe('buildAgentDrivenReportData private knowledge projection', () => {
   const baseResult = (sessionId: string) => ({
@@ -86,10 +87,13 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
         conclusionContract: {claims: [{text: 'PRIVATE_CLAIM_CANARY'}]},
         claimSupport: [{claimId: 'claim-1', text: 'PRIVATE_CLAIM_CANARY'}] as any,
         claimVerificationResult: {
+          schemaVersion: 'claim_verifier@2', policy: 'record_only', passed: false,
+          checkedClaimCount: 0, unsupportedClaimCount: 0, claimResults: [],
           status: 'partial',
-          issues: [{message: 'PRIVATE_VERIFICATION_CANARY'}],
+          issues: [{claimId: 'claim-1', severity: 'warning', code: 'not_checked', message: 'PRIVATE_VERIFICATION_CANARY'}],
         } as any,
         identityResolutions: [{
+          version: 'identity_contract@1', target: {traceId: 'trace-a', source: 'derived'}, processes: [], threads: [],
           identityRefId: 'identity-1',
           status: 'verified',
           warnings: ['PRIVATE_IDENTITY_CANARY'],
@@ -356,12 +360,34 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
       }),
       sourceClaimBindings: [{
         claimId: 'claim-1',
-        mechanismStatus: 'compatible',
+        mechanismStatus: 'unverified',
         sourceReferenceIds: [reference.id],
         traceEvidenceRefIds: ['trace-evidence-1'],
       }],
     }));
     expect(JSON.stringify(report.sourceContext)).not.toContain('/Users/chris');
     expect(JSON.stringify(report.sourceContext)).not.toContain('SECRET_');
+  });
+
+  it('keeps the current final body and receipt together when history contains another turn', () => {
+    const sessionId = 'report-current-body';
+    const conclusion = 'Current body without a heading or terminal punctuation';
+    const completion = {schemaVersion: 1 as const, runtimeKind: 'openai-agents-sdk' as const, status: 'completed' as const,
+      candidateRef: 'candidate-current', runId: 'run-current', attemptId: 'attempt-current',
+      conclusionFingerprint: analysisDeliveryFingerprint(conclusion)};
+    const session = {sessionId, traceId: 'trace-a', query: 'current query', orchestrator: {},
+      hypotheses: [], agentDialogue: [], conversationSteps: [], dataEnvelopes: [], agentResponses: [],
+      runSequence: 2, conclusionHistory: [{turn: 1, conclusion: 'Prior completed report.', confidence: 1, timestamp: 1}]};
+    const result = {...baseResult(sessionId), conclusion, completion,
+      runtimeAppendix: {schemaVersion: 1 as const, origin: 'runtime_fallback' as const,
+        sourceCandidate: completion, text: 'Separate runtime provenance.'}};
+    expect(buildAgentDrivenReportData({session: session as any, result}).result).toEqual(result);
+    const emptyResult = {...result, conclusion: '', completion: {...completion, status: 'unknown' as const,
+      conclusionFingerprint: analysisDeliveryFingerprint('')}};
+    const report = buildAgentDrivenReportData({session: session as any, result: emptyResult});
+    expect(report.result.conclusion).toBe('');
+    expect(report.result.completion).toEqual(emptyResult.completion);
+    expect(report.result.runtimeAppendix?.text).toBe('Separate runtime provenance.');
+    expect(report.conclusionHistory?.[0].conclusion).toBe('Prior completed report.');
   });
 });

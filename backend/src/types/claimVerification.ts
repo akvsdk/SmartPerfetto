@@ -2,7 +2,8 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-export type ClaimVerificationSchemaVersion = 'claim_verifier@1';
+/** Version 1 remains readable in persisted results; new verification emits version 2. */
+export type ClaimVerificationSchemaVersion = 'claim_verifier@1' | 'claim_verifier@2';
 
 export type ClaimVerificationStatus = 'passed' | 'failed' | 'partial' | 'not_checked';
 export type ClaimVerificationPolicy = 'block' | 'retry' | 'warn_only' | 'record_only';
@@ -18,6 +19,7 @@ export type ClaimReferenceVerificationStatus =
   | 'missing'
   | 'ambiguous'
   | 'value_mismatch'
+  | 'ineligible'
   | 'not_checked';
 
 export interface ClaimReferenceVerificationResult {
@@ -25,14 +27,51 @@ export interface ClaimReferenceVerificationResult {
   sourceRef?: string;
   artifactId?: string;
   sourceToolCallId?: string;
+  anchorId?: string;
+  column?: string;
   status: ClaimReferenceVerificationStatus;
   message?: string;
+}
+
+export type DeterministicClaimProofKind =
+  | 'numeric_cell'
+  | 'interval_overlap'
+  | 'comparison_delta'
+  | 'none';
+
+export interface DeterministicClaimProof {
+  kind: DeterministicClaimProofKind;
+  status: 'proved' | 'candidate' | 'rejected' | 'not_checked';
+  /** Stable machine-readable explanation; never inferred from the claim body. */
+  reason: string;
+  anchorIds: string[];
+  evidenceRefIds: string[];
+}
+
+export interface ClaimPropositionCoverage {
+  status: 'complete' | 'partial' | 'none';
+  covered: string[];
+  uncovered: string[];
+  reason: string;
 }
 
 export interface ClaimVerificationClaimResult {
   claimId: string;
   status: ClaimVerificationClaimStatus;
+  /** Compatibility alias. A matched cell alone never verifies a proposition in v2. */
   referenceResults?: ClaimReferenceVerificationResult[];
+  referenceCells?: ClaimReferenceVerificationResult[];
+  deterministicProof?: DeterministicClaimProof;
+  propositionCoverage?: ClaimPropositionCoverage;
+}
+
+export interface ClaimVerificationClaimResultV2 extends ClaimVerificationClaimResult {
+  /** Cell matching is independent of typed proof and prose/semantics agreement. */
+  referenceCells: ClaimReferenceVerificationResult[];
+  /** A proved typed declaration still requires the shared semantic assessment. */
+  deterministicProof: DeterministicClaimProof;
+  /** Complete means the typed declaration, never the surrounding prose, is covered. */
+  propositionCoverage: ClaimPropositionCoverage;
 }
 
 export interface ClaimVerificationIssue {
@@ -54,4 +93,9 @@ export interface ClaimVerificationResult {
   unsupportedClaimCount: number;
   claimResults: ClaimVerificationClaimResult[];
   issues: ClaimVerificationIssue[];
+}
+
+export interface ClaimVerificationResultV2 extends ClaimVerificationResult {
+  schemaVersion: 'claim_verifier@2';
+  claimResults: ClaimVerificationClaimResultV2[];
 }
