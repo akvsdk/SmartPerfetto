@@ -19,8 +19,7 @@
  * failing on 237 files at once, not as a parking space for new debt.
  */
 
-import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -39,12 +38,18 @@ const GATE_SCRIPT_PREFIXES = ['test:', 'verify:'];
  * `src/tests/`; both suffixes are real suites the gate should be able to run.
  */
 export function listTestFiles(backendDir = BACKEND) {
-  const out = execFileSync(
-    'find',
-    ['src', '-name', '*.test.ts', '-o', '-name', '*_unittest.ts'],
-    { cwd: backendDir, encoding: 'utf8' },
-  );
-  return out.split('\n').map(line => line.trim()).filter(Boolean).sort();
+  const files = [];
+  function visit(relative) {
+    for (const entry of readdirSync(join(backendDir, relative), { withFileTypes: true })) {
+      const path = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile() && (entry.name.endsWith('.test.ts') || entry.name.endsWith('_unittest.ts'))) {
+        files.push(path);
+      }
+    }
+  }
+  visit('src');
+  return files.sort();
 }
 
 /**

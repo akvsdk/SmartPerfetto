@@ -3,7 +3,8 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -15,6 +16,27 @@ import {
 } from '../check-test-registration.mjs';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+test('suite discovery uses regular files and stable portable paths', t => {
+  const backend = mkdtempSync(join(tmpdir(), 'test-registration-'));
+  t.after(() => rmSync(backend, { recursive: true, force: true }));
+  mkdirSync(join(backend, 'src', 'nested space', 'decoy.test.ts'), { recursive: true });
+  writeFileSync(join(backend, 'src', 'z.test.ts'), '');
+  writeFileSync(join(backend, 'src', 'nested space', 'a_unittest.ts'), '');
+  writeFileSync(join(backend, 'src', 'nested space', 'decoy.test.ts', 'inner.test.ts'), '');
+  writeFileSync(join(backend, 'src', 'ignored.ts'), '');
+  assert.deepEqual(listTestFiles(backend), [
+    'src/nested space/a_unittest.ts',
+    'src/nested space/decoy.test.ts/inner.test.ts',
+    'src/z.test.ts',
+  ]);
+});
+
+test('suite discovery fails when the source root cannot be read', t => {
+  const backend = mkdtempSync(join(tmpdir(), 'test-registration-missing-'));
+  t.after(() => rmSync(backend, { recursive: true, force: true }));
+  assert.throws(() => listTestFiles(backend), { code: 'ENOENT' });
+});
 
 test('a suite named in a test:* script counts as reachable', () => {
   const targets = collectGateTargets({
