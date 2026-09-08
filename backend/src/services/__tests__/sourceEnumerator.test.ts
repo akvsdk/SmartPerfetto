@@ -373,6 +373,10 @@ describe('SourceEnumerator', () => {
     const delayedOpen = new Promise<typeof handle>(resolve => {
       releaseOpen = resolve;
     });
+    let reportOpenEntered!: () => void;
+    const openEntered = new Promise<void>(resolve => {
+      reportOpenEntered = resolve;
+    });
     let reportClosed!: () => void;
     const closed = new Promise<void>(resolve => {
       reportClosed = resolve;
@@ -387,36 +391,51 @@ describe('SourceEnumerator', () => {
       }
     });
     const open = jest.spyOn(fs.promises, 'open')
-      .mockImplementationOnce(async (..._args: any[]) => await delayedOpen);
-    let guard: NodeJS.Timeout | undefined;
-    const guardFailure = new Promise<never>((_resolve, reject) => {
-      guard = setTimeout(() => reject(new Error('test_guard_timeout')), 300);
+      .mockImplementationOnce(async (..._args: any[]) => {
+        reportOpenEntered();
+        return await delayedOpen;
+      });
+    jest.useFakeTimers({
+      now: 0,
+      doNotFake: [
+        'nextTick',
+        'queueMicrotask',
+        'setImmediate',
+        'clearImmediate',
+        'hrtime',
+        'performance',
+      ],
     });
 
     try {
-      const result = await Promise.race([
-        new SourceEnumerator({ripgrepPath: '__missing_rg__', timeoutMs: 50}).enumerate({
-          rootRealpath: fs.realpathSync(root),
-          policy: buildSourceSelectionIR({kind: 'app_source'}),
-          gate: new PathSecurityGate({allowlistRoots: [root]}),
+      const enumeration = new SourceEnumerator({ripgrepPath: '__missing_rg__', timeoutMs: 50}).enumerate({
+        rootRealpath: fs.realpathSync(root),
+        policy: buildSourceSelectionIR({kind: 'app_source'}),
+        gate: new PathSecurityGate({allowlistRoots: [root]}),
+      });
+      await Promise.race([
+        openEntered,
+        enumeration.then(() => {
+          throw new Error('enumeration_finished_before_gitmodules_open');
         }),
-        guardFailure,
       ]);
+      expect(open).toHaveBeenCalledTimes(1);
+      expect(open.mock.calls[0][0]).toBe(fs.realpathSync(gitmodulesPath));
+      await jest.advanceTimersByTimeAsync(50);
+      const result = await enumeration;
       expect(result).toEqual(expect.objectContaining({
         backend: 'git',
         enumerationComplete: false,
         incompleteReason: 'time_budget',
       }));
-      const afterDeadline = jest.spyOn(Date, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER);
-      try {
-        releaseOpen(handle);
-        await expect(Promise.race([closed, guardFailure])).resolves.toBeUndefined();
-        expect(stat).not.toHaveBeenCalled();
-      } finally {
-        afterDeadline.mockRestore();
-      }
+      expect(close).not.toHaveBeenCalled();
+      releaseOpen(handle);
+      await closed;
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(stat).not.toHaveBeenCalled();
     } finally {
-      if (guard) clearTimeout(guard);
+      jest.clearAllTimers();
+      jest.useRealTimers();
       releaseOpen(handle);
       open.mockRestore();
       close.mockRestore();
