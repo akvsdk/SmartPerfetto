@@ -987,25 +987,27 @@ async function waitForReadiness({
   version,
 }) {
   const controller = new AbortController();
-  const probes = [
-    waitForHealth(
+  const readiness = (async () => {
+    const backend = await waitForHealth(
       backendUrl,
       {status: 'OK', version},
       backendTimeoutMs,
       controller.signal,
       healthProbe,
-    ),
-    waitForHealth(
+    );
+    controller.signal.throwIfAborted();
+    const frontend = await waitForHealth(
       frontendUrl,
       {status: 'OK'},
       frontendTimeoutMs,
       controller.signal,
       healthProbe,
-    ),
-  ];
+    );
+    return [backend, frontend];
+  })();
   try {
     return await Promise.race([
-      Promise.all(probes),
+      readiness,
       launcherExitPromise.then((exit) => {
         throw new Error(
           `launcher exited before readiness: code=${exit.code}, signal=${exit.signal}`,
@@ -1014,7 +1016,7 @@ async function waitForReadiness({
     ]);
   } finally {
     controller.abort(new Error('portable readiness probe group completed'));
-    await Promise.allSettled(probes);
+    await Promise.allSettled([readiness]);
   }
 }
 

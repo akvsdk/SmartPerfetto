@@ -1221,81 +1221,110 @@ test('portable health probe timeout reports ETIMEDOUT and destroys its client so
   await waitForSocketClose(healthSocket);
 });
 
-test('portable readiness cancels and settles the peer probe after one health failure', async (t) => {
-  const failing = http.createServer((_request, response) => {
-    response.writeHead(503, {'Content-Type': 'application/json'});
-    response.end(JSON.stringify({status: 'ERROR'}));
-  });
-  const failingPort = await listenOnLoopback(failing);
-  t.after(() => closeHttpServer(failing));
-
-  let hangingSocket;
-  let hangingRequestResolve;
-  const hangingRequest = new Promise((resolve) => {
-    hangingRequestResolve = resolve;
-  });
-  const hanging = http.createServer((_request, _response) => {
-    hangingRequestResolve();
-  });
-  hanging.once('connection', (socket) => {
-    hangingSocket = socket;
-  });
-  const hangingPort = await listenOnLoopback(hanging);
-  t.after(() => closeHttpServer(hanging));
-
+test('portable readiness starts the frontend budget after delayed backend readiness', async (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  let releaseBackend;
+  const backendResponse = new Promise((resolve) => { releaseBackend = resolve; });
+  let reportBackendEntered;
+  const backendEntered = new Promise((resolve) => { reportBackendEntered = resolve; });
+  const calls = [];
+  const backendPayload = {status: 'OK', version: 'fixture-version'};
+  const frontendPayload = {status: 'OK', surface: 'frontend'};
   const readiness = waitForReadiness({
-    backendTimeoutMs: 300,
-    backendUrl: `http://127.0.0.1:${failingPort}/health`,
-    frontendTimeoutMs: 5_000,
-    frontendUrl: `http://127.0.0.1:${hangingPort}/health`,
+    backendTimeoutMs: 100,
+    backendUrl: 'http://127.0.0.1:3100/health',
+    frontendTimeoutMs: 20,
+    frontendUrl: 'http://127.0.0.1:3101/health',
     launcherExitPromise: new Promise(() => {}),
     version: 'fixture-version',
+    healthProbe: {
+      attemptTimeoutMs: 100,
+      run: (url, timeoutMs) => {
+        calls.push({url, timeoutMs, now});
+        if (url.includes(':3100/')) {
+          reportBackendEntered();
+          return backendResponse;
+        }
+        return Promise.resolve({statusCode: 200, body: JSON.stringify(frontendPayload)});
+      },
+    },
   });
-  await hangingRequest;
-  await assert.rejects(readiness, /did not become healthy/);
-  assert.ok(hangingSocket, 'hanging frontend did not observe a connection');
-  await waitForSocketClose(hangingSocket);
+  try {
+    await backendEntered;
+    now = 30;
+    assert.equal(calls.length, 1, 'frontend must not start while backend is pending');
+    releaseBackend({statusCode: 200, body: JSON.stringify(backendPayload)});
+    assert.deepEqual(await readiness, [backendPayload, frontendPayload]);
+    assert.deepEqual(calls, [
+      {url: 'http://127.0.0.1:3100/health', timeoutMs: 100, now: 0},
+      {url: 'http://127.0.0.1:3101/health', timeoutMs: 20, now: 30},
+    ]);
+  } finally {
+    releaseBackend({statusCode: 200, body: JSON.stringify(backendPayload)});
+    await Promise.allSettled([readiness]);
+  }
 });
 
-test('portable readiness cancels both probes when the launcher exits', async (t) => {
-  const sockets = [];
-  let backendRequestResolve;
-  const backendRequest = new Promise((resolve) => {
-    backendRequestResolve = resolve;
-  });
-  const hanging = http.createServer((_request, _response) => {
-    backendRequestResolve();
-  });
-  hanging.on('connection', (socket) => sockets.push(socket));
-  const backendPort = await listenOnLoopback(hanging);
-  t.after(() => closeHttpServer(hanging));
+test('portable readiness does not start frontend probing after backend failure', async () => {
+  const calls = [];
+  let signal;
+  await assert.rejects(waitForReadiness({
+    backendUrl: 'http://127.0.0.1:3100/health',
+    frontendUrl: 'http://127.0.0.1:3101/health',
+    launcherExitPromise: new Promise(() => {}),
+    version: 'fixture-version',
+    healthProbe: {
+      attemptTimeoutMs: 100,
+      run: async (url, _timeoutMs, probeSignal) => {
+        calls.push(url);
+        signal = probeSignal;
+        const error = new Error('fixture backend response exceeds limit');
+        error.code = 'ERR_HEALTH_RESPONSE_TOO_LARGE';
+        throw error;
+      },
+    },
+  }), /did not become healthy.*fixture backend response exceeds limit/);
+  assert.deepEqual(calls, ['http://127.0.0.1:3100/health']);
+  assert.equal(signal.aborted, true);
+});
 
-  let frontendRequestResolve;
-  const frontendRequest = new Promise((resolve) => {
-    frontendRequestResolve = resolve;
-  });
-  const second = http.createServer((_request, _response) => {
-    frontendRequestResolve();
-  });
-  second.on('connection', (socket) => sockets.push(socket));
-  const frontendPort = await listenOnLoopback(second);
-  t.after(() => closeHttpServer(second));
+for (const stage of ['backend', 'frontend']) {
+  test(`portable readiness cancels and drains the ${stage} probe when the launcher exits`, async (t) => {
+    const sockets = [];
+    let reportActiveRequest;
+    const activeRequest = new Promise((resolve) => { reportActiveRequest = resolve; });
+    let frontendRequests = 0;
+    const backend = http.createServer((_request, response) => {
+      if (stage === 'backend') {
+        reportActiveRequest();
+      } else {
+        response.writeHead(200, {'Content-Type': 'application/json'});
+        response.end(JSON.stringify({status: 'OK', version: 'fixture-version'}));
+      }
+    });
+    backend.on('connection', (socket) => sockets.push(socket));
+    const backendPort = await listenOnLoopback(backend);
+    t.after(() => closeHttpServer(backend));
+    const frontend = http.createServer((_request, _response) => {
+      frontendRequests += 1;
+      reportActiveRequest();
+    });
+    frontend.on('connection', (socket) => sockets.push(socket));
+    const frontendPort = await listenOnLoopback(frontend);
+    t.after(() => closeHttpServer(frontend));
 
-  await assert.rejects(
-    waitForReadiness({
+    await assert.rejects(waitForReadiness({
       backendUrl: `http://127.0.0.1:${backendPort}/health`,
       frontendUrl: `http://127.0.0.1:${frontendPort}/health`,
-      launcherExitPromise: Promise.all([
-        backendRequest,
-        frontendRequest,
-      ]).then(() => ({code: 23, signal: null})),
+      launcherExitPromise: activeRequest.then(() => ({code: 23, signal: null})),
       version: 'fixture-version',
-    }),
-    /launcher exited before readiness: code=23/,
-  );
-  assert.equal(sockets.length, 2);
-  await Promise.all(sockets.map((socket) => waitForSocketClose(socket)));
-});
+    }), /launcher exited before readiness: code=23/);
+    assert.equal(frontendRequests, stage === 'backend' ? 0 : 1);
+    assert.equal(sockets.length, stage === 'backend' ? 1 : 2);
+    await Promise.all(sockets.map((socket) => waitForSocketClose(socket)));
+  });
+}
 
 test('portable health errors preserve bounded response-limit diagnostics', async (t) => {
   let requestCount = 0;
