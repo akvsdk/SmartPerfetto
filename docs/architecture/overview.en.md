@@ -133,7 +133,8 @@ share a trace prerequisite:
 
 In OIDC mode, session, trace, lease, connection, run/receipt, and transient
 connection state remain in page memory only. Persisted messages first remove
-runtime bindings and private source text, then use a tenant/user/workspace-
+runtime bindings and raw private prompts; authorized source quotations in analysis
+results remain readable. Messages use a tenant/user/workspace-
 scoped namespace; changing identity or workspace cannot restore another
 scope's history. Logout, 401, cross-tab authority invalidation, identity/context
 changes, and page disposal abort start/stream work, advance the runtime

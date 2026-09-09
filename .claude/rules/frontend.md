@@ -118,8 +118,8 @@ even when no answer tokens were streamed.
   indented under a header that was trimmed away.
 - Plan phase boundaries are identified by `sourceEventType === 'plan_phase_updated'`,
   never by matching the localized wording. Runs without boundaries must render
-  a flat list: private-knowledge runs suppress `plan_phase_updated`, and quick
-  mode has no plan at all.
+  a flat list; quick mode has no plan at all. Owner source-analysis process
+  views may retain phase updates while strict log projection remains separate.
 - Do not mirror answer text into the process view. The answer streams in its
   own bubble. Start and completion markers are fine.
 - The stop control has two forms: plain stop, and stop-and-redirect, which

@@ -435,7 +435,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
     expect(orchestrator.abortSession).toHaveBeenCalledWith('conversation-1:run-1');
   });
 
-  it('projects private runtime updates and terminal outcomes before publishing them', async () => {
+  it('retains owner source query references in runtime updates and terminal outcomes', async () => {
     const privateQuery = 'private pasted source line';
     const emitter = new EventEmitter() as unknown as IOrchestrator;
     emitter.analyze = jest.fn<IOrchestrator['analyze']>(async () => {
@@ -466,12 +466,12 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
       onUpdate: update => updates.push(update),
     });
 
-    expect(JSON.stringify(updates)).not.toContain(privateQuery);
-    expect(JSON.stringify(outcome)).not.toContain(privateQuery);
-    expect(outcome.message).toContain('[PRIVATE_QUERY_REFERENCE]');
+    expect(JSON.stringify(updates)).toContain(privateQuery);
+    expect(JSON.stringify(outcome)).toContain(privateQuery);
+    expect(outcome.message).not.toContain('[PRIVATE_QUERY_REFERENCE]');
   });
 
-  it('keeps private user queries from earlier turns guarded for the whole current run', async () => {
+  it('allows owner source query references from earlier turns throughout the current run', async () => {
     const previousPrivateQuery = 'private source pasted in the previous turn';
     const currentPrivateQuery = 'continue reviewing that source';
     const emitter = new EventEmitter() as unknown as IOrchestrator;
@@ -506,9 +506,9 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
       onUpdate: update => updates.push(update),
     });
 
-    expect(JSON.stringify(updates)).not.toContain(previousPrivateQuery);
-    expect(JSON.stringify(outcome)).not.toContain(previousPrivateQuery);
-    expect(outcome.message).toContain('[PRIVATE_QUERY_REFERENCE]');
+    expect(JSON.stringify(updates)).toContain(previousPrivateQuery);
+    expect(JSON.stringify(outcome)).toContain(previousPrivateQuery);
+    expect(outcome.message).not.toContain('[PRIVATE_QUERY_REFERENCE]');
   });
 
   it.each([
@@ -766,7 +766,7 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
     const outcome = await adapter.run({sessionId: 'private', runId: 'private-run', query: privateQuery, history: [], traceContext: {kind: 'none'}});
     expect(outcome.finalResult?.claimVerificationResult).toMatchObject({schemaVersion: 'claim_verifier@2', status: 'failed', passed: false});
     expect(outcome.message).toBe(outcome.finalResult?.conclusion);
-    expect(JSON.stringify(outcome)).not.toContain('PRIVATE_FINAL_CANARY');
+    expect(JSON.stringify(outcome)).toContain('PRIVATE_FINAL_CANARY');
     expect(outcome).not.toHaveProperty('semanticAssessment');
     expect(outcome).not.toHaveProperty('context');
   });

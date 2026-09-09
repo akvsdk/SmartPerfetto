@@ -37,7 +37,7 @@ import {
   projectToolResultForExternalSurface,
 } from '../../../services/rag/toolResultProjectionFilter';
 import { extractSourceLookupCodeReferences } from '../../../services/codebase/sourceLookupTools';
-import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeOwnerSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import {
   createPiAgentCoreSnapshotEngineState,
   getPiAgentCoreSnapshotEngineState,
@@ -388,7 +388,7 @@ function projectPiAnalysisResult(
     result.partial = true;
     result.terminationReason ??= 'quality_gate_failed';
   }
-  return finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse, {
+  return finalizeOwnerSourceAwareAnalysisResultWithProjection(result, sourceUse, {
     context,
   });
 }

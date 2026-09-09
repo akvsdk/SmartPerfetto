@@ -1130,7 +1130,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     intentDecision = {...defaultIntent, taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'};
     const sessionId = `claude-projection-replaced-${language}`;
     revokeCodeAwareOutputGuards(sessionId);
-    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
       {enableSubAgents: false});
     mockClaudeVerifierVerifyConclusion.mockResolvedValue({passed: true, heuristicIssues: [], durationMs: 0});
@@ -1156,7 +1156,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     revokeCodeAwareOutputGuards(sessionId);
     const generatedExplanation = sanitizeCodeAwareStructuredTextWithReceipt(sessionId, 'native content').text;
     clearCodeAwareOutputGuards(sessionId);
-    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
       {enableSubAgents: false});
     mockClaudeVerifierVerifyConclusion.mockResolvedValue({passed: true, heuristicIssues: [], durationMs: 0});
@@ -1176,7 +1176,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     const sessionId = `claude-projection-redacted-${origin}`;
     const body = 'Before PRIVATE_CLAUDE_REDACTION_CANARY after';
     registerCodeAwareCanary(sessionId, 'PRIVATE_CLAUDE_REDACTION_CANARY');
-    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
       {enableSubAgents: false});
     mockClaudeVerifierVerifyConclusion.mockResolvedValue({passed: true, heuristicIssues: [], durationMs: 0});
@@ -1206,7 +1206,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     intentDecision = {...defaultIntent, taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'};
     const sessionId = 'claude-projection-native-empty';
     revokeCodeAwareOutputGuards(sessionId);
-    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
       {enableSubAgents: false});
     claudeSdkMock.__setQueryImplementation(async function* () {
@@ -2631,7 +2631,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
       expect(result.terminationMessage).toBeDefined();
       expect(result.sourceUseDecision).toEqual(decision);
       expect(result.sourceReferences).toEqual(decision.references);
-      expect(JSON.stringify(result)).not.toContain(SOURCE_FINALIZATION_CANARY);
+      expect(JSON.stringify(result)).toContain(SOURCE_FINALIZATION_CANARY);
     } finally {
       createMcpSpy.mockRestore();
       fixture.cleanup();
@@ -2696,7 +2696,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
       expect(terminal.success).toBe(true);
       expect(terminal.sourceUseDecision).toEqual(decision);
       expect(terminal.sourceReferences).toEqual(decision.references);
-      expect(JSON.stringify(terminal)).not.toContain(SOURCE_FINALIZATION_CANARY);
+      expect(JSON.stringify(terminal)).toContain(SOURCE_FINALIZATION_CANARY);
       expect(next.sourceUseDecision).toBeUndefined();
       expect(next.sourceReferences).toBeUndefined();
     } finally {

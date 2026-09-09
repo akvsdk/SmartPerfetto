@@ -1181,7 +1181,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       expect(terminal.success).toBe(true);
       expect(terminal.sourceUseDecision).toEqual(decision);
       expect(terminal.sourceReferences).toEqual(decision.references);
-      expect(JSON.stringify(terminal)).not.toContain(SOURCE_FINALIZATION_CANARY);
+      expect(JSON.stringify(terminal)).toContain(SOURCE_FINALIZATION_CANARY);
       expect(next.sourceUseDecision).toBeUndefined();
       expect(next.sourceReferences).toBeUndefined();
     } finally {
@@ -3297,8 +3297,8 @@ describe('experimental Pi agent-core runtime contract', () => {
     passVerification();
     const raw = `The marker is present.\n${protocolSidecar}`;
     FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: raw}]}];
-    const realProject = sourceProjectionModule.finalizeSourceAwareAnalysisResultWithProjection;
-    const project = jest.spyOn(sourceProjectionModule, 'finalizeSourceAwareAnalysisResultWithProjection').mockImplementation((...args) => {
+    const realProject = sourceProjectionModule.finalizeOwnerSourceAwareAnalysisResultWithProjection;
+    const project = jest.spyOn(sourceProjectionModule, 'finalizeOwnerSourceAwareAnalysisResultWithProjection').mockImplementation((...args) => {
       const projected = realProject(...args);
       return {...projected, result: {...projected.result, conclusion: raw.replace('"focused_answer"', '"invalid-mode"')}};
     });
@@ -3359,12 +3359,12 @@ describe('experimental Pi agent-core runtime contract', () => {
   });
 
   function observePiProjection() {
-    const projection = jest.spyOn(sourceProjectionModule, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceProjectionModule, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const gate = jest.spyOn(qualityGateModule, 'applyFinalResultQualityGate');
     return {
       projection, gate,
       assertReturnedContext(result: unknown) {
-        const projected = projection.mock.results.map(entry => entry.value as ReturnType<typeof sourceProjectionModule.finalizeSourceAwareAnalysisResultWithProjection>)
+        const projected = projection.mock.results.map(entry => entry.value as ReturnType<typeof sourceProjectionModule.finalizeOwnerSourceAwareAnalysisResultWithProjection>)
           .find(entry => entry?.result === result);
         const gateInput = gate.mock.calls.map(([input]) => input).find(input => input.result === result);
         expect(projected).toBeDefined();

@@ -105,11 +105,11 @@ import {
 } from '../../../agentv3/analysisPatternMemory';
 import {
   createCodeAwareStreamingTextProjection,
-  sanitizeCodeAwareStructuredTextWithReceipt,
+  sanitizeOwnerCodeAwareStructuredTextWithReceipt,
 } from '../../../services/security/codeAwareOutputRegistry';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
-import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeOwnerSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import {diagnosticLogIdentity} from '../../../utils/logger';
 import { runSnapshots } from '../../../agentv3/selfImprove/strategyFingerprint';
 import {verifyConclusion, generateCorrectionPrompt} from './claudeVerifier';
@@ -872,7 +872,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       // Empty native output remains empty and unsuccessful before any guard can
       // substitute a user-facing explanation for private content.
       const partial = failed || rawBody.trim().length === 0 || completion.status !== 'completed';
-      const projection = finalizeSourceAwareAnalysisResultWithProjection({
+      const projection = finalizeOwnerSourceAwareAnalysisResultWithProjection({
         sessionId,
         success: !failed && rawBody.trim().length > 0 &&
           (completion.status === 'completed' || completion.status === 'incomplete'),
@@ -1025,7 +1025,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         if (!runActivity.active || executionLease.signal.aborted) return;
         const normalizedUpdate = update.type === 'error' && typeof update.content?.message === 'string'
           ? {...update, content: {...update.content,
-              message: sanitizeCodeAwareStructuredTextWithReceipt(sessionId, update.content.message).text}}
+              message: sanitizeOwnerCodeAwareStructuredTextWithReceipt(sessionId, update.content.message).text}}
           : update;
         if (normalizedUpdate.type === 'answer_token' || normalizedUpdate.type === 'thought') {
           runtimePerformance.recordFirstOutput();
@@ -1049,7 +1049,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       }, outputLanguage, {
         tracePairContext: ctx.analysisContextForRebuild.comparison?.tracePairContext,
       }, ((options.codeAwareMode && options.codeAwareMode !== 'off') || options.knowledgeSourceIds?.length)
-        ? createCodeAwareStreamingTextProjection(sessionId, 'claude-full-answer')
+        ? createCodeAwareStreamingTextProjection(sessionId, 'claude-full-answer', 'owner')
         : undefined);
       // The bridge accumulates native text before applying the public stream projection.
       let attemptStreamOffset = 0;
@@ -1919,7 +1919,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       finalAnalysisResult.partial = isRuntimePartialResult || undefined;
       finalAnalysisResult.terminationReason ??= terminationReason;
       finalAnalysisResult.terminationMessage ??= terminationMessage === undefined ? undefined
-        : sanitizeCodeAwareStructuredTextWithReceipt(sessionId, terminationMessage).text;
+        : sanitizeOwnerCodeAwareStructuredTextWithReceipt(sessionId, terminationMessage).text;
       attachQuickReceipt(finalAnalysisResult);
       // This is the final accepted projection. A shared finalization context can
       // be attached here once, using deliveryContext rather than the native one.
@@ -2028,7 +2028,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         ? {status: 'cancelled', reason: 'cancelled'}
         : acceptedTerminal.status === 'incomplete' ? acceptedTerminal
           : {status: 'failed', reason: quotaExceeded ? 'budget_limit' : 'provider_error'};
-      const safeErrorMessage = sanitizeCodeAwareStructuredTextWithReceipt(sessionId, errMsg).text;
+      const safeErrorMessage = sanitizeOwnerCodeAwareStructuredTextWithReceipt(sessionId, errMsg).text;
       this.emitUpdate({type: 'error', content: {message: safeErrorMessage}, timestamp: Date.now()});
       const failedProjection = projectAcceptedCandidate(body, true);
       const failedResult = failedProjection.result;

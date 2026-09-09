@@ -11,6 +11,7 @@ import {LLMEchoOutputStream, type CodeRef} from './llmEchoOutputFilter';
 type GuardRegistration =
   | {kind: 'snippet'; snippet: string; ref: CodeRef}
   | {kind: 'private'; snippet: string; replacement: string}
+  | {kind: 'query'; snippet: string; replacement: string}
   | {kind: 'canary'; canary: string};
 
 const MAX_GUARD_REGISTRATIONS = 200;
@@ -91,7 +92,7 @@ class SessionCodeAwareOutputGuard {
     if (this.overflowed) return;
     const pattern = registration.kind === 'snippet'
       ? registration.snippet
-      : registration.kind === 'private'
+      : (registration.kind === 'private' || registration.kind === 'query')
         ? `${registration.snippet}\0${registration.replacement}`
         : registration.canary;
     const patternBytes = Buffer.byteLength(pattern, 'utf8');
@@ -179,6 +180,8 @@ class SessionCodeAwareOutputGuard {
     return this.registrationBytes;
   }
 
+  get unavailable(): boolean { return this.overflowed; }
+
   private createStream(): LLMEchoOutputStream {
     const stream = new LLMEchoOutputStream();
     for (const registration of this.registrations) this.apply(stream, registration);
@@ -188,7 +191,7 @@ class SessionCodeAwareOutputGuard {
   private apply(stream: LLMEchoOutputStream, registration: GuardRegistration): void {
     if (registration.kind === 'snippet') {
       stream.registerSnippet(registration.snippet, registration.ref);
-    } else if (registration.kind === 'private') {
+    } else if ((registration.kind === 'private' || registration.kind === 'query')) {
       stream.registerPrivateSnippet(registration.snippet, registration.replacement);
     } else {
       stream.registerCanary(registration.canary);
@@ -196,7 +199,56 @@ class SessionCodeAwareOutputGuard {
   }
 }
 
-const sessionGuards = new Map<string, SessionCodeAwareOutputGuard>();
+export type CodeAwareOutputAudience = 'strict' | 'owner';
+let projectionAudience: CodeAwareOutputAudience = 'strict';
+
+/** Pure synchronous projection only. Never span provider calls, logging, or awaits. */
+export function withOwnerCodeAwareProjection<T>(project: () => T): T {
+  const previous = projectionAudience;
+  projectionAudience = 'owner';
+  try {
+    const result = project();
+    if (result && typeof (result as {then?: unknown}).then === 'function') {
+      throw new TypeError('Owner projection must be synchronous');
+    }
+    return result;
+  } finally { projectionAudience = previous; }
+}
+
+export function isOwnerCodeAwareProjection(): boolean { return projectionAudience === 'owner'; }
+
+/** Credentials have explicit syntax; hashes and company URLs are ordinary source context. */
+function credentialValues(text: string): string[] {
+  const patterns = [
+    /(?:["']?\b(?:api[_-]?key|secret|password|token|access[_-]?token|auth[_-]?token)["']?)\s*[:=]\s*['"]([^'"\r\n]{8,})['"]/gi,
+    /(?:["']?\b(?:api[_-]?key|secret|password|token|access[_-]?token|auth[_-]?token)["']?)\s*[:=]\s*(?!['"])([^\s'";,]{8,})/gi,
+    /\bBearer\s+([A-Za-z0-9._~+/-]{8,})/gi,
+    /\b((?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}))\b/g,
+  ];
+  return patterns.flatMap(pattern => [...text.matchAll(pattern)].map(match => match[1]));
+}
+
+function redactOwnerCredentials(text: string): string {
+  for (const credential of credentialValues(text)) text = text.split(credential).join('[REDACTED_SECRET]');
+  return text;
+}
+
+class SessionOutputGuards {
+  readonly strict = new SessionCodeAwareOutputGuard();
+  readonly owner = new SessionCodeAwareOutputGuard();
+  register(registration: GuardRegistration): void {
+    this.strict.register(registration);
+    if (registration.kind === 'snippet' || registration.kind === 'query') {
+      for (const credential of credentialValues(registration.snippet)) {
+        this.owner.register({kind: 'private', snippet: credential, replacement: '[REDACTED_SECRET]'});
+      }
+    } else { this.owner.register(registration); }
+  }
+  get patternBytes(): number { return this.strict.patternBytes + this.owner.patternBytes; }
+  destroy(): void { this.strict.destroy(); this.owner.destroy(); }
+}
+
+const sessionGuards = new Map<string, SessionOutputGuards>();
 const revokedSessions = new Map<string, number>();
 let failClosedUnknownUntil = 0;
 
@@ -227,7 +279,7 @@ function sessionWasRevoked(sessionId: string): boolean {
   return failClosedUnknownUntil > Date.now() || revokedSessions.has(sessionMarker(sessionId));
 }
 
-function touchGuard(sessionId: string): SessionCodeAwareOutputGuard | undefined {
+function touchGuard(sessionId: string): SessionOutputGuards | undefined {
   const guard = sessionGuards.get(sessionId);
   if (!guard) return undefined;
   sessionGuards.delete(sessionId);
@@ -246,33 +298,29 @@ function evictLeastRecentlyUsedGuard(excludeSessionId?: string): boolean {
   return false;
 }
 
-function aggregateGuardPatternBytes(): number {
+function aggregateGuardPatternBytes(audience: CodeAwareOutputAudience): number {
   let total = 0;
-  for (const guard of sessionGuards.values()) total += guard.patternBytes;
+  for (const guards of sessionGuards.values()) total += guards[audience].patternBytes;
   return total;
 }
 
 function enforceRegistryLimits(currentSessionId: string): void {
-  while (
-    sessionGuards.size > MAX_SESSION_GUARDS ||
-    aggregateGuardPatternBytes() > MAX_AGGREGATE_GUARD_PATTERN_BYTES
-  ) {
-    if (evictLeastRecentlyUsedGuard(currentSessionId)) continue;
-    const current = sessionGuards.get(currentSessionId);
-    if (current) {
-      sessionGuards.delete(currentSessionId);
-      current.destroy();
-      markSessionRevoked(currentSessionId);
+  while (sessionGuards.size > MAX_SESSION_GUARDS) {
+    if (!evictLeastRecentlyUsedGuard(currentSessionId)) break;
+  }
+  for (const audience of ['strict', 'owner'] as const) {
+    for (const guards of sessionGuards.values()) {
+      if (aggregateGuardPatternBytes(audience) <= MAX_AGGREGATE_GUARD_PATTERN_BYTES) break;
+      guards[audience].destroy();
     }
-    break;
   }
 }
 
-function guardFor(sessionId: string): SessionCodeAwareOutputGuard | undefined {
+function guardFor(sessionId: string): SessionOutputGuards | undefined {
   if (sessionWasRevoked(sessionId)) return undefined;
   let guard = touchGuard(sessionId);
   if (!guard) {
-    guard = new SessionCodeAwareOutputGuard();
+    guard = new SessionOutputGuards();
     sessionGuards.set(sessionId, guard);
     enforceRegistryLimits(sessionId);
     guard = touchGuard(sessionId);
@@ -361,27 +409,30 @@ export function registerPrivateAnalysisQueryForEcho(
 ): void {
   if (!sessionId || !query.trim()) return;
   registerForSession(sessionId, {
-    kind: 'private',
+    kind: 'query',
     snippet: query,
     replacement: '[PRIVATE_QUERY_REFERENCE]',
   });
 }
 
 export function sanitizeCodeAwareText(sessionId: string | undefined, text: string): string {
-  if (!sessionId || !text) return text;
-  const guard = touchGuard(sessionId);
+  if (!text) return text;
+  if (!sessionId) return isOwnerCodeAwareProjection() ? redactOwnerCredentials(text) : text;
+  const guard = touchGuard(sessionId)?.[projectionAudience];
   if (!guard && sessionWasRevoked(sessionId)) return PRIVATE_OUTPUT_SUPPRESSED;
-  return guard ? guard.projectComplete(text) : text;
+  const projected = guard ? guard.projectComplete(text) : text;
+  return isOwnerCodeAwareProjection() ? redactOwnerCredentials(projected) : projected;
 }
 
 export function sanitizeCodeAwareTextWithReceipt(
   sessionId: string | undefined,
   text: string,
 ): CodeAwareTextProjectionReceipt {
-  if (!sessionId || !text) return textProjectionReceipt(text, text);
-  const guard = touchGuard(sessionId);
+  if (!sessionId || !text) return textProjectionReceipt(text, isOwnerCodeAwareProjection() ? redactOwnerCredentials(text) : text);
+  const guard = touchGuard(sessionId)?.[projectionAudience];
   if (!guard && sessionWasRevoked(sessionId)) return textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true);
-  return guard ? guard.projectCompleteWithReceipt(text) : textProjectionReceipt(text, text);
+  const receipt = guard ? guard.projectCompleteWithReceipt(text) : textProjectionReceipt(text, text);
+  return isOwnerCodeAwareProjection() ? composeCodeAwareTextProjectionReceipts(receipt, textProjectionReceipt(receipt.text, redactOwnerCredentials(receipt.text))) : receipt;
 }
 
 /** Same per-string limit and empty-string behavior as structured projection. */
@@ -399,7 +450,7 @@ export function sanitizeCodeAwareStructuredTextWithReceipt(
 /** Only validated, product-defined protocol literals may use this narrower role. */
 export function projectCodeAwareProtocolLiteral(sessionId: string | undefined, literal: string): string {
   if (!sessionId) return literal;
-  const guard = touchGuard(sessionId);
+  const guard = touchGuard(sessionId)?.[projectionAudience];
   if (!guard && sessionWasRevoked(sessionId)) return PRIVATE_OUTPUT_SUPPRESSED;
   return guard ? guard.projectProtocolLiteral(literal) : literal;
 }
@@ -480,7 +531,8 @@ function sanitizeStructuredTextValue(
       }
       const projected = sanitizeStructuredTextValue(
         sessionId,
-        descriptor.value,
+        isOwnerCodeAwareProjection() && isCredentialField(key) && typeof descriptor.value === 'string' && descriptor.value.length >= 8
+          ? '[REDACTED_SECRET]' : descriptor.value,
         state,
         depth + 1,
       );
@@ -552,29 +604,60 @@ export interface CodeAwareStreamingTextProjection {
 export function createCodeAwareStreamingTextProjection(
   sessionId: string | undefined,
   channel: string,
+  audience: CodeAwareOutputAudience = projectionAudience,
 ): CodeAwareStreamingTextProjection {
-  const preserved = (text: string) => textProjectionReceipt(text, text);
-  if (!sessionId) {
-    return {write: text => text, flush: () => '', projectComplete: text => text, projectCompleteWithReceipt: preserved};
-  }
-  const guard = touchGuard(sessionId);
-  if (!guard && sessionWasRevoked(sessionId)) {
-    return {
-      write: () => '',
-      flush: () => PRIVATE_OUTPUT_SUPPRESSED,
-      projectComplete: () => PRIVATE_OUTPUT_SUPPRESSED,
-      projectCompleteWithReceipt: text => textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true),
-    };
-  }
-  if (!guard) {
-    return {write: text => text, flush: () => '', projectComplete: text => text, projectCompleteWithReceipt: preserved};
-  }
-  return {
-    write: text => guard.write(channel, text),
-    flush: () => guard.flush(channel),
-    projectComplete: text => guard.projectComplete(text),
-    projectCompleteWithReceipt: text => guard.projectCompleteWithReceipt(text),
+  // Capture audience and guard once. A later scope or guard registration cannot
+  // convert a retired stream into an unguarded stream.
+  const guard = sessionId ? (touchGuard(sessionId) ?? guardFor(sessionId))?.[audience] : undefined;
+  const unavailable = () => guard?.unavailable || Boolean(sessionId && sessionWasRevoked(sessionId));
+  const credentials = new OwnerCredentialStream();
+  const project = (text: string): CodeAwareTextProjectionReceipt => {
+    if (unavailable()) return textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true);
+    const receipt = guard ? guard.projectCompleteWithReceipt(text) : textProjectionReceipt(text, text);
+    return audience === 'owner' ? composeCodeAwareTextProjectionReceipts(receipt,
+      textProjectionReceipt(receipt.text, redactOwnerCredentials(receipt.text))) : receipt;
   };
+  return {
+    write: text => {
+      if (unavailable()) { credentials.clear(); return ''; }
+      const projected = guard ? guard.write(channel, text) : text;
+      return audience === 'owner' ? credentials.write(projected) : projected;
+    },
+    flush: () => {
+      if (unavailable()) { credentials.clear(); return PRIVATE_OUTPUT_SUPPRESSED; }
+      const projected = guard?.flush(channel) ?? '';
+      return audience === 'owner' ? credentials.write(projected) + credentials.flush() : projected;
+    },
+    projectComplete: text => project(text).text,
+    projectCompleteWithReceipt: project,
+  };
+}
+
+/** Credentials may cross provider token boundaries. Bound buffering to one line. */
+class OwnerCredentialStream {
+  private pending = '';
+  private discardingLine = false;
+  write(text: string): string {
+    let output = '';
+    for (const fragment of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+      const complete = fragment.endsWith('\n');
+      if (!this.discardingLine) {
+        this.pending += fragment;
+        if (this.pending.length > 64 * 1024) {
+          output += '[OVERSIZED_OUTPUT_LINE]';
+          this.pending = '';
+          this.discardingLine = true;
+        } else if (complete) {
+          output += redactOwnerCredentials(this.pending);
+          this.pending = '';
+        }
+      }
+      if (complete && this.discardingLine) { this.discardingLine = false; output += '\n'; }
+    }
+    return output;
+  }
+  flush(): string { const output = redactOwnerCredentials(this.pending); this.clear(); return output; }
+  clear(): void { this.pending = ''; this.discardingLine = false; }
 }
 
 export function clearCodeAwareOutputGuards(sessionId: string): void {
@@ -601,4 +684,20 @@ export function clearAllCodeAwareOutputGuards(): void {
   sessionGuards.clear();
   revokedSessions.clear();
   failClosedUnknownUntil = 0;
+}
+
+
+export function sanitizeOwnerCodeAwareText(sessionId: string | undefined, text: string): string {
+  return withOwnerCodeAwareProjection(() => sanitizeCodeAwareText(sessionId, text));
+}
+
+export function sanitizeOwnerCodeAwareStructuredTextWithReceipt(
+  ...args: Parameters<typeof sanitizeCodeAwareStructuredTextWithReceipt>
+): CodeAwareTextProjectionReceipt {
+  return withOwnerCodeAwareProjection(() => sanitizeCodeAwareStructuredTextWithReceipt(...args));
+}
+
+
+export function isCredentialField(key: string): boolean {
+  return /^(?:apikey|secret|password|accesstoken|authtoken|authorization)$/.test(key.replace(/[_-]/g, '').toLowerCase());
 }

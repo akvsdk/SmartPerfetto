@@ -36,8 +36,11 @@ import {
   sanitizeCodeAwareStructuredTextWithReceipt,
   sanitizeCodeAwareText,
   sanitizeCodeAwareTextWithReceipt,
+  sanitizeOwnerCodeAwareText,
+  withOwnerCodeAwareProjection,
+  registerCodeAwareLookupForEcho,
 } from '../security/codeAwareOutputRegistry';
-import {projectCodeAwareStreamingUpdate} from '../security/codeAwareStreamingUpdateProjection';
+import {projectCodeAwareStreamingUpdate, projectOwnerCodeAwareStreamingUpdate} from '../security/codeAwareStreamingUpdateProjection';
 import {issuePrivateToolResultNarrationReceipt} from '../../agentv3/toolNarration';
 import {LLMEchoOutputStream, type CodeRef} from '../security/llmEchoOutputFilter';
 import {ExternalKnowledgeSourceRegistry} from '../externalKnowledgeSourceRegistry';
@@ -1839,5 +1842,69 @@ describe('source echo text units', () => {
     }
     expect(project('Before `unfinished code').output).toBe('Before [PRIVATE_OUTPUT_SUPPRESSED]');
     expect(project('Before “unfinished quote').output).toBe('Before [PRIVATE_OUTPUT_SUPPRESSED]');
+  });
+});
+
+
+describe('owner source output isolation', () => {
+  const sessionId = 'owner-output-regression';
+  afterEach(() => clearCodeAwareOutputGuards(sessionId));
+  it('retains source and query but keeps credentials, knowledge and canaries private', () => {
+    const source = 'fun executeStartup() { synchronizeWindowLayout(); }';
+    registerOnDemandSourceLookupForEcho(sessionId, [{referenceId: 'read', codebaseId: 'app', filePath: 'Main.kt', text: source}]);
+    registerPrivateAnalysisQueryForEcho(sessionId, 'Why is startup slow in executeStartup?');
+    registerCodeAwareCanary(sessionId, 'CANARY_NEVER_DISPLAY');
+    registerCodeAwareLookupForEcho(sessionId, {hits: [{chunkId: 'wiki-chunk', snippet: 'INTERNAL_KNOWLEDGE_PRIVATE_TEXT',
+      metadata: {knowledgeSourceId: 'wiki'}}]} as any);
+    const text = `${source} Why is startup slow in executeStartup? api_key="private-key-value-123" CANARY_NEVER_DISPLAY INTERNAL_KNOWLEDGE_PRIVATE_TEXT`;
+    const owner = sanitizeOwnerCodeAwareText(sessionId, text);
+    expect(owner).toContain(source);
+    expect(owner).toContain('Why is startup slow');
+    expect(owner).not.toContain('private-key-value-123');
+    expect(owner).not.toContain('CANARY_NEVER_DISPLAY');
+    expect(owner).not.toContain('INTERNAL_KNOWLEDGE_PRIVATE_TEXT');
+    expect(sanitizeCodeAwareText(sessionId, source)).not.toContain(source);
+  });
+  it('preserves source after strict registration overflow and redacts split generated credentials', () => {
+    for (let index = 0; index < 201; index++) registerOnDemandSourceLookupForEcho(sessionId,
+      [{referenceId: `read-${index}`, codebaseId: 'app', filePath: 'Main.kt', text: `fun boundedSource${index}() { renderFrame(); }`}]);
+    const projection = createCodeAwareStreamingTextProjection(sessionId, 'owner-stream', 'owner');
+    const output = projection.write('fun boundedSource200() { renderFrame(); }\napi_') +
+      projection.write('key="generated-secret-value-123"\n') + projection.flush();
+    expect(output).toContain('fun boundedSource200()');
+    expect(output).not.toContain('generated-secret-value-123');
+    expect(sanitizeCodeAwareText(sessionId, 'anything')).toBe('[PRIVATE_OUTPUT_SUPPRESSED]');
+  });
+  it('keeps company URLs and commit hashes intact and restores strict scope after errors', () => {
+    const context = 'https://ai.company.internal/v1 0123456789abcdef0123456789abcdef01234567';
+    expect(sanitizeOwnerCodeAwareText(sessionId, context)).toBe(context);
+    expect(() => withOwnerCodeAwareProjection(() => {throw new Error('projection failed');})).toThrow('projection failed');
+    expect(() => withOwnerCodeAwareProjection(() => Promise.resolve('invalid'))).toThrow('must be synchronous');
+    registerPrivateAnalysisQueryForEcho(sessionId, context);
+    expect(sanitizeCodeAwareText(sessionId, context)).not.toBe(context);
+  });
+  it('redacts quoted credential fields across stream chunks without swallowing answer tokens', () => {
+    const text = '{"api_key":"private-key-value-123", "token":"private-token-value-456"}';
+    expect(sanitizeOwnerCodeAwareText(sessionId, text)).not.toContain('private-key-value-123');
+    expect(sanitizeOwnerCodeAwareText(sessionId, text)).not.toContain('private-token-value-456');
+    const stream = createCodeAwareStreamingTextProjection(sessionId, 'json-credential', 'owner');
+    const output = stream.write(text.slice(0, 11)) + stream.write(text.slice(11)) + stream.flush();
+    expect(output).not.toContain('private-key-value-123');
+    expect(output).not.toContain('private-token-value-456');
+    const update = projectOwnerCodeAwareStreamingUpdate(sessionId, {type: 'answer_token',
+      content: {token: 'A useful source analysis answer', api_key: 'private-key-value-123'}, timestamp: 1}, true, 'en');
+    expect(update?.content.token).toBe('A useful source analysis answer');
+    expect(update?.content.api_key).toBe('[REDACTED_SECRET]');
+  });
+  it('revokes buffered owner streams and exposes model process without raw tool payloads', () => {
+    const projection = createCodeAwareStreamingTextProjection(sessionId, 'revoked-owner', 'owner');
+    projection.write('unfinished private answer');
+    revokeCodeAwareOutputGuards(sessionId);
+    expect(projection.flush()).toBe('[PRIVATE_OUTPUT_SUPPRESSED]');
+    clearCodeAwareOutputGuards(sessionId);
+    const update = {type: 'thought' as const, content: {thought: 'Checking renderFrame against the trace.', arguments: {raw: 'tool payload'}}, timestamp: 1};
+    expect(projectOwnerCodeAwareStreamingUpdate(sessionId, update, true, 'en')?.content)
+      .toEqual({thought: 'Checking renderFrame against the trace.'});
+    expect(projectCodeAwareStreamingUpdate(sessionId, update, true, 'en')).toBeNull();
   });
 });

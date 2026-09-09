@@ -479,8 +479,8 @@ describe('OpenAI bounded output-limit recovery', () => {
   it('records a post-native projection fault without retrying a valid native candidate', async () => {
     const raw = `The marker is present.\n${protocolSidecar}`;
     const {runtime, updates} = createRuntimeWithUpdates(); prepareStub(runtime);
-    const project = sourceProjection.finalizeSourceAwareAnalysisResultWithProjection;
-    jest.spyOn(sourceProjection, 'finalizeSourceAwareAnalysisResultWithProjection').mockImplementation((...args) => {
+    const project = sourceProjection.finalizeOwnerSourceAwareAnalysisResultWithProjection;
+    jest.spyOn(sourceProjection, 'finalizeOwnerSourceAwareAnalysisResultWithProjection').mockImplementation((...args) => {
       const projected = project(...args);
       return {...projected, result: {...projected.result, conclusion: raw.replace('"focused_answer"', '"invalid-mode"')}};
     });
@@ -872,7 +872,7 @@ describe('OpenAI source finalization parity', () => {
         analysisMode: 'fast', providerId: null, codeAwareMode: 'provider_send', codebaseIds: [fixture.codebaseId],
       });
       expect(result.sourceUseDecision).toEqual(sourceDecision); expect(result.sourceReferences).toEqual(sourceDecision.references);
-      expect(JSON.stringify(result)).not.toContain(SOURCE_FINALIZATION_CANARY);
+      expect(JSON.stringify(result)).toContain(SOURCE_FINALIZATION_CANARY);
       expect(result.completion.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
       const context = finalization.takeFinalizationContext(result)!;
       finalizationContexts.push(context);
@@ -892,10 +892,10 @@ describe('OpenAI candidate-bound privacy projection', () => {
     const nativeBody = outputLanguage === 'en' ? 'Before PRIVATE_CANARY after' : '前文 PRIVATE_CANARY 后文';
     registerCodeAwareCanary(sessionId, 'PRIVATE_CANARY');
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime); mockRun(sdkStream(nativeBody));
-    const projected = jest.spyOn(sourceProjection, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projected = jest.spyOn(sourceProjection, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const verified = jest.spyOn(verifier, 'verifyConclusion');
     const result = await runtime.analyze('query', sessionId, 'trace', {providerId: null, outputLanguage, knowledgeSourceIds: ['private-source']});
-    const outcome = projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeSourceAwareAnalysisResultWithProjection>;
+    const outcome = projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeOwnerSourceAwareAnalysisResultWithProjection>;
     expect(outcome.conclusionProjection.disposition).toBe('redacted');
     expect(result).toMatchObject({outputOrigin: 'sdk_final', completion: {status: 'completed'}});
     expect(result.partial).toBeUndefined();
@@ -916,10 +916,10 @@ describe('OpenAI candidate-bound privacy projection', () => {
     const sessionId = `replaced-candidate-${outputLanguage}-${nativeBody.length}`; privacySessions.push(sessionId);
     revokeCodeAwareOutputGuards(sessionId);
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime); mockRun(sdkStream(nativeBody));
-    const projected = jest.spyOn(sourceProjection, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projected = jest.spyOn(sourceProjection, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const verified = jest.spyOn(verifier, 'verifyConclusion');
     const result = await runtime.analyze('query', sessionId, 'trace', {providerId: null, outputLanguage, knowledgeSourceIds: ['private-source']});
-    const outcome = projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeSourceAwareAnalysisResultWithProjection>;
+    const outcome = projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeOwnerSourceAwareAnalysisResultWithProjection>;
     expect(outcome.conclusionProjection.disposition).toBe('replaced');
     expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback', completion: {status: 'unknown'}, quickRun: {stopReason: 'partial'}});
     expect(verified.mock.calls[0][2]?.deliveryContext).toBe(outcome.deliveryContext);
@@ -933,9 +933,9 @@ describe('OpenAI candidate-bound privacy projection', () => {
   });
   it('keeps literal placeholder text as model content when no replacement occurred', async () => {
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime); mockRun(sdkStream('[PRIVATE_OUTPUT_SUPPRESSED]'));
-    const projected = jest.spyOn(sourceProjection, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projected = jest.spyOn(sourceProjection, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const result = await runtime.analyze('query', 'literal-placeholder', 'trace', {providerId: null});
-    const outcome = projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeSourceAwareAnalysisResultWithProjection>;
+    const outcome = projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeOwnerSourceAwareAnalysisResultWithProjection>;
     expect(outcome.conclusionProjection.disposition).toBe('preserved');
     expect(result).toMatchObject({success: true, outputOrigin: 'sdk_final', completion: {status: 'completed'}});
     expect(result.partial).toBeUndefined();
@@ -958,9 +958,9 @@ describe('OpenAI candidate-bound privacy projection', () => {
       yield {type: 'raw_model_stream_event', data: {type: 'output_text_delta', delta: 'Before PRIVATE_CANARY after'}};
       throw new Error('PRIVATE_CANARY provider failure');
     }});
-    const projected = jest.spyOn(sourceProjection, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projected = jest.spyOn(sourceProjection, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const result = await runtime.analyze('query', sessionId, 'trace', {providerId: null, knowledgeSourceIds: ['private-source']});
-    expect((projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeSourceAwareAnalysisResultWithProjection>).conclusionProjection.disposition).toBe('redacted');
+    expect((projected.mock.results[0].value as ReturnType<typeof sourceProjection.finalizeOwnerSourceAwareAnalysisResultWithProjection>).conclusionProjection.disposition).toBe('redacted');
     expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'assistant_stream', completion: {status: 'failed', reason: 'provider_error'}});
     expect(JSON.stringify(result)).not.toContain('PRIVATE_CANARY');
   });
@@ -997,7 +997,7 @@ describe('OpenAI candidate-bound privacy projection', () => {
       yield {type: 'raw_model_stream_event', data: {type: 'output_text_delta', delta: 'Before PRIVATE_CANARY after'}};
       entered.resolve(); await release.promise;
     }});
-    const projected = jest.spyOn(sourceProjection, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projected = jest.spyOn(sourceProjection, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const pending = runtime.analyze('query', sessionId, 'trace', {providerId: null, knowledgeSourceIds: ['private-source']});
     const rejected = expect(pending).rejects.toThrow(); await entered.promise; runtime.abortSession(sessionId); release.resolve(); await rejected;
     expect(projected).not.toHaveBeenCalled();

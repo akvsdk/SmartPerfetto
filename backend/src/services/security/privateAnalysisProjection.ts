@@ -11,7 +11,7 @@ import type {ConclusionContract} from '../../agent/core/conclusionContract';
 import type {ClaimSupportV1} from '../../types/evidenceContract';
 import type {ClaimVerificationResult, DeterministicNativeRowIdentity} from '../../types/claimVerification';
 import type {IdentityResolutionV1} from '../../types/identityContract';
-import {sanitizeCodeAwareText} from './codeAwareOutputRegistry';
+import {sanitizeCodeAwareText, withOwnerCodeAwareProjection, isOwnerCodeAwareProjection, isCredentialField} from './codeAwareOutputRegistry';
 import type {CodeLookupSummary} from '../codebase/codeLookupLedger';
 import {sanitizeSourceUseDecision, type SourceUseDecisionV1, type SourceReferenceV1} from '../codebase/sourceUseDecision';
 import {isCodebaseKind} from '../codebase/codebaseRegistry';
@@ -232,7 +232,10 @@ export function projectPrivateConclusion(input: {
   language: OutputLanguage;
   state?: Partial<Pick<AnalysisResult, 'completion' | 'partial'>> & {terminationReason?: unknown};
 }): string {
-  if (!input.success) {
+  if (isOwnerCodeAwareProjection() && !String(input.conclusion ?? '').trim()) {
+    return localize(input.language, '未生成可显示的分析结论。', 'No analysis conclusion was generated.');
+  }
+  if (!input.success && !isOwnerCodeAwareProjection()) {
     const completion = input.state?.completion?.status;
     if (completion === 'failed' || completion === 'cancelled' || completion === 'incomplete') {
       return privateAnalysisFailureMessage(input.language);
@@ -259,8 +262,13 @@ export function projectPrivateTerminationReason(value: unknown): AnalysisResult[
 export function projectPrivateTerminationMessage(
   value: unknown,
   language: OutputLanguage,
-  state?: Partial<Pick<AnalysisResult, 'success' | 'partial' | 'completion'>> & {terminationReason?: unknown},
+  state?: Partial<Pick<AnalysisResult, 'sessionId' | 'success' | 'partial' | 'completion'>> & {terminationReason?: unknown},
+  sessionId?: string,
 ): string | undefined {
+  if (isOwnerCodeAwareProjection()) {
+    if (state?.completion?.status === 'completed' && state.success !== false && !state.partial && !state.terminationReason) return undefined;
+    return typeof value === 'string' && value ? sanitizeCodeAwareText(sessionId ?? state?.sessionId, value) : undefined;
+  }
   const completion = state?.completion?.status;
   if (completion === 'failed' || completion === 'cancelled' || completion === 'incomplete') {
     return privateAnalysisFailureMessage(language);
@@ -356,7 +364,8 @@ function projectPrivateEnvelopeValue(
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     const normalizedKey = key.replace(/[_-]/g, '').toLowerCase();
     if (PRIVATE_ENVELOPE_FORBIDDEN_KEYS.has(normalizedKey)) continue;
-    const projectedEntry = projectPrivateEnvelopeValue(sessionId, entry, depth + 1);
+    const projectedEntry = isOwnerCodeAwareProjection() && isCredentialField(key) && typeof entry === 'string' && entry.length >= 8
+      ? '[REDACTED_SECRET]' : projectPrivateEnvelopeValue(sessionId, entry, depth + 1);
     if (projectedEntry !== undefined) projected[key] = projectedEntry;
   }
   return projected;
@@ -699,8 +708,8 @@ export function projectPrivateAnalysisResult(
     ...(projectPrivateTerminationReason(result.terminationReason)
       ? {terminationReason: projectPrivateTerminationReason(result.terminationReason) as AnalysisResult['terminationReason']}
       : {}),
-    ...(projectPrivateTerminationMessage(result.terminationMessage, language, result)
-      ? {terminationMessage: projectPrivateTerminationMessage(result.terminationMessage, language, result)}
+    ...(projectPrivateTerminationMessage(result.terminationMessage, language, result, sessionId)
+      ? {terminationMessage: projectPrivateTerminationMessage(result.terminationMessage, language, result, sessionId)}
       : {}),
     ...(result.quickRun ? {quickRun: result.quickRun} : {}),
     ...(conclusionContract ? {conclusionContract} : {}),
@@ -875,4 +884,52 @@ export function projectPrivateSessionStateSnapshot(
     runSequence: snapshot.runSequence,
     conversationOrdinal: snapshot.conversationOrdinal,
   };
+}
+
+
+/** Owner-authenticated surfaces retain source quotations; strict projectors remain the log/public default. */
+export function projectOwnerAnalysisResult(...args: Parameters<typeof projectPrivateAnalysisResult>): AnalysisResult {
+  return withOwnerCodeAwareProjection(() => projectPrivateAnalysisResult(...args));
+}
+export function projectOwnerConclusion(...args: Parameters<typeof projectPrivateConclusion>): string {
+  return withOwnerCodeAwareProjection(() => projectPrivateConclusion(...args));
+}
+export function projectOwnerTerminationMessage(...args: Parameters<typeof projectPrivateTerminationMessage>): string | undefined {
+  return withOwnerCodeAwareProjection(() => projectPrivateTerminationMessage(...args));
+}
+export function projectOwnerStructuredValue<T>(sessionId: string, value: T): T {
+  return withOwnerCodeAwareProjection(() => projectPrivateStructuredValue(sessionId, value));
+}
+export function projectOwnerDataEnvelopes(...args: Parameters<typeof projectPrivateDataEnvelopes>): DataEnvelope[] {
+  return withOwnerCodeAwareProjection(() => projectPrivateDataEnvelopes(...args));
+}
+export function projectOwnerFindings(...args: Parameters<typeof projectPrivateFindings>): ReturnType<typeof projectPrivateFindings> {
+  return withOwnerCodeAwareProjection(() => projectPrivateFindings(...args));
+}
+export function projectOwnerUiActionProposals(...args: Parameters<typeof projectPrivateUiActionProposals>): ReturnType<typeof projectPrivateUiActionProposals> {
+  return withOwnerCodeAwareProjection(() => projectPrivateUiActionProposals(...args));
+}
+export function projectOwnerSessionStateSnapshot(snapshot: SessionStateSnapshot): SessionStateSnapshot {
+  return withOwnerCodeAwareProjection(() => ({...projectPrivateSessionStateSnapshot(snapshot),
+    conversationSteps: projectPrivateStructuredValue(snapshot.sessionId, snapshot.conversationSteps),
+    conclusionHistory: projectPrivateStructuredValue(snapshot.sessionId, snapshot.conclusionHistory),
+  }));
+}
+
+export function projectOwnerHypotheses(...args: Parameters<typeof projectPrivateHypotheses>): ReturnType<typeof projectPrivateHypotheses> {
+  return withOwnerCodeAwareProjection(() => projectPrivateHypotheses(...args));
+}
+
+export function projectOwnerClaimVerification(...args: Parameters<typeof projectPrivateClaimVerification>): ReturnType<typeof projectPrivateClaimVerification> {
+  return withOwnerCodeAwareProjection(() => projectPrivateClaimVerification(...args));
+}
+export function projectOwnerClaimSupport(...args: Parameters<typeof projectPrivateClaimSupport>): ReturnType<typeof projectPrivateClaimSupport> {
+  return withOwnerCodeAwareProjection(() => projectPrivateClaimSupport(...args));
+}
+
+
+export function projectOwnerAnalysisError(sessionId: string | undefined, error: unknown, language: OutputLanguage): string {
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  return withOwnerCodeAwareProjection(() => sanitizeCodeAwareText(sessionId, message ||
+    localize(language, '分析未能完成。', 'Analysis did not complete.')));
 }

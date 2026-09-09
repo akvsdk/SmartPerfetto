@@ -76,7 +76,7 @@ describe('agent route private projections', () => {
   it.each([false, true])('uses native completion and delivery state consistently in SSE, turn history and report (qualityFailure=%s)', qualityFailure => {
     const conclusion = 'The original completed candidate remains available.';
     const result = {sessionId, success: !qualityFailure, conclusion, findings: [], hypotheses: [], confidence: 0.8,
-      rounds: 1, totalDurationMs: 1, terminationMessage: 'PRIVATE_DISCARDED_ATTEMPT_ERROR',
+      rounds: 1, totalDurationMs: 1, terminationMessage: qualityFailure ? 'The current claim is not supported by trace evidence.' : 'PRIVATE_DISCARDED_ATTEMPT_ERROR',
       ...(qualityFailure ? {partial: true, terminationReason: 'quality_gate_failed' as const} : {}),
       completion: {schemaVersion: 1 as const, runtimeKind: 'openai-agents-sdk' as const, status: 'completed' as const,
         runId: 'termination-run', attemptId: 'attempt-original', candidateRef: 'candidate-original',
@@ -99,15 +99,14 @@ describe('agent route private projections', () => {
     handler({params: {sessionId}, requestContext: {tenantId: 'tenant', workspaceId: 'workspace', userId: 'user'}}, response);
     const report = (response.json.mock.calls[0][0] as any).report;
     for (const message of [payload.terminationMessage, turn.terminationMessage, report.summary.terminationMessage]) {
-      if (qualityFailure) expect(message).toContain('have not passed checks');
+      if (qualityFailure) expect(message).toBe('The current claim is not supported by trace evidence.');
       else expect(message).toBeUndefined();
       expect(message ?? '').not.toContain('did not complete');
       expect(message ?? '').not.toContain('PRIVATE_DISCARDED_ATTEMPT_ERROR');
     }
     for (const body of [payload.conclusion, turn.conclusionPreview, report.summary.conclusion]) {
       if (qualityFailure) {
-        expect(body).toContain('An answer was generated');
-        expect(body).not.toContain(conclusion);
+        expect(body).toBe(conclusion);
       } else expect(body).toBe(conclusion);
       expect(body).not.toContain('did not complete');
     }
@@ -591,7 +590,7 @@ describe('agent route private projections', () => {
     expect(JSON.stringify(projected)).not.toContain('PRIVATE_REPLAY_CANARY');
     const data = JSON.parse(projected.eventData).data;
     expect(data.conclusion)
-      .toMatch(/未能确认|could not be confirmed/);
+      .toMatch(/未生成可显示|No analysis conclusion/);
     expect(data.resultContract).toBeUndefined();
   });
 

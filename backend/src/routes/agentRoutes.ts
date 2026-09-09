@@ -225,17 +225,18 @@ import {
   registerPrivateAnalysisQueryForEcho,
   revokeCodeAwareOutputGuards,
 } from '../services/security/codeAwareOutputRegistry';
-import {projectCodeAwareStreamingUpdate} from '../services/security/codeAwareStreamingUpdateProjection';
+import {projectCodeAwareStreamingUpdate, projectOwnerCodeAwareStreamingUpdate} from '../services/security/codeAwareStreamingUpdateProjection';
 import {
   privateAnalysisFailureMessage,
+  projectOwnerAnalysisError,
   privateAnalysisQueryMessage,
   projectPrivateAnalysisReceipt,
-  projectPrivateAnalysisResult,
+  projectOwnerAnalysisResult,
   copyAnalysisResultForSnapshot,
-  projectPrivateFindings,
-  projectPrivateConclusion,
-  projectPrivateStructuredValue,
-  projectPrivateTerminationMessage,
+  projectOwnerFindings,
+  projectOwnerConclusion,
+  projectOwnerStructuredValue,
+  projectOwnerTerminationMessage,
   projectPrivateTerminationReason,
   sessionUsesPrivateKnowledge,
 } from '../services/security/privateAnalysisProjection';
@@ -1461,7 +1462,7 @@ function persistSessionRunState(
   if (!scope) return;
   try {
     const durableError = error && sessionUsesPrivateKnowledge(session)
-      ? privateAnalysisFailureMessage(sessionOutputLanguage(session))
+      ? projectOwnerAnalysisError(session.sessionId, error, sessionOutputLanguage(session))
       : error;
     persistAnalysisRunState(scope, status, {
       error: durableError,
@@ -1566,7 +1567,7 @@ function sanitizePersistedAnalysisCompletedEvent(
     return {
       ...event,
       eventData: JSON.stringify({
-        data: projectPrivateAnalysisResult(session.sessionId, {
+        data: projectOwnerAnalysisResult(session.sessionId, {
           sessionId: session.sessionId,
           success: false,
           findings: [],
@@ -1639,7 +1640,7 @@ function sanitizePersistedAnalysisCompletedEvent(
       }
     : result;
   const durableResult = privateKnowledge
-    ? projectPrivateAnalysisResult(session.sessionId, resultForProjection, outputLanguage)
+    ? projectOwnerAnalysisResult(session.sessionId, resultForProjection, outputLanguage)
     : resultForProjection;
 
   const nextData = privateKnowledge
@@ -1661,16 +1662,16 @@ function sanitizePersistedAnalysisCompletedEvent(
         hypotheses: durableResult.hypotheses,
         uiActionProposals: durableResult.uiActionProposals,
         smartScenePreview: trustedPrivateProjection && data.smartScenePreview
-          ? projectPrivateStructuredValue(session.sessionId, data.smartScenePreview)
+          ? projectOwnerStructuredValue(session.sessionId, data.smartScenePreview)
           : undefined,
         conversationTimeline: [],
         agentDialogueCount: 0,
         conversationTimelineCount: 0,
         comparisonReportSection: trustedPrivateProjection && data.comparisonReportSection
-          ? projectPrivateStructuredValue(session.sessionId, data.comparisonReportSection)
+          ? projectOwnerStructuredValue(session.sessionId, data.comparisonReportSection)
           : undefined,
         resultContract: trustedPrivateProjection && data.resultContract
-          ? projectPrivateStructuredValue(session.sessionId, data.resultContract)
+          ? projectOwnerStructuredValue(session.sessionId, data.resultContract)
           : undefined,
         analysisReceipt: projectPrivateAnalysisReceipt(durableResult.analysisReceipt),
         confidence: durableResult.confidence,
@@ -1680,7 +1681,7 @@ function sanitizePersistedAnalysisCompletedEvent(
         terminationReason: durableResult.terminationReason,
         terminationMessage: durableResult.terminationMessage,
         quickRun: durableResult.quickRun
-          ? projectPrivateStructuredValue(session.sessionId, durableResult.quickRun)
+          ? projectOwnerStructuredValue(session.sessionId, durableResult.quickRun)
           : undefined,
         reportUrl: typeof data?.reportUrl === 'string' &&
             /^\/api\/reports\/[A-Za-z0-9._~-]+$/.test(data.reportUrl)
@@ -2226,7 +2227,7 @@ function buildTurnSummary(
 ) {
   const displayResult = buildDisplayTurnResult(turn);
   const projectedMessage = privateSessionId && displayResult
-    ? projectPrivateConclusion({
+    ? projectOwnerConclusion({
         sessionId: privateSessionId,
         conclusion: displayResult.message,
         success: displayResult.success !== false,
@@ -2258,7 +2259,7 @@ function buildTurnSummary(
       ? projectPrivateTerminationReason(displayResult?.terminationReason)
       : displayResult?.terminationReason,
     terminationMessage: privateSessionId
-      ? projectPrivateTerminationMessage(displayResult?.terminationMessage, outputLanguage, displayResult)
+      ? projectOwnerTerminationMessage(displayResult?.terminationMessage, outputLanguage, displayResult, privateSessionId)
       : displayResult?.terminationMessage,
     confidence,
     findingCount: Array.isArray(turn.findings) ? turn.findings.length : 0,
@@ -2279,7 +2280,7 @@ function buildTurnDetail(
     intent: privateSessionId ? summary.intent : toJsonSafe(turn.intent),
     result: displayResult
       ? toJsonSafe(privateSessionId
-          ? projectPrivateAnalysisResult(privateSessionId, {
+          ? projectOwnerAnalysisResult(privateSessionId, {
               sessionId: turn.id,
               success: displayResult.success !== false,
               findings: Array.isArray(turn.findings) ? turn.findings : [],
@@ -2302,7 +2303,7 @@ function buildTurnDetail(
           : displayResult)
       : null,
     findings: toJsonSafe(privateSessionId
-      ? projectPrivateFindings(privateSessionId, turn.findings || [])
+      ? projectOwnerFindings(privateSessionId, turn.findings || [])
       : turn.findings || []),
   };
 }
@@ -3104,20 +3105,20 @@ async function handleAnalyzeRequest(
           if (session) {
             const privateKnowledge = sessionUsesPrivateKnowledge(session);
             const publicErrorMessage = privateKnowledge
-              ? privateAnalysisFailureMessage(sessionOutputLanguage(session))
+              ? projectOwnerAnalysisError(sessionId, error, sessionOutputLanguage(session))
               : error.message;
             if (isSessionRunCancelled(session, runContext.runId) || isStaleRun(session, runContext.runId)) {
               session.logger.info('AgentRoutes', 'Ignoring smart analysis failure after cancellation', {
                 sessionId,
                 runId: runContext.runId,
-                error: privateKnowledge ? publicErrorMessage : error?.message || String(error),
+                error: privateKnowledge ? privateAnalysisFailureMessage(sessionOutputLanguage(session)) : error?.message || String(error),
               });
               return;
             }
             session.logger.error(
               'AgentRoutes',
               'Smart analysis failed',
-              privateKnowledge ? new Error(publicErrorMessage) : error,
+              privateKnowledge ? new Error(privateAnalysisFailureMessage(sessionOutputLanguage(session))) : error,
             );
             session.status = 'failed';
             session.error = publicErrorMessage;
@@ -3207,20 +3208,20 @@ async function handleAnalyzeRequest(
           if (session) {
             const privateKnowledge = sessionUsesPrivateKnowledge(session);
             const publicErrorMessage = privateKnowledge
-              ? privateAnalysisFailureMessage(sessionOutputLanguage(session))
+              ? projectOwnerAnalysisError(sessionId, error, sessionOutputLanguage(session))
               : error?.message || String(error);
             if (isSessionRunCancelled(session, runContext.runId) || isStaleRun(session, runContext.runId)) {
               session.logger.info('AgentRoutes', 'Ignoring agent-driven analysis failure after cancellation', {
                 sessionId,
                 runId: runContext.runId,
-                error: publicErrorMessage,
+                error: privateKnowledge ? privateAnalysisFailureMessage(sessionOutputLanguage(session)) : publicErrorMessage,
               });
               return;
             }
             session.logger.error(
               'AgentRoutes',
               'Agent-driven analysis failed',
-              privateKnowledge ? new Error(publicErrorMessage) : error,
+              privateKnowledge ? new Error(privateAnalysisFailureMessage(sessionOutputLanguage(session))) : error,
             );
             session.status = 'failed';
             session.error = publicErrorMessage;
@@ -3604,7 +3605,7 @@ router.get('/:sessionId/status', (req, res) => {
           ? projectPrivateTerminationReason(result.terminationReason)
           : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
+          ? projectOwnerTerminationMessage(result.terminationMessage, outputLanguage, result)
           : result.terminationMessage,
         reportUrl: finalArtifacts?.reportUrl,
         reportError: privateKnowledge ? undefined : finalArtifacts?.reportError,
@@ -3613,12 +3614,12 @@ router.get('/:sessionId/status', (req, res) => {
           ? projectPrivateAnalysisReceipt(completedPayload?.analysisReceipt)
           : completedPayload?.analysisReceipt,
         uiActionProposals: privateKnowledge
-          ? projectPrivateStructuredValue(sessionId, completedPayload?.uiActionProposals || [])
+          ? projectOwnerStructuredValue(sessionId, completedPayload?.uiActionProposals || [])
           : completedPayload?.uiActionProposals,
         findings: projectedFindings,
         findingsCount: projectedFindings.length,
         resultContract: privateKnowledge
-          ? projectPrivateStructuredValue(sessionId, resultContract)
+          ? projectOwnerStructuredValue(sessionId, resultContract)
           : resultContract,
       };
     }
@@ -3626,7 +3627,7 @@ router.get('/:sessionId/status', (req, res) => {
 
   if (session.status === 'failed' || session.status === 'cancelled') {
     response.error = sessionUsesPrivateKnowledge(session)
-      ? privateAnalysisFailureMessage(sessionOutputLanguage(session))
+      ? projectOwnerAnalysisError(sessionId, session.error, sessionOutputLanguage(session))
       : session.error;
   }
 
@@ -4622,7 +4623,7 @@ async function runSmartAnalysis(
     const publicErrorMessage = error instanceof SmartPreviewSelectionError
       ? smartPreviewSelectionErrorMessage(outputLanguage, error.reportId)
       : privateKnowledge
-        ? privateAnalysisFailureMessage(outputLanguage)
+        ? projectOwnerAnalysisError(sessionId, error, outputLanguage)
         : error.message || String(error);
     session.status = 'failed';
     session.error = publicErrorMessage;
@@ -4630,7 +4631,7 @@ async function runSmartAnalysis(
     session.logger.error(
       'SmartAnalysis',
       'Smart analysis failed',
-      privateKnowledge ? new Error(publicErrorMessage) : error,
+      privateKnowledge ? new Error(privateAnalysisFailureMessage(sessionOutputLanguage(session))) : error,
     );
     if (!dispatchedToAgentDeepDive && smartCancelBridge.tryClaimTerminal(sessionId, runId)) {
       broadcastToAgentDrivenClients(
@@ -5752,19 +5753,13 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
       codebaseIds: options.codebaseIds,
       knowledgeSourceIds: options.knowledgeSourceIds,
     });
-    const projectedUpdate = projectCodeAwareStreamingUpdate(
-      sessionId,
-      update,
-      sourceAware,
-      outputLanguage,
-    );
-    if (!projectedUpdate) return;
-    // Token events are both extremely high volume and may contain model text in
-    // non-private runs. They are already represented by aggregate runtime
-    // telemetry, so never duplicate them into console/session logs.
-    if (projectedUpdate.type !== 'answer_token') {
-      logger.debug('Stream', `Update: ${projectedUpdate.type}`, projectedUpdate.content);
+    // Log from the strict projection independently, before entering owner scope.
+    const logUpdate = projectCodeAwareStreamingUpdate(sessionId, update, sourceAware, outputLanguage);
+    if (logUpdate && logUpdate.type !== 'answer_token') {
+      logger.debug('Stream', `Update: ${logUpdate.type}`, logUpdate.content);
     }
+    const projectedUpdate = projectOwnerCodeAwareStreamingUpdate(sessionId, update, sourceAware, outputLanguage);
+    if (!projectedUpdate) return;
     const normalizedUpdate = normalizeAgentDrivenUpdate(projectedUpdate, outputLanguage);
 
     if (normalizedUpdate.type === 'conclusion' || normalizedUpdate.type === 'answer_token') return;
@@ -6067,13 +6062,13 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
       if (!finalizationRun.owner.isCurrent()) return;
     }
     const publicErrorMessage = privateKnowledge
-      ? privateAnalysisFailureMessage(outputLanguage)
+      ? projectOwnerAnalysisError(sessionId, error, outputLanguage)
       : error.message;
     if (isSessionRunCancelled(session, runIdForAnalysis)) {
       logger.info('AgentDrivenAnalysis', 'Ignoring analysis error after cancellation', {
         sessionId,
         runId: runIdForAnalysis,
-        error: publicErrorMessage,
+        error: privateKnowledge ? privateAnalysisFailureMessage(sessionOutputLanguage(session)) : publicErrorMessage,
       });
       return;
     }
@@ -6081,7 +6076,7 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
       logger.info('AgentDrivenAnalysis', 'Ignoring stale analysis error', {
         sessionId,
         runId: runIdForAnalysis,
-        error: publicErrorMessage,
+        error: privateKnowledge ? privateAnalysisFailureMessage(sessionOutputLanguage(session)) : publicErrorMessage,
       });
       return;
     }
@@ -6091,7 +6086,7 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
     logger.error(
       'AgentDrivenAnalysis',
       'Agent-driven analysis failed',
-      privateKnowledge ? new Error(publicErrorMessage) : error,
+      privateKnowledge ? new Error(privateAnalysisFailureMessage(sessionOutputLanguage(session))) : error,
     );
 
     broadcastToAgentDrivenClients(
@@ -7927,7 +7922,7 @@ function ensureCompletedAnalysisFinalArtifacts(
   const privateKnowledge = sessionUsesPrivateKnowledge(session);
   const outputLanguage = sessionOutputLanguage(session);
   const durableResultForClient = privateKnowledge
-    ? projectPrivateAnalysisResult(session.sessionId, input.resultForClient, outputLanguage)
+    ? projectOwnerAnalysisResult(session.sessionId, input.resultForClient, outputLanguage)
     : input.resultForClient;
   const finalArtifacts: CompletedAnalysisFinalArtifacts = {
     generatedAt: Date.now(),
@@ -8111,7 +8106,7 @@ function ensureCompletedAnalysisFinalArtifacts(
           ? projectPrivateTerminationReason(result.terminationReason)
           : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
+          ? projectOwnerTerminationMessage(result.terminationMessage, outputLanguage, result)
           : result.terminationMessage,
         dataEnvelopes: session.dataEnvelopes,
         analysisReceipt: privateKnowledge
@@ -8168,7 +8163,7 @@ function copyStoredClientFindings(findings: AgentRuntimeAnalysisResult['findings
 
 function projectStoredHttpResult(session: AnalysisSession, result: AgentRuntimeAnalysisResult): AgentRuntimeAnalysisResult {
   return sessionUsesPrivateKnowledge(session)
-    ? projectPrivateAnalysisResult(session.sessionId, result, sessionOutputLanguage(session))
+    ? projectOwnerAnalysisResult(session.sessionId, result, sessionOutputLanguage(session))
     : copyAnalysisResultForSnapshot(result);
 }
 
@@ -8283,15 +8278,15 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
   const projectedConclusionContract = normalizedConclusionContract;
   const projectedQualityArtifacts = qualityArtifacts;
   const projectedUiActionProposals = privateKnowledge
-    ? projectPrivateStructuredValue(session.sessionId, uiActionProposals)
+    ? projectOwnerStructuredValue(session.sessionId, uiActionProposals)
     : uiActionProposals;
   const projectedClientFindings = privateKnowledge
-    ? projectPrivateStructuredValue(session.sessionId, clientFindings)
+    ? projectOwnerStructuredValue(session.sessionId, clientFindings)
     : clientFindings;
   const projectedResultContract = privateKnowledge
-    ? projectPrivateStructuredValue(session.sessionId, resultContract)
+    ? projectOwnerStructuredValue(session.sessionId, resultContract)
     : resultContract;
-  const projectedHypotheses = projectPrivateStructuredValue(
+  const projectedHypotheses = projectOwnerStructuredValue(
     session.sessionId,
     result.hypotheses.map((h: AgentRuntimeAnalysisResult['hypotheses'][number]) => ({
       id: h.id,
@@ -8374,7 +8369,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
             ? projectPrivateTerminationReason(result.terminationReason)
             : result.terminationReason,
           terminationMessage: privateKnowledge
-            ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
+            ? projectOwnerTerminationMessage(result.terminationMessage, outputLanguage, result)
             : result.terminationMessage,
           quickRun,
           analysisReceipt: privateKnowledge
@@ -8382,7 +8377,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
             : analysisReceipt,
           uiActionProposals: projectedUiActionProposals,
           smartScenePreview: privateKnowledge && result.smartScenePreview
-            ? projectPrivateStructuredValue(session.sessionId, result.smartScenePreview)
+            ? projectOwnerStructuredValue(session.sessionId, result.smartScenePreview)
             : result.smartScenePreview,
           findings: projectedClientFindings,
           resultContract: projectedResultContract,
@@ -8403,7 +8398,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
           reportError: privateKnowledge ? undefined : finalArtifacts.reportError,
           comparisonReportSection: session.comparisonReportSection
             ? (privateKnowledge
-                ? projectPrivateStructuredValue(session.sessionId, {
+                ? projectOwnerStructuredValue(session.sessionId, {
                     source: session.comparisonReportSection.source,
                     title: session.comparisonReportSection.title,
                     markdown: session.comparisonReportSection.markdown,

@@ -17,7 +17,7 @@ import {finalizeAnalysisResult, type AnalysisFinalizationOwner} from '../finaliz
 import {clearAllCodeAwareOutputGuards, registerCodeAwareCanary,
   registerPrivateAnalysisQueryForEcho, registerOnDemandSourceLookupForEcho, sanitizeCodeAwareText} from '../security/codeAwareOutputRegistry';
 import {sanitizeSourceReference, type SourceUseDecisionV1} from '../codebase/sourceUseDecision';
-import {finalizeSourceAwareAnalysisResultWithProjection} from '../codebase/sourceClaimVerifier';
+import {finalizeOwnerSourceAwareAnalysisResultWithProjection} from '../codebase/sourceClaimVerifier';
 import {canonicalizeAnalysisResult} from '../canonicalAnalysisResult';
 
 const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'final-result-test'});
@@ -69,7 +69,7 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
     conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)};
   const nativeDelivery = {entry: 'runtime_draft' as const, acceptedCandidate: candidate, outputOrigin: 'sdk_final' as const,
     completion: {...candidate, schemaVersion: 1 as const, runtimeKind: 'openai-agents-sdk' as const, status: 'completed' as const}};
-  const projection = sourceUse ? finalizeSourceAwareAnalysisResultWithProjection(result,
+  const projection = sourceUse ? finalizeOwnerSourceAwareAnalysisResultWithProjection(result,
     {getSourceUseDecision: () => sourceUse!}, {context: nativeDelivery}) : undefined;
   const semanticBody = canonicalizeAnalysisResult(result).result.conclusion;
   const controller = new AbortController();
@@ -112,7 +112,7 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
 afterEach(() => {clearAllCodeAwareOutputGuards(); jest.useRealTimers();});
 
 describe('shared final analysis boundary', () => {
-  it('reviews exact native declaration prose against the actual projected body after a source echo collision', async () => {
+  it('reviews source quotations and original declarations without an echo collision', async () => {
     const marker = 'synthetic_source_marker_long_name';
     const target = fixture({source: {marker}, body: `The captured name is ${marker}.`, dispatch: async input => {
       const snapshot = JSON.parse(input.prompt.slice(input.prompt.lastIndexOf('\n\n{') + 2));
@@ -128,15 +128,15 @@ describe('shared final analysis boundary', () => {
     const prompt = target.dispatch.mock.calls[0][0].prompt;
     const snapshot = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n{') + 2));
     expect(snapshot.body).toBe(final.result.conclusion);
-    expect(snapshot.body).not.toContain(marker);
+    expect(snapshot.body).toContain(marker);
     expect(snapshot.conclusionContract.claims[0].text).toBe(`The captured name is ${marker}.`);
-    expect(JSON.stringify(final.result)).not.toContain(marker);
+    expect(JSON.stringify(final.result)).toContain(marker);
   });
 
-  it('matches original captured source-marker cells while redacting their public declaration', async () => {
+  it('matches original captured source-marker cells while retaining their owner declaration', async () => {
     const marker = 'synthetic_source_marker_long_name';
     const target = fixture({source: {marker}});
-    expect(target.result.conclusion).not.toContain(marker);
+    expect(target.result.conclusion).toContain(marker);
     const final = await target.run();
     expect(final.result.conclusionContract?.bindingEligibility).toBe('eligible');
     expect(final.result.claimVerificationResult?.claimResults[0]).toMatchObject({status: 'partial',
@@ -144,7 +144,7 @@ describe('shared final analysis boundary', () => {
     expect(final.semanticAssessment?.status).toBe('checked');
     expect(target.dispatch).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(target.dispatch.mock.calls)).toContain(marker);
-    expect(JSON.stringify(final.result)).not.toContain(marker);
+    expect(JSON.stringify(final.result)).toContain(marker);
   });
 
   it('does not turn different originals into a match when both display as the same CodeRef', async () => {
@@ -200,9 +200,15 @@ describe('shared final analysis boundary', () => {
     else registerPrivateAnalysisQueryForEcho(target.result.sessionId, marker);
     const final = await target.run();
     expect(final.result.claimVerificationResult?.claimResults[0].referenceResults?.[0].status).toBe('matched');
-    expect(final.semanticAssessment).toMatchObject({status: 'coverage_incomplete', reason: 'input_projection_incomplete'});
-    expect(target.dispatch).not.toHaveBeenCalled();
-    expect(JSON.stringify(final.result)).not.toContain(marker);
+    if (kind === 'canary') {
+      expect(final.semanticAssessment).toMatchObject({status: 'coverage_incomplete', reason: 'input_projection_incomplete'});
+      expect(target.dispatch).not.toHaveBeenCalled();
+      expect(JSON.stringify(final.result)).not.toContain(marker);
+    } else {
+      expect(final.semanticAssessment?.status).toBe('checked');
+      expect(target.dispatch).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(final.result)).toContain(marker);
+    }
   });
 
   it('keeps the native invalid declaration ineligible after source projection', async () => {
@@ -211,7 +217,7 @@ describe('shared final analysis boundary', () => {
     expect(final.result.conclusionContract?.bindingEligibility).toBe('ineligible');
     expect(final.result.claimVerificationResult?.passed).toBe(false);
     expect(target.dispatch).not.toHaveBeenCalled();
-    expect(JSON.stringify(final.result)).not.toContain('synthetic_source_marker_long_name');
+    expect(JSON.stringify(final.result)).toContain('synthetic_source_marker_long_name');
   });
 
   const capturedIdentity: IdentityResolutionV1 = {version: 'identity_contract@1', identityRefId: 'identity:target',
@@ -414,13 +420,13 @@ describe('shared final analysis boundary', () => {
     expect(JSON.stringify(result)).not.toContain(question);
   });
 
-  it('does not extend query-role permission to the same text in a claim or evidence', async () => {
+  it('allows the owner query as analysis context without treating it as captured evidence', async () => {
     const question = 'PRIVATE original provider question';
     const target = fixture({providerQuery: {text: question}});
     target.result.conclusionContract!.claims![0].rawReferences = {privateValue: question};
     registerPrivateAnalysisQueryForEcho(target.result.sessionId, question);
-    expect((await target.run()).result.claimVerificationResult?.passed).toBe(false);
-    expect(target.dispatch).not.toHaveBeenCalled();
+    expect((await target.run()).result.claimVerificationResult?.passed).toBe(true);
+    expect(target.dispatch).toHaveBeenCalledTimes(1);
   });
 
   it('requires the original authorization selection for the captured query view', async () => {

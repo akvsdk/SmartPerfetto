@@ -9,11 +9,11 @@ import {
   registerPrivateAnalysisQueryForEcho,
   revokeCodeAwareOutputGuards,
 } from '../../services/security/codeAwareOutputRegistry';
-import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
+import {projectOwnerCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
 import {
-  privateAnalysisFailureMessage,
-  projectPrivateStructuredValue,
-  projectPrivateAnalysisResult,
+  projectOwnerAnalysisError,
+  projectOwnerStructuredValue,
+  projectOwnerAnalysisResult,
 } from '../../services/security/privateAnalysisProjection';
 import {analysisContextUsesPrivateKnowledge, AnalysisContextAuthorizationChangedError,
   buildAnalysisContextAuthorizationFingerprint, assertCurrentAnalysisContextAuthorization} from '../../services/resolvedAnalysisContext';
@@ -185,7 +185,7 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
           Boolean(value && typeof value === 'object' && validateDataEnvelope(value).length === 0)));
       }
       this.assertActive(input, state);
-      const safeUpdate = projectCodeAwareStreamingUpdate(runtimeSessionId, update, privateKnowledge, outputLanguage);
+      const safeUpdate = projectOwnerCodeAwareStreamingUpdate(runtimeSessionId, update, privateKnowledge, outputLanguage);
       const projected = safeUpdate ? narrative.project(safeUpdate) : null;
       if (projected) input.onUpdate?.(projected);
     };
@@ -209,7 +209,7 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
       if (artifacts.artifacts.length > 0) {
         const template = loadPromptTemplate('prompt-conversation-evidence-context');
         if (!template) throw new Error('Conversation evidence context template is not configured');
-        const projectedArtifacts = privateKnowledge ? projectPrivateStructuredValue(runtimeSessionId, artifacts) : artifacts;
+        const projectedArtifacts = privateKnowledge ? projectOwnerStructuredValue(runtimeSessionId, artifacts) : artifacts;
         prompt += `\n\n${renderTemplate(template, {retainedEvidenceContext: JSON.stringify({
           context: 'retained_artifacts', ...projectedArtifacts,
         })})}`;
@@ -232,9 +232,9 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
         });
       const finalized = await this.awaitExecution(analysis, state.controller.signal);
       this.assertActive(input, state);
-      const finalResult = privateKnowledge ? projectPrivateAnalysisResult(runtimeSessionId, finalized.result, outputLanguage) : finalized.result;
+      const finalResult = privateKnowledge ? projectOwnerAnalysisResult(runtimeSessionId, finalized.result, outputLanguage) : finalized.result;
       const {finalResult: _previousResult, ...outcome} = finalized.conversationOutcome!;
-      const safeOutcome = privateKnowledge ? projectPrivateStructuredValue(runtimeSessionId, outcome) : outcome;
+      const safeOutcome = privateKnowledge ? projectOwnerStructuredValue(runtimeSessionId, outcome) : outcome;
       this.assertActive(input, state);
       return {...safeOutcome, message: finalResult.conclusion, finalResult};
     } catch (error) {
@@ -251,7 +251,7 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
         (state.controller.signal.aborted || (error instanceof Error && error.name === 'AbortError'))) {
         return {kind: 'cancelled', message: ''};
       }
-      if (privateKnowledge) throw new Error(privateAnalysisFailureMessage(outputLanguage));
+      if (privateKnowledge) throw new Error(projectOwnerAnalysisError(runtimeSessionId, error, outputLanguage));
       throw error;
     } finally {
       this.orchestrator.off('update', onUpdate);

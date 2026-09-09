@@ -35,14 +35,14 @@ import type {KnowledgeScope} from './scopedKnowledgeStore';
 import {getDefaultExternalKnowledgeSourceRegistry} from './externalKnowledgeSourceRegistry';
 import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import {
-  projectPrivateConclusion,
-  projectPrivateDataEnvelopes,
+  projectOwnerConclusion,
+  projectOwnerDataEnvelopes,
   privateAnalysisQueryMessage,
-  projectPrivateSessionStateSnapshot,
-  projectPrivateTerminationMessage,
+  projectOwnerSessionStateSnapshot,
+  projectOwnerTerminationMessage,
   sessionUsesPrivateKnowledge,
   copyAnalysisResultForSnapshot,
-  projectPrivateAnalysisResult,
+  projectOwnerAnalysisResult,
 } from './security/privateAnalysisProjection';
 import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import {
@@ -251,7 +251,7 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
   const logComponent = input.logComponent ?? 'AgentPersistence';
   const persistenceService = SessionPersistenceService.getInstance();
   const durableDataEnvelopes = privateKnowledge
-    ? projectPrivateDataEnvelopes(sessionId, (session.dataEnvelopes || []) as DataEnvelope[])
+    ? projectOwnerDataEnvelopes(sessionId, (session.dataEnvelopes || []) as DataEnvelope[])
     : (session.dataEnvelopes || []) as DataEnvelope[];
   const traceSummary = sanitizeStoredTraceSummaryAttribution(session.traceSummary);
   // Older adapters may provide only message text. They cannot borrow a prior
@@ -260,7 +260,7 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
     Array.isArray(result.findings) && Array.isArray(result.hypotheses) &&
     typeof result.confidence === 'number' && typeof result.rounds === 'number'
     ? privateKnowledge
-      ? projectPrivateAnalysisResult(sessionId, result as AnalysisResult, outputLanguage)
+      ? projectOwnerAnalysisResult(sessionId, result as AnalysisResult, outputLanguage)
       : copyAnalysisResultForSnapshot(result as AnalysisResult)
     : undefined;
 
@@ -333,7 +333,7 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
         })
       : null;
     const snapshot = rawSnapshot && privateKnowledge
-      ? projectPrivateSessionStateSnapshot(rawSnapshot)
+      ? projectOwnerSessionStateSnapshot(rawSnapshot)
       : rawSnapshot;
 
     // Stash snapshot EARLY — report builder reads `_lastSnapshot` for
@@ -454,17 +454,18 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
             content: privateKnowledge
               ? buildPersistedAssistantMessage({
                   ...result,
-                  conclusion: projectPrivateConclusion({
+                  conclusion: projectOwnerConclusion({
                     sessionId,
                     conclusion: result.conclusion,
                     success: session.result?.success !== false,
                     language: outputLanguage,
                     state: result,
                   }),
-                  terminationMessage: projectPrivateTerminationMessage(
+                  terminationMessage: projectOwnerTerminationMessage(
                     result.terminationMessage,
                     outputLanguage,
                     result,
+                    sessionId,
                   ),
                 })
               : buildPersistedAssistantMessage(result),

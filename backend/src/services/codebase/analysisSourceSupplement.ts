@@ -12,7 +12,7 @@ import {assertCurrentAnalysisContextAuthorization, buildAnalysisContextAuthoriza
   type AnalysisContextSelection} from '../resolvedAnalysisContext';
 import {resolveKnowledgeScope} from '../scopedKnowledgeStore';
 import {registerPrivateAnalysisQueryForEcho, revokeCodeAwareOutputGuards} from '../security/codeAwareOutputRegistry';
-import {projectPrivateAnalysisResult} from '../security/privateAnalysisProjection';
+import {projectOwnerAnalysisResult} from '../security/privateAnalysisProjection';
 
 export interface AnalysisSourceSupplementMetrics {
   searchCalls: number;
@@ -173,7 +173,7 @@ export async function runAnalysisSourceSupplement(input: {
     assertCurrent();
     const finalized = await Promise.race([finalizeAnalysisResult({result, context, owner, query: prompt}), aborted]);
     assertCurrent();
-    const finalResult = projectPrivateAnalysisResult(runtimeSessionId, finalized.result, analysisOptions.outputLanguage ?? 'zh-CN');
+    const finalResult = projectOwnerAnalysisResult(runtimeSessionId, finalized.result, analysisOptions.outputLanguage ?? 'zh-CN');
     const executed = CodeLookupLedger.restore(runtimeSessionId, 12_000, 2).getEntries()
       .filter(entry => entry.outcome !== 'budget_exceeded');
     const metrics: AnalysisSourceSupplementMetrics = {

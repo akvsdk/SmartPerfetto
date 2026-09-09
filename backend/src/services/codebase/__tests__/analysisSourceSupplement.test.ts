@@ -9,7 +9,7 @@ import * as finalizationContext from '../../../agentRuntime/analysisFinalization
 import {buildStrategyRegistrySnapshotFromDefinitions} from '../../../agentv3/strategyLoader';
 import {analysisDeliveryFingerprint} from '../../../types/analysisDelivery';
 import * as finalizer from '../../finalizeAnalysisResult';
-import {clearAllCodeAwareOutputGuards} from '../../security/codeAwareOutputRegistry';
+import {clearAllCodeAwareOutputGuards, registerCodeAwareCanary} from '../../security/codeAwareOutputRegistry';
 import {CodeLookupLedger} from '../codeLookupLedger';
 import {AnalysisSourceSupplementFailure, analysisSourceSupplementRuntimeSessionId,
   cancelAnalysisSourceSupplement, runAnalysisSourceSupplement} from '../analysisSourceSupplement';
@@ -179,12 +179,13 @@ describe('analysis source supplement', () => {
     expect(dispatch).not.toHaveBeenCalled();
   });
 
-  it('retains incomplete coverage when the runtime omitted its authorized private query view', async () => {
+  it('retains incomplete coverage when protected query text has no authorized semantic view', async () => {
+    registerCodeAwareCanary(analysisSourceSupplementRuntimeSessionId('session-a', 'run-a'), 'Protected query marker');
     const fixture = createOrchestrator();
     const dispatch = jest.fn();
     fixture.analyze.mockImplementationOnce(async (_prompt, sessionId, _trace, options) =>
       runtimeResult(sessionId, options.runId!, {dispatch}));
-    const outcome = await runAnalysisSourceSupplement(input(fixture, {question: 'Private request to inspect source'}));
+    const outcome = await runAnalysisSourceSupplement(input(fixture, {question: 'Protected query marker'}));
     expect(dispatch).not.toHaveBeenCalled();
     expect(outcome.finalResult).toMatchObject({
       success: true, conclusion: '  A bounded source supplement.\n', completion: {status: 'completed'},

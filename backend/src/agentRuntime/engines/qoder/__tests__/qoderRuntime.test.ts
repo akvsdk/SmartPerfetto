@@ -1472,7 +1472,7 @@ describe('QoderRuntime', () => {
         expect(terminal.success).toBe(true);
         expect(terminal.sourceUseDecision).toEqual(decision);
         expect(terminal.sourceReferences).toEqual(decision.references);
-        expect(JSON.stringify(terminal)).not.toContain(SOURCE_FINALIZATION_CANARY);
+        expect(JSON.stringify(terminal)).toContain(SOURCE_FINALIZATION_CANARY);
         expect(next.sourceUseDecision).toBeUndefined();
         expect(next.sourceReferences).toBeUndefined();
       } finally {
@@ -1566,7 +1566,7 @@ describe('QoderRuntime', () => {
       mockProjectionWrite.mockImplementation(text => `<${text}>`);
       mockProjectionFlush.mockReturnValue('<tail>');
       const api = privacyProjectionApi();
-      api.registerPrivateAnalysisQueryForEcho('session-qoder-linear-projection', 'second');
+      api.registerCodeAwareCanary('session-qoder-linear-projection', 'second');
       const receipt = api.sanitizeCodeAwareTextWithReceipt('session-qoder-linear-projection', finalText);
       mockQuery.mockReturnValue(createMockSdkStream([
         ...chunks.map(text => ({
@@ -1881,7 +1881,7 @@ describe('QoderRuntime', () => {
     it('transfers completion only through the issued redaction chain and uses the returned candidate', async () => {
       const api = privacyProjectionApi();
       const nativeBody = 'The observation remains valid. Private implementation detail is removed.';
-      api.registerPrivateAnalysisQueryForEcho('redaction-run', 'Private implementation detail');
+      api.registerCodeAwareCanary('redaction-run', 'Private implementation detail');
       const receipt = api.sanitizeCodeAwareTextWithReceipt('redaction-run', nativeBody);
       expect(receipt.disposition).toBe('redacted');
       mockQuery.mockReturnValue(createMockSdkStream([
@@ -1901,7 +1901,7 @@ describe('QoderRuntime', () => {
     it('keeps failed setup provenance through an issued redaction instead of rebinding the raw error', async () => {
       const api = privacyProjectionApi();
       const sessionId = 'qoder-private-setup-error';
-      api.registerPrivateAnalysisQueryForEcho(sessionId, 'private setup detail');
+      api.registerCodeAwareCanary(sessionId, 'private setup detail');
       mockEnsureSkillRegistryInitialized.mockRejectedValueOnce(new Error('Failure: private setup detail'));
       const result = await createRuntime().analyze('any request', sessionId, 'trace-1', {runId: 'setup-error-run'});
       expect(result).toMatchObject({success: false, confidence: 0, outputOrigin: 'runtime_fallback',

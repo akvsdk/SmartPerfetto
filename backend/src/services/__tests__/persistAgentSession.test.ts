@@ -13,7 +13,7 @@ import { persistAgentTurn, refreshPersistedAgentSnapshot } from '../persistAgent
 import { createDataEnvelope } from '../../types/dataContract';
 import {CodeLookupLedger} from '../codebase/codeLookupLedger';
 import {SOURCE_USE_DECISION_SCHEMA_VERSION} from '../codebase/sourceUseDecision';
-import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../security/codeAwareOutputRegistry';
+import {clearCodeAwareOutputGuards, registerCodeAwareCanary, registerOnDemandSourceLookupForEcho} from '../security/codeAwareOutputRegistry';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 
@@ -484,7 +484,7 @@ describe('persistAgentTurn', () => {
     expect(JSON.stringify(second)).not.toContain('/private/summary');
   });
 
-  it('persists a private-safe snapshot and messages while retaining deterministic envelopes', () => {
+  it('retains source commentary and conclusion history while filtering canaries and raw context', () => {
     const appendMessages = jest.fn();
     const saveSessionStateSnapshot = jest.fn(() => true);
     jest.spyOn(SessionPersistenceService, 'getInstance').mockReturnValue({
@@ -495,6 +495,8 @@ describe('persistAgentTurn', () => {
     const sessionId = 'session-private-durable';
     const traceId = 'trace-private-durable';
     const canary = 'PRIVATE_DURABLE_CANARY';
+    const source = 'fun scheduleFrame() { workOnMainThread() }';
+    registerOnDemandSourceLookupForEcho(sessionId, [{referenceId: 'history-source', codebaseId: 'private-codebase', filePath: 'Main.kt', text: source}]);
     const envelope = {
       ...createDataEnvelope({columns: ['dur_ms', 'leak'], rows: [[42, canary]]}, {
         type: 'sql_result',
@@ -528,9 +530,9 @@ describe('persistAgentTurn', () => {
             snapshotTimestamp: 123,
             sessionId,
             traceId,
-            conversationSteps: [{content: canary}],
+            conversationSteps: [{content: `${source} ${canary}`}],
             queryHistory: [{query: canary}],
-            conclusionHistory: [{conclusion: canary}],
+            conclusionHistory: [{conclusion: `${source} ${canary}`}],
             agentDialogue: [{content: canary}],
             agentResponses: [{content: canary}],
             dataEnvelopes: [envelope],
@@ -556,9 +558,9 @@ describe('persistAgentTurn', () => {
     };
     expect(JSON.stringify(persistedSnapshot)).not.toContain(canary);
     expect(persistedSnapshot).toEqual(expect.objectContaining({
-      conversationSteps: [],
+      conversationSteps: [{content: expect.stringContaining(source)}],
       queryHistory: [],
-      conclusionHistory: [],
+      conclusionHistory: [{conclusion: expect.stringContaining(source)}],
       analysisNotes: [],
       analysisPlan: null,
       dataEnvelopes: [expect.objectContaining({

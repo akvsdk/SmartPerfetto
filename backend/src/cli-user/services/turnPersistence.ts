@@ -32,11 +32,11 @@ import { upsertSession } from '../io/indexJson';
 import { appendTranscriptTurn } from '../io/transcriptWriter';
 import {localize, parseOutputLanguage, type OutputLanguage} from '../../agentv3/outputLanguage';
 import {
-  privateAnalysisFailureMessage,
+  projectOwnerAnalysisError,
   privateAnalysisQueryMessage,
-  projectPrivateAnalysisResult,
+  projectOwnerAnalysisResult,
 } from '../../services/security/privateAnalysisProjection';
-import {sanitizeCodeAwareText} from '../../services/security/codeAwareOutputRegistry';
+import {sanitizeOwnerCodeAwareText} from '../../services/security/codeAwareOutputRegistry';
 import {
   projectSafeSourceProvenance,
   type SafeSourceProvenanceProjection,
@@ -74,9 +74,9 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
   const result: RunTurnOutput = input.result.privateKnowledge
     ? {
         ...input.result,
-        result: projectPrivateAnalysisResult(sessionId, input.result.result, outputLanguage),
+        result: projectOwnerAnalysisResult(sessionId, input.result.result, outputLanguage),
         reportError: input.result.reportError
-          ? privateAnalysisFailureMessage(outputLanguage)
+          ? projectOwnerAnalysisError(sessionId, input.result.reportError, outputLanguage)
           : undefined,
       }
     : input.result;
@@ -84,7 +84,7 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
     ? privateAnalysisQueryMessage(outputLanguage)
     : query;
   const baseTurnMarkdown = result.privateKnowledge
-    ? sanitizeCodeAwareText(
+    ? sanitizeOwnerCodeAwareText(
         sessionId,
         replaceExact(
           replaceExact(input.turnMarkdown, query, durableQuery),
@@ -117,7 +117,7 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
 
   let turnReportPath: string | undefined;
   const privateSafeReportHtml = result.privateKnowledge && result.reportHtml
-    ? sanitizeCodeAwareText(
+    ? sanitizeOwnerCodeAwareText(
         sessionId,
         replaceExact(
           replaceExact(result.reportHtml, query, durableQuery),
@@ -184,7 +184,7 @@ export function commitSourceSupplementOutput(input: {
 }): void {
   const outputLanguage = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
   const safeSupplement = {
-    message: sanitizeCodeAwareText(input.sessionId, input.supplement.message),
+    message: sanitizeOwnerCodeAwareText(input.sessionId, input.supplement.message),
     metrics: {...input.supplement.metrics},
   };
   const turnPrefix = path.join(input.sp.turnsDir, String(input.turn).padStart(3, '0'));

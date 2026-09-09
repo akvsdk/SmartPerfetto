@@ -6,8 +6,8 @@ import type {StreamingUpdate} from '../../agent/types';
 import type {VerificationIssue} from '../../agentv3/types';
 import type {OutputLanguage} from '../../agentv3/outputLanguage';
 import {localize} from '../../agentv3/outputLanguage';
-import {sanitizeCodeAwareText} from './codeAwareOutputRegistry';
-import {projectPrivateDataEnvelope} from './privateAnalysisProjection';
+import {sanitizeCodeAwareText, sanitizeCodeAwareStructuredText, withOwnerCodeAwareProjection} from './codeAwareOutputRegistry';
+import {projectPrivateDataEnvelope, projectPrivateStructuredValue} from './privateAnalysisProjection';
 import {validateDataEnvelope} from '../../types/dataContract';
 import {formatToolCallNarration, formatToolResultNarration, readPrivateToolResultNarrationReceipt} from '../../agentv3/toolNarration';
 import {sanitizeCandidateProtocolDiagnostic} from '../canonicalAnalysisResult';
@@ -277,4 +277,26 @@ export function projectCodeAwareStreamingUpdate(
     };
   }
   return null;
+}
+
+
+/** Authenticated owner process view. Raw tool payloads still use deterministic narration. */
+export function projectOwnerCodeAwareStreamingUpdate(
+  sessionId: string,
+  update: StreamingUpdate,
+  sourceAware: boolean,
+  language: OutputLanguage,
+): StreamingUpdate | null {
+  if (!sourceAware) return update;
+  if (update.type === 'tool_call' || update.type === 'agent_task_dispatched' || update.type === 'agent_response') {
+    return privateExecutionUpdate(update, language);
+  }
+  return withOwnerCodeAwareProjection(() => {
+    if (update.type === 'data') return projectCodeAwareStreamingUpdate(sessionId, update, true, language);
+    // Tool acquisition payloads belong to evidence artifacts, not the process timeline.
+    if (update.type === 'skill_data' || update.type === 'skill_layered_result' ||
+        update.type === 'sql_generated') return null;
+    const content = sanitizeCodeAwareStructuredText(sessionId, update.content);
+    return {...update, content: projectPrivateStructuredValue(sessionId, content)};
+  });
 }

@@ -318,7 +318,7 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     mockAnalyze.mockImplementationOnce(async () => {
       mockPreparedSession.orchestrator.emit('update', {
         type: 'finding',
-        content: {message: 'CLI_PRIVATE_STREAM_CANARY'},
+        content: {message: 'Source location found; implementation has not been read.'},
         timestamp: Date.now(),
       } satisfies StreamingUpdate);
       return {
@@ -356,7 +356,9 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     }));
     expect(output.codeAwareMode).toBe('metadata_only');
     expect(output.result.analysisReceipt?.outputs.cliTurnPath).toBeUndefined();
-    expect(JSON.stringify(events)).not.toContain('CLI_PRIVATE_STREAM_CANARY');
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'finding', content: {message: 'Source location found; implementation has not been read.'},
+    }));
   });
 
   it.each([

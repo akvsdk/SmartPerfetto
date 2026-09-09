@@ -15,6 +15,8 @@ import {
 import {
   copyAnalysisResultForSnapshot,
   projectPrivateAnalysisResult,
+  projectOwnerAnalysisResult,
+  projectOwnerSessionStateSnapshot,
   projectPrivateClaimVerification,
   projectPrivateTerminationMessage,
   projectPrivateSessionStateSnapshot,
@@ -22,7 +24,7 @@ import {
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import type {DeterministicNativeRowIdentity} from '../../types/claimVerification';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
-import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../security/codeAwareOutputRegistry';
+import {clearCodeAwareOutputGuards, registerCodeAwareCanary, registerOnDemandSourceLookupForEcho, registerPrivateAnalysisQueryForEcho} from '../security/codeAwareOutputRegistry';
 
 function deliveredResult(): AnalysisResult {
   const conclusion = 'A current trace fact has a complete explanation without report headings.';
@@ -817,5 +819,40 @@ describe('private termination state', () => {
     expect(projectPrivateTerminationMessage(diagnostic, 'en')).toBe('Detailed analysis diagnostics are hidden by the privacy policy.');
     expect(projectPrivateTerminationMessage(undefined, 'en')).toBeUndefined();
     expect(projectPrivateTerminationMessage(diagnostic, 'en', {success: false})).toContain('did not complete');
+  });
+});
+
+
+describe('owner source analysis delivery', () => {
+  it.each(['quality_gate_failed', 'plan_incomplete'] as const)('retains a generated answer and diagnostics for %s', terminationReason => {
+    const result = deliveredResult();
+    const source = 'fun dispatchWork() { trace.beginSection("startup"); }';
+    registerOnDemandSourceLookupForEcho(result.sessionId, [{referenceId: 'owner-read', codebaseId: 'app', filePath: 'src/Main.kt', text: source}]);
+    registerPrivateAnalysisQueryForEcho(result.sessionId, source);
+    result.conclusion = `Source candidate: ${source}`;
+    result.success = false;
+    result.partial = true;
+    result.terminationReason = terminationReason;
+    result.terminationMessage = 'Claim startup latency has no matching current trace evidence.';
+    const projected = projectOwnerAnalysisResult(result.sessionId, result, 'en');
+    expect(projected.conclusion).toContain(source);
+    expect(projected.success).toBe(false);
+    expect(projected.terminationMessage).toBe(result.terminationMessage);
+    expect(projected.terminationReason).toBe(terminationReason);
+    expect(projectPrivateAnalysisResult(result.sessionId, result, 'en').conclusion).not.toContain(source);
+    clearCodeAwareOutputGuards(result.sessionId);
+  });
+  it('keeps owner source quotations in the durable snapshot final result', () => {
+    const result = deliveredResult();
+    const source = 'fun renderFrame() { invalidate(); }';
+    result.conclusion = source;
+    registerOnDemandSourceLookupForEcho(result.sessionId, [{referenceId: 'read', codebaseId: 'app', filePath: 'Main.kt', text: source}]);
+    const snapshot = normalizeSessionStateSnapshot({version: 1, snapshotTimestamp: 1, sessionId: result.sessionId,
+      traceId: 'trace', codeAwareMode: 'provider_send', codebaseIds: ['app'], finalResult: result,
+      conversationSteps: [], queryHistory: [], conclusionHistory: [], agentDialogue: [], agentResponses: [],
+      dataEnvelopes: [], hypotheses: [], analysisNotes: [], analysisPlan: null, planHistory: [],
+      uncertaintyFlags: [], claudeHypotheses: [], runSequence: 1, conversationOrdinal: 0})!;
+    expect(projectOwnerSessionStateSnapshot(snapshot).finalResult?.conclusion).toContain(source);
+    clearCodeAwareOutputGuards(result.sessionId);
   });
 });

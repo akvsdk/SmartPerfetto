@@ -47,7 +47,9 @@ SmartPerfetto 在 Perfetto Trace 之上增加 AI 分析层。加载 Trace、用�
 - 按每次请求显式选择已注册的本机源码，无需索引也能有界按需检索，并在
   Web、报告、CLI、snapshot 和 API 的安全来源中区分 trace 发生证据与
   `CodeRef` 机制证据。通过“选择文件夹 → 添加并用于分析”即可开始，排除路径和
-  可选索引设置见[源码分析指南](docs/getting-started/code-aware-analysis.md)。
+  可选索引设置见[源码分析指南](docs/getting-started/code-aware-analysis.md)。相关片段会发送给
+  当前配置的 AI 服务，源码检索会增加分析耗时。结果和源码引用可随本地历史、报告保存；
+  AI 服务的内容留存取决于该服务的配置与政策。
 - UI 选区只传身份与时间边界；名称等描述性事实由后端重新查询，`/anr` 与 `/jank`
   也进入同一套证据和验证管线。
 - 支持浏览器 UI、`smp` CLI 和 HTTP/SSE 接入；完整范围见

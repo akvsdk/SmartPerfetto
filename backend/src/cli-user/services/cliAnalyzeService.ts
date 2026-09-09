@@ -97,7 +97,7 @@ import {
   assertCurrentAnalysisContextAuthorization,
   buildAnalysisContextAuthorizationFingerprint,
 } from '../../services/resolvedAnalysisContext';
-import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
+import {projectOwnerCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
 import {
   clearCodeAwareOutputGuards,
   revokeCodeAwareOutputGuards,
@@ -120,9 +120,9 @@ import {
   type SourceUseDecisionV1,
 } from '../../services/codebase/sourceUseDecision';
 import {
-  privateAnalysisFailureMessage,
+  projectOwnerAnalysisError,
   privateAnalysisQueryMessage,
-  projectPrivateAnalysisResult,
+  projectOwnerAnalysisResult,
 } from '../../services/security/privateAnalysisProjection';
 import {registerPrivateAnalysisQueryForEcho} from '../../services/security/codeAwareOutputRegistry';
 import {buildSkillRegistryAttribution} from '../../services/selfEvolution/skillFingerprint';
@@ -637,7 +637,7 @@ export class CliAnalyzeService {
           if (envelopes.length > 0) {
             session.dataEnvelopes.push(...envelopes);
           }
-          const projectedUpdate = projectCodeAwareStreamingUpdate(
+          const projectedUpdate = projectOwnerCodeAwareStreamingUpdate(
             sessionId,
             update,
             primaryPrivateKnowledge,
@@ -866,7 +866,7 @@ export class CliAnalyzeService {
         assertActive();
         const reportOutput = this.buildReportHtml(session, result);
         const durableResult = primaryPrivateKnowledge
-          ? projectPrivateAnalysisResult(sessionId, result, outputLanguage)
+          ? projectOwnerAnalysisResult(sessionId, result, outputLanguage)
           : result;
 
         assertActive();
@@ -878,7 +878,7 @@ export class CliAnalyzeService {
           reportHtml: reportOutput.html,
           reportError:
             primaryPrivateKnowledge && reportOutput.error
-              ? privateAnalysisFailureMessage(outputLanguage)
+              ? projectOwnerAnalysisError(sessionId, reportOutput.error, outputLanguage)
               : reportOutput.error,
           model,
           providerId: persistedProviderId !== undefined ? persistedProviderId : (session.providerId ?? null),
@@ -1160,7 +1160,7 @@ async function runCliE2eFakeTurn(input: RunTurnInput, traceId: string): Promise<
   );
   if (!privateKnowledge) return output;
   const outputLanguage = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
-  const durableResult = projectPrivateAnalysisResult(sessionId, output.result, outputLanguage);
+  const durableResult = projectOwnerAnalysisResult(sessionId, output.result, outputLanguage);
   return {
     ...output,
     privateKnowledge: true,

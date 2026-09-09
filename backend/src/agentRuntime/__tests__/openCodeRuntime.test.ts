@@ -564,7 +564,7 @@ describe('OpenCode native turn intent and delivery', () => {
   ])('carries a redacted %s candidate through the returned delivery context', async (language, answer) => withBackendDataDir(async () => {
     const sessionId = `privacy-redacted-${language}`;
     registerCodeAwareCanary(sessionId, 'PRIVATE_CANARY');
-    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const gate = jest.spyOn(finalResultQualityGate, 'applyFinalResultQualityGate');
     try {
       const harness = createNativeIntentHarness({answer});
@@ -590,7 +590,7 @@ describe('OpenCode native turn intent and delivery', () => {
   ])('does not certify a whole %s privacy replacement as an SDK answer', async (language, answer) => withBackendDataDir(async () => {
     const sessionId = `privacy-replaced-${language}`;
     revokeCodeAwareOutputGuards(sessionId);
-    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeSourceAwareAnalysisResultWithProjection');
+    const projection = jest.spyOn(sourceClaimVerifier, 'finalizeOwnerSourceAwareAnalysisResultWithProjection');
     const gate = jest.spyOn(finalResultQualityGate, 'applyFinalResultQualityGate');
     try {
       const harness = createNativeIntentHarness({answer});
@@ -2951,7 +2951,7 @@ describe('experimental OpenCode runtime contract', () => {
       expect(terminal.success).toBe(true);
       expect(terminal.sourceUseDecision).toEqual(decision);
       expect(terminal.sourceReferences).toEqual(decision.references);
-      expect(JSON.stringify(terminal)).not.toContain(SOURCE_FINALIZATION_CANARY);
+      expect(JSON.stringify(terminal)).toContain(SOURCE_FINALIZATION_CANARY);
       expect(next.sourceUseDecision).toBeUndefined();
       expect(next.sourceReferences).toBeUndefined();
     } finally {

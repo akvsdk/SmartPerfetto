@@ -23,7 +23,7 @@ import {
   getSnapshotRuntimeProviderSnapshotHash,
 } from '../agentv3/sessionStateSnapshot';
 import { readTraceMetadataForContext } from '../services/traceMetadataStore';
-import {copyAnalysisResultForSnapshot, projectPrivateAnalysisResult, sessionUsesPrivateKnowledge} from '../services/security/privateAnalysisProjection';
+import {copyAnalysisResultForSnapshot, projectOwnerAnalysisResult, sessionUsesPrivateKnowledge} from '../services/security/privateAnalysisProjection';
 import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import {
   requireAiEnabledForHttp,
@@ -227,7 +227,7 @@ export function registerAgentResumeRoutes(
         (!storedFinalRunId || storedFinalRunId === snapshotRun.runId);
       const recoveredResult = matchingStoredFinal
         ? (sessionUsesPrivateKnowledge(snapshot!)
-            ? projectPrivateAnalysisResult(sessionId, storedFinal!, snapshot?.outputLanguage ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE))
+            ? projectOwnerAnalysisResult(sessionId, storedFinal!, snapshot?.outputLanguage ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE))
             : copyAnalysisResultForSnapshot(storedFinal!))
         : deps.buildRecoveredResultFromContext(sessionId, restoredContext);
       const restoredRunSequence = Math.max(0, restoredTurns.length);

@@ -310,6 +310,7 @@ describe('deterministic code-aware semantic delta', () => {
       });
       expect(summary.sse).toMatchObject({
         rawSourceCanarySuppressed: true,
+        ownerSourceVisible: true,
         analysisCompletionSourceAttached: true,
       });
       expect(JSON.stringify(summary)).not.toContain(sourceRoot);

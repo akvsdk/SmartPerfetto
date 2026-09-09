@@ -117,7 +117,7 @@ Web UI 的两个 AI 入口共享同一鉴权边界，但不共享 trace 前置�
   只返回粗粒度状态，不返回端口、凭据、文件路径或其他租户信息。
 
 OIDC 模式下，session、trace、lease、connection、run/receipt 和临时连接状态都只存在于
-当前页面内存。可持久化消息先移除运行时绑定和私有原文，再写入 tenant/user/workspace
+当前页面内存。可持久化消息先移除运行时绑定和原始私有请求；已授权的分析源码引用可以保留，再写入 tenant/user/workspace
 隔离的命名空间；切换身份或 workspace 不会恢复另一个作用域的历史。logout、401、跨
 标签页 authority invalidation、身份/上下文切换和页面卸载都会 abort start/stream，递增
 运行代际并清空页面运行态，迟到结果不得写回新身份。

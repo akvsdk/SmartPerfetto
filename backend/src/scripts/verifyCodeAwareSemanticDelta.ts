@@ -27,6 +27,7 @@ import {CodeLookupLedger} from '../services/codebase/codeLookupLedger';
 import {PathSecurityGate} from '../services/codebase/pathSecurityGate';
 import {
   finalizeSourceAwareAnalysisResult,
+  finalizeOwnerSourceAwareAnalysisResultWithProjection,
   verifySourceClaimBindings,
 } from '../services/codebase/sourceClaimVerifier';
 import type {
@@ -35,7 +36,7 @@ import type {
 } from '../services/codebase/sourceUseDecision';
 import {RagStore} from '../services/ragStore';
 import {clearCodeAwareOutputGuards} from '../services/security/codeAwareOutputRegistry';
-import {projectCodeAwareStreamingUpdate} from '../services/security/codeAwareStreamingUpdateProjection';
+import {projectCodeAwareStreamingUpdate, projectOwnerCodeAwareStreamingUpdate} from '../services/security/codeAwareStreamingUpdateProjection';
 import {runClaimVerification} from '../services/verifier/claimVerificationRunner';
 import {prepareClaimEvidence} from '../services/evidence/claimEvidencePreparation';
 import {captureEvidenceTable} from '../services/evidence/evidenceCapture';
@@ -129,6 +130,7 @@ export interface DeterministicVerificationSummary {
   conditions: Record<MatrixCondition, Record<string, unknown>>;
   sse: {
     rawSourceCanarySuppressed: boolean;
+    ownerSourceVisible: boolean;
     analysisCompletionSourceAttached: boolean;
   };
   runtimeProof: {
@@ -644,10 +646,15 @@ function createSseEvidence(input: {
     rounds: 1,
     totalDurationMs: 1,
   };
+  const ownerAnswer = projectOwnerCodeAwareStreamingUpdate(input.harness.sessionId,
+    {type: 'answer_token', content: input.rawSourceText, timestamp: 1}, true, 'en');
+  const ownerFinal = finalizeOwnerSourceAwareAnalysisResultWithProjection({...result}, input.harness.sourceUse).result;
   const finalized = finalizeSourceAwareAnalysisResult(result, input.harness.sourceUse);
   const projected = JSON.stringify({answer, finalized});
   return {
     rawSourceCanarySuppressed: !projected.includes(input.rawSourceText),
+    ownerSourceVisible: ownerAnswer?.content === input.rawSourceText &&
+      ownerFinal.conclusion.includes(input.rawSourceText),
     analysisCompletionSourceAttached:
       finalized.sourceUseDecision?.status === 'corroborated' &&
       Boolean(finalized.sourceReferences?.length),

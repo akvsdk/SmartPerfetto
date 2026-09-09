@@ -62,10 +62,10 @@ import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisDeliv
 import { verifyConclusion } from '../claude/claudeVerifier';
 import {
   createCodeAwareStreamingTextProjection,
-  sanitizeCodeAwareText,
+  sanitizeOwnerCodeAwareText,
 } from '../../../services/security/codeAwareOutputRegistry';
 import { analysisContextUsesPrivateKnowledge } from '../../../services/resolvedAnalysisContext';
-import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeOwnerSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
 import {formatToolCallNarration, formatToolResultNarration, issuePrivateToolResultNarrationReceipt} from '../../../agentv3/toolNarration';
@@ -302,9 +302,9 @@ function bindQoderDelivery(
   reason?: AnalysisCompletion['reason'],
   sdkFinishReason?: string,
   projectionOptions: {
-    sourceUse?: Parameters<typeof finalizeSourceAwareAnalysisResultWithProjection>[1];
+    sourceUse?: Parameters<typeof finalizeOwnerSourceAwareAnalysisResultWithProjection>[1];
   } = {},
-): {context: AnalysisDeliveryContext; protocolProjection?: ReturnType<typeof finalizeSourceAwareAnalysisResultWithProjection>['protocolProjection']} {
+): {context: AnalysisDeliveryContext; protocolProjection?: ReturnType<typeof finalizeOwnerSourceAwareAnalysisResultWithProjection>['protocolProjection']} {
   const runId = executionLease.key.runId!;
   const candidate = {
     runId, attemptId: 'main', candidateRef: `${runId}:qoder:main`,
@@ -320,7 +320,7 @@ function bindQoderDelivery(
   const nativeContext: AnalysisDeliveryContext = {
     entry: 'runtime_draft', acceptedCandidate: candidate, completion, outputOrigin, turnIntent,
   };
-  const projected = finalizeSourceAwareAnalysisResultWithProjection(result, projectionOptions.sourceUse, {
+  const projected = finalizeOwnerSourceAwareAnalysisResultWithProjection(result, projectionOptions.sourceUse, {
     context: nativeContext,
   });
   if (!projected.deliveryContext) throw new Error('Qoder delivery context was lost during privacy projection');
@@ -1061,7 +1061,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         resolveModel,
       };
 
-      answerProjection = createCodeAwareStreamingTextProjection(sessionId, 'qoder-answer');
+      answerProjection = createCodeAwareStreamingTextProjection(sessionId, 'qoder-answer', 'owner');
       const activeAnswerProjection = answerProjection;
 
       // Execute the query with timeout. Provider timing includes synchronous
@@ -1281,7 +1281,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       if (executionLease.signal.aborted) throw error;
       const totalDurationMs = Date.now() - startTime;
       const errorMessage = describeQoderSdkError(error);
-      const safeErrorMessage = sanitizeCodeAwareText(sessionId, errorMessage);
+      const safeErrorMessage = sanitizeOwnerCodeAwareText(sessionId, errorMessage);
       const isAborted = sessionState.aborted
         || executionLease.signal.aborted
         || (error instanceof Error && error.name === 'AbortError')

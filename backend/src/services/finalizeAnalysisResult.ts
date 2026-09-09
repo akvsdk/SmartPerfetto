@@ -21,11 +21,11 @@ import {runClaimVerification, collectMatchedTraceEvidenceRefIdsByClaimId,
   collectVerifiedTraceOccurrenceRefIdsByClaimId} from './verifier/claimVerificationRunner';
 import {assessFinalSemantics, type FinalSemanticAssessment, type FinalSemanticSnapshot} from './finalSemanticAssessment';
 import {applyFinalResultQualityGate, type FinalResultComparisonIdentity, type FinalResultQualityIssue} from './finalResultQualityGate';
-import {projectCodeAwareStructuredText} from './security/codeAwareOutputRegistry';
+import {projectCodeAwareStructuredText, withOwnerCodeAwareProjection} from './security/codeAwareOutputRegistry';
 import {projectConclusionSemanticInput} from './security/conclusionProtocolProjection';
 import {applySourceLocationProofs} from './codebase/sourceLocationProof';
 import {isUnusedSourceDecision, type SourceExecutionScopeV1, type SourceUseDecisionV1} from './codebase/sourceUseDecision';
-import {projectPrivateClaimVerification, projectPrivateClaimSupport} from './security/privateAnalysisProjection';
+import {projectOwnerClaimVerification, projectOwnerClaimSupport} from './security/privateAnalysisProjection';
 
 export interface AnalysisFinalizationOwner {
   runId: string;
@@ -281,10 +281,10 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
             issues: diagnostics.conversation.issues} : undefined} : undefined};
       // This query was accepted as provider input in the same run. The echo guard
       // still protects it in output and in every other role in this snapshot.
-      const projected = projectConclusionSemanticInput({sessionId: result.sessionId, snapshot, prepared,
+      const projected = withOwnerCodeAwareProjection(() => projectConclusionSemanticInput({sessionId: result.sessionId, snapshot, prepared,
         providerQuery: providerQuery?.text, nativeDeclaration,
         ...(isIssuedFinalizationContext(context) ? {canonicalProjection: canonical.projection,
-          canonicalCandidate: candidate, runId: context.runId} : {})});
+          canonicalCandidate: candidate, runId: context.runId} : {})}));
       const safeSnapshot: FinalSemanticSnapshot = projected.changed
         ? {...snapshot, inputCoverage: 'incomplete', query: '', body: result.conclusion,
           conclusionContract: undefined, protocolDiagnostics: undefined, evidenceSnapshot: null,
@@ -311,8 +311,8 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
       verifiedTraceOccurrenceRefIdsByClaimId: collectVerifiedTraceOccurrenceRefIdsByClaimId(result.claimVerificationResult)});
     if (nativeDeclaration) {
       // The verdict is computed from original values. Only its public projection enters delivery artifacts.
-      result.claimVerificationResult = projectPrivateClaimVerification(result.sessionId, result.claimVerificationResult)!;
-      result.claimSupport = projectPrivateClaimSupport(result.sessionId, result.claimSupport);
+      result.claimVerificationResult = projectOwnerClaimVerification(result.sessionId, result.claimVerificationResult)!;
+      result.claimSupport = projectOwnerClaimSupport(result.sessionId, result.claimSupport);
     }
     const claimsFingerprint = analysisDeliveryFingerprint(result.conclusionContract?.claims ?? []);
     const sourceUseFingerprint = analysisDeliveryFingerprint(result.sourceUseDecision);

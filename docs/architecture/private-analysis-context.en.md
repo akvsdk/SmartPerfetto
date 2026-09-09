@@ -39,16 +39,18 @@ and run boundaries recompute it. Deletion, reindex, consent revocation, or scope
 change therefore fails the old session closed and requires a fresh session.
 
 Private analysis permits only bounded in-process multi-turn continuity; it does
-not restore a persisted provider conversation. Raw queries, tool arguments,
-retrieved prose, and intermediate reasoning do not enter logs, ordinary session
-history, HTML reports, or snapshots. A private request also scrubs private
-context snapshots left by an older version before refusing restoration. Final
-conclusions, deterministic trace evidence, and bounded provenance pass through
-the shared projection before chat, report, CLI artifact, and analysis-result
-snapshot surfaces receive them.
+not restore a persisted provider conversation. Raw queries, tool arguments, and
+complete retrieval payloads are not additionally written to logs or provider transcripts.
+The separate owner projection retains analysis prose, source quotations, and specific
+check diagnostics in local history, HTML reports, CLI artifacts, and result snapshots.
+Logs and public artifacts retain strict projection; private knowledge, credentials,
+authorization, and session revocation remain separate protections. Owner and strict
+filter state and budgets are independent: source-echo capacity must not hide owner
+results. Audience scopes contain synchronous projection only, and streaming objects
+fix their audience when created so display policy cannot escape into log callbacks.
 
-Progress retains deterministic tool calls, outcomes, and phase status; hidden
-model content produces no repeated placeholder. Before transport truncation,
+Progress retains model-provided commentary, tool calls, outcome summaries, and phase
+status. Failed quality checks retain their prose and specific diagnostic reasons. Before transport truncation,
 each runtime issues an in-process receipt from the externally projected tool
 result. Shared narration uses its safe facts to describe returned locations,
 authorized content, or failures. JSON and model prose cannot forge that receipt.

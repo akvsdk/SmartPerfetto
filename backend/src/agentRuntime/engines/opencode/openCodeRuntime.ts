@@ -89,7 +89,7 @@ import { verifyConclusion } from '../claude/claudeVerifier';
 import { getExtendedKnowledgeBase } from '../../../services/sqlKnowledgeBase';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
-import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeOwnerSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import { getProviderService, type ProviderConfig, type ProviderScope } from '../../../services/providerManager';
 import {providerSubprocessEnv} from '../../../services/providerManager/envIsolation';
 import type { RuntimeSelection } from '../../runtimeSelection';
@@ -2861,7 +2861,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       entry: 'runtime_draft', acceptedCandidate: completion, completion,
       turnIntent, outputOrigin: result.outputOrigin,
     };
-    const {deliveryContext, protocolProjection} = finalizeSourceAwareAnalysisResultWithProjection(result, prep.sourceUse, {
+    const {deliveryContext, protocolProjection} = finalizeOwnerSourceAwareAnalysisResultWithProjection(result, prep.sourceUse, {
       context: nativeDeliveryContext,
     });
     executionLease.throwIfAborted();

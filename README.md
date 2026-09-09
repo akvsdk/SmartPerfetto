@@ -53,7 +53,9 @@ The [Android Performance Ecosystem](https://github.com/Gracker/android-performan
   `CodeRef` mechanism evidence in safe Web, report, CLI, snapshot, and API
   provenance. Choose a folder and **Add and use for analysis** to get started;
   see the [source analysis guide](docs/getting-started/code-aware-analysis.en.md)
-  for excluded paths and optional indexing.
+  for excluded paths and optional indexing. Relevant snippets are sent to the configured
+  AI service; source lookup adds analysis time. Results and quoted source can be
+  retained in local history and exports; AI-service retention depends on its policy.
 - Sends UI selections as identity and time bounds only; the backend re-queries
   descriptive facts and runs `/anr` or `/jank` through the same evidence and
   verification pipeline.

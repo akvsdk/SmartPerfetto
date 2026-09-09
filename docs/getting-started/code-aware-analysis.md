@@ -2,7 +2,7 @@
 
 [English](code-aware-analysis.en.md) | [中文](code-aware-analysis.md)
 
-Code-Aware Analysis 让 SmartPerfetto 在分析 trace 时按需引用本机代码库，把调用栈、native frame 或 kernel symbol 映射到 `CodeRef`。注册且仍可访问的路径可直接用于有界搜索和读取，不要求先建立索引。Web 的“添加并用于分析”同时完成明确的授权和本次选择；“仅添加”只登记代码库，之后仍需选择。索引是可选的语义/符号检索与 patch 加速层。源码正文不写入 session、报告或导出。
+Code-Aware Analysis 让 SmartPerfetto 在分析 trace 时按需引用本机代码库，把调用栈、native frame 或 kernel symbol 映射到 `CodeRef`。注册且仍可访问的路径可直接用于有界搜索和读取，不要求先建立索引。Web 的“添加并用于分析”同时完成明确的授权和本次选择；“仅添加”只登记代码库，之后仍需选择。索引是可选的语义/符号检索与 patch 加速层。分析结果及其中引用的源码可以随本地历史、报告和导出保存。
 
 ## 启用方式
 
@@ -79,7 +79,11 @@ npm run cli:dev -- run --format json \
 
 工具返回的 `sourceReferences[].id` 可直接用于 `sourceClaimBindings[].sourceReferenceIds`。引用只能来自本轮实际返回且属于本次选择的代码库；模型自造引用或歧义别名不被接受。达到引用容量时，工具明确返回限制，不会继续交付无法核验的引用。Web 回执区分定位、已提供片段和实际核验结果，不把模型的机制声明当作核验通过。
 
-分析过程展示安全的工具调用和结果摘要，不显示原始查询、源码正文、绝对路径或模型中间文本，也不会用重复的隐私提示替代每一步。
+分析过程展示工具调用、结果摘要和模型提供的分析说明；结论可以引用源码。原始工具载荷不会直接灌入聊天或日志。
+
+引用源码会增加检索、读取和额外模型分析步骤，流程和耗时会相应增加。相关片段发送给当前配置的 AI 服务，包括公司内部服务；该服务是否留存内容取决于其配置与政策，SmartPerfetto 不承诺第三方零留存。
+
+“未通过检查”是结果可靠性与完整性状态，例如证据不足、源码引用与 Trace 不匹配、报告覆盖不完整或运行未完成。结果仍可阅读，并保留具体原因和质量标记；它不是隐私审查结论。
 
 ## 取证顺序与可选代码图
 
@@ -142,14 +146,14 @@ Web UI 的 `Codebases` 页不只用于注册：它会展示 root 是否可用、
 - `metadata_only`：模型可按需搜索，但只看到相对路径、行号和 `referenceId`，不能读取源码正文。
 - `provider_send`：只有本次显式选中、注册时同意 `sendToProvider`，且目标相对路径同时被当前 selection 与 consent grant 允许时，才能搜索和读取有界、脱敏后的片段。selection/grant revision 不一致时，新增范围保持 metadata-only，已授权交集不被扩大。
 - 按需工具受注册 path filter、exclude glob、文件类型、单文件大小、结果数、读取行数和 secret 脱敏约束；绝对 root 始终留在后端信任边界内，不进入工具结果、模型上下文、报告或导出。
-- 代码图结果始终是 metadata-only。报告、snapshot 和 CLI artifact 只能保留安全名称/ID 与相对 `CodeRef`，不能保留原始源码或把图关系写成 trace 证据。
+- 代码图结果始终是 metadata-only。报告、snapshot 和 CLI artifact 可以保留相对 `CodeRef` 及分析引用的源码，但不能把图关系写成 Trace 证据。
 - 系统文件夹选择器的变更请求必须同时具有 loopback Host、socket 与 Origin；只读能力探测可省略 Origin。选择器在 Docker、enterprise 或非 loopback 监听模式下关闭；目录绝对路径和 `rootAuthorization` 不会出现在 codebase list/detail/audit 响应中。
-- 私有源码/知识分析的原始 query、中间推理、工具参数和检索正文不写入 session、日志、报告或导出；Claude 本地 transcript 与 OpenAI Responses 存储会关闭，也不会读写跨会话 pattern、verifier 或 SQL 修复学习。最终结论与确定性 trace 证据会经过统一隐私投影；多轮连续性仅由当前进程内的受限会话上下文提供。
+- 原始 query、工具参数和完整检索载荷不额外写入日志；provider transcript、跨会话学习等后台边界保持独立。用户可见的分析结果和源码引用可以保存在本地历史、报告和快照中。私有知识库正文仍受其独立过滤规则约束。
 - 旧 RAG chunk 不受 code-aware 规则破坏；`app_source`、`kernel_source` 或 `registryOrigin=codebase_registry` 的 chunk 缺少 codebase metadata 时会 fail-closed。
 - 旧 `/api/rag/chunks/:id` 和 `/api/rag/search` 对 code-aware chunk 返回 hash/长度等 sanitized 信息，不返回源码正文。
 - Web UI 的“删除源码库”会先撤销检索与 provider 授权，再清理当前 scope 内的全部索引代际；删除中断时可安全重试。已经发送给 provider 的历史内容无法由本地删除操作撤回。
 - Patch 只分三态：`verified`、`sketch`、`unverified`。本次改动仍要求先由 indexed lookup 获得 `chunkId`；按需工具的 `referenceId` 不直接授权 patch。`sketch` 和 `unverified` 不给 copyable diff。
-- SSE、HTML report、CLI JSON/Markdown/HTML、analysis-result snapshot 和报告/snapshot API 共用同一安全源码 provenance 投影，不保留绝对 root、snippet 正文、检索 query 或模型自由文本原因。Web chat 内的折叠回执更严格：只保留 mode、status/reason code、coverage、selected/queried/used ID 和去重后的 mechanism status，不保留 `CodeRef`。回执只能绑定当前 run 的消息，不会回填到旧结论。
+- SSE、HTML report、CLI JSON/Markdown/HTML、analysis-result snapshot 和报告/snapshot API 共用用户结果投影，保留源码引用及具体校验原因；日志和公开材料使用严格投影。Web 折叠回执仍只保留 mode、status/reason code、coverage、selected/queried/used ID 和 mechanism status，不保留 `CodeRef`，且只绑定当前 run。
 
 ## 验证
 
@@ -170,7 +174,7 @@ npm --prefix backend run test:report-contracts
 E2E 覆盖两条路径：
 
 - 未给 session 配置 codebase：Light trace 正常完成，报告不出现 `CodeRef` / code-aware section。
-- 给 session 配置 HighPerformanceFriendsCircle：Heavy/Light trace 正常完成，报告和导出里出现 `CodeRef`，例如 `MainActivity.kt`、`LoadSimulator.kt` 的相对路径与行号；报告不得出现绝对 root path 或源码正文。
+- 给 session 配置 HighPerformanceFriendsCircle：Heavy/Light trace 正常完成，报告和导出里出现 `CodeRef`，例如 `MainActivity.kt`、`LoadSimulator.kt` 的相对路径与行号；报告不得暴露绝对 root path；用户结果允许保留源码引用，日志和公开材料仍不得包含原始源码。
 
 缺少本机资产时可用环境变量覆盖：
 

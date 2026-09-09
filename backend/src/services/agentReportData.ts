@@ -23,10 +23,10 @@ import { getTraceProcessorService } from './traceProcessorService';
 import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import {
   privateAnalysisQueryMessage,
-  projectPrivateAnalysisResult,
-  projectPrivateDataEnvelopes,
-  projectPrivateHypotheses,
-  projectPrivateStructuredValue,
+  projectOwnerAnalysisResult,
+  projectOwnerDataEnvelopes,
+  projectOwnerHypotheses,
+  projectOwnerStructuredValue,
   sessionUsesPrivateKnowledge,
 } from './security/privateAnalysisProjection';
 import type {SessionStateSnapshot} from '../agentv3/sessionStateSnapshot';
@@ -174,7 +174,7 @@ export function buildAgentDrivenReportData(
   // only carries the current turn's findings, but multi-turn reports need
   // the full picture to stay consistent with the timeline section.
   let cumulativeResult: ReportResultLike = privateKnowledge
-    ? projectPrivateAnalysisResult(
+    ? projectOwnerAnalysisResult(
         session.sessionId,
         result as import('../agent/core/orchestratorTypes').AnalysisResult,
         outputLanguage,
@@ -211,7 +211,7 @@ export function buildAgentDrivenReportData(
     codeLookupSummary?: SessionStateSnapshot['codeLookupSummary'];
   } })._lastSnapshot;
   const hypotheses = privateKnowledge
-    ? projectPrivateHypotheses(session.sessionId, session.hypotheses as any[])
+    ? projectOwnerHypotheses(session.sessionId, session.hypotheses as any[])
     : session.hypotheses;
   const sourceProvenance = projectSafeSourceProvenance({
     conclusionContract: cumulativeResult.conclusionContract,
@@ -245,16 +245,16 @@ export function buildAgentDrivenReportData(
     hypotheses: hypotheses as AgentDrivenReportData['hypotheses'],
     dialogue: privateKnowledge ? [] : session.agentDialogue as AgentDrivenReportData['dialogue'],
     conversationTimeline: privateKnowledge
-      ? []
+      ? projectOwnerStructuredValue(session.sessionId, session.conversationSteps)
       : session.conversationSteps as AgentDrivenReportData['conversationTimeline'],
     dataEnvelopes: (privateKnowledge
-      ? projectPrivateDataEnvelopes(session.sessionId, session.dataEnvelopes as any[])
+      ? projectOwnerDataEnvelopes(session.sessionId, session.dataEnvelopes as any[])
       : session.dataEnvelopes) as AgentDrivenReportData['dataEnvelopes'],
     agentResponses: privateKnowledge ? [] : session.agentResponses as AgentDrivenReportData['agentResponses'],
     timestamp: Date.now(),
     conversationTurns: session.runSequence || 1,
     queryHistory: privateKnowledge ? [] : session.queryHistory || [],
-    conclusionHistory: privateKnowledge ? [] : session.conclusionHistory || [],
+    conclusionHistory: privateKnowledge ? projectOwnerStructuredValue(session.sessionId, session.conclusionHistory || []) : session.conclusionHistory || [],
     // Snapshot-first — the HTTP route's persistence step stashes `_lastSnapshot`
     // on the session, the CLI's `persistTurnToBackend` does the same. Callers
     // that skip the snapshot step (tests, partial builds) fall through to
@@ -269,7 +269,7 @@ export function buildAgentDrivenReportData(
       ?? (typeof session.orchestrator.getSessionUncertaintyFlags === 'function'
         ? session.orchestrator.getSessionUncertaintyFlags(session.sessionId) : []),
     comparisonReportSection: privateKnowledge
-      ? projectPrivateStructuredValue(
+      ? projectOwnerStructuredValue(
           session.sessionId,
           snapshot?.comparisonReportSection ?? session.comparisonReportSection,
         )

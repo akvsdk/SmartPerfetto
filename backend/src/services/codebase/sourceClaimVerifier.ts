@@ -21,6 +21,7 @@ import {randomUUID} from 'node:crypto';
 import {
   composeCodeAwareTextProjectionReceipts,
   createCodeAwareStreamingTextProjection,
+  withOwnerCodeAwareProjection,
   isIssuedCodeAwareTextProjectionReceipt,
   projectCodeAwareStructuredText,
   sanitizeCodeAwareStructuredText,
@@ -644,4 +645,12 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
     ? issueConclusionProtocolProjection({original: originalDeclaration, result, nativeCandidate, displayCandidate}) : undefined;
   return {result, conclusionProjection, ...(deliveryContext ? {deliveryContext} : {}),
     ...(protocolProjection ? {protocolProjection} : {})};
+}
+
+
+/** Runtime delivery to the source owner; verification and issued receipts are unchanged. */
+export function finalizeOwnerSourceAwareAnalysisResultWithProjection(
+  ...args: Parameters<typeof finalizeSourceAwareAnalysisResultWithProjection>
+): SourceAwareAnalysisProjection {
+  return withOwnerCodeAwareProjection(() => finalizeSourceAwareAnalysisResultWithProjection(...args));
 }

@@ -23,11 +23,11 @@ import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import type {OutputLanguage} from '../agentv3/outputLanguage';
 import {
   privateAnalysisQueryMessage,
-  projectPrivateDataEnvelopes,
-  projectPrivateTerminationMessage,
+  projectOwnerDataEnvelopes,
+  projectOwnerTerminationMessage,
   projectPrivateTerminationReason,
-  projectPrivateUiActionProposals,
-  projectPrivateAnalysisResult,
+  projectOwnerUiActionProposals,
+  projectOwnerAnalysisResult,
   copyAnalysisResultForSnapshot,
 } from './security/privateAnalysisProjection';
 import type {AnalysisResult} from '../agent/core/orchestratorTypes';
@@ -634,7 +634,7 @@ export function persistCompletedAnalysisResultSnapshot(
 ): AnalysisResultSnapshot | null {
   const outputLanguage = input.outputLanguage
     ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
-  const privateResult = input.privateKnowledge ? projectPrivateAnalysisResult(input.sessionId, {
+  const privateResult = input.privateKnowledge ? projectOwnerAnalysisResult(input.sessionId, {
     sessionId: input.sessionId, success: input.success ?? true,
     findings: [], hypotheses: [], conclusion: input.conclusion ?? '',
     confidence: input.confidence ?? 0, rounds: 0, totalDurationMs: 0,
@@ -663,13 +663,13 @@ export function persistCompletedAnalysisResultSnapshot(
         claimVerificationResult: privateResult?.claimVerificationResult,
         identityResolutions: privateResult?.identityResolutions,
         terminationReason: projectPrivateTerminationReason(input.terminationReason),
-        terminationMessage: projectPrivateTerminationMessage(input.terminationMessage, outputLanguage, privateResult ?? input),
+        terminationMessage: projectOwnerTerminationMessage(input.terminationMessage, outputLanguage, privateResult ?? input),
         analysisReceipt: privateResult?.analysisReceipt,
-        uiActionProposals: projectPrivateUiActionProposals(
+        uiActionProposals: projectOwnerUiActionProposals(
           input.sessionId,
           input.uiActionProposals,
         ),
-        dataEnvelopes: projectPrivateDataEnvelopes(input.sessionId, input.dataEnvelopes || []),
+        dataEnvelopes: projectOwnerDataEnvelopes(input.sessionId, input.dataEnvelopes || []),
       }
     : input;
   const snapshot = buildCompletedAnalysisResultSnapshot(durableInput);

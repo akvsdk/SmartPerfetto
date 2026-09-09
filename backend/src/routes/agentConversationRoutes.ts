@@ -41,7 +41,7 @@ import {
 import {buildAnalysisContextAuthorizationFingerprint} from '../services/resolvedAnalysisContext';
 import {knowledgeScopeFromRequestContext} from '../services/scopedKnowledgeStore';
 import {
-  privateAnalysisFailureMessage,
+  projectOwnerAnalysisError,
   privateAnalysisQueryMessage,
 } from '../services/security/privateAnalysisProjection';
 import {readTraceMetadataForContext} from '../services/traceMetadataStore';
@@ -138,7 +138,7 @@ function settleRun(session: ConversationSession, run: ConversationRun): void {
         ? 'awaiting_user'
         : 'completed';
   const error = run.error && conversationRunUsesPrivateKnowledge(session, run)
-    ? privateAnalysisFailureMessage(session.outputLanguage ?? configuredOutputLanguage())
+    ? projectOwnerAnalysisError(undefined, run.error, session.outputLanguage ?? configuredOutputLanguage())
     : run.error;
   persistAnalysisRunState(runScope(session, run), status, {error});
 }
@@ -455,7 +455,7 @@ async function startConversation(req: express.Request, res: express.Response): P
     const message = error instanceof Error ? error.message : String(error);
     res.status(/not found/i.test(message) ? 404 : /in progress|cancellation/i.test(message) ? 409 : 500).json({
       success: false,
-      error: privateKnowledge ? privateAnalysisFailureMessage(failureLanguage) : message,
+      error: privateKnowledge ? projectOwnerAnalysisError(undefined, message, failureLanguage) : message,
     });
   }
 }

@@ -9,7 +9,7 @@ jest.mock('../traceProcessorService', () => ({
 
 import {buildAgentDrivenReportData} from '../agentReportData';
 import {HTMLReportGenerator} from '../htmlReportGenerator';
-import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../security/codeAwareOutputRegistry';
+import {clearCodeAwareOutputGuards, registerCodeAwareCanary, registerOnDemandSourceLookupForEcho} from '../security/codeAwareOutputRegistry';
 import {sanitizeSourceReference} from '../codebase/sourceUseDecision';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 
@@ -25,8 +25,10 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
     totalDurationMs: 10,
   });
 
-  it('keeps verified conclusion and deterministic evidence but drops intermediate model prose', () => {
+  it('retains owner source commentary and evidence while filtering private canaries and raw internals', () => {
     const sessionId = 'private-report-session';
+    const source = 'fun scheduleFrame() { workOnMainThread() }';
+    registerOnDemandSourceLookupForEcho(sessionId, [{referenceId: 'report-source', codebaseId: 'private-app', filePath: 'Main.kt', text: source}]);
     [
       'PRIVATE_CONCLUSION_CANARY',
       'PRIVATE_FINDING_CANARY',
@@ -36,6 +38,8 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
       'PRIVATE_VERIFICATION_CANARY',
       'PRIVATE_IDENTITY_CANARY',
       'PRIVATE_ACTION_CANARY',
+      'PRIVATE_STEP_CANARY',
+      'PRIVATE_HISTORY_CANARY',
     ].forEach(canary => registerCodeAwareCanary(sessionId, canary));
     const report = buildAgentDrivenReportData({
       session: {
@@ -52,7 +56,7 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
         },
         hypotheses: [{description: 'PRIVATE_HYPOTHESIS_CANARY'}],
         agentDialogue: [{content: 'PRIVATE_DIALOGUE_CANARY'}],
-        conversationSteps: [{text: 'PRIVATE_STEP_CANARY'}],
+        conversationSteps: [{text: `${source} PRIVATE_STEP_CANARY`}],
         dataEnvelopes: [{meta: {kind: 'sql'}, data: {rows: [[1]]}, display: {type: 'table'}}],
         agentResponses: [{response: 'PRIVATE_RESPONSE_CANARY'}],
         runSequence: 1,
@@ -123,7 +127,7 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
     expect(report.result.identityResolutions).toHaveLength(1);
     expect(report.result.uiActionProposals).toHaveLength(1);
     expect(report.dialogue).toEqual([]);
-    expect(report.conversationTimeline).toEqual([]);
+    expect(report.conversationTimeline).toEqual([{text: expect.stringContaining(source)}]);
     expect(report.agentResponses).toEqual([]);
     expect(report.analysisNotes).toEqual([]);
     expect(report.analysisPlan).toBeNull();

@@ -2,7 +2,7 @@
 
 [English](code-aware-analysis.en.md) | [中文](code-aware-analysis.md)
 
-Code-Aware Analysis lets SmartPerfetto inspect selected local source on demand and connect trace anchors to `CodeRef` locations. A live registered root supports bounded search and reading without an index. **Add and use for analysis** combines explicit provider consent with the current selection; **Add only** registers a selectable codebase without enabling it. Indexing is optional acceleration for semantic/symbol lookup and patch workflows. Raw source text is not persisted in sessions, reports, or exports.
+Code-Aware Analysis lets SmartPerfetto inspect selected local source on demand and connect trace anchors to `CodeRef` locations. A live registered root supports bounded search and reading without an index. **Add and use for analysis** combines explicit provider consent with the current selection; **Add only** registers a selectable codebase without enabling it. Indexing is optional acceleration for semantic/symbol lookup and patch workflows. Analysis results and quoted source may be saved in local history, reports, and exports.
 
 ## Enable It
 
@@ -79,7 +79,11 @@ Each run retains `SourceUseDecisionV1`:
 
 The returned `sourceReferences[].id` can be used directly in `sourceClaimBindings[].sourceReferenceIds`. References must come from actual current-run outputs within the current selection. Model-invented references and ambiguous aliases are rejected. At reference capacity, tools report the limit rather than delivering references the verifier cannot accept. The Web receipt distinguishes located source, supplied snippets, and actual verification outcomes; a model's mechanism declaration is not a passed check.
 
-The process view retains safe tool-call and result summaries. It omits raw queries, source text, absolute roots, and intermediate model text, without replacing every event with repetitive privacy messages.
+The process view retains tool calls, outcome summaries, and model-provided analysis commentary; conclusions can quote source. Raw tool payloads are not dumped into chat or logs.
+
+Source searches, reads, and additional model analysis make the workflow longer and increase analysis time. Relevant snippets are sent to the configured AI service, including internal company services. Retention depends on that service’s configuration and policy; SmartPerfetto cannot promise third-party zero retention.
+
+A failed check concerns result reliability or completeness, such as missing evidence, mismatched source/Trace references, incomplete report coverage, or unfinished execution. Results remain readable with their specific reasons and quality status; this is not a privacy-review verdict.
 
 ## Evidence Order And Optional Code Graphs
 
@@ -168,14 +172,14 @@ does not change current authorization.
 - `metadata_only`: the model can search on demand but receives only relative paths, line ranges, and `referenceId`, not source text.
 - `provider_send`: bounded, redacted search/read text can be sent only when the codebase is selected for this run, registered with `sendToProvider` consent, and the relative path is admitted by both the current selection and consent grant. When selection/grant revisions differ, newly added scope stays metadata-only and the authorized intersection is never expanded implicitly.
 - On-demand tools enforce registered path filters, exclude globs, file types, per-file size, result and line limits, and secret redaction. Absolute roots remain inside the backend trust boundary and never enter tool results, model context, reports, or exports.
-- Code-graph results are always metadata-only. Reports, snapshots, and CLI artifacts may retain only safe names/IDs and relative `CodeRef` values, never raw source or a graph relationship presented as trace evidence.
+- Code-graph results are always metadata-only. Reports, snapshots, and CLI artifacts may retain relative `CodeRef` values and source quoted in the analysis, but must not present graph relationships as Trace evidence.
 - System-picker mutation requests require a loopback Host, socket, and Origin; the read-only capability probe may omit Origin. The picker is disabled for Docker, enterprise, or non-loopback listeners. Absolute roots and `rootAuthorization` are never returned by codebase list/detail/audit responses.
-- Raw queries, intermediate reasoning, tool arguments, and retrieved text from private source/knowledge runs are not persisted to sessions, logs, reports, or exports. Claude local transcripts and OpenAI Responses storage are disabled, and cross-session pattern, verifier, and SQL-fix learning is neither read nor written. Final conclusions and deterministic trace evidence pass through one shared privacy projection; bounded in-process session context provides multi-turn continuity.
+- Raw queries, tool arguments, and complete retrieval payloads are not additionally written to logs. Provider transcripts and cross-session learning retain their separate restrictions. User-visible analysis results and source quotations may be saved in local history, reports, and snapshots. Private knowledge text retains its independent filtering policy.
 - Legacy RAG chunks keep their existing behavior; `app_source`, `kernel_source`, or `registryOrigin=codebase_registry` chunks without codebase metadata fail closed.
 - Legacy `/api/rag/chunks/:id` and `/api/rag/search` return sanitized hash/length data for code-aware chunks, not source text.
 - Web UI “Delete codebase” revokes retrieval and provider consent before removing every indexed generation in the current scope; interrupted deletion is safe to retry. Local deletion cannot recall content already sent to a provider.
 - Patch proposals have three states: `verified`, `sketch`, and `unverified`. This change still requires an indexed lookup `chunkId`; on-demand `referenceId` values do not directly authorize a patch. `sketch` and `unverified` never expose a copyable diff.
-- SSE, HTML reports, CLI JSON/Markdown/HTML, analysis-result snapshots, and report/snapshot APIs share one safe source-provenance projector. None retains absolute roots, snippets, search queries, or model-authored free-text reasons. The collapsible Web chat receipt is stricter: it keeps only mode, status/reason code, coverage, selected/queried/used IDs, and unique mechanism statuses, with no `CodeRef`. It can attach only to the current run's message and never backfills an older conclusion.
+- SSE, HTML reports, CLI JSON/Markdown/HTML, analysis-result snapshots, and report/snapshot APIs share the owner-result projection, retaining source quotations and specific check failures. Logs and public artifacts use the strict projection. The collapsible Web receipt remains metadata-only: mode, status/reason code, coverage, selected/queried/used IDs, and mechanism status, without `CodeRef`, bound only to the current run.
 
 ## Verification
 
@@ -196,7 +200,7 @@ The local full E2E uses:
 The E2E covers both paths:
 
 - No codebase configured for the session: Light trace completes normally and the report has no `CodeRef` / code-aware section.
-- HighPerformanceFriendsCircle configured for the session: Heavy/Light traces complete normally and reports/exports contain `CodeRef` entries such as relative `MainActivity.kt` and `LoadSimulator.kt` file paths with line ranges; reports must not contain the absolute root path or raw source text.
+- HighPerformanceFriendsCircle configured for the session: Heavy/Light traces complete normally and reports/exports contain `CodeRef` entries such as relative `MainActivity.kt` and `LoadSimulator.kt` file paths with line ranges; reports must not expose absolute roots. Owner results may retain quoted source; logs and public artifacts must still exclude raw source.
 
 Override paths when needed:
 

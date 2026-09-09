@@ -10,11 +10,11 @@ import {copyAnalysisDeliveryFields} from '../services/security/analysisDeliveryP
 import {parseOutputLanguage} from '../agentv3/outputLanguage';
 import {
   privateAnalysisQueryMessage,
-  projectPrivateAnalysisResult,
+  projectOwnerAnalysisResult,
   copyAnalysisResultForSnapshot,
-  projectPrivateConclusion,
-  projectPrivateStructuredValue,
-  projectPrivateTerminationMessage,
+  projectOwnerConclusion,
+  projectOwnerStructuredValue,
+  projectOwnerTerminationMessage,
   projectPrivateTerminationReason,
   sessionUsesPrivateKnowledge,
 } from '../services/security/privateAnalysisProjection';
@@ -62,21 +62,21 @@ export function registerAgentReportRoutes(
     const outputLanguage = session.outputLanguage
       ?? parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
     const result = privateKnowledge
-      ? projectPrivateAnalysisResult(sessionId, storedResult, outputLanguage)
+      ? projectOwnerAnalysisResult(sessionId, storedResult, outputLanguage)
       : copyAnalysisResultForSnapshot(storedResult);
     const conclusion = result.conclusion;
     const findings = Array.isArray(result.findings) ? result.findings : [];
     const rawClientFindings = deps.buildClientFindings(findings, session.scenes || []);
     const clientFindings = privateKnowledge
-      ? projectPrivateStructuredValue(sessionId, rawClientFindings)
+      ? projectOwnerStructuredValue(sessionId, rawClientFindings)
       : rawClientFindings;
     const rawResultContract = deps.buildSessionResultContract(session, rawClientFindings);
     const resultContract = privateKnowledge
-      ? projectPrivateStructuredValue(sessionId, rawResultContract)
+      ? projectOwnerStructuredValue(sessionId, rawResultContract)
       : rawResultContract;
     const rawHypotheses = Array.isArray(result.hypotheses) ? result.hypotheses : [];
     const hypotheses = privateKnowledge
-      ? projectPrivateStructuredValue(sessionId, rawHypotheses)
+      ? projectOwnerStructuredValue(sessionId, rawHypotheses)
       : rawHypotheses;
     const conversationTimeline = Array.isArray(session.conversationSteps)
       ? session.conversationSteps
@@ -123,7 +123,7 @@ export function registerAgentReportRoutes(
           ? projectPrivateTerminationReason(result.terminationReason)
           : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
+          ? projectOwnerTerminationMessage(result.terminationMessage, outputLanguage, result)
           : result.terminationMessage,
       },
       reportUrl: completedPayload?.finalArtifacts?.reportUrl,
@@ -134,7 +134,7 @@ export function registerAgentReportRoutes(
       claimVerificationResult: rawClaimVerification,
       identityResolutions: rawIdentityResolutions,
       uiActionProposals: privateKnowledge
-        ? projectPrivateStructuredValue(sessionId, rawUiActionProposals)
+        ? projectOwnerStructuredValue(sessionId, rawUiActionProposals)
         : rawUiActionProposals,
       findings: clientFindings.map((f: any) => ({
         id: f.id,
@@ -149,7 +149,7 @@ export function registerAgentReportRoutes(
         status: h.status,
         confidence: h.confidence,
       })),
-      conversationTimeline: (privateKnowledge ? [] : conversationTimeline).map((step: any) => ({
+      conversationTimeline: (privateKnowledge ? projectOwnerStructuredValue(sessionId, conversationTimeline) : conversationTimeline).map((step: any) => ({
         eventId: step.eventId,
         ordinal: step.ordinal,
         phase: step.phase,
@@ -159,7 +159,7 @@ export function registerAgentReportRoutes(
         sourceEventType: step.sourceEventType,
       })),
       queryHistory: privateKnowledge ? [] : session.queryHistory || [],
-      conclusionHistory: privateKnowledge ? [] : session.conclusionHistory || [],
+      conclusionHistory: privateKnowledge ? projectOwnerStructuredValue(sessionId, session.conclusionHistory || []) : session.conclusionHistory || [],
       analysisNotes,
       analysisPlan,
       uncertaintyFlags,

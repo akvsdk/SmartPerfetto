@@ -507,13 +507,13 @@ describe('owner guard for agent session routes', () => {
     expect(recoverResultForSessionIfNeeded).not.toHaveBeenCalled();
   });
 
-  it('projects private session reports without intermediate model state or provider errors', async () => {
+  it('retains owner report commentary and history while filtering protected values and raw state', async () => {
     const {app} = makeAgentApp();
     registerPrivateAnalysisQueryForEcho(
       'private-session',
       'PRIVATE_QUERY_CANARY PRIVATE_REPORT_CANARY',
     );
-    [
+    const protectedCanaries = [
       'PRIVATE_FINDING_CANARY',
       'PRIVATE_HYPOTHESIS_CANARY',
       'PRIVATE_CLAIM_CANARY',
@@ -524,7 +524,8 @@ describe('owner guard for agent session routes', () => {
       'PRIVATE_PAYLOAD_IDENTITY_CANARY',
       'PRIVATE_RESULT_CONTRACT_CANARY',
       'PRIVATE_TERMINATION_CANARY',
-    ].forEach(canary => registerCodeAwareCanary('private-session', canary));
+    ];
+    protectedCanaries.forEach(canary => registerCodeAwareCanary('private-session', canary));
 
     try {
       const res = await authHeaders(request(app).get('/api/agent/v1/private-session/report'));
@@ -539,8 +540,8 @@ describe('owner guard for agent session routes', () => {
         identityResolutions: [expect.objectContaining({version: 'identity_contract@1',
           identityRefId: '[REDACTED_CODE_ECHO]', status: 'weak'})],
         resultContract: expect.any(Object),
-        conversationTimeline: [],
-        conclusionHistory: [],
+        conversationTimeline: [{text: 'PRIVATE_TIMELINE_CANARY'}],
+        conclusionHistory: [{conclusion: 'PRIVATE_HISTORY_CANARY'}],
         analysisNotes: [],
         analysisPlan: null,
         uncertaintyFlags: [],
@@ -550,10 +551,18 @@ describe('owner guard for agent session routes', () => {
         'Private source or knowledge analysis request (original content not persisted)',
       );
       expect(res.body.report.summary.terminationMessage).toBe(
-        'Parts of this result remain incomplete or have not passed checks; detailed diagnostics are hidden by the privacy policy.',
+        '[REDACTED_CODE_ECHO]',
       );
       expect(res.body.report.summary.terminationMessage).not.toContain('PRIVATE_TERMINATION_CANARY');
-      expect(JSON.stringify(res.body)).not.toMatch(/PRIVATE_[A-Z_]+_CANARY/);
+      expect(res.body.report.summary).toEqual(expect.objectContaining({
+        conclusion: 'safe conclusion PRIVATE_REPORT_CANARY', partial: true, terminationReason: 'execution_error',
+      }));
+      // Ordinary source/query quotations are owner-visible; registered canaries
+      // and raw prompt/runtime state remain protected independently.
+      for (const canary of [...protectedCanaries, 'PRIVATE_QUERY_CANARY', 'PRIVATE_NOTE_CANARY',
+        'PRIVATE_PLAN_CANARY', 'PRIVATE_FLAG_CANARY', 'PRIVATE_LOG_CANARY']) {
+        expect(JSON.stringify(res.body)).not.toContain(canary);
+      }
     } finally {
       clearCodeAwareOutputGuards('private-session');
     }

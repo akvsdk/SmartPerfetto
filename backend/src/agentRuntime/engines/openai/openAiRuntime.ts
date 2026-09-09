@@ -57,7 +57,7 @@ import {RuntimeExecutionGuard, type RuntimeExecutionLease} from '../../runtimeEx
 import {createRuntimePerformanceRun, runtimeOutcomeFromError, type RuntimePerformanceOutcome, type RuntimePerformanceRun} from '../../runtimePerformance';
 import {OPENAI_AGENT_RUNTIME_KIND} from '../../runtimeKinds';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
-import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
+import {finalizeOwnerSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import {countCompletedQuickConversationTurns} from '../../quickDirectResult';
 import {buildRuntimeTracePairComparisonContext} from '../../runtimePromptContext';
 import {createResettableRuntimeTimeout, resolveFullRequestTimeoutMs, serializedByteLength, summarizeExternalToolResult} from '../../runtimeLimits';
@@ -215,7 +215,7 @@ function finalizeOpenAiCandidate(input: {
   }
   const nativeContext: AnalysisDeliveryContext = {entry: 'runtime_draft', acceptedCandidate,
     completion: result.completion, outputOrigin: input.outputOrigin, turnIntent: result.turnIntent};
-  const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, input.sourceUse, {
+  const finalized = finalizeOwnerSourceAwareAnalysisResultWithProjection(result, input.sourceUse, {
     context: nativeContext,
   });
   if (finalized.result.quickRun) {
@@ -829,7 +829,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
         let streamCompleted = false;
         const answerStreamFilter = createOpenAiReasoningFilterState();
         const answerTextProjection = analysisContextUsesPrivateKnowledge(options)
-          ? createCodeAwareStreamingTextProjection(sessionId, `openai-answer-${attemptId}`) : undefined;
+          ? createCodeAwareStreamingTextProjection(sessionId, `openai-answer-${attemptId}`, 'owner') : undefined;
         const toolInputsByTaskId = new Map<string, {toolName: string; args: Record<string, unknown>}>();
         const processedToolResultIds = new Set<string>();
         const reasoningThoughts = new ReasoningThoughtBuffer();
