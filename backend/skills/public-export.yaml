@@ -32,6 +32,15 @@ sql_fragments:
   backend/skills/fragments/flutter_process_identity.sql:
     disposition: exported
     destination: references/generated/runtime/fragments/flutter_process_identity.sql
+  backend/skills/fragments/main_thread_work.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/main_thread_work.sql
+  backend/skills/fragments/main_thread_work_cadence.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/main_thread_work_cadence.sql
+  backend/skills/fragments/main_thread_work_tasks.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/main_thread_work_tasks.sql
   backend/skills/fragments/root_cause_sample_cap.sql:
     disposition: exported
     destination: references/generated/runtime/fragments/root_cause_sample_cap.sql
