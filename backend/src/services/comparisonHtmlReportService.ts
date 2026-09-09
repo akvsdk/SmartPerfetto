@@ -3,6 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import crypto from 'crypto';
+import {investigationStatusLines} from './analysisInvestigationPresentation';
 import { persistReport } from '../routes/reportRoutes';
 import type {
   ComparisonDelta,
@@ -151,6 +152,9 @@ function renderSnapshots(result: ComparisonResult): string {
     <div class="snapshot">
       <div class="snapshot-title">${escapeHtml(snapshot.title || snapshot.traceLabel)}</div>
       <div class="snapshot-meta">${escapeHtml(snapshot.snapshotId)} &middot; ${escapeHtml(snapshot.sceneType)} &middot; ${escapeHtml(snapshot.traceLabel)}</div>
+      ${investigationStatusLines(snapshot.investigationAssurance, 'en').map(line => `<p>${escapeHtml(line)}</p>`).join('')}
+      ${snapshot.investigationAssessment ? `<details><summary>Saved investigation dimensions and evidence</summary>
+        <pre>${escapeHtml(JSON.stringify(snapshot.investigationAssessment, null, 2))}</pre></details>` : ''}
     </div>
   `).join('');
 }

@@ -3,6 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {EventEmitter} from 'events';
+import {resolveAnalysisHistoryReader, createAnalysisHistoryReader, createRuntimeAnalysisHistoryReader, type AnalysisHistoryReader, toAnalysisHistoryTurn} from '../../../agentRuntime/analysisHistory';
 import {setImmediate as nextImmediate} from 'node:timers/promises';
 import {beforeEach, describe, expect, it, jest} from '@jest/globals';
 import type {FinalizeAnalysisResultInput, FinalizedAnalysisResult} from '../../../services/finalizeAnalysisResult';
@@ -552,11 +553,14 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
   });
 
   it.each(['provider_send', 'metadata_only', 'off', undefined] as const)(
-    'uses actual %s authorization to retain or filter source-derived history', async codeAwareMode => {
+    'rejects legacy source history without a fingerprint under %s authorization', async codeAwareMode => {
       let receivedQuery = '';
+      let history = '';
       const orchestrator = createOrchestrator(async () => result('trace answer'));
-      orchestrator.analyze = jest.fn<IOrchestrator['analyze']>(async query => {
+      orchestrator.analyze = jest.fn<IOrchestrator['analyze']>(async (query, _session, _trace, options) => {
         receivedQuery = query;
+        history = JSON.stringify(resolveAnalysisHistoryReader(options!,
+          createAnalysisHistoryReader({getTurns: () => [], assertActive: () => {}})).getTurns());
         return result('trace answer');
       });
       const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: {
@@ -568,11 +572,103 @@ describe('OrchestratorConversationRuntimeAdapter', () => {
           {role: 'assistant', content: '普通 Trace 回答'},
           {role: 'assistant', content: 'PRIVATE_SOURCE_DERIVED_CANARY', sourceDerived: true},
         ], traceContext: {kind: 'attached', traceId: 'trace-1'}});
-      expect(receivedQuery).toContain('普通 Trace 回答');
-      expect(receivedQuery.includes('PRIVATE_SOURCE_DERIVED_CANARY')).toBe(
-        codeAwareMode === 'provider_send' || codeAwareMode === 'metadata_only');
+      expect(receivedQuery).not.toContain('普通 Trace 回答');
+      expect(history).toContain('普通 Trace 回答');
+      expect(history).not.toContain('PRIVATE_SOURCE_DERIVED_CANARY');
     },
   );
+
+  it('keeps explicit source A and B history scoped through the real runtime wrapper and rejects unknown legacy grants', async () => {
+    const check = jest.spyOn(authorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {});
+    const options: AnalysisOptions = {codeAwareMode: 'provider_send', codebaseIds: ['source-a'], analysisContextFingerprint: 'grant-a'};
+    const turns = ['a', 'b', 'legacy'].map((source, index) => toAnalysisHistoryTurn({
+      id: `turn-${source}`, turnIndex: index, query: `QUERY_${source}`, traceId: 'trace-1', timestamp: index,
+      sourceDerived: true, ...(source !== 'legacy' ? {analysisContextFingerprint: `grant-${source}`} : {}),
+      result: {conclusion: `ANSWER_${source}`, completion: {status: 'completed'}},
+    }));
+    const received: string[][] = [];
+    try {
+      const orchestrator = createOrchestrator(async () => result('answer'));
+      orchestrator.analyze = jest.fn<IOrchestrator['analyze']>(async (_query, _session, _trace, runtimeOptions) => {
+        const reader = createRuntimeAnalysisHistoryReader({options: {...runtimeOptions!}, sessionId: _session, traceId: _trace,
+          getTurns: () => [], assertActive: () => {}});
+        received.push(reader.getTurns().map(turn => turn.id));
+        const forbidden = options.analysisContextFingerprint === 'grant-a' ? 'turn-b' : 'turn-a';
+        expect(reader.read({turnId: forbidden})).toMatchObject({success: false});
+        expect(reader.read({turnId: 'turn-legacy'})).toMatchObject({success: false});
+        return result('answer');
+      });
+      const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: options});
+      const input = {sessionId: 'scope-switch', query: '结合源码继续', history: [], getHistoryTurns: () => turns,
+        traceContext: {kind: 'attached' as const, traceId: 'trace-1'}};
+      await adapter.run({...input, runId: 'run-a'});
+      options.codebaseIds = ['source-b']; options.analysisContextFingerprint = 'grant-b';
+      await adapter.run({...input, runId: 'run-b'});
+      options.analysisContextFingerprint = undefined;
+      await adapter.run({...input, runId: 'run-unknown'});
+      expect(received).toEqual([['turn-a'], ['turn-b'], []]);
+      expect(turns[2].analysisContextFingerprint).toBeUndefined();
+      await adapter.dispose();
+    } finally {check.mockRestore();}
+  });
+
+  it('restores matching knowledge-only history through the runtime wrapper and denies every read after revocation', async () => {
+    let revoked = false;
+    const check = jest.spyOn(authorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(selection => {
+      expect(selection.knowledgeSourceIds).toEqual(['private-wiki']);
+      if (revoked) throw new authorization.AnalysisContextAuthorizationChangedError();
+    });
+    const restoredTurn = toAnalysisHistoryTurn({id: 'restored-knowledge', turnIndex: 0,
+      query: 'Prior knowledge question', traceId: 'trace-1', timestamp: 1, sourceDerived: true,
+      analysisContextFingerprint: 'knowledge-grant', result: {conclusion: 'Retained knowledge conclusion', partial: true}});
+    try {
+      const orchestrator = createOrchestrator(async () => result('answer'));
+      orchestrator.analyze = jest.fn<IOrchestrator['analyze']>(async (_query, sessionId, traceId, runtimeOptions) => {
+        expect(runtimeOptions?.sourceUsePolicy).toBeUndefined();
+        const reader = createRuntimeAnalysisHistoryReader({options: {...runtimeOptions!}, sessionId, traceId,
+          getTurns: () => [], assertActive: () => {}});
+        expect(reader.getTurns()).toEqual([restoredTurn]);
+        expect(reader.read({turnId: restoredTurn.id})).toMatchObject({success: true});
+        revoked = true;
+        expect(() => reader.getTurns()).toThrow('analysis_context_changed_restart_required');
+        expect(() => reader.read({turnId: restoredTurn.id})).toThrow('analysis_context_changed_restart_required');
+        revoked = false;
+        return result('answer');
+      });
+      const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: {
+        codeAwareMode: 'off', knowledgeSourceIds: ['private-wiki'], analysisContextFingerprint: 'knowledge-grant',
+      }});
+      await adapter.run({sessionId: 'knowledge-conversation', runId: 'knowledge-followup', query: '继续解释上一轮',
+        history: [], getHistoryTurns: () => [restoredTurn], traceContext: {kind: 'attached', traceId: 'trace-1'}});
+      expect(orchestrator.analyze).toHaveBeenCalledTimes(1);
+      await adapter.dispose();
+    } finally {check.mockRestore();}
+  });
+
+  it('filters both sides of dormant source turns and rechecks authorization for every historical read', async () => {
+    let reader: AnalysisHistoryReader | undefined;
+    let revoked = false;
+    const check = jest.spyOn(authorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
+      if (revoked) throw new authorization.AnalysisContextAuthorizationChangedError();
+    });
+    try {
+      const orchestrator = createOrchestrator(async () => result('answer'));
+      orchestrator.analyze = jest.fn<IOrchestrator['analyze']>(async (_query, _session, _trace, options) => {
+        reader = resolveAnalysisHistoryReader(options!, createAnalysisHistoryReader({getTurns: () => [], assertActive: () => {}}));
+        expect(JSON.stringify(reader.getTurns())).not.toMatch(/SOURCE_QUERY_CANARY|SOURCE_ANSWER_CANARY/);
+        revoked = true;
+        expect(() => reader!.read({turnId: 'legacy-1'})).toThrow('analysis_context_changed_restart_required');
+        revoked = false;
+        return result('answer');
+      });
+      const adapter = new OrchestratorConversationRuntimeAdapter(orchestrator, {analysisOptions: {codeAwareMode: 'off'}});
+      await adapter.run({sessionId: 'history-auth', runId: 'history-run', query: 'continue', traceContext: {kind: 'none'},
+        history: [{role: 'user', content: 'SOURCE_QUERY_CANARY'},
+          {role: 'assistant', content: 'SOURCE_ANSWER_CANARY', sourceDerived: true}]});
+      await adapter.dispose();
+      expect(() => reader!.read({})).toThrow();
+    } finally {check.mockRestore();}
+  });
 
   it.each([
     '```xml\n<invoke name="example">quoted text</invoke>\n```',

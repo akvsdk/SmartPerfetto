@@ -6,6 +6,9 @@ import {createHash} from 'node:crypto';
 import type {AnalysisTurnIntent} from '../agentRuntime/analysisTurnIntent';
 import type {AgentRuntimeKind} from '../agentRuntime/runtimeKinds';
 import type {CaseKnowledgeReportRecommendation} from './caseKnowledge';
+import type {ResolvedAnalysisInvestigationRequirements} from './analysisInvestigation';
+import type {FinalInvestigationAssessment} from './analysisInvestigationAssessment';
+import type {InvestigationEvidenceSnapshot} from '../services/evidence/investigationEvidenceLedger';
 
 export type AnalysisDeliveryEntry = 'runtime_draft' | 'new_finalization' | 'historical_restore';
 export type AnalysisAssuranceStatus =
@@ -133,6 +136,9 @@ interface CurrentAnalysisDeliveryContext {
   sourceScopeFingerprint?: string;
   reportRequirements?: PinnedAnalysisReportRequirements;
   reportAssessment?: FinalReportAssessment;
+  investigationRequirements?: ResolvedAnalysisInvestigationRequirements;
+  investigationEvidence?: InvestigationEvidenceSnapshot;
+  investigationAssessment?: FinalInvestigationAssessment;
   caseRetrieval?: AnalysisCaseRetrievalState;
 }
 
@@ -154,6 +160,9 @@ export interface AnalysisDeliveryAssurance {
   source: AnalysisAssuranceStatus;
   identity: AnalysisAssuranceStatus;
   report: AnalysisAssuranceStatus;
+  /** Independent of native completion, report formatting and claim truth. */
+  investigation?: AnalysisAssuranceStatus;
+  investigationEvidence?: AnalysisAssuranceStatus;
 }
 
 /** Conservative content address; changing even whitespace creates a new body. */

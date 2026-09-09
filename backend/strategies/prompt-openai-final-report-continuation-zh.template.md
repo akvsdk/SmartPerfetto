@@ -1,7 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
 <!-- Copyright (C) 2024-2026 Gracker (Chris) | SmartPerfetto -->
 
-当前原生候选需要完成修正，原因代码：{{completion_reason}}。output_limit 表示模型输出上限；empty_body 表示去除机器协议片段后没有正文；invalid_protocol 表示声明协议的格式或字段不合法。这是同一轮分析中唯一一次完成答案的机会，工具已关闭。
+当前原生候选需要完成修正，原因代码：{{completion_reason}}。output_limit 表示模型输出上限；empty_body 表示去除机器协议片段后没有正文；invalid_protocol 表示声明协议的格式或字段不合法；turn_limit 表示调查轮次已用完，现在使用总预算内预留的一轮总结。这是同一轮分析中唯一一次完成答案的机会，工具已关闭。
+
+若原因为 turn_limit，先明确说明调查尚未完整结束，概括已有证据支持的发现及未完成项；证据不足时直接说明不能得出根因。不要把计划或假设的状态当成已验证发现。
 
 请仅依据本轮完整对话中已经返回的证据，重新输出一份从头到尾完整、简洁且自包含的答案，替换刚才的未完成候选；不要只续写尾部，不要重复工具调用，不要声称未完成的分析阶段已完成。
 

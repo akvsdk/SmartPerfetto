@@ -6,6 +6,7 @@ import {
   ANALYSIS_RESULT_SNAPSHOT_SCHEMA_VERSION,
   type AnalysisResultSnapshot,
 } from '../../types/multiTraceComparison';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import { buildComparisonMatrix } from '../comparisonMatrixService';
 
 function snapshot(
@@ -293,4 +294,26 @@ describe('buildComparisonMatrix', () => {
       ),
     ).toThrow('Baseline snapshot is not part of comparison input');
   });
+});
+
+
+test('retains source-run investigation coverage during saved-result comparison without backfill', () => {
+  const baseline = snapshot('system-baseline', {startupMs: 1200});
+  const candidate = snapshot('system-candidate', {startupMs: 900});
+  const hash = analysisDeliveryFingerprint;
+  baseline.summary.conclusion = 'A scoped task observation.';
+  baseline.summary.investigationAssessment = {schemaVersion: 1, status: 'checked',
+    binding: {candidateRef: 'candidate', runId: 'run', attemptId: 'attempt', conclusionFingerprint: hash(baseline.summary.conclusion),
+      conclusionContractFingerprint: hash(undefined), evidenceFingerprint: hash([]), requirementsFingerprint: hash([]),
+      registryFingerprint: 'registry', intentFingerprint: hash(undefined), ledgerFingerprint: hash('ledger'), evidenceRecordsFingerprint: hash([])},
+    requirements: [], evidenceRecords: []};
+  baseline.summary.deliveryAssurance = {schemaVersion: 1, entry: 'new_finalization', completion: 'passed',
+    claims: 'not_checked', source: 'not_applicable', identity: 'not_checked', report: 'not_applicable',
+    investigation: 'passed', investigationEvidence: 'coverage_incomplete'};
+  const matrix = buildComparisonMatrix([baseline, candidate]);
+  expect(matrix.inputSnapshots[0].investigationAssessment).toEqual(baseline.summary.investigationAssessment);
+  expect(matrix.inputSnapshots[0].investigationAssurance).toEqual({investigation: 'passed', investigationEvidence: 'coverage_incomplete'});
+  expect(matrix.inputSnapshots[1].investigationAssessment).toBeUndefined();
+  expect(matrix.inputSnapshots[1].investigationAssurance).toBeUndefined();
+  expect(candidate.summary).toEqual({headline: 'ok'});
 });

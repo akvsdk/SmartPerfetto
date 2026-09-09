@@ -39,6 +39,7 @@ import {
   moduleCoveredByStdlibDeclaration,
 } from '../../services/sqlStdlibDependencyAnalyzer';
 import {validateCaseKnowledgeFiles} from '../../services/caseSchemaValidator';
+import {parseInvestigationContract, parseInvestigationProfiles, type InvestigationProfiles} from '../../agentv3/strategyLoader';
 
 // ANSI color codes (fallback for chalk ESM issues)
 const colors = {
@@ -85,6 +86,8 @@ const VERIFIER_MISDIAGNOSIS_SEVERITIES = new Set(['warning', 'info']);
 export interface StrategyFrontmatterValidationContext {
   knownScenes?: Set<string>;
   seenVerifierMisdiagnosisIds?: Map<string, string>;
+  investigationProfiles?: InvestigationProfiles;
+  requireInvestigationContract?: boolean;
 }
 
 /**
@@ -1050,7 +1053,19 @@ export function validateStrategyFrontmatter(
 ): string[] {
   const parsed = parseStrategyFrontmatter(content, file);
   if (parsed.errors.length > 0 || !parsed.frontmatter) return parsed.errors;
+  const investigationErrors: string[] = [];
+  try {
+    const contract = parseInvestigationContract(parsed.frontmatter.investigation_contract, context.investigationProfiles ?? new Map());
+    if (!contract && context.requireInvestigationContract) investigationErrors.push(`${file}: investigation_contract is required`);
+    const legacy = parsed.frontmatter.investigation_requirements;
+    if (legacy !== undefined && (!Array.isArray(legacy) || !legacy.length || !legacy.every(isNonEmptyString))) {
+      investigationErrors.push(`${file}: invalid legacy investigation_requirements`);
+    }
+  } catch (error) {
+    investigationErrors.push(`${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return [
+    ...investigationErrors,
     ...validateFinalReportContractFrontmatter(parsed.frontmatter, file),
     ...validateVerifierMisdiagnosisFrontmatter(parsed.frontmatter, file, context),
   ];
@@ -1117,6 +1132,10 @@ function validateStrategySkillReferences(): number {
   const frontmatterValidationContext: StrategyFrontmatterValidationContext = {
     knownScenes,
     seenVerifierMisdiagnosisIds: new Map(),
+    investigationProfiles: parseInvestigationProfiles(yaml.load(fs.readFileSync(
+      path.join(STRATEGIES_DIR, 'investigation-profiles.yaml'), 'utf8',
+    ))),
+    requireInvestigationContract: true,
   };
 
   for (const file of strategyFiles) {

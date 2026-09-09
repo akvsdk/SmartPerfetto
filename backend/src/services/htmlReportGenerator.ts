@@ -14,6 +14,7 @@
  */
 
 import markdownit from 'markdown-it';
+import {investigationStatusLines} from './analysisInvestigationPresentation';
 import {
   AnalysisSession,
   CollectedResult,
@@ -136,6 +137,7 @@ export interface AgentDrivenReportData {
     outputOrigin?: import('../types/analysisDelivery').AnalysisOutputOrigin;
     runtimeAppendix?: import('../types/analysisDelivery').AnalysisRuntimeAppendix;
     reportAssessment?: import('../types/analysisDelivery').FinalReportAssessment;
+    investigationAssessment?: import('../types/analysisInvestigationAssessment').FinalInvestigationAssessment;
     deliveryAssurance?: import('../types/analysisDelivery').AnalysisDeliveryAssurance;
     sourceUseDecision?: import('./codebase/sourceUseDecision').SourceUseDecisionV1;
     sourceClaimVerificationResult?: import('./codebase/sourceClaimVerifier').SourceClaimVerificationResult;
@@ -4647,6 +4649,46 @@ export class HTMLReportGenerator {
     </div>
 
     ${this.renderAnalysisReceiptSection(result.analysisReceipt, outputLanguage)}
+    <div class="section">
+      <h2 class="section-title">${localize(outputLanguage, '系统调查范围与证据', 'System investigation scope and evidence')}</h2>
+      ${investigationStatusLines(result.deliveryAssurance, outputLanguage).map(line => `<p>${this.escapeHtml(line)}</p>`).join('')}
+      ${result.investigationAssessment?.requirements.length ? `
+      <details><summary>${localize(outputLanguage, '查看全部调查维度与证据引用', 'All investigation dimensions and evidence references')}</summary>
+        <table><thead><tr>
+          <th>${localize(outputLanguage, '调查维度', 'Investigation dimension')}</th>
+          <th>${localize(outputLanguage, '适用性 / 内容覆盖', 'Applicability / content coverage')}</th>
+          <th>${localize(outputLanguage, '采集状态 / 范围匹配', 'Acquisition / scope match')}</th>
+          <th>${localize(outputLanguage, '证据引用', 'Evidence references')}</th>
+        </tr></thead><tbody>${result.investigationAssessment.requirements.map(requirement => `<tr>
+          <td>${this.escapeHtml(requirement.domain)} / ${this.escapeHtml(requirement.requirementId)}</td>
+          <td>${this.escapeHtml(requirement.applicability)} / ${this.escapeHtml(requirement.coverage)}</td>
+          <td>${this.escapeHtml(requirement.acquisition)} / ${this.escapeHtml(requirement.scopeMatch)}</td>
+          <td>${requirement.evidenceRecordIds.map(id => this.escapeHtml(id)).join(', ') || '—'}</td>
+        </tr>`).join('')}</tbody></table>
+      </details>` : ''}
+      ${result.investigationAssessment?.evidenceRecords?.length ? `
+      <details><summary>${localize(outputLanguage, '查看全部系统证据记录', 'All system evidence records')}</summary>
+        <table><thead><tr>
+          <th>${localize(outputLanguage, '记录 / 指标', 'Record / metric')}</th>
+          <th>${localize(outputLanguage, 'Trace / 任务 / 范围', 'Trace / task / window')}</th>
+          <th>${localize(outputLanguage, '原始值 / 单位 / 覆盖', 'Original value / unit / coverage')}</th>
+          <th>${localize(outputLanguage, '状态 / 来源', 'Status / provenance')}</th>
+        </tr></thead><tbody>${result.investigationAssessment.evidenceRecords.map(row => `<tr>
+          <td>${this.escapeHtml(row.recordId)} / ${this.escapeHtml(row.metricId)}</td>
+          <td>${this.escapeHtml(row.traceSide)}: ${this.escapeHtml(row.traceId)};
+            UPID ${row.upid ?? '—'} / UTID ${row.utid ?? '—'};
+            CPU ${row.cpu ?? '—'} / ucpu ${row.ucpu ?? '—'} / machine ${row.machineId ?? '—'};
+            ${this.escapeHtml(String(row.windowId ?? '—'))} / ${this.escapeHtml(row.role ?? '—')};
+            [${this.escapeHtml(String(row.window.start))}, ${this.escapeHtml(String(row.window.end))}) ns</td>
+          <td>${this.escapeHtml(row.value === null ? 'null' : String(row.value))} ${this.escapeHtml(row.unit ?? '')};
+            ${this.escapeHtml(String(row.coverage ?? '—'))} / ${this.escapeHtml(String(row.denominator ?? '—'))}</td>
+          <td>${this.escapeHtml(row.status)} / ${this.escapeHtml(row.origin)};
+            ${this.escapeHtml(row.skillId)} / ${this.escapeHtml(row.stepId)};
+            ${this.escapeHtml(row.aggregation ?? '—')};
+            ${this.escapeHtml(row.captureId)} [${row.rowIndex}] / ${this.escapeHtml(row.artifactId ?? row.evidenceRefId ?? '')}</td>
+        </tr>`).join('')}</tbody></table>
+      </details>` : ''}
+    </div>
     ${this.renderUiActionProposalsSection(result.uiActionProposals, outputLanguage)}
 
     <div class="section">

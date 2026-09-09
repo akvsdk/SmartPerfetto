@@ -4,7 +4,6 @@
 
 import { describe, expect, it } from '@jest/globals';
 import {
-  buildStrategyDetailExcerpt,
   buildStrategyRegistrySnapshotFromDefinitions,
   getRegisteredScenes,
   getStrategyContent,
@@ -37,11 +36,4 @@ describe('strategy detail loader', () => {
     expect(getStrategyDetailByRef(existingRef, undefined, empty)).toBeUndefined();
   });
 
-  it('caps strategy detail excerpts so plan tool history cannot re-expand the prompt', () => {
-    const detail = getStrategyDetails('startup').find(section => section.id === 'overview_timing');
-    expect(detail).toBeDefined();
-    const excerpt = buildStrategyDetailExcerpt(detail!, 800);
-    expect(excerpt.excerpt.length).toBeLessThanOrEqual(800);
-    expect(excerpt.truncated).toBe(true);
-  });
 });

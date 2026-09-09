@@ -3,6 +3,18 @@
 
 ---
 scene: power
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: power_critical_path
+      domain: critical_path
+      description: "Align active work, wakeups, CPU idle and frequency residency with the measured energy window. Identify active tasks and coverage; retain integration units and denominators."
+    - id: power_dependencies
+      domain: dependency_chain
+      description: "Separate measured rails from model estimates such as Wattson. Correlate thermal, GPU and network only with supporting evidence; frequency/occupancy alone is not measured energy or thermal throttling."
 classification_description: "Energy use, battery drain, thermal behavior and resource activity associated with power consumption."
 priority: 4
 effort: medium

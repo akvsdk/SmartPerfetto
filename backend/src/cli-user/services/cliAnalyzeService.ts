@@ -72,6 +72,7 @@ import {
 } from '../../agentv3/sessionStateSnapshot';
 import type { StreamingUpdate } from '../../agent/types';
 import type { AnalysisOptions, AnalysisResult } from '../../agent/core/orchestratorTypes';
+import {createAnalysisHistoryReader, createRuntimeAnalysisHistoryReader, withAnalysisHistoryReader, type AnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
 import type { QueryResult } from '../../services/traceProcessorService';
 import {
   codeAwareFeatureEnabled,
@@ -139,6 +140,8 @@ export interface RunTurnInput {
   traceId?: string;
   referenceTraceId?: string;
   query: string;
+  /** Local transcript fallback for a missing backend history; never part of the user's question. */
+  history?: readonly AnalysisHistoryTurn[];
   sessionId?: string;
   analysisMode?: CliAnalysisMode;
   codeAwareMode?: CodeAwareMode;
@@ -179,6 +182,8 @@ export interface RunTurnOutput {
   codeAwareMode: CodeAwareMode;
   /** True when durable CLI artifacts must use the private projection. */
   privateKnowledge?: boolean;
+  /** Internal source-scope binding for durable history, not a provider credential. */
+  analysisContextFingerprint?: string;
   /** Safe, separately persisted source supplement. Never modifies the primary report. */
   sourceSupplement?: AnalysisSourceSupplementOutcome;
   /** Internal continuation that lets the caller commit the primary output first. */
@@ -663,7 +668,7 @@ export class CliAnalyzeService {
             ? session.agentQuery
             : buildAgentQueryWithContinuityNotice(input.query, session.continuityBreaks);
         try {
-          result = await orchestrator.analyze(agentQuery, sessionId, traceId, {
+          let runtimeOptions: AnalysisOptions = {
             providerId: session.providerId,
             runId: run.runId,
             referenceTraceId: effectiveReferenceTraceId,
@@ -675,7 +680,23 @@ export class CliAnalyzeService {
             analysisContextFingerprint: primaryOptions.analysisContextFingerprint,
             runManifestAttributionSink: runManifestLifecycle.builder,
             ...knowledgeScope,
-          });
+          };
+          if (input.history?.length) {
+            // Current source activation controls both the preview and later tool reads.
+            const history = input.history.filter(turn => !turn.sourceDerived ||
+              (primaryPrivateKnowledge && Boolean(turn.analysisContextFingerprint) &&
+                turn.analysisContextFingerprint === analysisContextFingerprint));
+            const backendHistory = createRuntimeAnalysisHistoryReader({options: runtimeOptions,
+              sessionId, traceId, assertActive,
+              getTurns: () => sessionContextManager.get(sessionId, traceId)?.getAnalysisHistory?.() ?? []});
+            const reader = createAnalysisHistoryReader({assertActive, getTurns: () => {
+              const merged = new Map(history.map(turn => [turn.id, turn]));
+              for (const turn of backendHistory.getTurns()) merged.set(turn.id, turn);
+              return [...merged.values()];
+            }});
+            runtimeOptions = withAnalysisHistoryReader(runtimeOptions, reader);
+          }
+          result = await orchestrator.analyze(agentQuery, sessionId, traceId, runtimeOptions);
           context = takeFinalizationContext(result);
           orchestrator.off('update', handler);
           assertActive();
@@ -808,6 +829,8 @@ export class CliAnalyzeService {
           partial: result.partial,
           terminationReason: result.terminationReason,
           terminationMessage: result.terminationMessage,
+          completion: result.completion,
+          outputOrigin: result.outputOrigin,
           conclusionContract: result.conclusionContract,
           claimSupport: result.claimSupport,
           claimVerificationResult: result.claimVerificationResult,
@@ -889,6 +912,7 @@ export class CliAnalyzeService {
               : (session.providerSnapshotHash ?? null),
           codeAwareMode: effectiveCodeAwareMode,
           privateKnowledge: primaryPrivateKnowledge,
+          analysisContextFingerprint,
         };
       }));
     } catch (error) {

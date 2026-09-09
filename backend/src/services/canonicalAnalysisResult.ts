@@ -238,10 +238,11 @@ export function canonicalizeAnalysisResult(
     delete result.claimVerificationResult;
     delete result.sourceClaimVerificationResult;
     delete result.reportAssessment;
+    delete result.investigationAssessment;
     delete result.deliveryAssurance;
     if (deliveryContext) deliveryContext = {...deliveryContext,
       claimVerificationBinding: undefined, sourceVerificationBinding: undefined,
-      reportAssessment: undefined, evidenceRenderedProof: undefined,
+      reportAssessment: undefined, investigationAssessment: undefined, evidenceRenderedProof: undefined,
     };
   }
   return {result, projection, bindingEligibility, ...(validationContract ? {validationContract} : {}), ...(deliveryContext ? {deliveryContext} : {}),

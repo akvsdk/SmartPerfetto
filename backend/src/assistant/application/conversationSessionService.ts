@@ -5,6 +5,8 @@
 import type {AssistantSessionStatus, ManagedAssistantSession} from './assistantApplicationService';
 import {AssistantApplicationService} from './assistantApplicationService';
 import type {AnalysisOptions} from '../../agent/core/orchestratorTypes';
+import {toAnalysisHistoryTurn, type AnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
+import type {ConversationSessionDescriptor} from '../../services/conversationSessionStore';
 import type {AgentRuntimeKind} from '../../services/providerManager';
 import type {
   ConversationEvidenceRef,
@@ -36,6 +38,7 @@ export interface ConversationRuntimeInput {
   runId: string;
   query: string;
   history: ConversationMessage[];
+  getHistoryTurns?(): readonly AnalysisHistoryTurn[];
   traceContext: ConversationTraceContext;
   selectionContext?: AnalysisOptions['selectionContext'];
   onUpdate?(update: unknown): void;
@@ -78,6 +81,8 @@ export type ConversationSessionEvent = ConversationSessionEventPayload & {seqId:
 export interface ConversationRun {
   runId: string;
   query: string;
+  turnIndex: number;
+  analysisContextFingerprint?: string;
   status: 'running' | 'completed' | 'cancelled' | 'failed';
   startedAt: number;
   completedAt?: number;
@@ -94,6 +99,8 @@ export interface ConversationRun {
 export interface ConversationSession extends ManagedAssistantSession {
   runtime: ConversationRuntimeAdapter;
   history: ConversationMessage[];
+  historyTurns: AnalysisHistoryTurn[];
+  recoveryStatus?: 'available' | 'unavailable' | 'interrupted';
   traceContext: ConversationTraceContext;
   evidence: ConversationEvidenceRef[];
   runs: ConversationRun[];
@@ -237,6 +244,61 @@ export class ConversationSessionService {
     return this.sessions.getSession(sessionId);
   }
 
+  /** Caller checks current provider, Trace access and source grants before loading history. */
+  restoreSession(descriptor: ConversationSessionDescriptor, turns: readonly AnalysisHistoryTurn[],
+    input: StartConversationTurnInput): ConversationSession {
+    const existing = this.sessions.getSession(descriptor.sessionId);
+    if (existing) return existing;
+    if (!input.owner || input.owner.userId !== descriptor.userId || input.owner.tenantId !== descriptor.tenantId ||
+      input.owner.workspaceId !== descriptor.workspaceId || input.providerId !== descriptor.providerId ||
+      input.providerSnapshotHash !== descriptor.providerSnapshotHash || input.runtimeKind !== descriptor.runtimeKind ||
+      input.analysisContextFingerprint !== descriptor.analysisContextFingerprint ||
+      !traceContextsEqual(normalizeTraceContext(input.traceContext), descriptor.traceContext)) {
+      throw new Error('conversation_recovery_context_mismatch');
+    }
+    assertCurrentAnalysisContextAuthorization(descriptor, resolveKnowledgeScope(descriptor),
+      descriptor.analysisContextFingerprint);
+    const historyTurns = structuredClone([...turns]);
+    const interrupted = descriptor.lastRun.status === 'running';
+    if (interrupted) {
+      const prior = historyTurns.findIndex(turn => turn.id === descriptor.lastRun.runId);
+      const originalFingerprint = prior >= 0 ? historyTurns[prior].analysisContextFingerprint : undefined;
+      if (prior >= 0) historyTurns.splice(prior, 1);
+      historyTurns.push(toAnalysisHistoryTurn({id: descriptor.lastRun.runId,
+        turnIndex: descriptor.lastRun.turnIndex, query: descriptor.lastRun.query,
+        traceId: descriptor.traceContext.kind === 'attached' ? descriptor.traceContext.traceId :
+          `conversation-no-trace:${descriptor.sessionId}`,
+        timestamp: descriptor.lastRun.startedAt, sourceDerived: descriptor.lastRun.sourceDerived,
+        analysisContextFingerprint: originalFingerprint,
+        result: {partial: true, completion: {status: 'incomplete'}, terminationReason: 'execution_error',
+          terminationMessage: 'conversation_run_interrupted_before_final_commit'},
+      }));
+    }
+    const history = historyTurns.flatMap((turn): ConversationMessage[] => [
+      {role: 'user', content: turn.query, turnId: turn.id, ...(!turn.answer ? {turn} : {}),
+        ...(turn.sourceDerived ? {sourceDerived: true} : {})},
+      ...(turn.answer ? [{role: 'assistant' as const, content: turn.answer, turnId: turn.id, turn,
+        ...(turn.sourceDerived ? {sourceDerived: true} : {})}] : []),
+    ]);
+    const outcome = interrupted ? undefined : descriptor.lastOutcome as ConversationRuntimeOutcome | undefined;
+    const session: ConversationSession = {...descriptor, runtime: this.createRuntime(input), history, historyTurns,
+      status: interrupted ? 'failed' : descriptor.status, sseClients: [], runs: [],
+      recoveryStatus: interrupted ? 'interrupted' : 'available',
+      ...(interrupted ? {error: 'conversation_run_interrupted_before_final_commit'} : {}),
+      ...(outcome?.kind === 'needs_user_input' ? {pendingQuestion: outcome.question} : {}),
+      ...(outcome?.kind === 'recommend_full' ? {recommendedFullAnalysis: true, fullAnalysisHandoff: outcome.handoff} : {}),
+      evidence: outcome?.evidence ?? [],
+    };
+    // Settled history is replayable; an interrupted SDK has no live execution or pending promise.
+    if (outcome) session.runs.push({runId: descriptor.lastRun.runId, query: descriptor.lastRun.query,
+      turnIndex: descriptor.lastRun.turnIndex, status: descriptor.lastRun.status === 'cancelled' ? 'cancelled' : 'completed',
+      sourceUseMode: descriptor.lastRun.sourceDerived ? 'explicit' : 'dormant',
+      startedAt: descriptor.lastRun.startedAt, completedAt: descriptor.lastRun.completedAt, outcome,
+      completion: Promise.resolve(outcome), lifecycleSettled: true, events: []});
+    this.sessions.setSession(session.sessionId, session);
+    return session;
+  }
+
   subscribe(
     sessionId: string,
     listener: (event: ConversationSessionEvent) => void,
@@ -272,6 +334,7 @@ export class ConversationSessionService {
         sseClients: [],
         runtime: this.createRuntime(input),
         history: [],
+        historyTurns: [],
         traceContext: normalizeTraceContext(input.traceContext),
         evidence: [],
         runs: [],
@@ -311,6 +374,12 @@ export class ConversationSessionService {
           : {}),
       };
       this.sessions.setSession(sessionId, session);
+    }
+    if (input.owner && (session.userId !== input.owner.userId || session.tenantId !== input.owner.tenantId ||
+      session.workspaceId !== input.owner.workspaceId)) throw new Error('Conversation session not found');
+    if (!isNewSession && input.analysisContextFingerprint && session.analysisContextFingerprint &&
+      input.analysisContextFingerprint !== session.analysisContextFingerprint) {
+      throw new Error('Start a new conversation after changing authorized sources');
     }
     const requestedTraceContext = input.traceContext
       ? normalizeTraceContext(input.traceContext)
@@ -356,6 +425,10 @@ export class ConversationSessionService {
       runId,
       query,
       history: session.history.map((message) => ({...message})),
+      getHistoryTurns: () => {
+        this.runAuthorizationChecks.get(run)?.();
+        return session!.historyTurns.filter(turn => turn.id !== runId);
+      },
       traceContext: session.traceContext,
       selectionContext: input.runtimeOptions?.selectionContext,
       onUpdate: (update) => {
@@ -368,6 +441,8 @@ export class ConversationSessionService {
     const run: ConversationRun = {
       runId,
       query,
+      turnIndex: Math.max(-1, ...session.historyTurns.map(turn => turn.turnIndex),
+        ...session.runs.map(previous => previous.turnIndex)) + 1,
       status: 'running',
       startedAt: this.now(),
       completion: Promise.resolve({kind: 'cancelled', message: ''}),
@@ -380,6 +455,9 @@ export class ConversationSessionService {
     const authorizationScope = resolveKnowledgeScope(session);
     const authorizationFingerprint = input.analysisContextFingerprint ?? input.runtimeOptions?.analysisContextFingerprint ??
       session.analysisContextFingerprint ?? buildAnalysisContextAuthorizationFingerprint(authorizationSelection, authorizationScope);
+    // Bind only new turns to the grant checked for this run; older entries keep their original provenance.
+    session.analysisContextFingerprint ??= authorizationFingerprint;
+    run.analysisContextFingerprint = authorizationFingerprint;
     this.runAuthorizationChecks.set(run, () => assertCurrentAnalysisContextAuthorization(
       authorizationSelection, authorizationScope, authorizationFingerprint));
     session.activeRun = run;
@@ -404,7 +482,7 @@ export class ConversationSessionService {
       this.publish(session.sessionId, {type: 'run_started', sessionId: session.sessionId, runId});
     }
     if (this.isCurrentRun(session, run) && !this.cancellationRequested.has(run)) {
-      session.history.push({role: 'user', content: query, ...(sourceUseMode === 'explicit' ? {sourceDerived: true} : {})});
+      session.history.push({role: 'user', content: query, turnId: runId, ...(sourceUseMode === 'explicit' || session.knowledgeSourceIds?.length ? {sourceDerived: true} : {})});
     }
 
     let runtimeCompletion: Promise<ConversationRuntimeOutcome>;
@@ -454,6 +532,7 @@ export class ConversationSessionService {
         session!.status = 'failed';
         session!.error = message;
         session!.lastActivityAt = run.completedAt;
+        this.recordRunHistory(session!, run);
         session!.activeRun = undefined;
         this.settleRun(session!, run);
         if (this.isLatestRun(session!, run)) this.publish(session!.sessionId, {
@@ -561,6 +640,7 @@ export class ConversationSessionService {
           activeRun.completedAt = options.now ?? this.now();
           session.status = 'cancelled';
           session.activeRun = undefined;
+          this.recordRunHistory(session, activeRun, {kind: 'cancelled', message: ''});
           this.settleRun(session, activeRun);
         }
         const cancel = activeRun
@@ -621,13 +701,7 @@ export class ConversationSessionService {
     run.outcome = outcome;
     run.completedAt = completedAt;
     run.status = outcome.kind === 'cancelled' ? 'cancelled' : 'completed';
-    if (outcome.message.trim()) {
-      session.history.push({
-        role: 'assistant',
-        content: outcome.message,
-        ...(run.sourceUseMode === 'explicit' ? {sourceDerived: true} : {}),
-      });
-    }
+    this.recordRunHistory(session, run, outcome);
     appendUniqueEvidence(session.evidence, outcome.evidence);
     session.lastActivityAt = completedAt;
     session.error = undefined;
@@ -648,13 +722,34 @@ export class ConversationSessionService {
     return outcome;
   }
 
+  private recordRunHistory(session: ConversationSession, run: ConversationRun, outcome?: ConversationRuntimeOutcome): void {
+    if (session.historyTurns.some(turn => turn.id === run.runId)) return;
+    const historyTurn = toAnalysisHistoryTurn({id: run.runId, turnIndex: run.turnIndex, query: run.query,
+      timestamp: run.completedAt ?? run.startedAt, analysisContextFingerprint: run.analysisContextFingerprint,
+      traceId: session.traceContext.kind === 'attached' ? session.traceContext.traceId :
+        `conversation-no-trace:${session.sessionId}`,
+      sourceDerived: run.sourceUseMode === 'explicit' || Boolean(session.knowledgeSourceIds?.length),
+      result: outcome?.finalResult ?? (outcome ? {message: outcome.message,
+        partial: outcome.kind === 'cancelled', completion: {status: outcome.kind === 'cancelled' ? 'incomplete' : 'completed'}} :
+        {partial: true, completion: {status: 'incomplete'}, terminationReason: 'execution_error'}),
+    });
+    session.historyTurns.push(historyTurn);
+    const userMessage = session.history.find(message => message.role === 'user' && message.turnId === run.runId);
+    if (userMessage && !outcome?.message.trim()) userMessage.turn = historyTurn;
+    if (outcome?.message.trim()) session.history.push({role: 'assistant', content: outcome.message,
+      turnId: run.runId, turn: historyTurn, ...(historyTurn.sourceDerived ? {sourceDerived: true} : {})});
+  }
+
   private settleRun(session: ConversationSession, run: ConversationRun): void {
     if (run.lifecycleSettled) return;
     run.lifecycleSettled = true;
     try {
       this.onRunSettled?.(session, run);
+      if (this.isLatestRun(session, run)) session.recoveryStatus = 'available';
     } catch {
-      // Lifecycle persistence is best-effort after the runtime has settled.
+      // Preserve the answer, but never promise recovery when the final commit failed.
+      if (this.isLatestRun(session, run)) session.recoveryStatus = 'unavailable';
+      if (run.outcome) run.outcome.recoveryStatus = 'unavailable';
     }
   }
 

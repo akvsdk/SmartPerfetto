@@ -22,7 +22,7 @@ const GPU_COMPUTE_MAX_ARGS = 64;
 const FRAME_TIMELINE_TRACE_PACKET_FIELD_NUMBER = 76;
 const SUPPORTED_SIGNAL_TYPES = new Set([
   'atrace-slice', 'atrace-counter', 'atrace-async-slice', 'atrace-async-track-slice',
-  'sched-running', 'process-stats', 'battery-counters', 'power-rail',
+  'sched-running', 'sched-switch', 'sched-waking', 'process-stats', 'battery-counters', 'power-rail',
   'gpu-work-period', 'gpu-compute-kernel', 'gpu-frequency', 'gpu-power-state',
   'cpu-frequency', 'cpu-idle', 'irq-span', 'frame-timeline', 'lmk-kill',
   'managed-heap-graph', 'anr-event', 'perf-sample', 'android-log',
@@ -430,18 +430,32 @@ function printEvent(timestamp, tid, buf) {
   return {timestamp, pid: tid, print: {buf}};
 }
 
-function schedSwitchEvent(timestamp, prev, next, prevState) {
+function schedPriority(value, field) {
+  if (!Number.isInteger(value) || value < -1 || value > 139) {
+    throw new Error(`${field} must be a kernel sched priority from -1 through 139`);
+  }
+  return value;
+}
+
+function schedActor(id, identities, field) {
+  if (id === null) return {tid: 0, name: 'swapper'};
+  const thread = identities.threadDefinitions.get(id);
+  if (!thread) throw new Error(`${field} references unknown thread ${id}`);
+  return thread;
+}
+
+function schedSwitchEvent(timestamp, prev, next, prevState, prevPrio = 120, nextPrio = 120) {
   return {
     timestamp,
     pid: 0,
     schedSwitch: {
       prevComm: prev.name,
       prevPid: prev.tid,
-      prevPrio: 120,
+      prevPrio,
       prevState,
       nextComm: next.name,
       nextPid: next.tid,
-      nextPrio: 120,
+      nextPrio,
     },
   };
 }
@@ -514,6 +528,31 @@ function encodeScenarioOverlay(repoRoot, scenario, options) {
       const events = eventsForCpu(signal.cpu);
       events.push(schedSwitchEvent(timestamp, idle, task, '0'));
       events.push(schedSwitchEvent(end, task, idle, endState));
+    } else if (signal.type === 'sched-switch') {
+      const prev = schedActor(signal.prev_thread, identities, 'sched-switch prev_thread');
+      const next = schedActor(signal.next_thread, identities, 'sched-switch next_thread');
+      if (prev.tid === next.tid) throw new Error('sched-switch must change the running thread');
+      eventsForCpu(signal.cpu).push(schedSwitchEvent(
+        timestamp, prev, next,
+        nonNegativeInt64String(signal.prev_state_raw, 'sched-switch prev_state_raw'),
+        schedPriority(signal.prev_priority, 'sched-switch prev_priority'),
+        schedPriority(signal.next_priority, 'sched-switch next_priority'),
+      ));
+    } else if (signal.type === 'sched-waking') {
+      const thread = schedActor(signal.thread, identities, 'sched-waking thread');
+      const waker = schedActor(signal.waker_thread, identities, 'sched-waking waker_thread');
+      if (thread.tid === 0) throw new Error('sched-waking cannot wake the idle thread');
+      eventsForCpu(signal.cpu).push({
+        timestamp,
+        pid: waker.tid,
+        schedWaking: {
+          comm: thread.name,
+          pid: thread.tid,
+          prio: schedPriority(signal.sched_priority, 'sched-waking sched_priority'),
+          success: 1,
+          targetCpu: nonNegativeInteger(signal.target_cpu, 'sched-waking target_cpu'),
+        },
+      });
     } else if (signal.type === 'process-stats') {
       const process = identities.processDefinitions.get(signal.process);
       if (!process) throw new Error(`signal references unknown process ${signal.process}`);
@@ -957,8 +996,13 @@ function allocateSequenceId(caseId, usedSequenceIds) {
 function isolateScenarioCpus(scenario, usedCpus) {
   const requested = [...new Set(
     scenario.signals
-      .map((signal) => signal.cpu)
-      .filter((cpu) => Number.isInteger(cpu)),
+      .flatMap((signal) => [
+        signal.cpu,
+        ...(['cpu-frequency', 'cpu-idle'].includes(signal.type) ? [signal.cpu_id] : []),
+        ...(signal.type === 'sched-waking' ? [signal.target_cpu] : []),
+      ])
+      .filter((cpu) => Number.isInteger(cpu))
+      .map((cpu) => nonNegativeInteger(cpu, 'scenario CPU identity')),
   )].sort((left, right) => left - right);
   let nextCpu = usedCpus.size > 0 ? Math.max(...usedCpus) + 1 : 0;
   const cpuMap = {};
@@ -975,6 +1019,8 @@ function isolateScenarioCpus(scenario, usedCpus) {
       signals: scenario.signals.map((signal) => ({
         ...signal,
         ...(Number.isInteger(signal.cpu) ? {cpu: cpuMap[signal.cpu]} : {}),
+        ...(['cpu-frequency', 'cpu-idle'].includes(signal.type) ? {cpu_id: cpuMap[signal.cpu_id]} : {}),
+        ...(signal.type === 'sched-waking' ? {target_cpu: cpuMap[signal.target_cpu]} : {}),
       })),
     },
   };

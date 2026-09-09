@@ -602,7 +602,8 @@ describe('SkillExecutor trusted exact UPID execution', () => {
     const registry = new SkillRegistry();
     const skillsDir = path.resolve(__dirname, '../../../../skills');
     const definitions = ['composite/scrolling_analysis.skill.yaml', 'atomic/cpu_topology_view.skill.yaml',
-      'atomic/frame_pipeline_variance.skill.yaml'].map(file => registry.loadSingleSkill(skillsDir, file)!);
+      'atomic/frame_pipeline_variance.skill.yaml','atomic/cpu_system_context_in_range.skill.yaml',
+      'atomic/thread_system_summary_in_range.skill.yaml','atomic/thread_preemption_handoffs_in_range.skill.yaml'].map(file => registry.loadSingleSkill(skillsDir, file)!);
     const query = jest.fn(async (_trace: string, sql: string) => {
       if (sql.includes('resolver_probe')) return identityRows;
       if (sql.includes('as has_frame_timeline')) return { columns: ['has_frame_timeline'], rows: [[1]] };
@@ -711,6 +712,8 @@ describe('ANR and frame-detail real YAML scope closure', () => {
   const skillsDir = path.resolve(__dirname, '../../../../skills');
   const files = [
     'composite/anr_detail.skill.yaml', 'composite/jank_frame_detail.skill.yaml',
+    'atomic/cpu_system_context_in_range.skill.yaml','atomic/thread_system_summary_in_range.skill.yaml',
+    'atomic/thread_preemption_handoffs_in_range.skill.yaml',
     'atomic/cpu_topology_view.skill.yaml', 'atomic/main_thread_states_in_range.skill.yaml',
     'atomic/main_thread_slices_in_range.skill.yaml', 'atomic/binder_in_range.skill.yaml',
     'atomic/binder_blocking_in_range.skill.yaml', 'atomic/main_thread_sched_latency_in_range.skill.yaml',
@@ -773,12 +776,17 @@ describe('ANR and frame-detail real YAML scope closure', () => {
         (42,13,4245,'UIWorker',0), (43,20,4343,'main',1), (43,21,4344,'RenderThread',0),
         (44,30,4444,'main',1), (45,40,4545,'main',1),
         (90,90,9000,'surfaceflinger',1), (91,91,9101,'Binder:server',0);
+      -- Waker identity belongs to the successor Runnable event. Zero-duration
+      -- transitions preserve these wakeup events without adding occupancy.
       INSERT INTO thread_state VALUES
         (10,100000000,10000000,'R',0,NULL,0,NULL),
         (10,110000000,20000000,'Running',0,NULL,0,NULL),
-        (10,130000000,20000000,'S',0,'binder_thread_read',0,91),
-        (10,150000000,10000000,'D',0,'do_page_fault',1,91),
-        (10,160000000,10000000,'S',0,'futex_wait',0,12),
+        (10,130000000,20000000,'S',0,'binder_thread_read',0,NULL),
+        (10,150000000,0,'R',0,NULL,0,91),
+        (10,150000000,10000000,'D',0,'do_page_fault',1,NULL),
+        (10,160000000,0,'R',0,NULL,0,91),
+        (10,160000000,10000000,'S',0,'futex_wait',0,NULL),
+        (10,170000000,0,'R',0,NULL,0,12),
         (10,180000000,5000000,'Running',1,NULL,0,NULL),
         (11,125000000,5000000,'Running',1,NULL,0,NULL),
         (11,130000000,3000000,'R',1,NULL,0,NULL),
@@ -816,6 +824,31 @@ describe('ANR and frame-detail real YAML scope closure', () => {
         (30,100000000,1),(30,116000000,1),(30,132000000,1),(30,148000000,1),
         (30,164000000,1),(30,180000000,1),(30,196000000,1);
       INSERT INTO android_gpu_frequency VALUES (0,800000000,50000000,100000000),(0,400000000,50000000,150000000);
+    `);
+    db.exec(`
+      CREATE TABLE trace_bounds(start_ts INTEGER,end_ts INTEGER);
+      INSERT INTO trace_bounds VALUES(0,1000000000);
+      ALTER TABLE thread ADD COLUMN is_idle INTEGER DEFAULT 0;
+      ALTER TABLE cpu ADD COLUMN cpu INTEGER;
+      ALTER TABLE cpu ADD COLUMN machine_id INTEGER;
+      ALTER TABLE cpu ADD COLUMN cluster_id INTEGER;
+      UPDATE cpu SET cpu=id,cluster_id=id;
+      ALTER TABLE thread_state ADD COLUMN id INTEGER;
+      ALTER TABLE thread_state ADD COLUMN ucpu INTEGER;
+      ALTER TABLE thread_state ADD COLUMN irq_context INTEGER;
+      UPDATE thread_state SET id=rowid,ucpu=cpu;
+      ALTER TABLE sched_slice ADD COLUMN id INTEGER;
+      ALTER TABLE sched_slice ADD COLUMN ucpu INTEGER;
+      ALTER TABLE sched_slice ADD COLUMN utid INTEGER;
+      ALTER TABLE sched_slice ADD COLUMN ts INTEGER;
+      ALTER TABLE sched_slice ADD COLUMN dur INTEGER;
+      ALTER TABLE sched_slice ADD COLUMN end_state TEXT;
+      ALTER TABLE sched_slice ADD COLUMN priority INTEGER;
+      DELETE FROM sched_slice;
+      INSERT INTO sched_slice SELECT cpu,id,ucpu,utid,ts,dur,'S',120 FROM thread_state WHERE state='Running';
+      CREATE TABLE cpu_frequency_counters AS
+        SELECT c.rowid AS id,t.id AS track_id,t.cpu AS ucpu,t.cpu,c.ts,LEAD(c.ts,1,1000000000) OVER(PARTITION BY t.cpu ORDER BY c.ts)-c.ts AS dur,c.value AS freq
+        FROM counter c JOIN cpu_counter_track t ON t.id=c.track_id WHERE t.name='cpufreq';
     `);
     const query = jest.fn(async (_trace: string, sql: string): Promise<QueryResult> => {
       // Materialized module tables above are fixture data, not replacement SQL.
@@ -947,7 +980,7 @@ describe('ANR and frame-detail real YAML scope closure', () => {
     } finally {db.close();}
   });
 
-  it('preserves helper thread subsets and keeps GPU APP plus SF aggregation contextual', async () => {
+  it('preserves scoped helper tasks including zero-migration rows and contextual GPU aggregation', async () => {
     const {db, executor} = fixture();
     try {
       const gate = await executor.prepareInvocation('anr_detail', 'trace', {...anrParams, upid: 42});
@@ -972,6 +1005,8 @@ describe('ANR and frame-detail real YAML scope closure', () => {
       expect(migration.success).toBe(true);
       expect(migration.rawResults?.migration_analysis.data).toEqual([
         expect.objectContaining({thread_name: 'main', migration_count: 1, little_to_big: 1, big_core_pct: 20, unique_cpus: 2}),
+        expect.objectContaining({thread_name: 'RenderThread', migration_count: 0, big_core_pct: 100, unique_cpus: 1}),
+        expect.objectContaining({thread_name: 'Binder:1', migration_count: 0, big_core_pct: 0, unique_cpus: 1}),
       ]);
       const gpu = await executeHelper(executor, 'gpu_render_in_range', gate.processScope!);
       expect(gpu.success).toBe(true);

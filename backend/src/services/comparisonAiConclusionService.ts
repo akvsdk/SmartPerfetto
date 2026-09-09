@@ -94,10 +94,18 @@ function buildPrompt(input: GenerateAiComparisonConclusionInput): string {
   if (!template) {
     throw new Error('comparison-conclusion prompt template is missing');
   }
+  // Original producer records remain in the saved matrix/report. The bounded
+  // comparison prompt keeps source-run coverage without displacing metric rows.
+  const {inputSnapshots, ...matrix} = input.result.matrix;
+  const promptMatrix = {...matrix, inputSnapshots: inputSnapshots.map(snapshot => {
+    if (!snapshot.investigationAssessment) return snapshot;
+    const {evidenceRecords: _records, ...assessment} = snapshot.investigationAssessment;
+    return {...snapshot, investigationAssessment: assessment};
+  })};
   return renderTemplate(template, {
     query: input.query,
     outputLanguage: outputLanguageDisplayName(parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE)),
-    matrixJson: truncateForPrompt(JSON.stringify(input.result.matrix, null, 2), 40_000),
+    matrixJson: truncateForPrompt(JSON.stringify(promptMatrix, null, 2), 40_000),
     deterministicFacts: input.result.conclusion.verifiedFacts.join('\n') || '(none)',
     uncertainty: input.result.conclusion.uncertainty.join('\n') || '(none)',
   });

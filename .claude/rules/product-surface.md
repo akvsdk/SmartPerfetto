@@ -22,13 +22,19 @@ be checked against the public product surfaces below.
 
 ## Runtime And Provider Matrix
 
-| Runtime | Provider families | Resume state | Important boundary |
+| Runtime | Provider families | Native state within a run | Important boundary |
 | --- | --- | --- | --- |
 | `claude-agent-sdk` | Anthropic direct, Bedrock, Vertex, Claude/Anthropic-compatible gateways, local Claude Code auth for source runs | Claude SDK session id in `SessionStateSnapshot` | Local Claude Code auth is not available in Docker or portable packages unless explicitly configured in that environment |
 | `openai-agents-sdk` | OpenAI Responses API, OpenAI-compatible gateways, Ollama/chat-completions endpoints | OpenAI history and last response id in `SessionStateSnapshot` | Requires OpenAI runtime rules; do not validate only Claude env vars |
 | `pi-agent-core` | Custom Provider Manager profiles, Pi model JSON, OpenAI-compatible providers where supported by Pi AI | Pi opaque transcript state in `SessionStateSnapshot` | Keep SmartPerfetto MCP tool allowlists, plan evidence logging, and final verifier parity with the Claude target path |
 | `opencode` | Custom Provider Manager profiles, OpenCode model JSON, OpenAI-compatible providers | OpenCode session id and isolated project/home/config dirs in `SessionStateSnapshot` | Keep the bridge sandboxed and route all SmartPerfetto tools through the shared MCP registry/plan evidence log |
 | `qoder-agent-sdk` | Custom Provider Manager profiles or env, local `qodercli` login, PAT, explicit CLI path, optional `resolveModel` BYOK | Qoder SDK session id for public runs only | SDK is opt-in; BYOK never replaces Qoder auth or enters subprocess env/plaintext snapshots; disable built-in tools, project tokens before SSE, and never resume or persist opaque state for private-knowledge runs |
+
+Follow-up questions start a fresh native context in every runtime. Only the
+shared authorized typed history crosses user turns: a bounded recent preview
+plus `read_session_history` for older records. Native state in the table is
+run-local implementation state, not permission to replay an earlier transcript.
+Source-derived history requires the original exact analysis-context fingerprint.
 
 Provider Manager active profiles override `.env` and system fallback. A
 session keeps its selected provider/runtime. Resume must not silently switch to

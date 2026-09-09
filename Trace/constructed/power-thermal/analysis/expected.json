@@ -357,11 +357,14 @@
       "expected_condition_skips": [],
       "semantic_step": "temperature_overview",
       "required_columns": [
+        "sensor_track_id",
         "sensor_name",
+        "source_unit",
         "sample_count",
         "min_temp",
         "max_temp",
         "avg_temp",
+        "aggregation_basis",
         "temp_range",
         "status"
       ],

@@ -7,11 +7,11 @@
     "authoredNarrativeRemainsVerbatim": true
   },
   "inventory": {
-    "skillCount": 236,
+    "skillCount": 240,
     "pipelineDefinitionCount": 31,
     "moduleExpertCount": 18,
-    "stepCount": 1238,
-    "explicitColumnCount": 3779
+    "stepCount": 1268,
+    "explicitColumnCount": 4203
   },
   "skills": {
     "ams_module": {
@@ -1767,6 +1767,18 @@
             "en": "System CPU Health"
           },
           "columns": {
+            "sched_covered_ns": {
+              "label": {
+                "zh-CN": "SchedCoveredns",
+                "en": "sched_covered_ns"
+              }
+            },
+            "idle_identity_unknown_ns": {
+              "label": {
+                "zh-CN": "IdleIdentityUnknownns",
+                "en": "idle_identity_unknown_ns"
+              }
+            },
             "core_type": {
               "label": {
                 "zh-CN": "核心类型",
@@ -2571,6 +2583,42 @@
             "en": "Main Thread Quadrant"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "UnknownRunningms",
+                "en": "unknown_running_ms"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "Uninterruptiblems",
+                "en": "uninterruptible_ms"
+              }
+            },
+            "interruptible_sleep_ms": {
+              "label": {
+                "zh-CN": "InterruptibleSleepms",
+                "en": "interruptible_sleep_ms"
+              }
+            },
+            "state_coverage_pct": {
+              "label": {
+                "zh-CN": "StateCoveragePct",
+                "en": "state_coverage_pct"
+              }
+            },
             "q1_big_running_ms": {
               "label": {
                 "zh-CN": "Q1大核运行(ms)",
@@ -2617,6 +2665,18 @@
               "label": {
                 "zh-CN": "Sleeping占比(%)",
                 "en": "Sleeping Pct"
+              }
+            },
+            "classify_method": {
+              "label": {
+                "zh-CN": "核类型证据来源",
+                "en": "Classify Method"
+              }
+            },
+            "thread_type": {
+              "label": {
+                "zh-CN": "线程角色",
+                "en": "Thread Type"
               }
             },
             "status_verdict": {
@@ -2693,6 +2753,38 @@
           "columns": {},
           "synthesizeLabels": {}
         },
+        "system_context_window": {
+          "title": {
+            "zh-CN": "系统证据窗口",
+            "en": "System Context Window"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_cpu_context": {
+          "title": {
+            "zh-CN": "窗口 CPU 系统上下文",
+            "en": "System CPU Context"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_handoffs": {
+          "title": {
+            "zh-CN": "目标任务调度交接",
+            "en": "System Task Handoffs"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_summary": {
+          "title": {
+            "zh-CN": "目标任务系统状态",
+            "en": "System Task Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
         "thread_evidence_availability": {
           "title": {
             "zh-CN": "线程证据可用性",
@@ -2707,6 +2799,54 @@
             "en": "Wakeup Chain"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "wait_span_count": {
+              "label": {
+                "zh-CN": "WaitSpanCount",
+                "en": "wait_span_count"
+              }
+            },
+            "unfinished_wait_count": {
+              "label": {
+                "zh-CN": "UnfinishedWaitCount",
+                "en": "unfinished_wait_count"
+              }
+            },
+            "left_censored_wait_count": {
+              "label": {
+                "zh-CN": "LeftCensoredWaitCount",
+                "en": "left_censored_wait_count"
+              }
+            },
+            "right_censored_wait_count": {
+              "label": {
+                "zh-CN": "RightCensoredWaitCount",
+                "en": "right_censored_wait_count"
+              }
+            },
+            "raw_max_sleep_ms": {
+              "label": {
+                "zh-CN": "RawMaxSleepms",
+                "en": "raw_max_sleep_ms"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
+              }
+            },
             "waker_thread": {
               "label": {
                 "zh-CN": "唤醒线程",
@@ -7107,6 +7247,36 @@
             "en": "Input Thread State"
           },
           "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
             "event_type": {
               "label": {
                 "zh-CN": "事件类型",
@@ -7634,6 +7804,42 @@
             "en": "CPU Core Analysis"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "UnknownRunningms",
+                "en": "unknown_running_ms"
+              }
+            },
+            "priority_min": {
+              "label": {
+                "zh-CN": "PriorityMin",
+                "en": "priority_min"
+              }
+            },
+            "priority_max": {
+              "label": {
+                "zh-CN": "PriorityMax",
+                "en": "priority_max"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度PolicyEvidence",
+                "en": "scheduling_policy_evidence"
+              }
+            },
             "thread_type": {
               "label": {
                 "zh-CN": "线程类型",
@@ -7674,6 +7880,12 @@
               "label": {
                 "zh-CN": "运行占总时长(%)",
                 "en": "Running Pct"
+              }
+            },
+            "used_ucpus": {
+              "label": {
+                "zh-CN": "实际 UCPU",
+                "en": "Used Ucpus"
               }
             },
             "used_cpus": {
@@ -8014,6 +8226,42 @@
             "en": "Quadrant Analysis"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "UnknownRunningms",
+                "en": "unknown_running_ms"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "Uninterruptiblems",
+                "en": "uninterruptible_ms"
+              }
+            },
+            "interruptible_sleep_ms": {
+              "label": {
+                "zh-CN": "InterruptibleSleepms",
+                "en": "interruptible_sleep_ms"
+              }
+            },
+            "state_coverage_pct": {
+              "label": {
+                "zh-CN": "StateCoveragePct",
+                "en": "state_coverage_pct"
+              }
+            },
             "thread_type": {
               "label": {
                 "zh-CN": "线程类型",
@@ -8128,6 +8376,38 @@
               }
             }
           },
+          "synthesizeLabels": {}
+        },
+        "system_context_window": {
+          "title": {
+            "zh-CN": "系统证据窗口",
+            "en": "System Context Window"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_cpu_context": {
+          "title": {
+            "zh-CN": "窗口 CPU 系统上下文",
+            "en": "System CPU Context"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_handoffs": {
+          "title": {
+            "zh-CN": "目标任务调度交接",
+            "en": "System Task Handoffs"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_summary": {
+          "title": {
+            "zh-CN": "目标任务系统状态",
+            "en": "System Task Summary"
+          },
+          "columns": {},
           "synthesizeLabels": {}
         }
       }
@@ -8804,6 +9084,30 @@
             "en": "Blocked Functions"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
             "blocked_function": {
               "label": {
                 "zh-CN": "阻塞函数",
@@ -8914,6 +9218,24 @@
             "en": "Core Type Stats"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
             "core_type": {
               "label": {
                 "zh-CN": "核心类型",
@@ -8993,6 +9315,24 @@
             "en": "CPU Frequency Distribution"
           },
           "columns": {
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
             "cpu": {
               "label": {
                 "zh-CN": "CPU",
@@ -9073,6 +9413,30 @@
             "en": "Main Thread Cores"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
             "cpu": {
               "label": {
                 "zh-CN": "CPU",
@@ -9118,6 +9482,30 @@
             "en": "Main Thread States"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
             "state": {
               "label": {
                 "zh-CN": "状态码",
@@ -9180,6 +9568,30 @@
             "en": "Runnable Latency"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
             "wait_ms": {
               "label": {
                 "zh-CN": "等待时间",
@@ -9303,6 +9715,30 @@
             "en": "Thread CPU Usage"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
             "tid": {
               "label": {
                 "zh-CN": "TID",
@@ -9371,6 +9807,30 @@
             "en": "Wakeup Chain"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
             "waker_thread": {
               "label": {
                 "zh-CN": "唤醒线程",
@@ -9613,8 +10073,38 @@
             },
             "max_freq_mhz": {
               "label": {
-                "zh-CN": "最高频率(MHz)",
+                "zh-CN": "窗口观测峰值(MHz)",
                 "en": "Max Freq MHz"
+              }
+            },
+            "machine_id": {
+              "label": {
+                "zh-CN": "MachineId",
+                "en": "Machine"
+              }
+            },
+            "frequency_coverage_pct": {
+              "label": {
+                "zh-CN": "频率覆盖(%)",
+                "en": "Frequency Coverage Pct"
+              }
+            },
+            "frequency_coverage_status": {
+              "label": {
+                "zh-CN": "频率覆盖状态",
+                "en": "Frequency Coverage Status"
+              }
+            },
+            "censored_interval_count": {
+              "label": {
+                "zh-CN": "未闭合频率区间",
+                "en": "Censored Interval Count"
+              }
+            },
+            "high_frequency_basis": {
+              "label": {
+                "zh-CN": "高频判定依据",
+                "en": "High Frequency Basis"
               }
             }
           },
@@ -9883,14 +10373,6 @@
           "title": {
             "zh-CN": "CPU 利用率",
             "en": "CPU Utilization"
-          },
-          "columns": {},
-          "synthesizeLabels": {}
-        },
-        "init_cpu_topology": {
-          "title": {
-            "zh-CN": "初始化 CPU 拓扑",
-            "en": "Init CPU Topology"
           },
           "columns": {},
           "synthesizeLabels": {}
@@ -10560,6 +11042,186 @@
             "en": "CPU Slice Analysis"
           },
           "columns": {},
+          "synthesizeLabels": {}
+        }
+      }
+    },
+    "cpu_system_context_in_range": {
+      "displayName": {
+        "zh-CN": "逐核系统供给与覆盖",
+        "en": "CPU System Context In Range"
+      },
+      "description": {
+        "zh-CN": "范围内可定位的系统观测，保留覆盖与缺失；不单凭相关性判断根因",
+        "en": "Analyzes CPU System Context In Range using trace metrics and supporting evidence."
+      },
+      "type": "atomic",
+      "steps": {
+        "__synthesize_summary__": {
+          "title": {
+            "zh-CN": "洞见摘要",
+            "en": "Insight Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "root": {
+          "title": {
+            "zh-CN": "逐核系统供给与覆盖",
+            "en": "CPU System Context In Range"
+          },
+          "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "window_dur_ns": {
+              "label": {
+                "zh-CN": "WindowDurns",
+                "en": "window_dur_ns"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
+            "cpu": {
+              "label": {
+                "zh-CN": "CPU",
+                "en": "cpu"
+              }
+            },
+            "machine_id": {
+              "label": {
+                "zh-CN": "MachineId",
+                "en": "machine_id"
+              }
+            },
+            "cluster_id": {
+              "label": {
+                "zh-CN": "ClusterId",
+                "en": "cluster_id"
+              }
+            },
+            "capacity": {
+              "label": {
+                "zh-CN": "Capacity",
+                "en": "capacity"
+              }
+            },
+            "core_type": {
+              "label": {
+                "zh-CN": "CoreType",
+                "en": "core_type"
+              }
+            },
+            "topology_source": {
+              "label": {
+                "zh-CN": "TopologySource",
+                "en": "topology_source"
+              }
+            },
+            "avg_freq_khz": {
+              "label": {
+                "zh-CN": "AvgFreqKhz",
+                "en": "avg_freq_khz"
+              }
+            },
+            "min_freq_khz": {
+              "label": {
+                "zh-CN": "MinFreqKhz",
+                "en": "min_freq_khz"
+              }
+            },
+            "observed_max_freq_khz": {
+              "label": {
+                "zh-CN": "ObservedMaxFreqKhz",
+                "en": "observed_max_freq_khz"
+              }
+            },
+            "frequency_covered_ns": {
+              "label": {
+                "zh-CN": "频率Coveredns",
+                "en": "frequency_covered_ns"
+              }
+            },
+            "frequency_evidence": {
+              "label": {
+                "zh-CN": "频率Evidence",
+                "en": "frequency_evidence"
+              }
+            },
+            "frequency_source": {
+              "label": {
+                "zh-CN": "频率Source",
+                "en": "frequency_source"
+              }
+            },
+            "sched_covered_ns": {
+              "label": {
+                "zh-CN": "SchedCoveredns",
+                "en": "sched_covered_ns"
+              }
+            },
+            "busy_ns": {
+              "label": {
+                "zh-CN": "Busyns",
+                "en": "busy_ns"
+              }
+            },
+            "idle_ns": {
+              "label": {
+                "zh-CN": "Idlens",
+                "en": "idle_ns"
+              }
+            },
+            "idle_identity_unknown_ns": {
+              "label": {
+                "zh-CN": "IdleIdentityUnknownns",
+                "en": "idle_identity_unknown_ns"
+              }
+            },
+            "busy_pct": {
+              "label": {
+                "zh-CN": "BusyPct",
+                "en": "busy_pct"
+              }
+            },
+            "unfinished_sched_ns": {
+              "label": {
+                "zh-CN": "UnfinishedSchedns",
+                "en": "unfinished_sched_ns"
+              }
+            },
+            "sched_evidence": {
+              "label": {
+                "zh-CN": "SchedEvidence",
+                "en": "sched_evidence"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
+              }
+            }
+          },
           "synthesizeLabels": {}
         }
       }
@@ -15496,6 +16158,18 @@
                 "zh-CN": "平均耗时",
                 "en": "Avg ms"
               }
+            },
+            "censored_slice_count": {
+              "label": {
+                "zh-CN": "未闭合切片",
+                "en": "Censored Slice Count"
+              }
+            },
+            "duration_basis": {
+              "label": {
+                "zh-CN": "耗时口径",
+                "en": "Duration Basis"
+              }
             }
           },
           "synthesizeLabels": {}
@@ -17340,6 +18014,30 @@
             "en": "CPU Freq Analysis"
           },
           "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "num_cores": {
+              "label": {
+                "zh-CN": "NumCores",
+                "en": "num_cores"
+              }
+            },
+            "frequency_covered_ns": {
+              "label": {
+                "zh-CN": "频率Coveredns",
+                "en": "frequency_covered_ns"
+              }
+            },
+            "frequency_coverage_pct": {
+              "label": {
+                "zh-CN": "频率CoveragePct",
+                "en": "frequency_coverage_pct"
+              }
+            },
             "core_type": {
               "label": {
                 "zh-CN": "核心类型",
@@ -17373,6 +18071,48 @@
             "en": "CPU Freq Timeline"
           },
           "columns": {
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
+            "counter_id": {
+              "label": {
+                "zh-CN": "CounterId",
+                "en": "counter_id"
+              }
+            },
+            "track_id": {
+              "label": {
+                "zh-CN": "TrackId",
+                "en": "track_id"
+              }
+            },
+            "topology_source": {
+              "label": {
+                "zh-CN": "TopologySource",
+                "en": "topology_source"
+              }
+            },
+            "prev_freq_mhz": {
+              "label": {
+                "zh-CN": "PrevFreqMHz",
+                "en": "prev_freq_mhz"
+              }
+            },
+            "total_change_count": {
+              "label": {
+                "zh-CN": "TotalChangeCount",
+                "en": "total_change_count"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
+              }
+            },
             "ts": {
               "label": {
                 "zh-CN": "时间戳",
@@ -17513,6 +18253,42 @@
             "en": "I/O Blocking"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "unfinished_wait_count": {
+              "label": {
+                "zh-CN": "UnfinishedWaitCount",
+                "en": "unfinished_wait_count"
+              }
+            },
+            "left_censored_wait_count": {
+              "label": {
+                "zh-CN": "LeftCensoredWaitCount",
+                "en": "left_censored_wait_count"
+              }
+            },
+            "right_censored_wait_count": {
+              "label": {
+                "zh-CN": "RightCensoredWaitCount",
+                "en": "right_censored_wait_count"
+              }
+            },
+            "raw_max_wait_ms": {
+              "label": {
+                "zh-CN": "RawMaxWaitms",
+                "en": "raw_max_wait_ms"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -17521,7 +18297,7 @@
             },
             "blocked_count": {
               "label": {
-                "zh-CN": "阻塞次数",
+                "zh-CN": "相交等待区间数",
                 "en": "Blocked Count"
               }
             },
@@ -17670,6 +18446,42 @@
             "en": "Quadrant Analysis"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "thread_type": {
+              "label": {
+                "zh-CN": "线程Type",
+                "en": "thread_type"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
+              }
+            },
             "quadrant": {
               "label": {
                 "zh-CN": "象限",
@@ -20878,6 +21690,38 @@
           },
           "columns": {},
           "synthesizeLabels": {}
+        },
+        "system_context_window": {
+          "title": {
+            "zh-CN": "系统证据窗口",
+            "en": "System Context Window"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_cpu_context": {
+          "title": {
+            "zh-CN": "窗口 CPU 系统上下文",
+            "en": "System CPU Context"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_handoffs": {
+          "title": {
+            "zh-CN": "目标任务调度交接",
+            "en": "System Task Handoffs"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_summary": {
+          "title": {
+            "zh-CN": "目标任务系统状态",
+            "en": "System Task Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
         }
       }
     },
@@ -21010,6 +21854,54 @@
             "en": "Main Thread Sched Latency In Range"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "RunnablePreemptedms",
+                "en": "runnable_preempted_ms"
+              }
+            },
+            "right_censored_count": {
+              "label": {
+                "zh-CN": "RightCensoredCount",
+                "en": "right_censored_count"
+              }
+            },
+            "latency_evidence": {
+              "label": {
+                "zh-CN": "延迟Evidence",
+                "en": "latency_evidence"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -22194,6 +23086,60 @@
             "en": "Memory Pressure Analysis"
           },
           "columns": {
+            "psi_max": {
+              "label": {
+                "zh-CN": "PsiMax",
+                "en": "Psi Max"
+              }
+            },
+            "psi_avg": {
+              "label": {
+                "zh-CN": "PsiAvg",
+                "en": "Psi Avg"
+              }
+            },
+            "psi_sample_count": {
+              "label": {
+                "zh-CN": "PsiSampleCount",
+                "en": "Psi Sample Count"
+              }
+            },
+            "psi_metric_count": {
+              "label": {
+                "zh-CN": "PsiMetricCount",
+                "en": "Psi Metric Count"
+              }
+            },
+            "psi_metric_names": {
+              "label": {
+                "zh-CN": "PsiMetricNames",
+                "en": "Psi Metric Names"
+              }
+            },
+            "psi_aggregation_basis": {
+              "label": {
+                "zh-CN": "PsiAggregationBasis",
+                "en": "Psi Aggregation Basis"
+              }
+            },
+            "censored_event_count": {
+              "label": {
+                "zh-CN": "Censored事件Count",
+                "en": "Censored Event Count"
+              }
+            },
+            "duration_basis": {
+              "label": {
+                "zh-CN": "DurationBasis",
+                "en": "Duration Basis"
+              }
+            },
+            "pressure_basis": {
+              "label": {
+                "zh-CN": "PressureBasis",
+                "en": "Pressure Basis"
+              }
+            },
             "pressure_level": {
               "label": {
                 "zh-CN": "PressureLevel",
@@ -27133,6 +28079,54 @@
             "en": "Sched Latency In Range"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "RunnablePreemptedms",
+                "en": "runnable_preempted_ms"
+              }
+            },
+            "right_censored_count": {
+              "label": {
+                "zh-CN": "RightCensoredCount",
+                "en": "right_censored_count"
+              }
+            },
+            "latency_evidence": {
+              "label": {
+                "zh-CN": "延迟Evidence",
+                "en": "latency_evidence"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -27268,6 +28262,66 @@
             "en": "Scheduling Analysis"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "state_covered_ns": {
+              "label": {
+                "zh-CN": "StateCoveredns",
+                "en": "state_covered_ns"
+              }
+            },
+            "state_evidence": {
+              "label": {
+                "zh-CN": "StateEvidence",
+                "en": "state_evidence"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "Uninterruptiblems",
+                "en": "uninterruptible_ms"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "RunnablePreemptedms",
+                "en": "runnable_preempted_ms"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "OtherStatems",
+                "en": "other_state_ms"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -27743,6 +28797,38 @@
           "columns": {},
           "synthesizeLabels": {}
         },
+        "system_context_window": {
+          "title": {
+            "zh-CN": "系统证据窗口",
+            "en": "System Context Window"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_cpu_context": {
+          "title": {
+            "zh-CN": "窗口 CPU 系统上下文",
+            "en": "System CPU Context"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_handoffs": {
+          "title": {
+            "zh-CN": "目标任务调度交接",
+            "en": "System Task Handoffs"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_summary": {
+          "title": {
+            "zh-CN": "目标任务系统状态",
+            "en": "System Task Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
         "touch_phase_stats": {
           "title": {
             "zh-CN": "区间 ${session_id} - 按压滑动阶段",
@@ -27827,6 +28913,12 @@
             "en": "Batch Frame Root Cause"
           },
           "columns": {
+            "system_evidence_json": {
+              "label": {
+                "zh-CN": "系统EvidenceJson",
+                "en": "system_evidence_json"
+              }
+            },
             "frame_id": {
               "label": {
                 "zh-CN": "帧 ID",
@@ -29822,6 +30914,38 @@
           "columns": {},
           "synthesizeLabels": {}
         },
+        "system_context_window": {
+          "title": {
+            "zh-CN": "系统证据窗口",
+            "en": "System Context Window"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_cpu_context": {
+          "title": {
+            "zh-CN": "窗口 CPU 系统上下文",
+            "en": "System CPU Context"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_handoffs": {
+          "title": {
+            "zh-CN": "目标任务调度交接",
+            "en": "System Task Handoffs"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "system_task_summary": {
+          "title": {
+            "zh-CN": "目标任务系统状态",
+            "en": "System Task Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
         "vsync_config": {
           "title": {
             "zh-CN": "显示配置",
@@ -29882,6 +31006,36 @@
             "en": "CPU Freq By Core"
           },
           "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
+            "topology_source": {
+              "label": {
+                "zh-CN": "TopologySource",
+                "en": "topology_source"
+              }
+            },
             "cpu": {
               "label": {
                 "zh-CN": "CPU",
@@ -29927,6 +31081,30 @@
             "en": "CPU Freq Distribution"
           },
           "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
             "cpu": {
               "label": {
                 "zh-CN": "CPU",
@@ -29982,6 +31160,30 @@
             "en": "Running Process Ranking"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "runnable_ms": {
+              "label": {
+                "zh-CN": "Runnablems",
+                "en": "runnable_ms"
+              }
+            },
             "process_name": {
               "label": {
                 "zh-CN": "进程",
@@ -30015,6 +31217,72 @@
             "en": "Running Thread Quadrants"
           },
           "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "role": {
+              "label": {
+                "zh-CN": "Role",
+                "en": "role"
+              }
+            },
+            "state_covered_ns": {
+              "label": {
+                "zh-CN": "StateCoveredns",
+                "en": "state_covered_ns"
+              }
+            },
+            "total_observed_threads": {
+              "label": {
+                "zh-CN": "TotalObservedThreads",
+                "en": "total_observed_threads"
+              }
+            },
+            "sampling_evidence": {
+              "label": {
+                "zh-CN": "SamplingEvidence",
+                "en": "sampling_evidence"
+              }
+            },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "UnknownRunningms",
+                "en": "unknown_running_ms"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "OtherStatems",
+                "en": "other_state_ms"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -31466,6 +32734,54 @@
             "en": "Startup CPU Placement Timeline"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "unknown_core_ms": {
+              "label": {
+                "zh-CN": "UnknownCorems",
+                "en": "unknown_core_ms"
+              }
+            },
+            "used_ucpus": {
+              "label": {
+                "zh-CN": "UsedUcpus",
+                "en": "used_ucpus"
+              }
+            },
+            "sched_covered_ns": {
+              "label": {
+                "zh-CN": "SchedCoveredns",
+                "en": "sched_covered_ns"
+              }
+            },
+            "sched_evidence": {
+              "label": {
+                "zh-CN": "SchedEvidence",
+                "en": "sched_evidence"
+              }
+            },
             "bucket_idx": {
               "label": {
                 "zh-CN": "时间桶",
@@ -31538,6 +32854,36 @@
             "en": "Startup Critical Tasks"
           },
           "columns": {
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "total_observed_threads": {
+              "label": {
+                "zh-CN": "TotalObservedThreads",
+                "en": "total_observed_threads"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -31580,6 +32926,18 @@
                 "en": "Q3 Runnable ms"
               }
             },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "未知核类型运行(ms)",
+                "en": "Unknown Running ms"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "其他观测状态(ms)",
+                "en": "Other State ms"
+              }
+            },
             "q4a_io_blocked_ms": {
               "label": {
                 "zh-CN": "Q4a 不可中断等待",
@@ -31610,6 +32968,24 @@
                 "en": "Big Core Pct"
               }
             },
+            "observed_cross_cluster_migrations": {
+              "label": {
+                "zh-CN": "已确认跨Cluster迁移",
+                "en": "Observed Cross Cluster Migrations"
+              }
+            },
+            "unknown_cluster_migrations": {
+              "label": {
+                "zh-CN": "Cluster关系未知迁移",
+                "en": "Unknown Cluster Migrations"
+              }
+            },
+            "migration_evidence": {
+              "label": {
+                "zh-CN": "迁移证据范围",
+                "en": "Migration Evidence"
+              }
+            },
             "migrations": {
               "label": {
                 "zh-CN": "核迁移次数",
@@ -31620,6 +32996,60 @@
               "label": {
                 "zh-CN": "跨 cluster 迁移",
                 "en": "Cross Cluster Migrations"
+              }
+            },
+            "priority_min": {
+              "label": {
+                "zh-CN": "最小 kernel priority",
+                "en": "Priority Min"
+              }
+            },
+            "priority_max": {
+              "label": {
+                "zh-CN": "最大 kernel priority",
+                "en": "Priority Max"
+              }
+            },
+            "priority_value_count": {
+              "label": {
+                "zh-CN": "观测 priority 值数",
+                "en": "Priority Value Count"
+              }
+            },
+            "preemption_count": {
+              "label": {
+                "zh-CN": "窗口内 R+ 切出次数",
+                "en": "Preemption Count"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "R+ 等待(ms)",
+                "en": "Runnable Preempted ms"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度策略证据",
+                "en": "Scheduling Policy Evidence"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "PID",
+                "en": "PID"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "进程",
+                "en": "Process Name"
+              }
+            },
+            "priority_evidence": {
+              "label": {
+                "zh-CN": "优先级证据",
+                "en": "Priority Evidence"
               }
             }
           },
@@ -31840,6 +33270,18 @@
                 "zh-CN": "核判定来源",
                 "en": "Classify Method"
               }
+            },
+            "unknown_core_ms": {
+              "label": {
+                "zh-CN": "未知核类型运行(ms)",
+                "en": "Unknown Core ms"
+              }
+            },
+            "unknown_core_pct": {
+              "label": {
+                "zh-CN": "未知核类型占比",
+                "en": "Unknown Core Pct"
+              }
             }
           },
           "synthesizeLabels": {}
@@ -31889,6 +33331,54 @@
             "en": "CPU Placement Timeline"
           },
           "columns": {
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "unknown_core_ms": {
+              "label": {
+                "zh-CN": "UnknownCorems",
+                "en": "unknown_core_ms"
+              }
+            },
+            "used_ucpus": {
+              "label": {
+                "zh-CN": "UsedUcpus",
+                "en": "used_ucpus"
+              }
+            },
+            "sched_covered_ns": {
+              "label": {
+                "zh-CN": "SchedCoveredns",
+                "en": "sched_covered_ns"
+              }
+            },
+            "sched_evidence": {
+              "label": {
+                "zh-CN": "SchedEvidence",
+                "en": "sched_evidence"
+              }
+            },
             "bucket_offset_ms": {
               "label": {
                 "zh-CN": "偏移(ms)",
@@ -31922,12 +33412,38 @@
           },
           "synthesizeLabels": {}
         },
+        "critical_task_system_evidence": {
+          "title": {
+            "zh-CN": "关键任务系统证据与覆盖",
+            "en": "Critical Task System Evidence"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
         "critical_tasks": {
           "title": {
             "zh-CN": "启动关键任务（全线程四象限）",
             "en": "Critical Tasks"
           },
           "columns": {
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "total_observed_threads": {
+              "label": {
+                "zh-CN": "TotalObservedThreads",
+                "en": "total_observed_threads"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -31988,10 +33504,124 @@
                 "en": "Migrations"
               }
             },
+            "observed_cross_cluster_migrations": {
+              "label": {
+                "zh-CN": "已确认跨 cluster 迁移",
+                "en": "Observed Cross Cluster Migrations"
+              }
+            },
+            "unknown_cluster_migrations": {
+              "label": {
+                "zh-CN": "cluster 身份未知的迁移",
+                "en": "Unknown Cluster Migrations"
+              }
+            },
+            "migration_evidence": {
+              "label": {
+                "zh-CN": "迁移证据覆盖",
+                "en": "Migration Evidence"
+              }
+            },
             "cross_cluster_migrations": {
               "label": {
                 "zh-CN": "跨 cluster",
                 "en": "Cross Cluster Migrations"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "priority_min": {
+              "label": {
+                "zh-CN": "最小 kernel priority",
+                "en": "Priority Min"
+              }
+            },
+            "priority_max": {
+              "label": {
+                "zh-CN": "最大 kernel priority",
+                "en": "Priority Max"
+              }
+            },
+            "priority_value_count": {
+              "label": {
+                "zh-CN": "priority 值数",
+                "en": "Priority Value Count"
+              }
+            },
+            "preemption_count": {
+              "label": {
+                "zh-CN": "窗口内 R+ 切出次数",
+                "en": "Preemption Count"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "R+ 等待(ms)",
+                "en": "Runnable Preempted ms"
+              }
+            },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "未知核类型运行(ms)",
+                "en": "Unknown Running ms"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度策略证据",
+                "en": "Scheduling Policy Evidence"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "其他观测状态(ms)",
+                "en": "Other State ms"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "PID",
+                "en": "PID"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "TID"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "进程",
+                "en": "Process Name"
+              }
+            },
+            "priority_evidence": {
+              "label": {
+                "zh-CN": "优先级证据",
+                "en": "Priority Evidence"
+              }
+            },
+            "q4a_io_blocked_ms": {
+              "label": {
+                "zh-CN": "Q4a 不可中断等待(ms)",
+                "en": "Q4a I/O Blocked ms"
+              }
+            },
+            "total_ms": {
+              "label": {
+                "zh-CN": "总观测状态时间(ms)",
+                "en": "Total ms"
               }
             }
           },
@@ -32320,6 +33950,348 @@
           },
           "synthesizeLabels": {}
         },
+        "per_cpu_system_context": {
+          "title": {
+            "zh-CN": "逐核系统上下文（非目标因果归因）",
+            "en": "Per CPU System Context"
+          },
+          "columns": {
+            "idle_ns": {
+              "label": {
+                "zh-CN": "Idlens",
+                "en": "Idle duration"
+              }
+            },
+            "idle_identity_unknown_ns": {
+              "label": {
+                "zh-CN": "IdleIdentityUnknownns",
+                "en": "Unknown idle identity duration"
+              }
+            },
+            "sched_evidence": {
+              "label": {
+                "zh-CN": "SchedEvidence",
+                "en": "Scheduler coverage"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "capacity": {
+              "label": {
+                "zh-CN": "Capacity",
+                "en": "capacity"
+              }
+            },
+            "cluster_id": {
+              "label": {
+                "zh-CN": "ClusterId",
+                "en": "cluster_id"
+              }
+            },
+            "machine_id": {
+              "label": {
+                "zh-CN": "MachineId",
+                "en": "machine_id"
+              }
+            },
+            "frequency_evidence": {
+              "label": {
+                "zh-CN": "频率Evidence",
+                "en": "frequency_evidence"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "主线程 UTID",
+                "en": "UTID"
+              }
+            },
+            "cpu": {
+              "label": {
+                "zh-CN": "CPU",
+                "en": "CPU"
+              }
+            },
+            "core_type": {
+              "label": {
+                "zh-CN": "核类型",
+                "en": "Core Type"
+              }
+            },
+            "topology_source": {
+              "label": {
+                "zh-CN": "拓扑来源",
+                "en": "Topology Source"
+              }
+            },
+            "avg_freq_mhz": {
+              "label": {
+                "zh-CN": "窗口加权均频(MHz)",
+                "en": "Avg Freq MHz"
+              }
+            },
+            "min_freq_mhz": {
+              "label": {
+                "zh-CN": "最低频率(MHz)",
+                "en": "Min Freq MHz"
+              }
+            },
+            "max_freq_mhz": {
+              "label": {
+                "zh-CN": "最高频率(MHz)",
+                "en": "Max Freq MHz"
+              }
+            },
+            "freq_coverage_ms": {
+              "label": {
+                "zh-CN": "频率覆盖(ms)",
+                "en": "Freq Coverage ms"
+              }
+            },
+            "freq_coverage_pct": {
+              "label": {
+                "zh-CN": "频率覆盖比例",
+                "en": "Freq Coverage Pct"
+              }
+            },
+            "sched_coverage_ms": {
+              "label": {
+                "zh-CN": "调度记录覆盖(ms)",
+                "en": "Sched Coverage ms"
+              }
+            },
+            "system_busy_ms": {
+              "label": {
+                "zh-CN": "系统非 idle 运行(ms)",
+                "en": "System Busy ms"
+              }
+            },
+            "system_busy_pct": {
+              "label": {
+                "zh-CN": "系统忙碌/窗口",
+                "en": "System Busy Pct"
+              }
+            },
+            "target_main_running_ms": {
+              "label": {
+                "zh-CN": "目标主线程运行(ms)",
+                "en": "Target Main Running ms"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "目标 PID",
+                "en": "PID"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "目标 TID",
+                "en": "TID"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "目标进程",
+                "en": "Process Name"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据边界",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        },
+        "preemption": {
+          "title": {
+            "zh-CN": "R+ 抢占切出与直接 CPU 交接",
+            "en": "Preemption"
+          },
+          "columns": {
+            "next_is_idle": {
+              "label": {
+                "zh-CN": "NextIsIdle",
+                "en": "Successor is idle"
+              }
+            },
+            "next_role": {
+              "label": {
+                "zh-CN": "NextRole",
+                "en": "Successor role"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "目标 UTID",
+                "en": "UTID"
+              }
+            },
+            "thread_name": {
+              "label": {
+                "zh-CN": "目标线程",
+                "en": "Thread Name"
+              }
+            },
+            "cpu": {
+              "label": {
+                "zh-CN": "CPU",
+                "en": "CPU"
+              }
+            },
+            "switch_ts": {
+              "label": {
+                "zh-CN": "实际切出时间",
+                "en": "Switch Ts"
+              }
+            },
+            "priority": {
+              "label": {
+                "zh-CN": "切出片段 kernel priority",
+                "en": "Priority"
+              }
+            },
+            "next_process_name": {
+              "label": {
+                "zh-CN": "交接进程",
+                "en": "Next Process Name"
+              }
+            },
+            "next_thread_name": {
+              "label": {
+                "zh-CN": "交接线程",
+                "en": "Next Thread Name"
+              }
+            },
+            "next_priority": {
+              "label": {
+                "zh-CN": "交接片段 kernel priority",
+                "en": "Next Priority"
+              }
+            },
+            "observed_wait_ms": {
+              "label": {
+                "zh-CN": "窗口内 R+ 等待(ms)",
+                "en": "Observed Wait ms"
+              }
+            },
+            "wait_evidence": {
+              "label": {
+                "zh-CN": "等待证据",
+                "en": "Wait Evidence"
+              }
+            },
+            "handoff_evidence": {
+              "label": {
+                "zh-CN": "交接证据",
+                "en": "Handoff Evidence"
+              }
+            },
+            "sched_id": {
+              "label": {
+                "zh-CN": "切出 sched ID",
+                "en": "Sched Id"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "目标 UPID",
+                "en": "UPID"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "目标 PID",
+                "en": "PID"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "目标 TID",
+                "en": "TID"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "目标进程",
+                "en": "Process Name"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "唯一 CPU ID",
+                "en": "Ucpu"
+              }
+            },
+            "next_sched_id": {
+              "label": {
+                "zh-CN": "交接 sched ID",
+                "en": "Next Sched Id"
+              }
+            },
+            "next_utid": {
+              "label": {
+                "zh-CN": "交接 UTID",
+                "en": "Next UTID"
+              }
+            },
+            "next_tid": {
+              "label": {
+                "zh-CN": "交接 TID",
+                "en": "Next TID"
+              }
+            },
+            "next_upid": {
+              "label": {
+                "zh-CN": "交接 UPID",
+                "en": "Next UPID"
+              }
+            },
+            "next_pid": {
+              "label": {
+                "zh-CN": "交接 PID",
+                "en": "Next PID"
+              }
+            },
+            "wait_state_id": {
+              "label": {
+                "zh-CN": "R+ 状态 ID",
+                "en": "Wait State Id"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度策略证据",
+                "en": "Scheduling Policy Evidence"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        },
         "quadrant_analysis": {
           "title": {
             "zh-CN": "四大象限分析",
@@ -32402,6 +34374,18 @@
               "label": {
                 "zh-CN": "核判定来源",
                 "en": "Classify Method"
+              }
+            },
+            "unknown_running_ms": {
+              "label": {
+                "zh-CN": "未知核类型运行(ms)",
+                "en": "Unknown Running ms"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "其他观测状态(ms)",
+                "en": "Other State ms"
               }
             }
           },
@@ -35337,6 +37321,48 @@
             "en": "Migration Analysis"
           },
           "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "migration_evidence": {
+              "label": {
+                "zh-CN": "MigrationEvidence",
+                "en": "migration_evidence"
+              }
+            },
             "thread_name": {
               "label": {
                 "zh-CN": "线程",
@@ -35624,7 +37650,7 @@
         },
         "high_temp_periods": {
           "title": {
-            "zh-CN": "高温时段",
+            "zh-CN": "高温样本跨度",
             "en": "High Temp Periods"
           },
           "columns": {},
@@ -35650,12 +37676,16 @@
               "en": "Sensor Name"
             },
             "field:avg_temp": {
-              "zh-CN": "平均温度",
+              "zh-CN": "样本平均温度",
               "en": "Avg Temp"
             },
             "field:max_temp": {
               "zh-CN": "最高温度",
               "en": "Max Temp"
+            },
+            "field:source_unit": {
+              "zh-CN": "原始单位",
+              "en": "Source Unit"
             },
             "field:status": {
               "zh-CN": "状态",
@@ -35689,7 +37719,7 @@
         },
         "throttling_events": {
           "title": {
-            "zh-CN": "频率骤降事件 (可能的热节流)",
+            "zh-CN": "频率骤降事件（原因待查）",
             "en": "Throttling Events"
           },
           "columns": {},
@@ -36558,6 +38588,822 @@
               "label": {
                 "zh-CN": "亲和性异常",
                 "en": "Affinity Violation"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        }
+      }
+    },
+    "thread_cpu_placement_timeline": {
+      "displayName": {
+        "zh-CN": "任务驻核时间线",
+        "en": "Thread CPU Placement Timeline"
+      },
+      "description": {
+        "zh-CN": "范围内可定位的系统观测，保留覆盖与缺失；不单凭相关性判断根因",
+        "en": "Analyzes Thread CPU Placement Timeline using trace metrics and supporting evidence."
+      },
+      "type": "atomic",
+      "steps": {
+        "__synthesize_summary__": {
+          "title": {
+            "zh-CN": "洞见摘要",
+            "en": "Insight Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "root": {
+          "title": {
+            "zh-CN": "任务驻核时间线",
+            "en": "Thread CPU Placement Timeline"
+          },
+          "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "window_dur_ns": {
+              "label": {
+                "zh-CN": "WindowDurns",
+                "en": "window_dur_ns"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "PID",
+                "en": "pid"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "进程Name",
+                "en": "process_name"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "thread_name": {
+              "label": {
+                "zh-CN": "线程Name",
+                "en": "thread_name"
+              }
+            },
+            "role": {
+              "label": {
+                "zh-CN": "Role",
+                "en": "role"
+              }
+            },
+            "sched_id": {
+              "label": {
+                "zh-CN": "SchedId",
+                "en": "sched_id"
+              }
+            },
+            "raw_start_ts": {
+              "label": {
+                "zh-CN": "RawStartTs",
+                "en": "raw_start_ts"
+              }
+            },
+            "raw_dur": {
+              "label": {
+                "zh-CN": "RawDur",
+                "en": "raw_dur"
+              }
+            },
+            "raw_end_ts": {
+              "label": {
+                "zh-CN": "RawEndTs",
+                "en": "raw_end_ts"
+              }
+            },
+            "clipped_start_ts": {
+              "label": {
+                "zh-CN": "ClippedStartTs",
+                "en": "clipped_start_ts"
+              }
+            },
+            "clipped_end_ts": {
+              "label": {
+                "zh-CN": "ClippedEndTs",
+                "en": "clipped_end_ts"
+              }
+            },
+            "dur_ns": {
+              "label": {
+                "zh-CN": "Durns",
+                "en": "dur_ns"
+              }
+            },
+            "is_unfinished": {
+              "label": {
+                "zh-CN": "IsUnfinished",
+                "en": "is_unfinished"
+              }
+            },
+            "left_censored": {
+              "label": {
+                "zh-CN": "LeftCensored",
+                "en": "left_censored"
+              }
+            },
+            "right_censored": {
+              "label": {
+                "zh-CN": "RightCensored",
+                "en": "right_censored"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
+            "cpu": {
+              "label": {
+                "zh-CN": "CPU",
+                "en": "cpu"
+              }
+            },
+            "machine_id": {
+              "label": {
+                "zh-CN": "MachineId",
+                "en": "machine_id"
+              }
+            },
+            "cluster_id": {
+              "label": {
+                "zh-CN": "ClusterId",
+                "en": "cluster_id"
+              }
+            },
+            "capacity": {
+              "label": {
+                "zh-CN": "Capacity",
+                "en": "capacity"
+              }
+            },
+            "core_type": {
+              "label": {
+                "zh-CN": "CoreType",
+                "en": "core_type"
+              }
+            },
+            "topology_source": {
+              "label": {
+                "zh-CN": "TopologySource",
+                "en": "topology_source"
+              }
+            },
+            "priority": {
+              "label": {
+                "zh-CN": "Priority",
+                "en": "priority"
+              }
+            },
+            "end_state": {
+              "label": {
+                "zh-CN": "EndState",
+                "en": "end_state"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度PolicyEvidence",
+                "en": "scheduling_policy_evidence"
+              }
+            },
+            "placement_mode": {
+              "label": {
+                "zh-CN": "PlacementMode",
+                "en": "placement_mode"
+              }
+            },
+            "placement_evidence": {
+              "label": {
+                "zh-CN": "PlacementEvidence",
+                "en": "placement_evidence"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        }
+      }
+    },
+    "thread_preemption_handoffs_in_range": {
+      "displayName": {
+        "zh-CN": "实际抢占交接与目标等待",
+        "en": "Thread Preemption Handoffs In Range"
+      },
+      "description": {
+        "zh-CN": "范围内可定位的系统观测，保留覆盖与缺失；不单凭相关性判断根因",
+        "en": "Analyzes Thread Preemption Handoffs In Range using trace metrics and supporting evidence."
+      },
+      "type": "atomic",
+      "steps": {
+        "__synthesize_summary__": {
+          "title": {
+            "zh-CN": "洞见摘要",
+            "en": "Insight Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "root": {
+          "title": {
+            "zh-CN": "实际抢占交接与目标等待",
+            "en": "Thread Preemption Handoffs In Range"
+          },
+          "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "window_dur_ns": {
+              "label": {
+                "zh-CN": "WindowDurns",
+                "en": "window_dur_ns"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "PID",
+                "en": "pid"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "进程Name",
+                "en": "process_name"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "thread_name": {
+              "label": {
+                "zh-CN": "线程Name",
+                "en": "thread_name"
+              }
+            },
+            "role": {
+              "label": {
+                "zh-CN": "Role",
+                "en": "role"
+              }
+            },
+            "sched_id": {
+              "label": {
+                "zh-CN": "SchedId",
+                "en": "sched_id"
+              }
+            },
+            "ucpu": {
+              "label": {
+                "zh-CN": "Ucpu",
+                "en": "ucpu"
+              }
+            },
+            "cpu": {
+              "label": {
+                "zh-CN": "CPU",
+                "en": "cpu"
+              }
+            },
+            "raw_start_ts": {
+              "label": {
+                "zh-CN": "RawStartTs",
+                "en": "raw_start_ts"
+              }
+            },
+            "raw_dur": {
+              "label": {
+                "zh-CN": "RawDur",
+                "en": "raw_dur"
+              }
+            },
+            "raw_end_ts": {
+              "label": {
+                "zh-CN": "RawEndTs",
+                "en": "raw_end_ts"
+              }
+            },
+            "switch_ts": {
+              "label": {
+                "zh-CN": "SwitchTs",
+                "en": "switch_ts"
+              }
+            },
+            "priority": {
+              "label": {
+                "zh-CN": "Priority",
+                "en": "priority"
+              }
+            },
+            "end_state": {
+              "label": {
+                "zh-CN": "EndState",
+                "en": "end_state"
+              }
+            },
+            "peer_sched_id": {
+              "label": {
+                "zh-CN": "PeerSchedId",
+                "en": "peer_sched_id"
+              }
+            },
+            "peer_utid": {
+              "label": {
+                "zh-CN": "PeerUTID",
+                "en": "peer_utid"
+              }
+            },
+            "peer_is_idle": {
+              "label": {
+                "zh-CN": "PeerIsIdle",
+                "en": "peer_is_idle"
+              }
+            },
+            "peer_role": {
+              "label": {
+                "zh-CN": "PeerRole",
+                "en": "peer_role"
+              }
+            },
+            "peer_upid": {
+              "label": {
+                "zh-CN": "PeerUPID",
+                "en": "peer_upid"
+              }
+            },
+            "peer_tid": {
+              "label": {
+                "zh-CN": "PeerTID",
+                "en": "peer_tid"
+              }
+            },
+            "peer_thread_name": {
+              "label": {
+                "zh-CN": "Peer线程Name",
+                "en": "peer_thread_name"
+              }
+            },
+            "peer_process_name": {
+              "label": {
+                "zh-CN": "Peer进程Name",
+                "en": "peer_process_name"
+              }
+            },
+            "peer_start_ts": {
+              "label": {
+                "zh-CN": "PeerStartTs",
+                "en": "peer_start_ts"
+              }
+            },
+            "peer_raw_dur": {
+              "label": {
+                "zh-CN": "PeerRawDur",
+                "en": "peer_raw_dur"
+              }
+            },
+            "peer_priority": {
+              "label": {
+                "zh-CN": "PeerPriority",
+                "en": "peer_priority"
+              }
+            },
+            "peer_end_state": {
+              "label": {
+                "zh-CN": "PeerEndState",
+                "en": "peer_end_state"
+              }
+            },
+            "runnable_state_id": {
+              "label": {
+                "zh-CN": "RunnableStateId",
+                "en": "runnable_state_id"
+              }
+            },
+            "runnable_start_ts": {
+              "label": {
+                "zh-CN": "RunnableStartTs",
+                "en": "runnable_start_ts"
+              }
+            },
+            "runnable_raw_dur": {
+              "label": {
+                "zh-CN": "RunnableRawDur",
+                "en": "runnable_raw_dur"
+              }
+            },
+            "runnable_end_ts": {
+              "label": {
+                "zh-CN": "RunnableEndTs",
+                "en": "runnable_end_ts"
+              }
+            },
+            "runnable_overlap_ns": {
+              "label": {
+                "zh-CN": "RunnableOverlapns",
+                "en": "runnable_overlap_ns"
+              }
+            },
+            "runnable_right_censored": {
+              "label": {
+                "zh-CN": "RunnableRightCensored",
+                "en": "runnable_right_censored"
+              }
+            },
+            "handoff_evidence": {
+              "label": {
+                "zh-CN": "HandoffEvidence",
+                "en": "handoff_evidence"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度PolicyEvidence",
+                "en": "scheduling_policy_evidence"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        }
+      }
+    },
+    "thread_system_summary_in_range": {
+      "displayName": {
+        "zh-CN": "任务状态、摆核与调度观测",
+        "en": "Thread System Summary In Range"
+      },
+      "description": {
+        "zh-CN": "范围内可定位的系统观测，保留覆盖与缺失；不单凭相关性判断根因",
+        "en": "Analyzes Thread System Summary In Range using trace metrics and supporting evidence."
+      },
+      "type": "atomic",
+      "steps": {
+        "__synthesize_summary__": {
+          "title": {
+            "zh-CN": "洞见摘要",
+            "en": "Insight Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "root": {
+          "title": {
+            "zh-CN": "任务状态、摆核与调度观测",
+            "en": "Thread System Summary In Range"
+          },
+          "columns": {
+            "window_id": {
+              "label": {
+                "zh-CN": "WindowId",
+                "en": "window_id"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "WindowStartTs",
+                "en": "window_start_ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "WindowEndTs",
+                "en": "window_end_ts"
+              }
+            },
+            "window_dur_ns": {
+              "label": {
+                "zh-CN": "WindowDurns",
+                "en": "window_dur_ns"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "upid"
+              }
+            },
+            "pid": {
+              "label": {
+                "zh-CN": "PID",
+                "en": "pid"
+              }
+            },
+            "process_name": {
+              "label": {
+                "zh-CN": "进程Name",
+                "en": "process_name"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "utid"
+              }
+            },
+            "tid": {
+              "label": {
+                "zh-CN": "TID",
+                "en": "tid"
+              }
+            },
+            "thread_name": {
+              "label": {
+                "zh-CN": "线程Name",
+                "en": "thread_name"
+              }
+            },
+            "role": {
+              "label": {
+                "zh-CN": "Role",
+                "en": "role"
+              }
+            },
+            "total_target_threads": {
+              "label": {
+                "zh-CN": "TotalTargetThreads",
+                "en": "total_target_threads"
+              }
+            },
+            "state_count": {
+              "label": {
+                "zh-CN": "StateCount",
+                "en": "state_count"
+              }
+            },
+            "state_covered_ns": {
+              "label": {
+                "zh-CN": "StateCoveredns",
+                "en": "state_covered_ns"
+              }
+            },
+            "running_ns": {
+              "label": {
+                "zh-CN": "Runningns",
+                "en": "running_ns"
+              }
+            },
+            "runnable_ns": {
+              "label": {
+                "zh-CN": "Runnablens",
+                "en": "runnable_ns"
+              }
+            },
+            "runnable_preempted_ns": {
+              "label": {
+                "zh-CN": "RunnablePreemptedns",
+                "en": "runnable_preempted_ns"
+              }
+            },
+            "sleeping_ns": {
+              "label": {
+                "zh-CN": "Sleepingns",
+                "en": "sleeping_ns"
+              }
+            },
+            "uninterruptible_ns": {
+              "label": {
+                "zh-CN": "Uninterruptiblens",
+                "en": "uninterruptible_ns"
+              }
+            },
+            "other_state_ns": {
+              "label": {
+                "zh-CN": "OtherStatens",
+                "en": "other_state_ns"
+              }
+            },
+            "unfinished_state_ns": {
+              "label": {
+                "zh-CN": "UnfinishedStatens",
+                "en": "unfinished_state_ns"
+              }
+            },
+            "state_evidence": {
+              "label": {
+                "zh-CN": "StateEvidence",
+                "en": "state_evidence"
+              }
+            },
+            "sched_covered_ns": {
+              "label": {
+                "zh-CN": "SchedCoveredns",
+                "en": "sched_covered_ns"
+              }
+            },
+            "big_running_ns": {
+              "label": {
+                "zh-CN": "BigRunningns",
+                "en": "big_running_ns"
+              }
+            },
+            "little_running_ns": {
+              "label": {
+                "zh-CN": "LittleRunningns",
+                "en": "little_running_ns"
+              }
+            },
+            "unknown_running_ns": {
+              "label": {
+                "zh-CN": "UnknownRunningns",
+                "en": "unknown_running_ns"
+              }
+            },
+            "homogeneous_running_ns": {
+              "label": {
+                "zh-CN": "HomogeneousRunningns",
+                "en": "homogeneous_running_ns"
+              }
+            },
+            "topology_missing_running_ns": {
+              "label": {
+                "zh-CN": "TopologyMissingRunningns",
+                "en": "topology_missing_running_ns"
+              }
+            },
+            "placement_mode": {
+              "label": {
+                "zh-CN": "PlacementMode",
+                "en": "placement_mode"
+              }
+            },
+            "topology_source": {
+              "label": {
+                "zh-CN": "TopologySource",
+                "en": "topology_source"
+              }
+            },
+            "placement_evidence": {
+              "label": {
+                "zh-CN": "PlacementEvidence",
+                "en": "placement_evidence"
+              }
+            },
+            "avg_freq_khz": {
+              "label": {
+                "zh-CN": "AvgFreqKhz",
+                "en": "avg_freq_khz"
+              }
+            },
+            "frequency_covered_ns": {
+              "label": {
+                "zh-CN": "频率Coveredns",
+                "en": "frequency_covered_ns"
+              }
+            },
+            "frequency_evidence": {
+              "label": {
+                "zh-CN": "频率Evidence",
+                "en": "frequency_evidence"
+              }
+            },
+            "priority_min": {
+              "label": {
+                "zh-CN": "PriorityMin",
+                "en": "priority_min"
+              }
+            },
+            "priority_max": {
+              "label": {
+                "zh-CN": "PriorityMax",
+                "en": "priority_max"
+              }
+            },
+            "priority_value_count": {
+              "label": {
+                "zh-CN": "PriorityValueCount",
+                "en": "priority_value_count"
+              }
+            },
+            "priority_evidence": {
+              "label": {
+                "zh-CN": "PriorityEvidence",
+                "en": "priority_evidence"
+              }
+            },
+            "scheduling_policy_evidence": {
+              "label": {
+                "zh-CN": "调度PolicyEvidence",
+                "en": "scheduling_policy_evidence"
+              }
+            },
+            "affinity_evidence": {
+              "label": {
+                "zh-CN": "AffinityEvidence",
+                "en": "affinity_evidence"
+              }
+            },
+            "cgroup_evidence": {
+              "label": {
+                "zh-CN": "CgroupEvidence",
+                "en": "cgroup_evidence"
+              }
+            },
+            "uclamp_evidence": {
+              "label": {
+                "zh-CN": "UclampEvidence",
+                "en": "uclamp_evidence"
+              }
+            },
+            "preemption_count": {
+              "label": {
+                "zh-CN": "PreemptionCount",
+                "en": "preemption_count"
+              }
+            },
+            "preemption_evidence": {
+              "label": {
+                "zh-CN": "PreemptionEvidence",
+                "en": "preemption_evidence"
+              }
+            },
+            "migrations": {
+              "label": {
+                "zh-CN": "Migrations",
+                "en": "migrations"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "EvidenceScope",
+                "en": "evidence_scope"
               }
             }
           },

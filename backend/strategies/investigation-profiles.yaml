@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris) | SmartPerfetto
+schema_version: 1
+profiles:
+  system_execution:
+    version: 1
+    requirements:
+      - id: cpu_frequency
+        domain: cpu_frequency
+        evidence_metrics: [system.cpu.frequency.time_weighted]
+        description: >-
+          Explain per-CPU frequency and measured coverage in the relevant window.
+          Distinguish whole-window time weighting from target-running weighting;
+          intersect frequency, execution and requested intervals. Missing samples
+          are unknown; observed peak is not hardware maximum or throttling proof.
+        condition: {kind: semantic, description: "Relevant to execution latency, capacity or energy in the requested scope."}
+      - id: cpu_capacity
+        domain: cpu_capacity
+        evidence_metrics: [system.cpu.busy.duration]
+        description: >-
+          Relate target execution to per-CPU system busy time in the same window.
+          Preserve CPU/ucpu, machine and topology provenance. Whole-system load is
+          context: it alone neither proves competition nor excludes a local delay.
+        condition: {kind: semantic, description: "Relevant to CPU service or contention in the requested scope."}
+      - id: thread_state
+        domain: thread_state
+        evidence_metrics: [system.thread.state.duration]
+        description: >-
+          Explain critical-task Running, R/R+ Runnable, S/I sleeping/idle and D/DK
+          uninterruptible durations with a conserving window denominator and unknown
+          coverage. Four-quadrant summaries retain medium/unknown placement. S/I is
+          not proof of an empty message queue; D/DK requires blocker or IO evidence.
+        condition: {kind: semantic, description: "Relevant to why identified tasks execute, wait or miss a deadline."}
+      - id: cpu_placement
+        domain: cpu_placement
+        evidence_metrics: [system.thread.placement.duration]
+        description: >-
+          Explain critical-task residency on actual CPUs and little/medium/big/unknown
+          clusters, migrations and provenance. Keep per-task, process and system
+          denominators distinct. Do not map absent topology to little, infer cache
+          misses from migrations, or equate quadrant proportions with a cause.
+        condition: {kind: semantic, description: "Relevant to target CPU execution, heterogeneous capacity or energy."}
+      - id: preemption
+        domain: preemption
+        evidence_metrics: [system.thread.preemption.count]
+        description: >-
+          Examine relevant scheduling delay and R+ switch-out boundaries, preserving
+          victim/next-task UTID/UPID, CPU/ucpu, sched IDs and timestamps. Establish
+          the event population from covered scheduler intervals: zero is observed
+          only with sufficient coverage; when count is positive inspect exact handoffs. An exact
+          same-ucpu next task is an observed handoff, not proof of preemption motive
+          or attributable delay. Ordinary R queueing is separate. Retain peer identity.
+        condition: {kind: semantic, description: "Relevant to Runnable delay or an execution interruption on the critical path."}
+      - id: scheduling_policy
+        domain: scheduling_policy
+        evidence_metrics: [system.thread.priority.observed]
+        description: >-
+          Report observed kernel priority separately from actual FIFO/RR/OTHER/DEADLINE
+          policy, nice, affinity, cgroup and uclamp. State which fields lack direct
+          evidence; priority alone proves none of those policies. Do not recommend
+          enabling RT or fixed uclamp from latency, priority or residency alone.
+        condition: {kind: semantic, description: "Relevant to a scheduling or placement explanation about identified tasks."}
+  causal_reasoning:
+    version: 1
+    requirements:
+      - id: dependency_chain
+        domain: dependency_chain
+        description: >-
+          Connect observed work and waits to the selected performance goal using
+          task intervals and available slice/flow/wakeup/Binder/lock/IO/render evidence.
+          Preserve alternatives, unresolved links and missing capabilities; overlapping
+          activity is not causation. Investigate a dependency only when it can explain
+          the relevant path. Read evidence rows, not just artifact names or counts.
+      - id: supported_recommendations
+        domain: causal_reasoning
+        description: >-
+          Put supported root-cause detail, quantitative evidence and relevant App/system
+          remedies in the current body. State unavailable dimensions and causal limits.
+          A short overview may precede detail but cannot replace it or defer required
+          reasoning. No prescribed headings, prose length or fixed tool sequence.
+  result_comparison:
+    version: 1
+    requirements:
+      - id: comparable_system_evidence
+        domain: comparison
+        description: >-
+          Compare only compatible evidence across explicitly identified trace sides,
+          windows, process instances, sampling coverage, units and denominators. Keep
+          absent saved dimensions not_checked; a missing metric is not zero or absence
+          of a problem. Saved-result comparison uses stored provenance and does not
+          silently fetch either raw trace to fill gaps. Separate observed deltas from causes.

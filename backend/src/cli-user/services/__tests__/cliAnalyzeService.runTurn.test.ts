@@ -16,6 +16,8 @@ import * as finalizationContexts from '../../../agentRuntime/analysisFinalizatio
 import type {RuntimeFinalizationContextInput} from '../../../agentRuntime/analysisFinalizationContext';
 import {buildStrategyRegistrySnapshotFromDefinitions} from '../../../agentv3/strategyLoader';
 import {analysisDeliveryFingerprint} from '../../../types/analysisDelivery';
+import {createAnalysisHistoryReader, resolveAnalysisHistoryReader, toAnalysisHistoryTurn, type AnalysisHistoryReader} from '../../../agentRuntime/analysisHistory';
+import {AnalysisHistoryStore} from '../../../services/analysisHistoryStore';
 
 const mockAnalyze = jest.fn<IOrchestrator['analyze']>();
 const mockPersistAgentTurn = jest.fn();
@@ -275,6 +277,31 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
       rounds: 1,
       totalDurationMs: 1000,
     });
+  });
+
+  it('supplies CLI history separately from the question and filters dormant source turns on reads', async () => {
+    const stored = jest.spyOn(AnalysisHistoryStore.prototype, 'list').mockReturnValue([]);
+    const originalAnalyze = mockAnalyze.getMockImplementation()!;
+    const publicTurn = toAnalysisHistoryTurn({id: 'old-public-run', turnIndex: 0, query: 'Earlier question',
+      traceId: 'old-trace', timestamp: 1, result: {conclusion: 'Limited answer', partial: true,
+        terminationReason: 'max_turns', conclusionContract: {uncertainties: ['Cause unknown'], nextSteps: ['Read blocker']}}});
+    const sourceTurn = {...publicTurn, id: 'old-source-run', turnIndex: 1, sourceDerived: true,
+      query: 'PRIVATE_HISTORY_QUERY', answer: 'PRIVATE_HISTORY_ANSWER'};
+    let capturedReader: AnalysisHistoryReader | undefined;
+    mockAnalyze.mockImplementation(async (...args) => {
+      expect(args[0]).toBe('Continue with the blocker');
+      capturedReader = resolveAnalysisHistoryReader(args[3] ?? {}, createAnalysisHistoryReader({
+        getTurns: () => [], assertActive: () => {},
+      }));
+      expect(capturedReader.getTurns()).toEqual([publicTurn]);
+      expect(capturedReader.read({turnId: sourceTurn.id})).toMatchObject({success: false});
+      return originalAnalyze(...args);
+    });
+    try {
+      await new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli',
+        query: 'Continue with the blocker', history: [publicTurn, sourceTurn], onEvent: jest.fn()});
+      expect(() => capturedReader?.getTurns()).toThrow();
+    } finally { stored.mockRestore(); }
   });
 
   it('owns one Trace lease group through runtime and finalization, then releases it', async () => {

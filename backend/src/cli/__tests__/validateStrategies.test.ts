@@ -17,6 +17,7 @@ import {
   validateStrategyFrontmatter,
   type StrategyFrontmatterValidationContext,
 } from '../commands/validate';
+import {parseInvestigationProfiles} from '../../agentv3/strategyLoader';
 
 function frontmatter(yamlBody: string): string {
   return `---\n${yamlBody.trim()}\n---\n\nBody`;
@@ -35,6 +36,30 @@ function validationContext(): StrategyFrontmatterValidationContext {
     seenVerifierMisdiagnosisIds: new Map(),
   };
 }
+
+describe('validateStrategyFrontmatter investigation contracts', () => {
+  it('requires explicit contracts in the builtin validation gate while reading legacy fixtures', () => {
+    const content = frontmatter('scene: startup');
+    expect(validateStrategyFrontmatter(content, 'legacy.strategy.md')).toEqual([]);
+    expect(validateStrategyFrontmatter(content, 'builtin.strategy.md', {requireInvestigationContract: true}))
+      .toEqual(['builtin.strategy.md: investigation_contract is required']);
+  });
+
+  it('validates pinned profile references and rejects unknown versions', () => {
+    const investigationProfiles = parseInvestigationProfiles({schema_version: 1, profiles: {
+      shared: {version: 1, requirements: [{id: 'task', domain: 'execution', description: 'Explain the selected task'}]},
+    }});
+    const valid = frontmatter('scene: startup\ninvestigation_contract:\n  schema_version: 1\n  profiles: [{id: shared, version: 1}]');
+    expect(validateStrategyFrontmatter(valid, 'valid.strategy.md', {investigationProfiles, requireInvestigationContract: true})).toEqual([]);
+    expect(validateStrategyFrontmatter(valid.replace('version: 1}', 'version: 2}'), 'bad.strategy.md', {investigationProfiles}))
+      .toEqual(['bad.strategy.md: strategy_investigation_profile_unavailable']);
+  });
+
+  it('rejects malformed historical string lists instead of silently accepting partial obligations', () => {
+    expect(validateStrategyFrontmatter(frontmatter('scene: startup\ninvestigation_requirements: [valid, 7]'), 'bad.strategy.md'))
+      .toContain('bad.strategy.md: invalid legacy investigation_requirements');
+  });
+});
 
 describe('validateStrategyFrontmatter verifier_misdiagnosis_patterns', () => {
   it('accepts valid scene-scoped and global verifier rules', () => {

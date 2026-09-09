@@ -27,7 +27,19 @@ SmartPerfetto works best with Android 12+ traces, especially traces that include
 
 Auto mode first returns a scene inventory for mixed-action traces. The timeline lists detected startup, scrolling, click, navigation, device-state, ANR, and related scenes, then shows scope buttons. Select all scenes or one scene family before SmartPerfetto runs the matching startup, scrolling, click, or other deep-dive analysis.
 
+Incomplete CLI results show the reason and available diagnostics, distinguishing
+no narrative from narrative that failed quality checks. A limited summary after
+the investigation turn cap remains `partial` / `max_turns`; review unfinished
+questions before continuing with `smp ask`. See the [CLI reference](../reference/cli.en.md#global-options).
+
 ## Converse Before Starting Analysis
+
+At the investigation turn limit, the remaining budget can produce one no-tool
+summary of findings, gaps and next steps while retaining partial status. Follow-up
+questions inherit these limitations and retrieve older details when needed.
+The same conversation can recover after reopening or a backend restart, following
+current owner, provider, trace and source authorization checks. The page reports
+failed saves, interrupted runs and source history that is no longer readable.
 
 `Conversation` is the default entry. Without an open trace, the top-bar AI
 entry opens a dedicated conversation page. With a trace open, the same mode
@@ -239,3 +251,9 @@ The conclusion should trace back to tables, time ranges, threads, slices, or Ski
 ## Generated Reports
 
 After agent analysis completes, the backend generates an HTML report. The UI reads the report through `/api/agent/v1/:sessionId/report`; the general report endpoint is `/api/reports/:reportId`.
+
+## Reading system investigation results
+
+System analysis applies to relevant performance scenes. Each turn identifies target tasks, time windows and dependencies before explaining relevant frequency, system utilization, quadrants, preemption and scheduling observations. CPU placement ratios and observed priority alone do not establish scheduling policy, preemption motive or a bottleneck.
+
+The UI, HTML report and CLI distinguish system investigation coverage from system evidence coverage. The former evaluates whether the answer explains applicable dimensions; the latter requires trusted acquisition records. A checked explanation may explicitly identify insufficient evidence. Historical results without these fields display Not checked; restoring or comparing saved results does not trigger new trace acquisition. Bounded questions and existing-evidence-only requests retain their original scope.

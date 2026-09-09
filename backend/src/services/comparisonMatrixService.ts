@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
+import {projectPrivateAnalysisDelivery} from './security/analysisDeliveryProjection';
 import type {
   AnalysisResultSnapshot,
   ComparisonDelta,
@@ -39,6 +40,8 @@ const STANDARD_METRIC_BY_KEY = new Map<ComparisonMetricKey, ResolvedMetricDefini
 );
 
 function snapshotToInput(snapshot: AnalysisResultSnapshot): ComparisonMatrixInput {
+  const delivery = projectPrivateAnalysisDelivery({...snapshot.summary, conclusionContract: snapshot.conclusionContract},
+    {conclusion: snapshot.summary.conclusion ?? '', conclusionContract: snapshot.conclusionContract}, text => text, {privateMetadata: false});
   return {
     snapshotId: snapshot.id,
     traceId: snapshot.traceId,
@@ -50,6 +53,11 @@ function snapshotToInput(snapshot: AnalysisResultSnapshot): ComparisonMatrixInpu
     ...(snapshot.createdBy ? { createdBy: snapshot.createdBy } : {}),
     createdAt: snapshot.createdAt,
     traceMetadata: snapshot.traceMetadata,
+    ...(delivery.investigationAssessment ? {investigationAssessment: delivery.investigationAssessment} : {}),
+    ...(delivery.deliveryAssurance ? {investigationAssurance: {
+      investigation: delivery.deliveryAssurance.investigation ?? 'not_checked',
+      investigationEvidence: delivery.deliveryAssurance.investigationEvidence ?? 'not_checked',
+    }} : {}),
   };
 }
 

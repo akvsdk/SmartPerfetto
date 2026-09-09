@@ -9,6 +9,7 @@ import type {RuntimeToolInvocationEvent} from '../../agentRuntime/runtimeToolObs
 import * as runtimeToolSpec from '../../agentRuntime/runtimeToolSpec';
 import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
 import {recordPlanOrPrePlanToolCall} from '../planToolCallRecorder';
+import {isPolicyRefusalResult} from '../toolNarration';
 import type {AnalysisPlanV3} from '../types';
 
 import {
@@ -35,6 +36,42 @@ function stub(name: string): unknown {
 }
 
 describe('McpToolRegistry — basic registration', () => {
+  it('closes held descriptors before execution without turning the refusal into a tool failure', async () => {
+    let active = true;
+    const body = jest.fn(async () => createRuntimeToolResult({success: true}));
+    const registry = new McpToolRegistry({canInvokeTool: () => active});
+    registry.registerShared({name: 'retained', description: 'read', inputSchema: {}, handler: body,
+      exposure: 'public', evidenceEffect: 'read_existing'});
+    const held = registry.list()[0].shared;
+    await held.handler({}, {});
+    active = false;
+    const refused = await held.handler({}, {});
+    expect(body).toHaveBeenCalledTimes(1);
+    expect(isPolicyRefusalResult(refused)).toBe(true);
+    expect(refused.structuredContent).toMatchObject({unsupportedReason: 'acquisition_closed'});
+  });
+
+  it('rechecks acquisition after waiting behind an already running tool', async () => {
+    let active = true;
+    let release!: () => void;
+    let admitted!: () => void;
+    const started = new Promise<void>(resolve => {admitted = resolve;});
+    const blocked = new Promise<void>(resolve => {release = resolve;});
+    const body = jest.fn(async () => {admitted(); await blocked; return createRuntimeToolResult({success: true});});
+    const registry = new McpToolRegistry({canInvokeTool: () => active});
+    registry.registerShared({name: 'serial', description: 'serial evidence', inputSchema: {}, handler: body,
+      exposure: 'public', evidenceEffect: 'acquire'});
+    const held = registry.list()[0].shared;
+    const first = held.handler({}, {});
+    await started;
+    const queued = held.handler({}, {});
+    active = false;
+    release();
+    await first;
+    expect(isPolicyRefusalResult(await queued)).toBe(true);
+    expect(body).toHaveBeenCalledTimes(1);
+  });
+
   it('accepts legacy exported definitions without plan capability and derives a safe default', () => {
     const registry = new McpToolRegistry();
     registry.registerSdk(stub('legacy'), 'legacy_runtime_tool', 'public');
@@ -416,6 +453,27 @@ describe('McpToolRegistry — buildSdkServer', () => {
 });
 
 describe('McpToolRegistry — invocation observation', () => {
+  it.each(['shared', 'sdk'] as const)('does not delay %s read handlers for an inapplicable acquisition observer', async surface => {
+    const events: RuntimeToolInvocationEvent[] = [];
+    const registry = new McpToolRegistry({acquisitionObserver: event => {events.push(event);}});
+    const started: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    registry.registerShared({name: 'existing_read', description: 'Read existing evidence', exposure: 'public',
+      evidenceEffect: 'read_existing', inputSchema: {}, handler: async () => {
+        started.push('body'); await gate; return {content: []};
+      }});
+    const definition = registry.list()[0];
+    const handler = surface === 'shared' ? definition.shared.handler : (definition.tool as ClaudeSdkToolLike).handler;
+    const pending = handler({}, {});
+    try {
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(started).toEqual(['body']);
+      expect(events).toEqual([]);
+    } finally {release(); await pending;}
+  });
+
   it('observes actual shared and SDK handlers with one stable ID per identical invocation', async () => {
     const events: RuntimeToolInvocationEvent[] = [];
     const result = {content: [{type: 'text' as const, text: 'unstructured result'}]};

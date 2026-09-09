@@ -108,6 +108,57 @@ inputs:
     description: "Perfetto 跳转结束时间"
 
 steps:
+  - id: system_context_window
+    type: atomic
+    process_scope:
+      role: identity_metadata
+    name: "系统证据窗口"
+    display: false
+    sql: |
+      SELECT ${anr_ts} - ${timeout_ns} AS start_ts, ${anr_ts} AS end_ts
+    save_as: system_context_window
+
+  - id: system_cpu_context
+    type: skill
+    name: "窗口 CPU 系统上下文"
+    skill: cpu_system_context_in_range
+    optional: true
+    params:
+      start_ts: "${system_context_window.data[0].start_ts}"
+      end_ts: "${system_context_window.data[0].end_ts}"
+    save_as: system_cpu_context
+    display:
+      level: detail
+      layer: deep
+
+  - id: system_task_summary
+    type: skill
+    name: "目标任务系统状态"
+    skill: thread_system_summary_in_range
+    optional: true
+    params:
+      start_ts: "${system_context_window.data[0].start_ts}"
+      end_ts: "${system_context_window.data[0].end_ts}"
+      package: "${process_name}"
+    save_as: system_task_summary
+    display:
+      level: detail
+      layer: deep
+
+  - id: system_task_handoffs
+    type: skill
+    name: "目标任务调度交接"
+    skill: thread_preemption_handoffs_in_range
+    optional: true
+    params:
+      start_ts: "${system_context_window.data[0].start_ts}"
+      end_ts: "${system_context_window.data[0].end_ts}"
+      package: "${process_name}"
+    save_as: system_task_handoffs
+    display:
+      level: detail
+      layer: deep
+
   # ============================================================================
   # CPU 拓扑视图初始化
   # ============================================================================
@@ -207,6 +258,8 @@ steps:
       role: target
       binding: effective_target_processes
     sql_fragments:
+      - fragments/system_sched_spans.sql
+      - fragments/system_thread_state_spans.sql
       - fragments/effective_target_processes.sql
     name: "主线程四象限分析"
     optional: true
@@ -215,6 +268,12 @@ steps:
       layer: deep
       title: "主线程状态分布"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
+        - {name: unknown_running_ms, label: "unknown_running_ms", type: number, hidden: true}
+        - {name: uninterruptible_ms, label: "uninterruptible_ms", type: number, hidden: true}
+        - {name: interruptible_sleep_ms, label: "interruptible_sleep_ms", type: number, hidden: true}
+        - {name: state_coverage_pct, label: "state_coverage_pct", type: number, hidden: true}
         - name: q1_big_running_ms
           label: "Q1大核运行(ms)"
           type: number
@@ -242,86 +301,42 @@ steps:
           label: "Sleeping占比(%)"
           type: percentage
           format: percentage
+        - {name: classify_method, label: "核类型证据来源", type: string, hidden: true}
+        - {name: thread_type, label: "线程角色", type: string, hidden: true}
         - name: status_verdict
           label: "状态判断"
           type: string
     sql: |
-      WITH
-      main_thread AS (
-        SELECT t.utid, t.tid
-        FROM thread t
-        JOIN effective_target_processes p ON t.upid = p.upid
-        WHERE (
-            ${__process_scope.upid} IS NOT NULL
-            OR (${upid} > 0 AND p.upid = ${upid})
-            OR (${upid} <= 0 AND ${pid} > 0 AND p.pid = ${pid}
-                AND ('${process_name}' = '' OR p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
-            OR (${upid} <= 0 AND ${pid} <= 0
-                AND (p.name = '${process_name}' OR p.name GLOB '${process_name}:*'))
-          )
-          AND t.tid = p.pid
-        LIMIT 1
-      ),
-      anr_window AS (
-        SELECT
-          ${anr_ts} - ${timeout_ns} as start_ts,
-          ${anr_ts} as end_ts,
-          ${timeout_ns} as window_ns
-      ),
-      thread_states AS (
-        SELECT
-          ts.state,
-          COALESCE(ct.core_type, 'unknown') as core_type,
-          ts.blocked_function,
-          SUM(
-            MIN(CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END, aw.end_ts)
-              - MAX(ts.ts, aw.start_ts)
-          ) as dur_ns
-        FROM thread_state ts
-        JOIN main_thread mt ON ts.utid = mt.utid
-        CROSS JOIN anr_window aw
-        LEFT JOIN _cpu_topology ct ON ts.cpu = ct.cpu_id
-        WHERE ts.ts < aw.end_ts
-          AND (CASE WHEN ts.dur < 0 THEN aw.end_ts ELSE ts.ts + ts.dur END) > aw.start_ts
-        GROUP BY ts.state, ct.core_type, ts.blocked_function
-      ),
-      quadrant_data AS (
-        SELECT
-          CASE
-            WHEN state = 'Running' AND core_type IN ('prime', 'big') THEN 'Q1_big_running'
-            WHEN state = 'Running' AND core_type IN ('medium', 'little') THEN 'Q2_little_running'
-            WHEN state IN ('R', 'R+') THEN 'Q3_runnable'
-            WHEN state IN ('S', 'D', 'I') THEN 'Q4_sleeping'
-            ELSE 'other'
-          END as quadrant,
-          dur_ns,
-          blocked_function
-        FROM thread_states
+      WITH system_windows AS (
+        SELECT 0 AS window_id, COALESCE(${anr_ts}-${timeout_ns}, (SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+          COALESCE(${anr_ts}, (SELECT end_ts FROM trace_bounds)) AS window_end_ts
+      ),system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid = p.pid THEN 'MainThread' ELSE t.name END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR (${upid}>0 AND p.upid=${upid}) OR (${upid}<=0 AND ${pid}>0 AND p.pid=${pid} AND ('${process_name}'='' OR p.name='${process_name}' OR p.name GLOB '${process_name}:*')) OR (${upid}<=0 AND ${pid}<=0 AND (p.name='${process_name}' OR p.name GLOB '${process_name}:*'))) AND (t.tid=p.pid)
+      ),scene_states AS (
+        SELECT s.*,COALESCE(ct.core_type,'unknown') AS core_type,
+          COALESCE(ct.topology_source,'cpu_identity_unavailable') AS topology_source
+        FROM system_thread_state_spans s LEFT JOIN system_cpu_topology ct ON ct.ucpu=s.ucpu
       )
-      SELECT
-        ROUND(SUM(CASE WHEN quadrant = 'Q1_big_running' THEN dur_ns ELSE 0 END) / 1e6, 2) as q1_big_running_ms,
-        ROUND(SUM(CASE WHEN quadrant = 'Q2_little_running' THEN dur_ns ELSE 0 END) / 1e6, 2) as q2_little_running_ms,
-        ROUND(SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ns ELSE 0 END) / 1e6, 2) as q3_runnable_ms,
-        ROUND(SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ns ELSE 0 END) / 1e6, 2) as q4_sleeping_ms,
-        -- 总和与百分比
-        ROUND(SUM(dur_ns) / 1e6, 2) as total_ms,
-        ROUND(100.0 * SUM(CASE WHEN quadrant IN ('Q1_big_running', 'Q2_little_running') THEN dur_ns ELSE 0 END) /
-              NULLIF(SUM(dur_ns), 0), 1) as running_pct,
-        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ns ELSE 0 END) /
-              NULLIF(SUM(dur_ns), 0), 1) as runnable_pct,
-        ROUND(100.0 * SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ns ELSE 0 END) /
-              NULLIF(SUM(dur_ns), 0), 1) as sleeping_pct,
-        -- 状态判断
-        CASE
-          WHEN 100.0 * SUM(CASE WHEN quadrant = 'Q4_sleeping' THEN dur_ns ELSE 0 END) /
-               NULLIF(SUM(dur_ns), 0) > 80 THEN 'blocked'
-          WHEN 100.0 * SUM(CASE WHEN quadrant = 'Q3_runnable' THEN dur_ns ELSE 0 END) /
-               NULLIF(SUM(dur_ns), 0) > 30 THEN 'cpu_starved'
-          WHEN 100.0 * SUM(CASE WHEN quadrant IN ('Q1_big_running', 'Q2_little_running') THEN dur_ns ELSE 0 END) /
-               NULLIF(SUM(dur_ns), 0) > 70 THEN 'busy_running'
-          ELSE 'mixed'
-        END as status_verdict
-      FROM quadrant_data
+      SELECT upid,utid,role AS thread_type,
+        ROUND(SUM(CASE WHEN state='Running' AND core_type IN ('prime','big','medium') THEN dur_ns ELSE 0 END)/1e6,2) AS q1_big_running_ms,
+        ROUND(SUM(CASE WHEN state='Running' AND core_type='little' THEN dur_ns ELSE 0 END)/1e6,2) AS q2_little_running_ms,
+        ROUND(SUM(CASE WHEN state='Running' AND core_type='unknown' THEN dur_ns ELSE 0 END)/1e6,2) AS unknown_running_ms,
+        ROUND(SUM(CASE WHEN state IN ('R','R+') THEN dur_ns ELSE 0 END)/1e6,2) AS q3_runnable_ms,
+        ROUND(SUM(CASE WHEN state IN ('S','I','D','DK') THEN dur_ns ELSE 0 END)/1e6,2) AS q4_sleeping_ms,
+        ROUND(SUM(CASE WHEN state IN ('D','DK') THEN dur_ns ELSE 0 END)/1e6,2) AS uninterruptible_ms,
+        ROUND(SUM(CASE WHEN state IN ('S','I') THEN dur_ns ELSE 0 END)/1e6,2) AS interruptible_sleep_ms,
+        ROUND(SUM(dur_ns)/1e6,2) AS total_ms,
+        ROUND(100.0*SUM(CASE WHEN state='Running' THEN dur_ns ELSE 0 END)/NULLIF(SUM(dur_ns),0),1) AS running_pct,
+        ROUND(100.0*SUM(CASE WHEN state IN ('R','R+') THEN dur_ns ELSE 0 END)/NULLIF(SUM(dur_ns),0),1) AS runnable_pct,
+        ROUND(100.0*SUM(CASE WHEN state IN ('S','I','D','DK') THEN dur_ns ELSE 0 END)/NULLIF(SUM(dur_ns),0),1) AS sleeping_pct,
+        ROUND(100.0*SUM(dur_ns)/NULLIF(MAX(window_end_ts-window_start_ts),0),1) AS state_coverage_pct,
+        GROUP_CONCAT(DISTINCT topology_source) AS classify_method,
+        CASE WHEN SUM(CASE WHEN state IN ('S','I','D','DK') THEN dur_ns ELSE 0 END)>0.8*SUM(dur_ns) THEN 'waiting_dominant'
+          WHEN SUM(CASE WHEN state IN ('R','R+') THEN dur_ns ELSE 0 END)>0.3*SUM(dur_ns) THEN 'runnable_dominant'
+          WHEN SUM(CASE WHEN state='Running' THEN dur_ns ELSE 0 END)>0.7*SUM(dur_ns) THEN 'busy_running' ELSE 'mixed' END AS status_verdict
+      FROM scene_states GROUP BY window_id,upid,utid,role
     save_as: quadrant
 
   # ============================================================================
@@ -707,6 +722,7 @@ steps:
       context_fields:
         peer_context: [waker_thread, waker_process]
     sql_fragments:
+      - fragments/system_thread_state_spans.sql
       - fragments/effective_target_processes.sql
     name: "唤醒链分析"
     display:
@@ -714,6 +730,14 @@ steps:
       layer: deep
       title: "唤醒链"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
+        - {name: wait_span_count, label: "wait_span_count", type: number, hidden: true}
+        - {name: unfinished_wait_count, label: "unfinished_wait_count", type: number, hidden: true}
+        - {name: left_censored_wait_count, label: "left_censored_wait_count", type: number, hidden: true}
+        - {name: right_censored_wait_count, label: "right_censored_wait_count", type: number, hidden: true}
+        - {name: raw_max_sleep_ms, label: "raw_max_sleep_ms", type: number, hidden: true}
+        - {name: evidence_scope, label: "evidence_scope", type: string, hidden: true}
         - name: waker_thread
           label: "唤醒线程"
           type: string
@@ -741,7 +765,7 @@ steps:
           format: duration_ms
     sql: |
       WITH main_thread AS (
-        SELECT t.utid
+        SELECT t.utid, t.upid
         FROM thread t
         JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (
@@ -755,31 +779,42 @@ steps:
           AND t.tid = p.pid
         LIMIT 1
       ),
-      anr_window AS (
-        SELECT
-          ${anr_ts} - ${timeout_ns} as start_ts,
-          ${anr_ts} as end_ts
+      system_windows AS (
+        SELECT 0 AS window_id,${anr_ts}-${timeout_ns} AS window_start_ts,${anr_ts} AS window_end_ts
+      ),
+      system_target_threads AS (
+        SELECT w.window_id,t.upid,t.utid,'MainThread' AS role FROM system_windows w CROSS JOIN main_thread t
+      ),
+      wakeup_events AS (
+        SELECT e.utid,e.ts,COUNT(*) AS event_rows,
+          CASE WHEN COUNT(*)=1 THEN MAX(e.waker_utid) END AS waker_utid,
+          CASE WHEN COUNT(*)=1 THEN MAX(e.irq_context) END AS irq_context
+        FROM thread_state e JOIN system_target_threads t ON t.utid=e.utid
+        JOIN system_windows w ON w.window_id=t.window_id
+        WHERE e.state IN ('R','R+') AND e.ts>=w.window_start_ts AND e.ts<w.window_end_ts
+        GROUP BY e.utid,e.ts
       )
-      SELECT
-        COALESCE(waker_thread.name, 'unknown') AS waker_thread,
-        COALESCE(waker_process.name, 'kernel') AS waker_process,
-        ts.blocked_function,
-        COUNT(*) AS wakeup_count,
-        ROUND(AVG(ts.dur) / 1e6, 2) AS avg_sleep_ms,
-        ROUND(MAX(ts.dur) / 1e6, 2) AS max_sleep_ms,
-        ROUND(SUM(ts.dur) / 1e6, 2) AS total_sleep_ms
-      FROM thread_state ts
-      JOIN main_thread mt ON ts.utid = mt.utid
-      CROSS JOIN anr_window aw
-      LEFT JOIN thread waker_thread ON ts.waker_utid = waker_thread.utid
-      LEFT JOIN process waker_process ON waker_thread.upid = waker_process.upid
-      WHERE ts.ts >= aw.start_ts
-        AND ts.ts < aw.end_ts
-        AND ts.state IN ('S', 'D', 'I')
-        AND ts.dur >= 1000000  -- > 1ms
-      GROUP BY waker_thread.name, waker_process.name, ts.blocked_function
-      ORDER BY total_sleep_ms DESC
-      LIMIT 10
+      SELECT s.upid,s.utid,
+        COALESCE(waker_thread.name,'unknown') AS waker_thread,
+        COALESCE(waker_process.name,'unknown') AS waker_process,
+        s.blocked_function,
+        COUNT(*) AS wait_span_count,
+        SUM(CASE WHEN e.event_rows=1 AND (e.waker_utid IS NOT NULL OR e.irq_context=1) THEN 1 ELSE 0 END) AS wakeup_count,
+        SUM(s.is_unfinished) AS unfinished_wait_count,
+        SUM(s.left_censored) AS left_censored_wait_count,
+        SUM(s.right_censored) AS right_censored_wait_count,
+        ROUND(AVG(s.dur_ns)/1e6,2) AS avg_sleep_ms,
+        ROUND(MAX(s.dur_ns)/1e6,2) AS max_sleep_ms,
+        ROUND(SUM(s.dur_ns)/1e6,2) AS total_sleep_ms,
+        ROUND(MAX(CASE WHEN s.raw_dur>=0 THEN s.raw_dur END)/1e6,2) AS raw_max_sleep_ms,
+        'overlap_waits_with_in_window_wakeup_events' AS evidence_scope
+      FROM system_thread_state_spans s
+      LEFT JOIN wakeup_events e ON e.utid=s.utid AND e.ts=s.raw_end_ts
+      LEFT JOIN thread waker_thread ON e.waker_utid=waker_thread.utid
+      LEFT JOIN process waker_process ON waker_thread.upid=waker_process.upid
+      WHERE s.state IN ('S','I','D','DK') AND s.dur_ns>=1000000
+      GROUP BY s.upid,s.utid,waker_thread.name,waker_process.name,s.blocked_function
+      ORDER BY total_sleep_ms DESC LIMIT 10
     save_as: wakeup
     optional: true
 

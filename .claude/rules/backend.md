@@ -184,6 +184,16 @@ Keep these boundaries intact:
   the conclusion string was non-empty, so the same trace scored differently
   depending only on which runtime ran it. Confidence follows the findings' own
   confidences; never infer it from the presence of text.
+- Each runtime reserves one no-tool delivery call inside a turn budget above
+  one. Admit closeout only after actual investigation exhaustion, under the
+  original deadline, selected model, provider, authorization and explicit cost
+  limit. A bounded tape contains returned data excerpts and missing/pending
+  state, not a complete transcript or verification proof. The new candidate
+  retains `partial` / `max_turns`; failed summaries restore the original.
+  Count attempted calls and never the SDK's unexecuted cap+1 turn. Turn-limit
+  results must not authorize an additional semantic model call in finalization.
+  OpenCode's asynchronous observation can overshoot; record its actual count
+  and skip a summary if the total allowance is already exhausted.
 - Structured facts must be read from a tool result **before**
   `summarizeExternalToolResult` truncates it. `planPhaseId` and `success` are
   appended after the result body, so they are the first casualties of the
@@ -338,6 +348,23 @@ Keep scoped selection questions lightweight. A selected slice/range is a scope
 signal, not an automatic quick/full decision.
 
 ## Provider and Session Invariants
+
+- Logical follow-ups use fresh physical model context. `analysisHistory.ts`
+  supplies the single bounded history preview to classification and analysis;
+  do not also inject old native SDK history, findings, notes, plans or working
+  memory without their turn completeness and scope. Current-run context and
+  an explicitly submitted current plan remain intact.
+- `read_session_history` is a run-bound historical reader, not evidence acquisition.
+  Preserve native partial/unknown status, uncertainties, next steps and complete
+  declared locators; never infer same-turn identity from a reused turn index.
+  Source-derived history requires its original nonempty authorization fingerprint
+  to match the current permitted scope, including bound-reader and restart paths.
+  Missing historical scope must not be filled using current authorization.
+- Conversation descriptor and finalized turn writes are atomic. Recovery checks
+  tenant/workspace/current owner before loading content, validates provider and
+  source pins, and settles interrupted runs without recreating their execution.
+  Save failure must be observable. Browser logical locators are unambiguous
+  owner/backend-bound resource selectors, never authentication capabilities.
 
 - New sessions pin the effective provider/runtime at creation time.
 - Existing live sessions keep their pinned provider unless an explicit

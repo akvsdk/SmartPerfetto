@@ -3,6 +3,18 @@
 
 ---
 scene: overview
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: overview_critical_path
+      domain: critical_path
+      description: "Reconstruct important events/windows and select material segments for local investigation. Separate overall supply/pressure context from target task evidence and clearly distinguish investigated and uninvestigated segments."
+    - id: overview_dependencies
+      domain: dependency_chain
+      description: "Use representative local paths to explain material symptoms; do not claim a whole-trace cause from one fragment or require every detector for every segment."
 classification_description: "Reconstructing what happened across a trace and identifying which broad performance issues warrant investigation."
 priority: 5
 effort: high

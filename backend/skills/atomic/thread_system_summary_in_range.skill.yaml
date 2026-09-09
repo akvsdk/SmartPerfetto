@@ -1,0 +1,222 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+
+name: thread_system_summary_in_range
+version: "1.0"
+type: atomic
+category: kernel
+tier: B
+meta:
+  display_name: "任务状态、摆核与调度观测"
+  description: "范围内可定位的系统观测，保留覆盖与缺失；不单凭相关性判断根因"
+  icon: "analytics"
+  tags: [system, scheduling, evidence, range]
+prerequisites:
+  modules: [linux.cpu.frequency]
+identity:
+  policy: verify_if_present
+  scope: process
+  aliases: [package]
+process_scope:
+  role: target
+  binding: effective_target_processes
+sql_fragments:
+  - fragments/effective_target_processes.sql
+  - fragments/system_thread_state_spans.sql
+  - fragments/system_sched_spans.sql
+  - fragments/system_cpu_frequency_spans.sql
+inputs:
+  - {name: start_ts, type: timestamp, required: true}
+  - {name: end_ts, type: timestamp, required: true}
+  - {name: package, type: string, required: false}
+  - {name: utid, type: number, required: false}
+investigation_evidence:
+  window: {start: window_start_ts, end: window_end_ts}
+  identity: {upid: upid, utid: utid}
+  context: {window_id: window_id, role: role}
+  metrics:
+    - domain: thread_state
+      metric_id: system.thread.state.duration
+      value: running_ns
+      unit: ns
+      status: state_evidence
+      coverage: state_covered_ns
+      denominator: window_dur_ns
+    - domain: cpu_placement
+      metric_id: system.thread.placement.duration
+      value: big_running_ns
+      unit: ns
+      status: placement_evidence
+      coverage: sched_covered_ns
+      denominator: running_ns
+    - domain: cpu_frequency
+      aggregation: running_time_weighted
+      metric_id: system.thread.frequency.running_weighted
+      value: avg_freq_khz
+      unit: kHz
+      status: frequency_evidence
+      coverage: frequency_covered_ns
+      denominator: sched_covered_ns
+    - domain: preemption
+      metric_id: system.thread.preemption.count
+      value: preemption_count
+      status: preemption_evidence
+      coverage: state_covered_ns
+      denominator: window_dur_ns
+    - domain: scheduling_policy
+      metric_id: system.thread.priority.observed
+      value: priority_min
+      status: priority_evidence
+display:
+  level: detail
+  layer: deep
+  title: "任务状态、摆核与调度观测"
+  columns:
+    - {name: window_id, label: "window_id", type: number, hidden: true}
+    - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: window_dur_ns, label: "window_dur_ns", type: duration, unit: ns, hidden: true}
+    - {name: upid, label: "upid", type: number}
+    - {name: pid, label: "pid", type: number}
+    - {name: process_name, label: "process_name", type: string}
+    - {name: utid, label: "utid", type: number}
+    - {name: tid, label: "tid", type: number}
+    - {name: thread_name, label: "thread_name", type: string}
+    - {name: role, label: "role", type: string}
+    - {name: total_target_threads, label: "total_target_threads", type: number}
+    - {name: state_count, label: "state_count", type: number}
+    - {name: state_covered_ns, label: "state_covered_ns", type: duration, unit: ns}
+    - {name: running_ns, label: "running_ns", type: duration, unit: ns}
+    - {name: runnable_ns, label: "runnable_ns", type: duration, unit: ns}
+    - {name: runnable_preempted_ns, label: "runnable_preempted_ns", type: duration, unit: ns}
+    - {name: sleeping_ns, label: "sleeping_ns", type: duration, unit: ns}
+    - {name: uninterruptible_ns, label: "uninterruptible_ns", type: duration, unit: ns}
+    - {name: other_state_ns, label: "other_state_ns", type: duration, unit: ns}
+    - {name: unfinished_state_ns, label: "unfinished_state_ns", type: duration, unit: ns}
+    - {name: state_evidence, label: "state_evidence", type: string}
+    - {name: sched_covered_ns, label: "sched_covered_ns", type: duration, unit: ns}
+    - {name: big_running_ns, label: "big_running_ns", type: duration, unit: ns}
+    - {name: little_running_ns, label: "little_running_ns", type: duration, unit: ns}
+    - {name: unknown_running_ns, label: "unknown_running_ns", type: duration, unit: ns}
+    - {name: homogeneous_running_ns, label: "homogeneous_running_ns", type: duration, unit: ns}
+    - {name: topology_missing_running_ns, label: "topology_missing_running_ns", type: duration, unit: ns}
+    - {name: placement_mode, label: "placement_mode", type: string}
+    - {name: topology_source, label: "topology_source", type: string}
+    - {name: placement_evidence, label: "placement_evidence", type: string}
+    - {name: avg_freq_khz, label: "avg_freq_khz", type: number}
+    - {name: frequency_covered_ns, label: "frequency_covered_ns", type: duration, unit: ns}
+    - {name: frequency_evidence, label: "frequency_evidence", type: string}
+    - {name: priority_min, label: "priority_min", type: number}
+    - {name: priority_max, label: "priority_max", type: number}
+    - {name: priority_value_count, label: "priority_value_count", type: number}
+    - {name: priority_evidence, label: "priority_evidence", type: string}
+    - {name: scheduling_policy_evidence, label: "scheduling_policy_evidence", type: string}
+    - {name: affinity_evidence, label: "affinity_evidence", type: string}
+    - {name: cgroup_evidence, label: "cgroup_evidence", type: string}
+    - {name: uclamp_evidence, label: "uclamp_evidence", type: string}
+    - {name: preemption_count, label: "preemption_count", type: number}
+    - {name: preemption_evidence, label: "preemption_evidence", type: string}
+    - {name: migrations, label: "migrations", type: number}
+    - {name: evidence_scope, label: "evidence_scope", type: string}
+sql: |
+  WITH system_windows AS (
+    SELECT 0 AS window_id, ${start_ts} AS window_start_ts, ${end_ts} AS window_end_ts
+  ),
+  system_target_threads AS (
+    SELECT w.window_id, p.upid, t.utid,
+      CASE WHEN t.tid = p.pid THEN 'main' ELSE 'target' END AS role
+    FROM system_windows w CROSS JOIN effective_target_processes p
+    JOIN thread t ON t.upid = p.upid
+    WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = ''
+      OR p.name = '${package}' OR p.name GLOB '${package}:*')
+      AND (${utid} IS NULL OR t.utid = ${utid})
+  ),
+  states AS (
+    SELECT window_id, utid, COUNT(*) AS state_count, SUM(dur_ns) AS state_covered_ns,
+      SUM(CASE WHEN state='Running' THEN dur_ns ELSE 0 END) AS running_ns,
+      SUM(CASE WHEN state IN ('R','R+') THEN dur_ns ELSE 0 END) AS runnable_ns,
+      SUM(CASE WHEN state='R+' THEN dur_ns ELSE 0 END) AS runnable_preempted_ns,
+      SUM(CASE WHEN state IN ('S','I') THEN dur_ns ELSE 0 END) AS sleeping_ns,
+      SUM(CASE WHEN state IN ('D','DK') THEN dur_ns ELSE 0 END) AS uninterruptible_ns,
+      SUM(CASE WHEN state NOT IN ('Running','R','R+','S','I','D','DK') THEN dur_ns ELSE 0 END) AS other_state_ns,
+      SUM(CASE WHEN is_unfinished THEN dur_ns ELSE 0 END) AS unfinished_state_ns
+    FROM system_thread_state_spans GROUP BY window_id,utid
+  ),
+  sched AS (
+    SELECT s.*, tt.role,
+      LAG(s.ucpu) OVER (PARTITION BY s.window_id,s.utid ORDER BY s.raw_start_ts,s.sched_id) AS prev_ucpu
+    FROM system_sched_spans s JOIN system_target_threads tt
+      ON s.window_id=tt.window_id AND s.utid=tt.utid AND s.upid=tt.upid
+  ),
+  placement AS (
+    SELECT window_id,utid,COUNT(*) AS sched_count,SUM(dur_ns) AS sched_covered_ns,
+      SUM(CASE WHEN core_type IN ('prime','big','medium') THEN dur_ns ELSE 0 END) AS big_running_ns,
+      SUM(CASE WHEN core_type='little' THEN dur_ns ELSE 0 END) AS little_running_ns,
+      SUM(CASE WHEN core_type NOT IN ('prime','big','medium','little') THEN dur_ns ELSE 0 END) AS unknown_running_ns,
+      SUM(CASE WHEN topology_source='capacity_uniform_no_big_little' THEN dur_ns ELSE 0 END) AS homogeneous_running_ns,
+      SUM(CASE WHEN topology_source IN ('capacity_unavailable','capacity_incomplete','cpu_identity_unavailable') THEN dur_ns ELSE 0 END) AS topology_missing_running_ns,
+      GROUP_CONCAT(DISTINCT topology_source) AS topology_source,
+      MIN(priority) AS priority_min,MAX(priority) AS priority_max,COUNT(DISTINCT priority) AS priority_value_count,
+      SUM(CASE WHEN prev_ucpu IS NOT NULL AND prev_ucpu != ucpu THEN 1 ELSE 0 END) AS migrations
+    FROM sched GROUP BY window_id,utid
+  ),
+  frequency AS (
+    SELECT s.window_id,s.utid,
+      SUM(MIN(s.clipped_end_ts,f.clipped_end_ts)-MAX(s.clipped_start_ts,f.clipped_start_ts)) AS frequency_covered_ns,
+      SUM(f.freq_khz*1.0*(MIN(s.clipped_end_ts,f.clipped_end_ts)-MAX(s.clipped_start_ts,f.clipped_start_ts))) /
+        SUM(MIN(s.clipped_end_ts,f.clipped_end_ts)-MAX(s.clipped_start_ts,f.clipped_start_ts)) AS avg_freq_khz
+    FROM sched s JOIN system_cpu_frequency_spans f
+      ON f.window_id=s.window_id AND f.ucpu=s.ucpu
+        AND f.clipped_start_ts<s.clipped_end_ts AND f.clipped_end_ts>s.clipped_start_ts
+    GROUP BY s.window_id,s.utid
+  ),
+  preemptions AS (
+    SELECT w.window_id,s.utid,COUNT(*) AS preemption_count
+    FROM system_windows w JOIN sched_slice s ON s.dur>0 AND s.end_state='R+'
+      AND s.ts+s.dur>=w.window_start_ts AND s.ts+s.dur<w.window_end_ts
+    JOIN system_target_threads tt ON tt.window_id=w.window_id AND tt.utid=s.utid
+    GROUP BY w.window_id,s.utid
+  )
+  SELECT w.window_id,w.window_start_ts,w.window_end_ts,w.window_end_ts-w.window_start_ts AS window_dur_ns,
+    tt.upid,p.pid,p.name AS process_name,tt.utid,t.tid,t.name AS thread_name,tt.role,
+    COUNT(*) OVER (PARTITION BY w.window_id) AS total_target_threads,
+    COALESCE(st.state_count,0) AS state_count,COALESCE(st.state_covered_ns,0) AS state_covered_ns,
+    st.running_ns, st.runnable_ns, st.runnable_preempted_ns, st.sleeping_ns, st.uninterruptible_ns, st.other_state_ns, st.unfinished_state_ns,
+    CASE WHEN st.state_count IS NULL THEN 'unavailable'
+      WHEN st.state_covered_ns>w.window_end_ts-w.window_start_ts THEN 'unsupported'
+      WHEN st.state_covered_ns<w.window_end_ts-w.window_start_ts THEN 'partial' ELSE 'observed' END AS state_evidence,
+    pl.sched_covered_ns,pl.big_running_ns,pl.little_running_ns,pl.unknown_running_ns,
+    pl.homogeneous_running_ns,pl.topology_missing_running_ns,pl.topology_source,
+    CASE WHEN pl.sched_count IS NULL THEN 'unavailable'
+      WHEN pl.topology_missing_running_ns=pl.sched_covered_ns THEN 'unknown_topology'
+      WHEN pl.topology_missing_running_ns>0 THEN 'partial_topology'
+      WHEN pl.homogeneous_running_ns=pl.sched_covered_ns THEN 'homogeneous_big_little_not_applicable'
+      WHEN pl.homogeneous_running_ns>0 THEN 'mixed_topology_modes'
+      ELSE 'heterogeneous_capacity' END AS placement_mode,
+    CASE WHEN pl.sched_count IS NULL THEN 'unavailable'
+      WHEN pl.topology_missing_running_ns>0 THEN 'partial' ELSE 'observed' END AS placement_evidence,
+    f.avg_freq_khz,COALESCE(f.frequency_covered_ns,0) AS frequency_covered_ns,
+    CASE WHEN f.frequency_covered_ns IS NULL THEN 'unavailable'
+      WHEN f.frequency_covered_ns>pl.sched_covered_ns THEN 'unsupported'
+      WHEN f.frequency_covered_ns<pl.sched_covered_ns THEN 'partial' ELSE 'observed' END AS frequency_evidence,
+    pl.priority_min,pl.priority_max,COALESCE(pl.priority_value_count,0) AS priority_value_count,
+    CASE WHEN pl.priority_value_count>0 THEN 'observed' ELSE 'unavailable' END AS priority_evidence,
+    'not_recorded_in_sched_slice' AS scheduling_policy_evidence,
+    'not_recorded_in_sched_slice' AS affinity_evidence,
+    'not_recorded_in_sched_slice' AS cgroup_evidence,
+    'not_recorded_in_sched_slice' AS uclamp_evidence,
+    CASE WHEN st.state_count IS NULL AND pl.sched_count IS NULL AND pr.preemption_count IS NULL THEN NULL ELSE COALESCE(pr.preemption_count,0) END AS preemption_count,
+    CASE WHEN st.state_count IS NULL THEN 'unavailable'
+      WHEN st.state_covered_ns=w.window_end_ts-w.window_start_ts AND COALESCE(pl.sched_covered_ns,0)=st.running_ns THEN 'observed'
+      ELSE 'partial' END AS preemption_evidence,
+    pl.migrations,'task_observations_not_causal_attribution' AS evidence_scope
+  FROM system_windows w JOIN system_target_threads tt ON w.window_id=tt.window_id
+  JOIN thread t ON tt.utid=t.utid JOIN process p ON p.upid=tt.upid
+  LEFT JOIN states st ON st.window_id=w.window_id AND st.utid=tt.utid
+  LEFT JOIN placement pl ON pl.window_id=w.window_id AND pl.utid=tt.utid
+  LEFT JOIN frequency f ON f.window_id=w.window_id AND f.utid=tt.utid
+  LEFT JOIN preemptions pr ON pr.window_id=w.window_id AND pr.utid=tt.utid
+  WHERE w.window_end_ts>w.window_start_ts
+  ORDER BY w.window_id,CASE WHEN tt.role='main' THEN 0 ELSE 1 END,st.runnable_ns DESC,st.running_ns DESC,tt.utid
+output:
+  format: structured

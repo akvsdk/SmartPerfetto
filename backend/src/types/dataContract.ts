@@ -1146,6 +1146,7 @@ export interface AnalysisCompletedEvent {
     outputOrigin?: import('./analysisDelivery').AnalysisOutputOrigin;
     runtimeAppendix?: import('./analysisDelivery').AnalysisRuntimeAppendix;
     reportAssessment?: import('./analysisDelivery').FinalReportAssessment;
+    investigationAssessment?: import('./analysisInvestigationAssessment').FinalInvestigationAssessment;
     deliveryAssurance?: import('./analysisDelivery').AnalysisDeliveryAssurance;
     sourceUseDecision?: import('../services/codebase/sourceUseDecision').SourceUseDecisionV1;
     sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;

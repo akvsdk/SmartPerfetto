@@ -199,13 +199,21 @@ describe('golden experiment manifest compiler', () => {
 
   it('builds provider-free PR cells without serializing oracle content', () => {
     const registry = loadGoldenTraceRegistry();
+    const authored = JSON.parse(fs.readFileSync(path.resolve(
+      __dirname, '../../../../strategies/golden-trace-eval.registry.json',
+    ), 'utf8')) as {cases: Array<{caseId: string}>};
     const manifest = compileGoldenExperimentManifest({
       tier: 'pr',
       registry,
       profiles: [],
       createdAt: '2026-08-22T00:00:00.000Z',
     });
-    expect(manifest.cells).toHaveLength(14);
+    expect(manifest.cases.map(item => item.caseId).sort()).toEqual(
+      authored.cases.map(item => item.caseId).sort(),
+    );
+    expect(manifest.cells.map(cell => cell.caseId).sort()).toEqual(
+      authored.cases.map(item => item.caseId).sort(),
+    );
     expect(manifest.cells.every(cell =>
       cell.execution === 'deterministic_contract'
       && cell.profileId === null
@@ -223,6 +231,9 @@ describe('golden experiment manifest compiler', () => {
 
   it('expands nightly cells with three repeats and excludes holdout', () => {
     const registry = loadGoldenTraceRegistry();
+    const authored = JSON.parse(fs.readFileSync(path.resolve(
+      __dirname, '../../../../strategies/golden-trace-eval.registry.json',
+    ), 'utf8')) as {cases: Array<{caseId: string; split: string}>};
     const profiles = [
       profile('deepseek-fast', 'deepseek-chat', 'fast'),
       profile('deepseek-full', 'deepseek-chat', 'full'),
@@ -239,8 +250,14 @@ describe('golden experiment manifest compiler', () => {
     const second = compileGoldenExperimentManifest(input);
     expect(first).toEqual(second);
     expect(first.cases.every(item => item.split !== 'holdout')).toBe(true);
-    expect(first.cases).toHaveLength(10);
-    expect(first.cells).toHaveLength(10 * 2 * 3);
+    const selectedCaseIds = authored.cases.filter(item => item.split !== 'holdout')
+      .map(item => item.caseId).sort();
+    expect(first.cases.map(item => item.caseId).sort()).toEqual(selectedCaseIds);
+    const expectedCells = selectedCaseIds.flatMap(caseId => profiles.flatMap(item =>
+      Array.from({length: input.repeats}, (_, index) => `${caseId}:${item.profileId}:${index + 1}`),
+    )).sort();
+    expect(first.cells.map(cell => `${cell.caseId}:${cell.profileId}:${cell.repeat}`).sort())
+      .toEqual(expectedCells);
     expect(new Set(first.cells.map(cell => cell.cellId)).size)
       .toBe(first.cells.length);
     expect(first.policy).toMatchObject({concurrency: 1, repeats: 3});

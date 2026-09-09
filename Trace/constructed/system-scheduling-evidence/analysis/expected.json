@@ -1,0 +1,1002 @@
+{
+  "schema_version": 1,
+  "case_id": "system-scheduling-evidence",
+  "marker": "SmartPerfetto::CASE::system-scheduling-evidence",
+  "expectations": [
+    {
+      "id": "native-target-clipped-summary",
+      "type": "skill",
+      "target": "thread_system_summary_in_range",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/thread_system_summary_in_range.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}",
+        "package": "com.smartperfetto.fixture",
+        "upid": "${fixture_upid}",
+        "utid": "${fixture_utid}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "upid",
+        "pid",
+        "process_name",
+        "utid",
+        "tid",
+        "thread_name",
+        "role",
+        "total_target_threads",
+        "state_count",
+        "state_covered_ns",
+        "running_ns",
+        "runnable_ns",
+        "runnable_preempted_ns",
+        "sleeping_ns",
+        "uninterruptible_ns",
+        "other_state_ns",
+        "unfinished_state_ns",
+        "state_evidence",
+        "sched_covered_ns",
+        "big_running_ns",
+        "little_running_ns",
+        "unknown_running_ns",
+        "homogeneous_running_ns",
+        "topology_missing_running_ns",
+        "placement_mode",
+        "topology_source",
+        "placement_evidence",
+        "avg_freq_khz",
+        "frequency_covered_ns",
+        "frequency_evidence",
+        "priority_min",
+        "priority_max",
+        "priority_value_count",
+        "priority_evidence",
+        "scheduling_policy_evidence",
+        "affinity_evidence",
+        "cgroup_evidence",
+        "uclamp_evidence",
+        "preemption_count",
+        "preemption_evidence",
+        "migrations",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "thread_name",
+          "operator": "eq",
+          "value": "main"
+        },
+        {
+          "column": "process_name",
+          "operator": "eq",
+          "value": "com.smartperfetto.fixture"
+        },
+        {
+          "column": "role",
+          "operator": "eq",
+          "value": "main"
+        },
+        {
+          "column": "window_dur_ns",
+          "operator": "eq",
+          "value": 33000000
+        },
+        {
+          "column": "running_ns",
+          "operator": "eq",
+          "value": 11000000
+        },
+        {
+          "column": "runnable_ns",
+          "operator": "eq",
+          "value": 17000000
+        },
+        {
+          "column": "runnable_preempted_ns",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "uninterruptible_ns",
+          "operator": "eq",
+          "value": 5000000
+        },
+        {
+          "column": "state_covered_ns",
+          "operator": "eq",
+          "value": 33000000
+        },
+        {
+          "column": "state_evidence",
+          "operator": "eq",
+          "value": "observed"
+        },
+        {
+          "column": "sched_covered_ns",
+          "operator": "eq",
+          "value": 11000000
+        },
+        {
+          "column": "unknown_running_ns",
+          "operator": "eq",
+          "value": 11000000
+        },
+        {
+          "column": "big_running_ns",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "little_running_ns",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "placement_evidence",
+          "operator": "eq",
+          "value": "partial"
+        },
+        {
+          "column": "frequency_covered_ns",
+          "operator": "eq",
+          "value": 5000000
+        },
+        {
+          "column": "avg_freq_khz",
+          "operator": "eq",
+          "value": 1800000
+        },
+        {
+          "column": "frequency_evidence",
+          "operator": "eq",
+          "value": "partial"
+        },
+        {
+          "column": "priority_min",
+          "operator": "eq",
+          "value": 110
+        },
+        {
+          "column": "priority_max",
+          "operator": "eq",
+          "value": 120
+        },
+        {
+          "column": "priority_value_count",
+          "operator": "eq",
+          "value": 2
+        },
+        {
+          "column": "scheduling_policy_evidence",
+          "operator": "eq",
+          "value": "not_recorded_in_sched_slice"
+        },
+        {
+          "column": "preemption_count",
+          "operator": "eq",
+          "value": 1
+        },
+        {
+          "column": "migrations",
+          "operator": "eq",
+          "value": 1
+        },
+        {
+          "column": "upid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "utid",
+          "operator": "gt",
+          "value": 0
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "id": "native-pure-waiting-task-preserved",
+      "type": "skill",
+      "target": "thread_system_summary_in_range",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/thread_system_summary_in_range.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}",
+        "package": "com.smartperfetto.fixture",
+        "upid": "${fixture_upid}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "upid",
+        "pid",
+        "process_name",
+        "utid",
+        "tid",
+        "thread_name",
+        "role",
+        "total_target_threads",
+        "state_count",
+        "state_covered_ns",
+        "running_ns",
+        "runnable_ns",
+        "runnable_preempted_ns",
+        "sleeping_ns",
+        "uninterruptible_ns",
+        "other_state_ns",
+        "unfinished_state_ns",
+        "state_evidence",
+        "sched_covered_ns",
+        "big_running_ns",
+        "little_running_ns",
+        "unknown_running_ns",
+        "homogeneous_running_ns",
+        "topology_missing_running_ns",
+        "placement_mode",
+        "topology_source",
+        "placement_evidence",
+        "avg_freq_khz",
+        "frequency_covered_ns",
+        "frequency_evidence",
+        "priority_min",
+        "priority_max",
+        "priority_value_count",
+        "priority_evidence",
+        "scheduling_policy_evidence",
+        "affinity_evidence",
+        "cgroup_evidence",
+        "uclamp_evidence",
+        "preemption_count",
+        "preemption_evidence",
+        "migrations",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "thread_name",
+          "operator": "eq",
+          "value": "PureWaiting"
+        },
+        {
+          "column": "running_ns",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "runnable_ns",
+          "operator": "eq",
+          "value": 20000000
+        },
+        {
+          "column": "state_covered_ns",
+          "operator": "eq",
+          "value": 20000000
+        },
+        {
+          "column": "state_evidence",
+          "operator": "eq",
+          "value": "partial"
+        },
+        {
+          "column": "sched_covered_ns",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "frequency_covered_ns",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "frequency_evidence",
+          "operator": "eq",
+          "value": "unavailable"
+        },
+        {
+          "column": "priority_min",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "priority_value_count",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "priority_evidence",
+          "operator": "eq",
+          "value": "unavailable"
+        },
+        {
+          "column": "upid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "utid",
+          "operator": "gt",
+          "value": 0
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "id": "native-cpu-supply-unknown-topology",
+      "type": "skill",
+      "target": "cpu_system_context_in_range",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/cpu_system_context_in_range.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "ucpu",
+        "cpu",
+        "machine_id",
+        "cluster_id",
+        "capacity",
+        "core_type",
+        "topology_source",
+        "avg_freq_khz",
+        "min_freq_khz",
+        "observed_max_freq_khz",
+        "frequency_covered_ns",
+        "frequency_evidence",
+        "frequency_source",
+        "sched_covered_ns",
+        "busy_ns",
+        "idle_ns",
+        "idle_identity_unknown_ns",
+        "busy_pct",
+        "unfinished_sched_ns",
+        "sched_evidence",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "window_dur_ns",
+          "operator": "eq",
+          "value": 33000000
+        },
+        {
+          "column": "core_type",
+          "operator": "eq",
+          "value": "unknown"
+        },
+        {
+          "column": "capacity",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "topology_source",
+          "operator": "eq",
+          "value": "capacity_unavailable"
+        },
+        {
+          "column": "frequency_covered_ns",
+          "operator": "eq",
+          "value": 33000000
+        },
+        {
+          "column": "frequency_evidence",
+          "operator": "eq",
+          "value": "observed"
+        },
+        {
+          "column": "min_freq_khz",
+          "operator": "eq",
+          "value": 1000000
+        },
+        {
+          "column": "observed_max_freq_khz",
+          "operator": "eq",
+          "value": 2000000
+        },
+        {
+          "column": "busy_ns",
+          "operator": "eq",
+          "value": 17000000
+        },
+        {
+          "column": "sched_covered_ns",
+          "operator": "eq",
+          "value": 33000000
+        },
+        {
+          "column": "sched_evidence",
+          "operator": "eq",
+          "value": "observed"
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "id": "native-cpu-missing-frequency",
+      "type": "skill",
+      "target": "cpu_system_context_in_range",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/cpu_system_context_in_range.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "ucpu",
+        "cpu",
+        "machine_id",
+        "cluster_id",
+        "capacity",
+        "core_type",
+        "topology_source",
+        "avg_freq_khz",
+        "min_freq_khz",
+        "observed_max_freq_khz",
+        "frequency_covered_ns",
+        "frequency_evidence",
+        "frequency_source",
+        "sched_covered_ns",
+        "busy_ns",
+        "idle_ns",
+        "idle_identity_unknown_ns",
+        "busy_pct",
+        "unfinished_sched_ns",
+        "sched_evidence",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "window_dur_ns",
+          "operator": "eq",
+          "value": 33000000
+        },
+        {
+          "column": "core_type",
+          "operator": "eq",
+          "value": "unknown"
+        },
+        {
+          "column": "capacity",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "frequency_covered_ns",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "frequency_evidence",
+          "operator": "eq",
+          "value": "unavailable"
+        },
+        {
+          "column": "avg_freq_khz",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "busy_ns",
+          "operator": "eq",
+          "value": 6000000
+        },
+        {
+          "column": "sched_covered_ns",
+          "operator": "eq",
+          "value": 15000000
+        },
+        {
+          "column": "sched_evidence",
+          "operator": "eq",
+          "value": "partial"
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "id": "native-exact-preemption-handoff",
+      "type": "skill",
+      "target": "thread_preemption_handoffs_in_range",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/thread_preemption_handoffs_in_range.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}",
+        "package": "com.smartperfetto.fixture",
+        "upid": "${fixture_upid}",
+        "utid": "${fixture_utid}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "upid",
+        "pid",
+        "process_name",
+        "utid",
+        "tid",
+        "thread_name",
+        "role",
+        "sched_id",
+        "ucpu",
+        "cpu",
+        "raw_start_ts",
+        "raw_dur",
+        "raw_end_ts",
+        "switch_ts",
+        "priority",
+        "end_state",
+        "peer_sched_id",
+        "peer_utid",
+        "peer_is_idle",
+        "peer_role",
+        "peer_upid",
+        "peer_tid",
+        "peer_thread_name",
+        "peer_process_name",
+        "peer_start_ts",
+        "peer_raw_dur",
+        "peer_priority",
+        "peer_end_state",
+        "runnable_state_id",
+        "runnable_start_ts",
+        "runnable_raw_dur",
+        "runnable_end_ts",
+        "runnable_overlap_ns",
+        "runnable_right_censored",
+        "handoff_evidence",
+        "scheduling_policy_evidence",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "thread_name",
+          "operator": "eq",
+          "value": "main"
+        },
+        {
+          "column": "end_state",
+          "operator": "eq",
+          "value": "R+"
+        },
+        {
+          "column": "priority",
+          "operator": "eq",
+          "value": 120
+        },
+        {
+          "column": "raw_dur",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "peer_thread_name",
+          "operator": "eq",
+          "value": "SystemCompetitor"
+        },
+        {
+          "column": "peer_process_name",
+          "operator": "eq",
+          "value": "com.smartperfetto.systempeer"
+        },
+        {
+          "column": "peer_priority",
+          "operator": "eq",
+          "value": 90
+        },
+        {
+          "column": "peer_raw_dur",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "runnable_raw_dur",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "runnable_overlap_ns",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "runnable_right_censored",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "handoff_evidence",
+          "operator": "eq",
+          "value": "observed"
+        },
+        {
+          "column": "scheduling_policy_evidence",
+          "operator": "eq",
+          "value": "not_recorded_in_sched_slice"
+        },
+        {
+          "column": "evidence_scope",
+          "operator": "eq",
+          "value": "direct_handoff_not_entire_wait_cause"
+        },
+        {
+          "column": "upid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "utid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "peer_upid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "peer_utid",
+          "operator": "gt",
+          "value": 0
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "id": "native-placement-left-clipped-raw-boundary",
+      "type": "skill",
+      "target": "thread_cpu_placement_timeline",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/thread_cpu_placement_timeline.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}",
+        "package": "com.smartperfetto.fixture",
+        "upid": "${fixture_upid}",
+        "utid": "${fixture_utid}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "upid",
+        "pid",
+        "process_name",
+        "utid",
+        "tid",
+        "thread_name",
+        "role",
+        "sched_id",
+        "raw_start_ts",
+        "raw_dur",
+        "raw_end_ts",
+        "clipped_start_ts",
+        "clipped_end_ts",
+        "dur_ns",
+        "is_unfinished",
+        "left_censored",
+        "right_censored",
+        "ucpu",
+        "cpu",
+        "machine_id",
+        "cluster_id",
+        "capacity",
+        "core_type",
+        "topology_source",
+        "priority",
+        "end_state",
+        "scheduling_policy_evidence",
+        "placement_mode",
+        "placement_evidence",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "thread_name",
+          "operator": "eq",
+          "value": "main"
+        },
+        {
+          "column": "raw_dur",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "dur_ns",
+          "operator": "eq",
+          "value": 1000000
+        },
+        {
+          "column": "left_censored",
+          "operator": "eq",
+          "value": 1
+        },
+        {
+          "column": "right_censored",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "is_unfinished",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "priority",
+          "operator": "eq",
+          "value": 120
+        },
+        {
+          "column": "end_state",
+          "operator": "eq",
+          "value": "R+"
+        },
+        {
+          "column": "core_type",
+          "operator": "eq",
+          "value": "unknown"
+        },
+        {
+          "column": "capacity",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "placement_evidence",
+          "operator": "eq",
+          "value": "partial"
+        },
+        {
+          "column": "scheduling_policy_evidence",
+          "operator": "eq",
+          "value": "not_recorded_in_sched_slice"
+        },
+        {
+          "column": "upid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "utid",
+          "operator": "gt",
+          "value": 0
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "id": "native-placement-right-clipped",
+      "type": "skill",
+      "target": "thread_cpu_placement_timeline",
+      "mode": "semantic",
+      "source_file": "backend/skills/atomic/thread_cpu_placement_timeline.skill.yaml",
+      "parameters": {
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}",
+        "package": "com.smartperfetto.fixture",
+        "upid": "${fixture_upid}",
+        "utid": "${fixture_utid}"
+      },
+      "required_steps": [
+        "root"
+      ],
+      "required_sql_steps": [
+        "root"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "root",
+      "required_columns": [
+        "window_id",
+        "window_start_ts",
+        "window_end_ts",
+        "window_dur_ns",
+        "upid",
+        "pid",
+        "process_name",
+        "utid",
+        "tid",
+        "thread_name",
+        "role",
+        "sched_id",
+        "raw_start_ts",
+        "raw_dur",
+        "raw_end_ts",
+        "clipped_start_ts",
+        "clipped_end_ts",
+        "dur_ns",
+        "is_unfinished",
+        "left_censored",
+        "right_censored",
+        "ucpu",
+        "cpu",
+        "machine_id",
+        "cluster_id",
+        "capacity",
+        "core_type",
+        "topology_source",
+        "priority",
+        "end_state",
+        "scheduling_policy_evidence",
+        "placement_mode",
+        "placement_evidence",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "thread_name",
+          "operator": "eq",
+          "value": "main"
+        },
+        {
+          "column": "raw_dur",
+          "operator": "eq",
+          "value": 4000000
+        },
+        {
+          "column": "dur_ns",
+          "operator": "eq",
+          "value": 2000000
+        },
+        {
+          "column": "left_censored",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "right_censored",
+          "operator": "eq",
+          "value": 1
+        },
+        {
+          "column": "is_unfinished",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "priority",
+          "operator": "eq",
+          "value": 110
+        },
+        {
+          "column": "end_state",
+          "operator": "eq",
+          "value": "S"
+        },
+        {
+          "column": "core_type",
+          "operator": "eq",
+          "value": "unknown"
+        },
+        {
+          "column": "capacity",
+          "operator": "eq",
+          "value": null
+        },
+        {
+          "column": "placement_evidence",
+          "operator": "eq",
+          "value": "partial"
+        },
+        {
+          "column": "upid",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "utid",
+          "operator": "gt",
+          "value": 0
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::system-scheduling-evidence"
+    }
+  ],
+  "native_oracle": {
+    "kernel_preempted_raw": 256,
+    "clipped_window_relative_ns": [
+      5000000,
+      38000000
+    ],
+    "target_thread": "main",
+    "competitor_thread": "SystemCompetitor",
+    "state_duration_ns": {
+      "Running": 11000000,
+      "R+": 4000000,
+      "R": 13000000,
+      "D": 5000000
+    },
+    "preempted_handoff_relative_ns": 6000000,
+    "preempted_next_priority": 90,
+    "observed_target_priorities": [
+      110,
+      120
+    ],
+    "clipped_frequency_covered_running_ns": 5000000,
+    "clipped_frequency_unknown_running_ns": 6000000,
+    "clipped_frequency_weighted_mhz": 1800,
+    "topology": "unknown",
+    "policy": "not_captured",
+    "unfinished_thread": "UnfinishedTask",
+    "pure_waiting_thread": "PureWaiting"
+  }
+}

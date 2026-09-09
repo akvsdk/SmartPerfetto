@@ -42,7 +42,8 @@ SmartPerfetto 在 Perfetto Trace 之上增加 AI 分析层。加载 Trace、用�
 - 沿滑动和窗口动画期间的主线程连续时间线，追查 doFrame 之间的任务、执行/等待
   和来源线索；FrameTimeline 用于核对出帧结果，缺少帧数据仍可分析主线程工作。
 - 保留 Perfetto 时间线和 SQL 工作流，并通过 AI Assistant 提供证据化结论、连续追问、
-  对比和报告。
+  对比和报告。达到分析轮次上限后，会基于已有证据交付结论并列出不足；同一会话
+  的追问可继承已授权的历史，重新打开或后端重启后也可恢复。
 - 使用确定性的 YAML Skill 与 Markdown 策略，将事实证据、模型解释和报告来源分开。
 - 按每次请求显式选择已注册的本机源码，无需索引也能有界按需检索，并在
   Web、报告、CLI、snapshot 和 API 的安全来源中区分 trace 发生证据与
@@ -110,6 +111,9 @@ CLI 用法：
 smp run trace.pftrace "分析滑动卡顿"
 ```
 
+CLI 未完成时会显示终止原因和具体诊断；已有报告正文也可能未通过证据或声明
+校验。详见 [CLI 结果说明](docs/reference/cli.md#全局选项)。
+
 ## 文档
 
 - 入门：[文档中心](docs/README.md)、[快速开始](docs/getting-started/quick-start.md)和
@@ -137,3 +141,7 @@ smp run trace.pftrace "分析滑动卡顿"
 SmartPerfetto 核心代码使用 [AGPL-3.0-or-later](LICENSE)；`perfetto/` submodule 继续使用
 [Apache-2.0](https://github.com/google/perfetto/blob/main/LICENSE)。如需不受 AGPL 约束的
 商业授权，请通过微信 `553000664` 联系维护者。
+
+## 跨场景系统调查
+
+性能调查会按问题关联关键任务、CPU 频率、系统负载、线程状态、核运行分布和调度证据。根因策略详情完整读取；缺少的证据明确说明。调查覆盖独立于报告章节和运行时完成状态核验，使用方式见 [基本使用](docs/getting-started/usage.md)。

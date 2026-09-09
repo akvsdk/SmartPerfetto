@@ -502,7 +502,9 @@
         "count",
         "total_ms",
         "max_ms",
-        "avg_ms"
+        "avg_ms",
+        "censored_slice_count",
+        "duration_basis"
       ],
       "required_marker": "SmartPerfetto::CASE::rendering-jank"
     },
@@ -603,6 +605,12 @@
       "expected_condition_skips": [],
       "semantic_step": "quadrant_analysis",
       "required_columns": [
+        "upid",
+        "utid",
+        "thread_type",
+        "window_start_ts",
+        "window_end_ts",
+        "evidence_scope",
         "quadrant",
         "name",
         "dur_ms",
@@ -876,12 +884,17 @@
         "has_fling": 1
       },
       "required_steps": [
+        "system_context_window",
+        "system_cpu_context",
+        "system_task_summary",
+        "system_task_handoffs",
         "full_session_stats",
         "touch_phase_stats",
         "fling_phase_stats",
         "identify_janky_frames"
       ],
       "required_sql_steps": [
+        "system_context_window",
         "full_session_stats",
         "touch_phase_stats",
         "fling_phase_stats",
@@ -927,6 +940,10 @@
         "input_event_backlog_threshold": 3
       },
       "required_steps": [
+        "system_context_window",
+        "system_cpu_context",
+        "system_task_summary",
+        "system_task_handoffs",
         "main_thread_work_summary",
         "main_thread_work_tasks",
         "main_thread_work_sources",
@@ -934,7 +951,9 @@
         "init_cpu_topology",
         "frame_timeline_check",
         "vsync_config",
+        "buffer_tx_coverage_probe",
         "performance_summary",
+        "buffer_tx_performance_fallback",
         "input_data_fallback_view",
         "input_data_check",
         "input_latency_summary",
@@ -954,13 +973,16 @@
         "fallback_no_frame_timeline"
       ],
       "required_sql_steps": [
+        "system_context_window",
         "main_thread_work_summary",
         "main_thread_work_tasks",
         "main_thread_work_sources",
         "main_thread_work_cadence",
         "frame_timeline_check",
         "vsync_config",
+        "buffer_tx_coverage_probe",
         "performance_summary",
+        "buffer_tx_performance_fallback",
         "input_data_fallback_view",
         "input_data_check",
         "input_latency_summary",
@@ -980,7 +1002,9 @@
       ],
       "forced_sql_steps": [
         "vsync_config",
+        "buffer_tx_coverage_probe",
         "performance_summary",
+        "buffer_tx_performance_fallback",
         "input_data_check",
         "input_latency_summary",
         "expert_analysis_window",
@@ -1403,7 +1427,7 @@
       "id": "strategy-game",
       "type": "strategy",
       "target": "game",
-      "query": "\u6e38\u620f",
+      "query": "游戏",
       "expected_strategy": "game",
       "source_file": "backend/strategies/game.strategy.md",
       "required_marker": "SmartPerfetto::CASE::rendering-jank"
@@ -1412,7 +1436,7 @@
       "id": "strategy-scroll_response",
       "type": "strategy",
       "target": "scroll_response",
-      "query": "\u6ed1\u52a8\u54cd\u5e94",
+      "query": "滑动响应",
       "expected_strategy": "scroll_response",
       "source_file": "backend/strategies/scroll-response.strategy.md",
       "required_marker": "SmartPerfetto::CASE::rendering-jank"
@@ -1421,7 +1445,7 @@
       "id": "strategy-scrolling",
       "type": "strategy",
       "target": "scrolling",
-      "query": "\u6ed1\u52a8",
+      "query": "滑动",
       "expected_strategy": "scrolling",
       "source_file": "backend/strategies/scrolling.strategy.md",
       "required_marker": "SmartPerfetto::CASE::rendering-jank"

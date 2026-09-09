@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2024-2026 Gracker (Chris)
+
+name: cpu_system_context_in_range
+version: "1.0"
+type: atomic
+category: kernel
+tier: B
+meta:
+  display_name: "逐核系统供给与覆盖"
+  description: "范围内可定位的系统观测，保留覆盖与缺失；不单凭相关性判断根因"
+  icon: "analytics"
+  tags: [system, scheduling, evidence, range]
+prerequisites:
+  modules: [linux.cpu.frequency]
+process_scope:
+  role: global_context
+sql_fragments:
+  - fragments/system_sched_spans.sql
+  - fragments/system_cpu_frequency_spans.sql
+inputs:
+  - {name: start_ts, type: timestamp, required: true}
+  - {name: end_ts, type: timestamp, required: true}
+investigation_evidence:
+  window: {start: window_start_ts, end: window_end_ts}
+  identity: {cpu: cpu, ucpu: ucpu, machine_id: machine_id}
+  context: {window_id: window_id}
+  metrics:
+    - domain: cpu_frequency
+      aggregation: window_time_weighted
+      metric_id: system.cpu.frequency.time_weighted
+      value: avg_freq_khz
+      unit: kHz
+      status: frequency_evidence
+      coverage: frequency_covered_ns
+      denominator: window_dur_ns
+    - domain: cpu_capacity
+      metric_id: system.cpu.busy.duration
+      value: busy_ns
+      unit: ns
+      status: sched_evidence
+      coverage: sched_covered_ns
+      denominator: window_dur_ns
+display:
+  level: detail
+  layer: deep
+  title: "逐核系统供给与覆盖"
+  columns:
+    - {name: window_id, label: "window_id", type: number, hidden: true}
+    - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: window_dur_ns, label: "window_dur_ns", type: duration, unit: ns, hidden: true}
+    - {name: ucpu, label: "ucpu", type: number}
+    - {name: cpu, label: "cpu", type: number}
+    - {name: machine_id, label: "machine_id", type: number, hidden: true}
+    - {name: cluster_id, label: "cluster_id", type: number, hidden: true}
+    - {name: capacity, label: "capacity", type: number}
+    - {name: core_type, label: "core_type", type: string}
+    - {name: topology_source, label: "topology_source", type: string}
+    - {name: avg_freq_khz, label: "avg_freq_khz", type: number}
+    - {name: min_freq_khz, label: "min_freq_khz", type: number}
+    - {name: observed_max_freq_khz, label: "observed_max_freq_khz", type: number}
+    - {name: frequency_covered_ns, label: "frequency_covered_ns", type: duration, unit: ns}
+    - {name: frequency_evidence, label: "frequency_evidence", type: string}
+    - {name: frequency_source, label: "frequency_source", type: string}
+    - {name: sched_covered_ns, label: "sched_covered_ns", type: duration, unit: ns}
+    - {name: busy_ns, label: "busy_ns", type: duration, unit: ns}
+    - {name: idle_ns, label: "idle_ns", type: duration, unit: ns}
+    - {name: idle_identity_unknown_ns, label: "idle_identity_unknown_ns", type: duration, unit: ns}
+    - {name: busy_pct, label: "busy_pct", type: percentage}
+    - {name: unfinished_sched_ns, label: "unfinished_sched_ns", type: duration, unit: ns}
+    - {name: sched_evidence, label: "sched_evidence", type: string}
+    - {name: evidence_scope, label: "evidence_scope", type: string}
+sql: |
+  WITH system_windows AS (
+    SELECT 0 AS window_id, ${start_ts} AS window_start_ts, ${end_ts} AS window_end_ts
+  ),
+  frequency AS (
+    SELECT window_id, ucpu, SUM(dur_ns) AS frequency_covered_ns,
+      SUM(freq_khz * 1.0 * dur_ns) / SUM(dur_ns) AS avg_freq_khz,
+      MIN(freq_khz) AS min_freq_khz, MAX(freq_khz) AS observed_max_freq_khz
+    FROM system_cpu_frequency_spans GROUP BY window_id, ucpu
+  ),
+  running AS (
+    SELECT window_id, ucpu, SUM(dur_ns) AS sched_covered_ns,
+      SUM(CASE WHEN is_idle = 0 THEN dur_ns ELSE 0 END) AS busy_ns,
+      SUM(CASE WHEN is_idle = 1 THEN dur_ns ELSE 0 END) AS idle_ns,
+      SUM(CASE WHEN is_idle IS NULL THEN dur_ns ELSE 0 END) AS idle_identity_unknown_ns,
+      SUM(CASE WHEN is_unfinished THEN dur_ns ELSE 0 END) AS unfinished_sched_ns
+    FROM system_sched_spans GROUP BY window_id, ucpu
+  )
+  SELECT w.window_id, w.window_start_ts, w.window_end_ts,
+    w.window_end_ts-w.window_start_ts AS window_dur_ns,
+    c.ucpu, c.cpu, c.machine_id, c.cluster_id, c.capacity, c.core_type, c.topology_source,
+    f.avg_freq_khz, f.min_freq_khz, f.observed_max_freq_khz,
+    COALESCE(f.frequency_covered_ns, 0) AS frequency_covered_ns,
+    CASE WHEN m.mapping_count != 1 THEN 'unsupported'
+      WHEN f.frequency_covered_ns IS NULL THEN 'unavailable'
+      WHEN f.frequency_covered_ns > w.window_end_ts-w.window_start_ts THEN 'unsupported'
+      WHEN f.frequency_covered_ns < w.window_end_ts-w.window_start_ts THEN 'partial'
+      ELSE 'observed' END AS frequency_evidence,
+    'linux.cpu.frequency:cpu_frequency_counters' AS frequency_source,
+    COALESCE(s.sched_covered_ns, 0) AS sched_covered_ns, s.busy_ns,
+    s.idle_ns, s.idle_identity_unknown_ns,
+    100.0*s.busy_ns/NULLIF(w.window_end_ts-w.window_start_ts,0) AS busy_pct,
+    s.unfinished_sched_ns,
+    CASE WHEN s.sched_covered_ns IS NULL THEN 'unavailable'
+      WHEN s.sched_covered_ns > w.window_end_ts-w.window_start_ts THEN 'unsupported'
+      WHEN s.idle_identity_unknown_ns > 0 THEN 'partial'
+      WHEN s.sched_covered_ns < w.window_end_ts-w.window_start_ts THEN 'partial'
+      ELSE 'observed' END AS sched_evidence,
+    'system_context_not_causal_attribution' AS evidence_scope
+  FROM system_windows w CROSS JOIN system_cpu_topology c
+  LEFT JOIN system_frequency_cpu_mapping m ON c.ucpu=m.ucpu
+  LEFT JOIN frequency f ON f.window_id=w.window_id AND f.ucpu=c.ucpu
+  LEFT JOIN running s ON s.window_id=w.window_id AND s.ucpu=c.ucpu
+  WHERE w.window_end_ts > w.window_start_ts
+  ORDER BY w.window_id,c.ucpu
+output:
+  format: structured

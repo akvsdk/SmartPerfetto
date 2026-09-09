@@ -46,6 +46,25 @@ Options:
   -h, --help                display help for command
 ```
 
+For parallel regression jobs, give each case a different
+`--session-dir /tmp/smp-sessions/<case>` and use the same directory for subsequent
+`ask`, `list`, and `report` commands. Shared SQLite already waits up to five
+seconds for locks; separate directories isolate test state and do not replace
+investigation of persistent contention.
+
+Incomplete runs display their termination reason and available diagnostics,
+distinguishing absent narrative from narrative that failed quality checks.
+JSON/NDJSON also retain `terminationMessage` and `hasConclusion`.
+`quality_gate_failed` can mean invalid declarations or evidence bindings, not
+missing report sections. A budget above one reserves one no-tool summary of
+returned data, findings, gaps and next steps; exhaustion remains `partial` /
+`max_turns`. The original deadline, authorization and explicit cost budget still
+apply. OpenCode records observed turns and retains the result without an extra
+call if it has overshot the remaining allowance. `smp ask` passes history
+separately from the new question, retains completeness metadata and allows
+on-demand recall of older text. Evidence from a reloaded trace remains historical,
+not newly verified evidence for the new trace identity.
+
 ## Core Workflow
 
 ```bash
@@ -459,3 +478,7 @@ REPL commands:
 | `/focus` | Show current session state |
 | `/clear` | Clear the terminal |
 | `/exit` | Exit |
+
+## System investigation output
+
+The CLI reports system investigation coverage separately from system evidence coverage, with Not checked for missing historical fields. Machine-readable conclusion records include `investigationAssurance` without changing the original conclusion or native completion. Each turn also saves `NNN.investigation-assessment.json` and `NNN.delivery-assurance.json` with dimension statuses and evidence references. The HTML report shows the same investigation scope. Restoring historical results does not automatically acquire missing evidence.

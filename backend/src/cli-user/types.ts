@@ -141,6 +141,8 @@ export interface CliTranscriptTurn {
   timestamp: number;
   question: string;
   conclusionMd?: string;
+  /** Product-owned continuity; persisted evidence remains historical after restart. */
+  history?: import('../agentRuntime/analysisHistory').AnalysisHistoryTurn;
   confidence?: number;
   rounds?: number;
   durationMs?: number;

@@ -3,6 +3,18 @@
 
 ---
 scene: linux
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: linux_critical_path
+      domain: critical_path
+      description: "Bind the requested workload, process instance and critical threads/windows using available Linux trace identities. Analyze relevant state, runqueue signals, frequency/load and observed priority without Android startup or MainThread assumptions."
+    - id: linux_dependencies
+      domain: dependency_chain
+      description: "Preserve homogeneous topology and missing perf/PSI/policy capabilities as explicit boundaries. Distinguish user/kernel work, blocking, IRQ and peer activity using observed evidence."
 classification_description: "Linux system behavior, scheduling and workload performance in traces outside an Android-specific workflow."
 priority: 7
 effort: medium

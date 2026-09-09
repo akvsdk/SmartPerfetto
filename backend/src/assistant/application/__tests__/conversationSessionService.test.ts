@@ -5,6 +5,8 @@
 import {describe, expect, it, jest} from '@jest/globals';
 import * as authorization from '../../../services/resolvedAnalysisContext';
 import type {AnalysisResult} from '../../../agent/core/orchestratorTypes';
+import {toAnalysisHistoryTurn} from '../../../agentRuntime/analysisHistory';
+import type {ConversationSessionDescriptor} from '../../../services/conversationSessionStore';
 
 import {
   ConversationSessionService,
@@ -168,7 +170,7 @@ describe('ConversationSessionService', () => {
     });
     await followUp.completion;
 
-    expect(inputs[1].history[inputs[1].history.length - 1]).toEqual({
+    expect(inputs[1].history[inputs[1].history.length - 1]).toMatchObject({
       role: 'assistant',
       content: 'I need one detail before continuing.',
     });
@@ -379,6 +381,9 @@ describe('ConversationSessionService', () => {
     expect(inputs[1].history).toEqual(expect.arrayContaining([
       expect.objectContaining({content: 'source answer', sourceDerived: true}),
     ]));
+    expect(service.getSession(first.sessionId)!.historyTurns[0].analysisContextFingerprint).toBe(
+      service.getSession(first.sessionId)!.analysisContextFingerprint);
+    expect(service.getSession(first.sessionId)!.historyTurns[0].analysisContextFingerprint).toBeTruthy();
     expect(inputs[2].history).not.toEqual(expect.arrayContaining([
       expect.objectContaining({content: 'automatic supplement'}),
     ]));
@@ -649,6 +654,114 @@ describe('ConversationSessionService', () => {
       expect(session.runs[0].outcome).toBeUndefined();
       expect(session.runs[0].events.some(event => event.type === 'run_completed')).toBe(false);
     } finally {authorizationCheck.mockRestore();}
+  });
+
+  it('keeps finalized partial state, uncertainties and next steps in next-turn history', async () => {
+    let incoming: ConversationRuntimeInput | undefined;
+    const finalResult = {sessionId: 'runtime', success: false, partial: true, findings: [], hypotheses: [],
+      conclusion: 'Scheduling delay observed.', confidence: 0.4, rounds: 50, totalDurationMs: 100,
+      terminationReason: 'max_turns', conclusionContract: {uncertainties: ['Wakeup missing'], nextSteps: ['Inspect wakeup']}} as unknown as AnalysisResult;
+    const service = createService({run: async input => {incoming = input; return {kind: 'answered', message: finalResult.conclusion, finalResult};},
+      cancel: async () => undefined});
+    const first = service.startTurn({query: 'first'}); await first.completion;
+    const second = service.startTurn({sessionId: first.sessionId, query: 'followup'}); await second.completion;
+    expect(incoming!.getHistoryTurns!()).toEqual([expect.objectContaining({id: first.runId, query: 'first',
+      partial: true, completionStatus: 'incomplete', uncertainties: ['Wakeup missing'], nextSteps: ['Inspect wakeup']})]);
+  });
+
+  it('inherits the same failed query and incomplete state before and after restart', async () => {
+    const {descriptor, input} = recoveryFixture();
+    let calls = 0;
+    let sequence = 0;
+    let followupHistory: ReturnType<typeof toAnalysisHistoryTurn>[] | undefined;
+    const service = new ConversationSessionService({createId: prefix => prefix === 'conversation' ? descriptor.sessionId : `failure-run-${++sequence}`,
+      createRuntime: () => ({run: async incoming => {
+        if (++calls === 1) throw new Error('provider failed');
+        followupHistory = [...incoming.getHistoryTurns!()];
+        return {kind: 'answered', message: 'followup answer'};
+      }, cancel: async () => undefined})});
+    const first = service.startTurn({...input, sessionId: undefined, query: 'failed question'});
+    await expect(first.completion).rejects.toThrow('provider failed');
+    const failed = structuredClone(service.getSession(first.sessionId)!.historyTurns[0]);
+    expect(failed).toMatchObject({query: 'failed question', answer: '', partial: true, completionStatus: 'incomplete',
+      terminationReason: 'execution_error', analysisContextFingerprint: input.analysisContextFingerprint});
+    const followup = service.startTurn({...input, sessionId: first.sessionId, query: 'continue the failed question'});
+    await followup.completion;
+    expect(followupHistory).toEqual([failed]);
+    const restarted = createService({run: async () => ({kind: 'answered', message: 'restored'}), cancel: async () => undefined});
+    const restored = restarted.restoreSession({...descriptor, status: 'failed', lastOutcome: undefined,
+      lastRun: {...descriptor.lastRun, runId: first.runId, query: 'failed question', status: 'failed'}}, [failed], input);
+    expect(restored.historyTurns).toEqual(followupHistory);
+    expect(restored.history[0].turn).toEqual(failed);
+  });
+
+  it('returns an observable unavailable recovery state when finalized persistence fails', async () => {
+    const service = new ConversationSessionService({createRuntime: () => ({run: async () => ({kind: 'answered', message: 'Delivered answer'}),
+      cancel: async () => undefined}), onRunSettled: () => {throw new Error('sqlite disk failure');}});
+    const receipt = service.startTurn({query: 'question'});
+    const outcome = await receipt.completion;
+    expect(outcome).toMatchObject({message: 'Delivered answer', recoveryStatus: 'unavailable'});
+    expect(service.getSession(receipt.sessionId)?.recoveryStatus).toBe('unavailable');
+    expect(service.getSession(receipt.sessionId)?.runs[0].events).toContainEqual(expect.objectContaining({
+      type: 'run_completed', outcome: expect.objectContaining({recoveryStatus: 'unavailable'})}));
+  });
+
+  function recoveryFixture() {
+    const owner = {tenantId: 'tenant-recovery', workspaceId: 'workspace-recovery', userId: 'user-recovery'};
+    const fingerprint = authorization.buildAnalysisContextAuthorizationFingerprint({}, owner);
+    const descriptor: ConversationSessionDescriptor = {version: 1, ...owner, sessionId: 'restore-conversation',
+      traceContext: {kind: 'none'}, providerId: null, providerFollowsActive: false, runtimeKind: 'openai-agents-sdk',
+      providerSnapshotHash: 'provider-hash', analysisContextFingerprint: fingerprint, status: 'completed',
+      createdAt: 1, lastActivityAt: 2, lastRun: {runId: 'old-run', turnIndex: 0, query: 'first query', status: 'completed', startedAt: 1},
+      lastOutcome: {kind: 'answered', message: 'Prior incomplete answer'}};
+    const input = {query: '', sessionId: descriptor.sessionId, owner, traceContext: descriptor.traceContext,
+      providerId: descriptor.providerId, runtimeKind: descriptor.runtimeKind, providerSnapshotHash: descriptor.providerSnapshotHash,
+      analysisContextFingerprint: fingerprint};
+    const turn = toAnalysisHistoryTurn({id: 'old-run', turnIndex: 0, query: 'first query',
+      traceId: 'conversation-no-trace:restore-conversation', timestamp: 2,
+      result: {conclusion: 'Prior incomplete answer', partial: true, terminationReason: 'max_turns'}});
+    return {descriptor, input, turn};
+  }
+
+  it('restores finalized logical history into a fresh adapter and continues the same session', async () => {
+    const {descriptor, input, turn} = recoveryFixture();
+    const received: ConversationRuntimeInput[] = [];
+    const factory = jest.fn((): ConversationRuntimeAdapter => ({run: async incoming => {
+      received.push(incoming); return {kind: 'answered', message: 'continued'};}, cancel: async () => undefined}));
+    const service = new ConversationSessionService({createRuntime: factory});
+    const restored = service.restoreSession(descriptor, [turn], input);
+    expect(restored.activeRun).toBeUndefined();
+    expect(restored.historyTurns).toEqual([turn]);
+    expect(factory).toHaveBeenCalledTimes(1);
+    const receipt = service.startTurn({...input, query: 'followup'}); await receipt.completion;
+    expect(receipt.sessionId).toBe(descriptor.sessionId);
+    expect(receipt.isNewSession).toBe(false);
+    expect(received[0].getHistoryTurns!()).toEqual([turn]);
+  });
+
+  it('restores a crashed running descriptor as interrupted without a phantom active run', () => {
+    const {descriptor, input, turn} = recoveryFixture();
+    const service = createService({run: async () => ({kind: 'answered', message: ''}), cancel: async () => undefined});
+    const restored = service.restoreSession({...descriptor, status: 'running',
+      lastRun: {...descriptor.lastRun, status: 'running'}}, [{...turn, answer: ''}], input);
+    expect(restored).toMatchObject({status: 'failed', recoveryStatus: 'interrupted', runs: []});
+    expect(restored.activeRun).toBeUndefined();
+    expect(restored.historyTurns[0]).toMatchObject({partial: true, completionStatus: 'incomplete',
+      terminationMessage: 'conversation_run_interrupted_before_final_commit'});
+  });
+
+  it('denies changed owner, provider hash and revoked sources before recreating an adapter', () => {
+    const {descriptor, input, turn} = recoveryFixture();
+    const factory = jest.fn((): ConversationRuntimeAdapter => ({run: async () => ({kind: 'answered', message: ''}), cancel: async () => undefined}));
+    const service = new ConversationSessionService({createRuntime: factory});
+    expect(() => service.restoreSession(descriptor, [turn], {...input, owner: {...input.owner, userId: 'another-user'}})).toThrow('context_mismatch');
+    expect(() => service.restoreSession(descriptor, [turn], {...input, providerSnapshotHash: 'changed'})).toThrow('context_mismatch');
+    const check = jest.spyOn(authorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
+      throw new authorization.AnalysisContextAuthorizationChangedError();
+    });
+    try {expect(() => service.restoreSession(descriptor, [turn], input)).toThrow('analysis_context_changed_restart_required');}
+    finally {check.mockRestore();}
+    expect(factory).not.toHaveBeenCalled();
   });
 
 });

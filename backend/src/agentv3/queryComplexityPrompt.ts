@@ -53,10 +53,10 @@ export function buildComplexityClassifierPrompt(input: ComplexityPromptInput): s
     hasReferenceTrace: promptVar(input, 'hasReferenceTrace'),
     hasExistingFindings: promptVar(input, 'hasExistingFindings'),
     hasPriorFullAnalysis: promptVar(input, 'hasPriorFullAnalysis'),
-    previousQueries: formatPreviousQueries(input),
-    previousFindings: formatPreviousFindings(input),
+    previousQueries: typeof input !== 'string' && input.historyContext !== undefined ? 'none' : formatPreviousQueries(input),
+    previousFindings: typeof input !== 'string' && input.historyContext !== undefined ? 'none' : formatPreviousFindings(input),
   };
-  return template
+  const prompt = template
     ? renderTemplate(template, vars)
     : [
         'Classify this Android trace analysis query as "quick" (factual) or "full" (analysis).',
@@ -66,6 +66,7 @@ export function buildComplexityClassifierPrompt(input: ComplexityPromptInput): s
         `Query: ${query}`,
         'Output JSON: {"complexity": "quick" or "full", "reason": "..."}',
       ].join('\n');
+  return typeof input !== 'string' && input.historyContext ? `${prompt}\n\n${input.historyContext}` : prompt;
 }
 
 /** Rendering only: semantic policy lives in the external template. */
@@ -88,9 +89,11 @@ export function buildAnalysisTurnIntentPrompt(input: {
     requestedMode: context.requestedMode ?? 'auto',
     selection: context.selectionContext ?? null,
     hasReferenceTrace: context.hasReferenceTrace,
-    previousQueries: context.previousQueries?.slice(-3).map(query => query.slice(0, 800)) ?? [],
-    previousFindings: context.previousFindingDetails ?? context.previousFindings?.slice(-5) ?? [],
-    previousEntities: context.previousEntities ?? [],
+    ...(context.historyContext !== undefined ? {historyContext: context.historyContext} : {
+      previousQueries: context.previousQueries?.slice(-3).map(query => query.slice(0, 800)) ?? [],
+      previousFindings: context.previousFindingDetails ?? context.previousFindings?.slice(-5) ?? [],
+      previousEntities: context.previousEntities ?? [],
+    }),
   };
   return renderTemplate(input.template, {
     decisionSchema: JSON.stringify(input.decisionSchema),

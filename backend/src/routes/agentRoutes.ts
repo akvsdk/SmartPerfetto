@@ -617,6 +617,9 @@ interface HttpFinalizationRun {
 const httpFinalizationRuns = new WeakMap<AnalysisSession, Map<string, HttpFinalizationRun>>();
 // Root lease ownership outlives smart -> deep-dive finalization controller handoffs.
 const httpAnalysisRunLeaseControllers = new WeakMap<AnalysisSession, Map<string, AbortController>>();
+// Local durable parents require verified Trace backing from actual HTTP admission.
+// A restored session or a prior run cannot grant this readiness to another run.
+const admittedLocalAnalysisRuns = new WeakMap<AnalysisSession, Set<string>>();
 
 function abortHttpFinalizationRuns(session: AnalysisSession, runId?: string): void {
   for (const [id, controller] of httpAnalysisRunLeaseControllers.get(session) ?? []) {
@@ -1449,7 +1452,10 @@ function agentEventScopeFromSession(
 }
 
 function analysisRunScopeFromSession(session: AnalysisSession, runId?: string): AnalysisRunPersistenceScope | null {
-  return agentEventScopeFromSession(session, runId);
+  const scope = baseAgentEventScopeFromSession(session, runId);
+  return scope && (resolveFeatureConfig().enterprise || admittedLocalAnalysisRuns.get(session)?.has(scope.runId))
+    ? scope
+    : null;
 }
 
 function persistSessionRunState(
@@ -1634,7 +1640,7 @@ function sanitizePersistedAnalysisCompletedEvent(
         sourceClaimVerificationResult: undefined,
         sourceUseDecision: undefined,
         turnIntent: undefined, completion: undefined, outputOrigin: undefined, runtimeAppendix: undefined,
-        reportAssessment: undefined, deliveryAssurance: undefined,
+        reportAssessment: undefined, investigationAssessment: undefined, deliveryAssurance: undefined,
         identityResolutions: undefined,
         uiActionProposals: [],
       }
@@ -3045,6 +3051,13 @@ async function handleAnalyzeRequest(
             analysisMode: options.analysisMode, traceSizeBytes: selectedTrace.size,
           })} : {}),
       });
+      runTraceProcessorLeases.assertCurrent();
+      if (!resolveFeatureConfig().enterprise) {
+        const admittedRuns = admittedLocalAnalysisRuns.get(sessionForRun) ?? new Set<string>();
+        admittedRuns.add(runContext.runId);
+        admittedLocalAnalysisRuns.set(sessionForRun, admittedRuns);
+        persistSessionRunState(sessionForRun, 'pending', undefined, runContext.runId);
+      }
     } catch (leaseError: any) {
       if (leaseController.signal.aborted || isSessionRunCancelled(sessionForRun, runContext.runId) ||
         isStaleRun(sessionForRun, runContext.runId)) {

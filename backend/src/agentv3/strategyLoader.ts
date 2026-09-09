@@ -30,6 +30,7 @@ import {
 } from '../services/selfEvolution/effectiveRuntimeRegistryContext';
 import {currentRunManifestAttributionSink} from '../services/selfEvolution/runManifestLifecycle';
 import type {RunManifestScope} from '../types/selfEvolution';
+import type {AnalysisInvestigationContract, AnalysisInvestigationRequirement} from '../types/analysisInvestigation';
 
 /** Phase-level restatement hint — loaded from strategy frontmatter `phase_hints`. */
 export interface PhaseHint {
@@ -143,6 +144,8 @@ export interface StrategyDefinition {
   optionalCapabilities: string[];
   /** Scoped evidence obligations for typed investigations, independent of report presentation. */
   investigationRequirements?: string[];
+  /** Expanded profile contents travel with the same immutable registry pin. */
+  investigationContract?: AnalysisInvestigationContract;
   /** Phase-level hints for mid-analysis restatement injection. */
   phaseHints: PhaseHint[];
   /**
@@ -178,7 +181,6 @@ const STRATEGIES_DIR = path.resolve(__dirname, '../../strategies');
 /** Tolerates leading `<!-- -->` blocks (e.g. SPDX/license headers) before the frontmatter. */
 const FRONTMATTER_RE = /^(?:\s*<!--[\s\S]*?-->\s*)*---\n([\s\S]*?)\n---\n?([\s\S]*)$/;
 const STRATEGY_DETAIL_RE = /<!--\s*strategy-detail\b([^>]*)-->\s*([\s\S]*?)\s*<!--\s*\/strategy-detail\s*-->/g;
-const DEFAULT_STRATEGY_DETAIL_EXCERPT_CHARS = 1600;
 /** In dev mode, skip caching so .strategy.md / .template.md edits take effect without restart. */
 const DEV_MODE = process.env.NODE_ENV !== 'production';
 
@@ -362,7 +364,104 @@ export function parseFinalReportContract(value: unknown): FinalReportContract | 
   };
 }
 
-function parseStrategyFile(filePath: string): StrategyDefinition | null {
+export type InvestigationProfiles = ReadonlyMap<string, {
+  version: number;
+  requirements: readonly AnalysisInvestigationRequirement[];
+}>;
+
+function parseInvestigationRequirement(value: unknown): AnalysisInvestigationRequirement {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['id', 'domain', 'description', 'required', 'condition', 'evidence_metrics'])
+    || !nonEmptyString(value.id) || !/^[a-z][a-z0-9_]*$/.test(value.id)
+    || !nonEmptyString(value.domain) || !nonEmptyString(value.description)
+    || (value.required !== undefined && typeof value.required !== 'boolean')) {
+    throw new Error('strategy_invalid_investigation_requirement');
+  }
+  let condition: AnalysisInvestigationRequirement['condition'];
+  if (value.condition !== undefined) {
+    if (!isRecord(value.condition) || !hasOnlyKeys(value.condition, ['kind', 'description'])
+      || value.condition.kind !== 'semantic' || !nonEmptyString(value.condition.description)) {
+      throw new Error('strategy_invalid_investigation_condition');
+    }
+    condition = {kind: 'semantic', description: value.condition.description.trim()};
+  }
+  let evidenceMetrics: string[] | undefined;
+  if (value.evidence_metrics !== undefined) {
+    if (!Array.isArray(value.evidence_metrics) || !value.evidence_metrics.length
+      || !value.evidence_metrics.every(nonEmptyString)) throw new Error('strategy_invalid_investigation_metrics');
+    evidenceMetrics = value.evidence_metrics.map(metric => metric.trim());
+    if (new Set(evidenceMetrics).size !== evidenceMetrics.length) throw new Error('strategy_duplicate_investigation_metric');
+  }
+  return {id: value.id, domain: value.domain.trim(), description: value.description.trim(),
+    required: value.required !== false, ...(condition ? {condition} : {}),
+    ...(evidenceMetrics ? {evidenceMetrics} : {})};
+}
+
+/** Strict configuration parser shared by runtime loading and strategy validation. */
+export function parseInvestigationProfiles(value: unknown): InvestigationProfiles {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['schema_version', 'profiles'])
+    || value.schema_version !== 1 || !isRecord(value.profiles)) {
+    throw new Error('strategy_invalid_investigation_profiles');
+  }
+  const profiles = new Map<string, {version: number; requirements: AnalysisInvestigationRequirement[]}>();
+  for (const [id, entry] of Object.entries(value.profiles)) {
+    if (!/^[a-z][a-z0-9_]*$/.test(id) || !isRecord(entry) || !hasOnlyKeys(entry, ['version', 'requirements'])
+      || !Number.isSafeInteger(entry.version) || (entry.version as number) <= 0
+      || !Array.isArray(entry.requirements) || !entry.requirements.length) {
+      throw new Error('strategy_invalid_investigation_profile');
+    }
+    const requirements = entry.requirements.map(parseInvestigationRequirement);
+    if (new Set(requirements.map(requirement => requirement.id)).size !== requirements.length) {
+      throw new Error('strategy_duplicate_investigation_requirement');
+    }
+    profiles.set(id, {version: entry.version as number, requirements});
+  }
+  return profiles;
+}
+
+export function parseInvestigationContract(value: unknown, profiles: InvestigationProfiles): AnalysisInvestigationContract | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || !hasOnlyKeys(value, ['schema_version', 'profiles', 'requirements', 'not_applicable_reason'])
+    || value.schema_version !== 1) throw new Error('strategy_invalid_investigation_contract');
+  if (value.not_applicable_reason !== undefined) {
+    if (!nonEmptyString(value.not_applicable_reason) || value.profiles !== undefined || value.requirements !== undefined) {
+      throw new Error('strategy_invalid_investigation_exemption');
+    }
+    return {schemaVersion: 1, profileRefs: [], requirements: [], notApplicableReason: value.not_applicable_reason.trim()};
+  }
+  if ((value.profiles !== undefined && !Array.isArray(value.profiles))
+    || (value.requirements !== undefined && !Array.isArray(value.requirements))) {
+    throw new Error('strategy_invalid_investigation_contract');
+  }
+  const profileRefs: AnalysisInvestigationContract['profileRefs'] = [];
+  const requirements = new Map<string, AnalysisInvestigationRequirement>();
+  const append = (requirement: AnalysisInvestigationRequirement) => {
+    const previous = requirements.get(requirement.id);
+    if (previous) {
+      // Shared IDs may be reused unchanged; conflicting obligations cannot silently win.
+      const {profileId: _a, profileVersion: _b, ...left} = previous;
+      const {profileId: _c, profileVersion: _d, ...right} = requirement;
+      if (canonicalContentHash(left) !== canonicalContentHash(right)) throw new Error('strategy_conflicting_investigation_requirement');
+    } else requirements.set(requirement.id, requirement);
+  };
+  for (const ref of (value.profiles ?? []) as unknown[]) {
+    if (!isRecord(ref) || !hasOnlyKeys(ref, ['id', 'version']) || !nonEmptyString(ref.id)
+      || !Number.isSafeInteger(ref.version)) throw new Error('strategy_invalid_investigation_profile_ref');
+    const profile = profiles.get(ref.id);
+    if (!profile || profile.version !== ref.version) throw new Error('strategy_investigation_profile_unavailable');
+    if (profileRefs.some(existing => existing.id === ref.id)) throw new Error('strategy_duplicate_investigation_profile_ref');
+    profileRefs.push({id: ref.id, version: profile.version});
+    profile.requirements.forEach(requirement => append({...requirement, profileId: ref.id as string, profileVersion: profile.version}));
+  }
+  const localRequirements = ((value.requirements ?? []) as unknown[]).map(parseInvestigationRequirement);
+  if (new Set(localRequirements.map(requirement => requirement.id)).size !== localRequirements.length) {
+    throw new Error('strategy_duplicate_investigation_requirement');
+  }
+  localRequirements.forEach(append);
+  if (!requirements.size) throw new Error('strategy_empty_investigation_contract');
+  return {schemaVersion: 1, profileRefs, requirements: [...requirements.values()]};
+}
+
+function parseStrategyFile(filePath: string, investigationProfiles: InvestigationProfiles): StrategyDefinition | null {
   const raw = fs.readFileSync(filePath, 'utf-8');
   const match = raw.match(FRONTMATTER_RE);
   if (!match) return null;
@@ -382,6 +481,7 @@ function parseStrategyFile(filePath: string): StrategyDefinition | null {
     }
     investigationRequirements = rawInvestigationRequirements.map(requirement => requirement.trim());
   }
+  const investigationContract = parseInvestigationContract(frontmatter.investigation_contract, investigationProfiles);
 
   const rawHints = (frontmatter.phase_hints as Array<Record<string, unknown>> | undefined) || [];
   const phaseHints: PhaseHint[] = rawHints.map(h => ({
@@ -467,6 +567,7 @@ function parseStrategyFile(filePath: string): StrategyDefinition | null {
     requiredCapabilities: (frontmatter.required_capabilities as string[]) || [],
     optionalCapabilities: (frontmatter.optional_capabilities as string[]) || [],
     ...(investigationRequirements ? {investigationRequirements} : {}),
+    ...(investigationContract ? {investigationContract} : {}),
     phaseHints,
     planTemplate,
     finalReportContract,
@@ -498,6 +599,15 @@ function cloneStrategyDefinition(definition: StrategyDefinition): StrategyDefini
     optionalCapabilities: [...definition.optionalCapabilities],
     ...(definition.investigationRequirements
       ? {investigationRequirements: [...definition.investigationRequirements]} : {}),
+    ...(definition.investigationContract ? {investigationContract: {
+      ...definition.investigationContract,
+      profileRefs: definition.investigationContract.profileRefs.map(ref => ({...ref})),
+      requirements: definition.investigationContract.requirements.map(requirement => ({
+        ...requirement,
+        ...(requirement.condition ? {condition: {...requirement.condition}} : {}),
+        ...(requirement.evidenceMetrics ? {evidenceMetrics: [...requirement.evidenceMetrics]} : {}),
+      })),
+    }} : {}),
     phaseHints: definition.phaseHints.map(hint => ({
       ...hint,
       keywords: [...hint.keywords],
@@ -581,12 +691,15 @@ function baseStrategies(): Map<string, StrategyDefinition> {
   if (baseCache && !DEV_MODE) return baseCache;
 
   const loaded = new Map<string, StrategyDefinition>();
+  const investigationProfiles = parseInvestigationProfiles(yaml.load(
+    fs.readFileSync(path.join(STRATEGIES_DIR, 'investigation-profiles.yaml'), 'utf8'),
+  ));
   const files = fs.readdirSync(STRATEGIES_DIR)
     .filter(file => file.endsWith('.strategy.md'))
     .sort();
 
   for (const file of files) {
-    const definition = parseStrategyFile(path.join(STRATEGIES_DIR, file));
+    const definition = parseStrategyFile(path.join(STRATEGIES_DIR, file), investigationProfiles);
     if (definition) {
       loaded.set(definition.scene, cloneStrategyDefinition(definition));
     }
@@ -977,25 +1090,6 @@ export function getStrategyDetailByRef(
   if (!sceneFromRef || !idFromRef) return undefined;
   return getStrategyDetails(sceneFromRef, registry)
     .find(detail => detail.id === idFromRef || detail.ref === `${sceneFromRef}:${idFromRef}`);
-}
-
-export function buildStrategyDetailExcerpt(
-  detail: StrategyDetailSection,
-  maxChars = DEFAULT_STRATEGY_DETAIL_EXCERPT_CHARS,
-): { excerpt: string; truncated: boolean; maxChars: number } {
-  const content = detail.content.trim();
-  if (content.length <= maxChars) {
-    return { excerpt: content, truncated: false, maxChars };
-  }
-
-  const clipped = content.slice(0, maxChars);
-  const boundary = Math.max(
-    clipped.lastIndexOf('\n### '),
-    clipped.lastIndexOf('\n#### '),
-    clipped.lastIndexOf('\n\n'),
-  );
-  const excerpt = clipped.slice(0, boundary > Math.floor(maxChars * 0.35) ? boundary : maxChars).trimEnd();
-  return { excerpt, truncated: excerpt.length < content.length, maxChars };
 }
 
 export function getRegisteredScenes(): StrategyDefinition[] {

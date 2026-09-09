@@ -72,12 +72,17 @@
           "end_ts": "${fixture_end}"
         },
         "required_steps": [
+          "system_context_window",
+          "system_cpu_context",
+          "system_task_summary",
+          "system_task_handoffs",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
           "main_thread_work_cadence"
         ],
         "required_sql_steps": [
+          "system_context_window",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
@@ -189,12 +194,17 @@
           "end_ts": "${fixture_end}"
         },
         "required_steps": [
+          "system_context_window",
+          "system_cpu_context",
+          "system_task_summary",
+          "system_task_handoffs",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
           "main_thread_work_cadence"
         ],
         "required_sql_steps": [
+          "system_context_window",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
@@ -260,12 +270,17 @@
           "end_ts": "${fixture_end}"
         },
         "required_steps": [
+          "system_context_window",
+          "system_cpu_context",
+          "system_task_summary",
+          "system_task_handoffs",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
           "main_thread_work_cadence"
         ],
         "required_sql_steps": [
+          "system_context_window",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
@@ -340,12 +355,17 @@
           "end_ts": "${fixture_end}"
         },
         "required_steps": [
+          "system_context_window",
+          "system_cpu_context",
+          "system_task_summary",
+          "system_task_handoffs",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
           "main_thread_work_cadence"
         ],
         "required_sql_steps": [
+          "system_context_window",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
@@ -442,12 +462,17 @@
           "end_ts": "${fixture_end}"
         },
         "required_steps": [
+          "system_context_window",
+          "system_cpu_context",
+          "system_task_summary",
+          "system_task_handoffs",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",
           "main_thread_work_cadence"
         ],
         "required_sql_steps": [
+          "system_context_window",
           "main_thread_work_summary",
           "main_thread_work_tasks",
           "main_thread_work_sources",

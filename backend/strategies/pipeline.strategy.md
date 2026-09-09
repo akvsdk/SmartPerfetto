@@ -3,6 +3,18 @@
 
 ---
 scene: pipeline
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: pipeline_critical_path
+      domain: critical_path
+      description: "Follow the selected producer, RenderThread, BufferQueue, SF/HWC and presentation stages. Bind task and frame/buffer identities before attributing CPU waits or work to a pipeline delay."
+    - id: pipeline_dependencies
+      domain: dependency_chain
+      description: "Distinguish GPU work/fence, transaction, latch, present and visibility. CPU slice totals are not GPU execution time; missing fence/present events limit attribution."
 classification_description: "Identifying the application rendering architecture and the path from frame production to composition and presentation."
 priority: 4
 effort: medium

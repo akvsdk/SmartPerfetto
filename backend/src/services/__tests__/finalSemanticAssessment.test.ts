@@ -11,6 +11,8 @@ import type {IntentTransportInput, IntentTransportResult} from '../../agentRunti
 import {buildStrategyRegistrySnapshotFromDefinitions, loadPromptTemplate, type StrategyDefinition} from '../../agentv3/strategyLoader';
 import {analysisDeliveryFingerprint, type AnalysisReportRequirement, type AnalysisCaseRetrievalState} from '../../types/analysisDelivery';
 import {assessFinalSemantics, FINAL_SEMANTIC_INPUT_BYTE_LIMIT, type FinalSemanticAssessmentInput} from '../finalSemanticAssessment';
+import type {AnalysisInvestigationRequirement} from '../../types/analysisInvestigation';
+import {resolveAnalysisInvestigationRequirements} from '../../agentRuntime/analysisInvestigationRequirements';
 
 jest.mock('../../agentv3/strategyLoader', () => {
   const actual = jest.requireActual<typeof import('../../agentv3/strategyLoader')>('../../agentv3/strategyLoader');
@@ -32,6 +34,7 @@ function fixture(options: {
   caseRetrieval?: AnalysisCaseRetrievalState;
   deadlineMs?: number;
   dispatch?: (input: IntentTransportInput) => Promise<IntentTransportResult>;
+  investigationRequirements?: AnalysisInvestigationRequirement[];
 } = {}) {
   const body = options.body ?? 'Frame A took 9 ms.';
   const contract: ConclusionContract = {
@@ -51,6 +54,8 @@ function fixture(options: {
     sourcePath: '/fixtures/general.strategy.md', finalReportContract: {requiredSections: requirements.map(requirement => ({
       ...requirement, triggerPatterns: [], patterns: [], patternGroups: [], recoveryText: {zh: [], en: []},
     }))},
+    ...(options.investigationRequirements ? {investigationContract: {schemaVersion: 1 as const,
+      profileRefs: [], requirements: options.investigationRequirements}} : {}),
   };
   const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [strategy], overlayGeneration: 'semantic-test'});
   const candidate = {runId: 'run', attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: analysisDeliveryFingerprint(body)};
@@ -71,7 +76,7 @@ function fixture(options: {
     runId: 'run', sessionId: result.sessionId, deadlineMs: options.deadlineMs ?? Date.now() + 10_000,
     strategyRegistry: registry,
     turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: registry.registryFingerprint,
-      taskKind: 'fact', sceneId: 'general', scope: options.scope ?? 'bounded_question', recommendedComplexity: 'full',
+      taskKind: options.investigationRequirements ? 'investigation' : 'fact', sceneId: 'general', scope: options.scope ?? 'bounded_question', recommendedComplexity: 'full',
       deliverable: options.deliverable ?? (requirements.length ? 'report' : 'answer'), evidenceAccess: 'existing_only'},
     traceIdentity: {currentTraceId: 'trace-current', referenceTraceId: 'trace-reference'},
     deliveryContext: {entry: 'new_finalization', acceptedCandidate: candidate},
@@ -86,8 +91,58 @@ function fixture(options: {
       ...(requirements.length || options.deliverable === 'report' ? {reportRequirements: {
         sceneId: 'general', registryFingerprint: registry.registryFingerprint, requirements,
       }} : {}), ...(options.caseRetrieval ? {caseRetrieval: options.caseRetrieval} : {})}};
+  if (options.investigationRequirements) input.snapshot.investigationRequirements = resolveAnalysisInvestigationRequirements({
+    intent: context.turnIntent, strategyRegistry: registry});
   return {input, reply, dispatch, reads, controller, contract, candidate};
 }
+
+describe('versioned investigation semantic coverage', () => {
+  function investigationFixture() {
+    const run = fixture({scope: 'scene_wide', investigationRequirements: [{id: 'system-frequency', domain: 'cpu_frequency',
+      description: 'Explain observed frequency or the precise missing evidence.', required: true,
+      evidenceMetrics: ['system.cpu.frequency.time_weighted']}]});
+    run.reply.schemaVersion = 'final_semantic_response@3';
+    run.reply.claims[0].contentLocations = [{text: run.input.snapshot.body}] as any;
+    const row = {requirementId: 'system-frequency', applicability: 'applicable', coverage: 'covered',
+      contentLocations: [{text: run.input.snapshot.body}], evidenceRecordIds: [] as string[], scopeMatch: 'unknown', evidenceStatus: 'not_checked'};
+    Object.assign(run.reply, {investigation: [row]});
+    return {...run, row};
+  }
+
+  it('reviews answer obligations in the existing one-call request without new evidence reads', async () => {
+    const run = investigationFixture();
+    const assessment = await assessFinalSemantics(run.input);
+    expect(assessment).toMatchObject({status: 'checked', coverage: {report: 'not_applicable'},
+      investigation: {status: 'checked', requirements: [{requirementId: 'system-frequency', evidenceStatus: 'not_checked'}]}});
+    expect(run.dispatch).toHaveBeenCalledTimes(1);
+    expect(run.reads).not.toHaveBeenCalled();
+  });
+
+  it('keeps old response protocols readable without certifying investigation coverage', async () => {
+    const run = fixture({investigationRequirements: [{id: 'system-frequency', domain: 'cpu_frequency', description: 'Frequency', required: true}]});
+    expect(await assessFinalSemantics(run.input)).toMatchObject({status: 'checked', investigation: {status: 'not_checked', requirements: []}});
+  });
+
+  it.each(['omitted', 'duplicate', 'unknown_id', 'unknown_record', 'empty_location', 'waiver', 'observed_without_record'])(
+    'rejects %s investigation assertions', async kind => {
+      const run = investigationFixture();
+      if (kind === 'omitted') Object.assign(run.reply, {investigation: []});
+      if (kind === 'duplicate') Object.assign(run.reply, {investigation: [run.row, run.row]});
+      if (kind === 'unknown_id') run.row.requirementId = 'invented';
+      if (kind === 'unknown_record') run.row.evidenceRecordIds = ['invented'];
+      if (kind === 'empty_location') run.row.contentLocations = [];
+      if (kind === 'waiver') {run.row.applicability = 'not_applicable'; run.row.coverage = 'unknown';}
+      if (kind === 'observed_without_record') {run.row.evidenceStatus = 'observed'; run.row.scopeMatch = 'matched';}
+      expect(await assessFinalSemantics(run.input)).toMatchObject({status: 'unavailable', reason: 'invalid_response'});
+    });
+
+  it('does not accept requirements replaced after the pinned registry was captured', async () => {
+    const run = investigationFixture();
+    run.input.snapshot.investigationRequirements = {...run.input.snapshot.investigationRequirements!, contractFingerprint: 'changed'};
+    expect(await assessFinalSemantics(run.input)).toMatchObject({status: 'not_checked', reason: 'invalid_snapshot'});
+    expect(run.dispatch).not.toHaveBeenCalled();
+  });
+});
 
 describe('final semantic assessment snapshot and transport', () => {
   it('sends one complete provider-safe snapshot and returns only semantic coverage', async () => {
@@ -416,7 +471,7 @@ describe('final semantic v2 exact quotation locations', () => {
     expect(run.dispatch).toHaveBeenCalledTimes(1);
     expect(run.reads).not.toHaveBeenCalled();
     const prompt = run.dispatch.mock.calls[0][0].prompt;
-    expect(prompt).toContain('"schemaVersion": "final_semantic_response@2"');
+    expect(prompt).toContain('"schemaVersion": "final_semantic_response@3"');
     expect(prompt).toContain('including overlapping matches');
     expect(prompt).toContain('does not establish factual');
     expect(prompt).toContain(`"bodyUtf16Length":${run.input.snapshot.body.length}`);

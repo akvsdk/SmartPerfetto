@@ -37,6 +37,7 @@ import {
 } from '../state/traceAgentState';
 import { agentSessionConfig } from '../../config';
 import { loadPromptTemplate, renderTemplate } from '../../agentv3/strategyLoader';
+import {renderAnalysisHistoryContext, toAnalysisHistoryTurn, type AnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
 
 // =============================================================================
 // Semantic Working Memory (v2.0)
@@ -73,6 +74,7 @@ export class EnhancedSessionContext {
   private sessionId: string;
   private traceId: string;
   private turns: ConversationTurn[] = [];
+  private nextTurnIndex = 0;
   private findings: Map<string, Finding> = new Map();
   private findingTurnMap: Map<string, string> = new Map(); // findingId -> turnId
   private references: FindingReference[] = [];
@@ -575,7 +577,7 @@ export class EnhancedSessionContext {
     turnFindings?: Finding[]
   ): ConversationTurn {
     const turnId = uuidv4();
-    const turnIndex = this.turns.length;
+    const turnIndex = this.nextTurnIndex++;
     const findings = turnFindings || [];
 
     // Register findings
@@ -802,7 +804,9 @@ export class EnhancedSessionContext {
    * Enhanced to include referenceable entity identifiers (frame_id, session_id)
    * so LLM can understand what entities are available for drill-down.
    */
-  generatePromptContext(maxTokens: number = 500): string {
+  generatePromptContext(maxTokens: number = 500, options: {includeHistory?: boolean} = {}): string {
+    const history = options.includeHistory === false ? undefined
+      : renderAnalysisHistoryContext(this.getAnalysisHistory(), {maxBytes: Math.floor(maxTokens * 1.8)});
     const summary = this.generateContextSummary();
 
     const parts: string[] = [];
@@ -977,6 +981,11 @@ export class EnhancedSessionContext {
       }
     }
 
+    // Typed status and missing work are protected before optional legacy summaries.
+    if (history) {
+      const remaining = Math.max(0, Math.floor(charBudget) - history.length - 2);
+      return `${history}${remaining > 0 ? `\n\n${result.slice(0, remaining)}` : ''}`;
+    }
     return result;
   }
 
@@ -1243,6 +1252,13 @@ export class EnhancedSessionContext {
     return [...this.turns];
   }
 
+  getAnalysisHistory(): AnalysisHistoryTurn[] {
+    return this.turns.filter(turn => turn.result).map(turn => toAnalysisHistoryTurn({
+      id: turn.result?.completion?.runId ?? turn.id, turnIndex: turn.turnIndex, query: turn.query, traceId: this.traceId,
+      timestamp: turn.timestamp, result: turn.result, sourceDerived: turn.result?.sourceDerived,
+    }));
+  }
+
   /**
    * Get the last N turns
    */
@@ -1279,6 +1295,7 @@ export class EnhancedSessionContext {
       sessionId: this.sessionId,
       traceId: this.traceId,
       turns: this.turns,
+      nextTurnIndex: this.nextTurnIndex,
       findings: Array.from(this.findings.entries()),
       findingTurnMap: Array.from(this.findingTurnMap.entries()),
       references: this.references,
@@ -1298,6 +1315,8 @@ export class EnhancedSessionContext {
     const data = JSON.parse(json);
     const ctx = new EnhancedSessionContext(data.sessionId, data.traceId);
     ctx.turns = data.turns;
+    ctx.nextTurnIndex = Math.max(Number.isSafeInteger(data.nextTurnIndex) ? data.nextTurnIndex : 0,
+      ...ctx.turns.map(turn => turn.turnIndex + 1));
     ctx.findings = new Map(data.findings);
     ctx.findingTurnMap = new Map(data.findingTurnMap);
     ctx.references = data.references;

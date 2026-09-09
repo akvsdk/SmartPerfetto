@@ -30,9 +30,12 @@ import * as mcpModule from '../../agentv3/claudeMcpServer';
 import {getSourceLookupCodeReferences} from '../../services/codebase/sourceLookupTools';
 import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
 import * as contextAuthorization from '../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../services/scopedKnowledgeStore';
 import {renderConclusionContractSidecar, type ConclusionContract} from '../../agent/core/conclusionContract';
 import {inspectCandidateProtocol} from '../../services/canonicalAnalysisResult';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import {createAnalysisHistoryReader, toAnalysisHistoryTurn, withAnalysisHistoryReader} from '../../agentRuntime/analysisHistory';
+import {applyFinalResultQualityGate} from '../../services/finalResultQualityGate';
 import {createRuntimeSourceFinalizationFixture, SOURCE_FINALIZATION_CANARY, SOURCE_FINALIZATION_RAW_SOURCE} from '../../agentRuntime/__tests__/sourceFinalizationFixture';
 
 const runtimes: OpenAIRuntime[] = [];
@@ -128,10 +131,11 @@ describe('OpenAI typed intent integration', () => {
     const run = mockRun(sdkStream(answer));
     const result = await runtime.analyze('任意不参与控制流的问法', `typed-${analysisMode}`, 'trace', {analysisMode, providerId: null});
     expect(intentTransport.runOpenAiIntentTransport).toHaveBeenCalledTimes(1);
+    expect(intentTransport.runOpenAiIntentTransport).toHaveBeenCalledWith(expect.objectContaining({purpose: 'classification', maxOutputTokens: 1024}));
     expect(prepare.mock.calls[0][4]).toMatchObject({policy: {onDemandContext: true, allowAutomaticPrefetch: false, requiresReport: false}, turnIntent: decision});
     expect(run).toHaveBeenCalledTimes(1);
     expect((run.mock.calls[0][0] as any).model).toBe(analysisMode === 'full' ? 'pinned-primary' : 'pinned-light');
-    expect(run.mock.calls[0][2]).toMatchObject({maxTurns: analysisMode === 'full' ? 3 : 2});
+    expect(run.mock.calls[0][2]).toMatchObject({maxTurns: analysisMode === 'full' ? 2 : 1});
     expect(result.conclusion).toBe(answer);
     expect(result.completion).toMatchObject({status: 'completed', sdkFinishReason: 'completed', conclusionFingerprint: analysisDeliveryFingerprint(answer)});
     expect(result.partial).toBeUndefined();
@@ -144,7 +148,7 @@ describe('OpenAI typed intent integration', () => {
     expect(result.turnIntent).toMatchObject({status: 'unavailable', unavailableReason: 'invalid_response'});
     expect(prepare.mock.calls[0][4]).toMatchObject({policy: {budgetMode: 'quick', onDemandContext: true, allowAutomaticPrefetch: false}});
     expect((run.mock.calls[0][0] as any).model).toBe('pinned-primary');
-    expect(run.mock.calls[0][2]).toMatchObject({maxTurns: 2});
+    expect(run.mock.calls[0][2]).toMatchObject({maxTurns: 1});
     expect(result.quickRun.modeDecision).toBe('ai_unavailable');
   });
   it('passes the pinned provider auth and protocol to native classification', async () => {
@@ -360,11 +364,11 @@ describe('OpenAI cancellation and bounded recovery', () => {
     const rejected = expect(pending).rejects.toThrow(); await entered.promise;
     runtime.abortSession('cancel-stalled-provider'); await rejected;
   });
-  it('records the actual native turn cap without adding fixed plan or report loops', async () => {
+  it('counts the single failed closeout attempt after a native turn cap', async () => {
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
     const run = mockRun().mockRejectedValue(new MaxTurnsExceededError('native turn cap'));
     const result = await runtime.analyze('query', 'native-turn-cap', 'trace', {analysisMode: 'fast', providerId: null});
-    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({partial: true, rounds: 2, terminationReason: 'max_turns', completion: {status: 'incomplete', reason: 'turn_limit'}});
   });
   it('returns a candidate-bound timeout without re-entering the provider', async () => {
@@ -375,15 +379,153 @@ describe('OpenAI cancellation and bounded recovery', () => {
     expect(run).toHaveBeenCalledTimes(1); expect(result.completion).toMatchObject({status: 'incomplete', reason: 'timeout'});
     expect(result.conclusion).toBe(''); expect(result.partial).toBe(true);
   });
-  it('retries a typed missing previous response once without classifying or preparing again', async () => {
+
+  it('uses 49 investigation turns plus one no-tool summary inside a 50-turn budget', async () => {
+    jest.mocked(configModule.loadOpenAIConfig).mockReturnValue({...createOpenAiConfigForTest(), quickMaxTurns: 50});
+    const history = [{role: 'user', content: 'Investigate the trace.'},
+      {type: 'function_call', callId: 'evidence-1', name: 'execute_sql', arguments: '{}'},
+      {type: 'function_call_result', callId: 'evidence-1', output: '{"rows":[{"dur":9}]}'}];
+    const error = new MaxTurnsExceededError('Max turns (49) exceeded', {history, _currentTurn: 50} as any);
+    const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
+    const run = mockRun().mockResolvedValueOnce({currentTurn: 50, history, completed: Promise.resolve(),
+      async *[Symbol.asyncIterator]() {
+        for (let i = 0; i < 49; i++) yield {type: 'raw_model_stream_event', data: {type: 'response_started'}};
+        throw error;
+      }} as any).mockResolvedValueOnce(sdkStream('Investigation incomplete; one interval was observed, its cause remains unknown.'));
+    const result = await runtime.analyze('query', 'turn-cap-summary', 'trace', {analysisMode: 'fast', providerId: null});
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0][2]).toMatchObject({maxTurns: 49});
+    expect(run.mock.calls[1][2]).toMatchObject({maxTurns: 1});
+    expect((run.mock.calls[1][0] as any).tools).toEqual([]);
+    expect((run.mock.calls[1][0] as any).modelSettings.toolChoice).toBe('none');
+    expect((run.mock.calls[1][1] as any[]).slice(0, history.length)).toEqual(history);
+    expect(result).toMatchObject({rounds: 50, partial: true, terminationReason: 'max_turns', outputOrigin: 'sdk_final',
+      completion: {status: 'incomplete', reason: 'turn_limit', conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)}});
+    expect(result.conclusion).toContain('Investigation incomplete');
+    expect(runtime.sessionMap.size).toBe(0);
+  });
+
+  it.each(['missing', 'pending-call', 'no-user', 'oversized', 'unreadable', 'remote-resume'])
+  ('uses bounded returned-data context when native history is %s', async condition => {
+    const config = createOpenAiConfigForTest();
+    if (condition === 'oversized') config.maxHistoryBytes = 32;
+    jest.mocked(configModule.loadOpenAIConfig).mockReturnValue(config);
+    const history: any[] = condition === 'no-user' ? [] : [{role: 'user', content: 'The original question with enough content.'}];
+    if (condition === 'pending-call') history.push({type: 'function_call', callId: 'pending', name: 'execute_sql', arguments: '{}'});
+    const state = condition === 'missing' ? undefined : condition === 'unreadable'
+      ? {get history() {throw new Error('unreadable');}} : {history};
+    const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
+    if (condition === 'remote-resume') runtime.sessionMap.set('cap-denied', {lastResponseId: 'remote', updatedAt: Date.now()});
+    const run = mockRun().mockRejectedValueOnce(new MaxTurnsExceededError('cap', state as any))
+      .mockResolvedValueOnce(sdkStream('Investigation incomplete. No root cause is established.'));
+    const result = await runtime.analyze('query', 'cap-denied', 'trace', {analysisMode: 'fast', providerId: null});
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0][2]).not.toHaveProperty('previousResponseId');
+    expect((run.mock.calls[1][0] as any).tools).toEqual([]);
+    if (condition !== 'remote-resume') expect(JSON.stringify(run.mock.calls[1][1])).toContain('current_run_returned_data_excerpts');
+    expect(result).toMatchObject({rounds: 2, partial: true, terminationReason: 'max_turns'});
+    expect(result.conclusion).toContain('No root cause');
+  });
+
+  it('does not add a hidden closeout turn to a one-turn configuration', async () => {
+    jest.mocked(configModule.loadOpenAIConfig).mockReturnValue({...createOpenAiConfigForTest(), quickMaxTurns: 1});
+    const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
+    const run = mockRun().mockRejectedValue(new MaxTurnsExceededError('cap'));
+    const result = await runtime.analyze('query', 'one-turn-only', 'trace', {analysisMode: 'fast', providerId: null});
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({rounds: 1, partial: true, terminationReason: 'max_turns'});
+  });
+
+  it('summarizes raw returned tool data when the SDK cannot return a usable transcript', async () => {
+    const runtime = createOpenAiRuntimeForTest();
+    prepareStub(runtime).mockImplementation(async (...args: any[]) => {
+      const invocation = {toolCallId: 'current-sql', toolName: 'execute_sql', params: {}, extra: {}};
+      await args[4].toolObserver({...invocation, phase: 'started'});
+      await args[4].toolObserver({...invocation, phase: 'completed', result: {
+        content: [{type: 'text', text: JSON.stringify({columns: ['dur'], rows: [[9]], success: true})}],
+      }});
+      return {systemPrompt: 'test system prompt', tools: [], allowedTools: [], hypotheses: [],
+        sessionContext: args[4].sessionContext, previousTurns: args[4].previousTurns,
+        sessionMapKey: args[4].analysisRunSpec.identity.sessionMapKey};
+    });
+    const run = mockRun().mockRejectedValueOnce(new MaxTurnsExceededError('cap'))
+      .mockResolvedValueOnce(sdkStream('Observed dur=9; the root cause is unknown.'));
+    const result = await runtime.analyze('query', 'returned-tape', 'trace', {analysisMode: 'fast', providerId: null});
+    const prompt = (run.mock.calls[1][1] as any[])[0].content;
+    expect(prompt).toContain('"rows":[[9]]');
+    expect(prompt).toContain('"completeTranscript":false');
+    expect(prompt).toContain('"verified":false');
+    expect((run.mock.calls[1][0] as any).model).toBe('pinned-light');
+    expect(result).toMatchObject({partial: true, rounds: 2, completion: {reason: 'turn_limit'}});
+  });
+
+  it.each(['error', 'empty', 'output-limit'])('retains the original turn-limit candidate if its summary returns %s', async outcome => {
+    const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
+    const error = new MaxTurnsExceededError('cap', {history: [{role: 'user', content: 'query'}]} as any);
+    const run = mockRun().mockRejectedValueOnce(error);
+    if (outcome === 'error') run.mockRejectedValueOnce(new Error('summary failed'));
+    else run.mockResolvedValueOnce(sdkStream(outcome === 'empty' ? '' : 'cut short', {status: outcome === 'output-limit' ? 'incomplete' : 'completed'}));
+    const result = await runtime.analyze('query', 'failed-cap-summary', 'trace', {analysisMode: 'fast', providerId: null});
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({conclusion: '', partial: true, rounds: 2, terminationReason: 'max_turns', outputOrigin: 'assistant_stream',
+      completion: {status: 'incomplete', reason: 'turn_limit', conclusionFingerprint: analysisDeliveryFingerprint('')}});
+  });
+
+  it('retains a turn-limit summary with invalid declarations without clearing its quality failure', async () => {
+    const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
+    const invalidSummary = 'Investigation incomplete; the cause is still unknown.\n' +
+      '<!-- smartperfetto:conclusion-contract@1\n```json\n{"schemaVersion":"conclusion_contract_v1","mode":"focused_answer","conclusions":[],"clusters":["investigation"],"evidenceChain":[],"claims":[],"relationProposals":[],"uncertainties":[],"nextSteps":[]}\n```\n-->';
+    const error = new MaxTurnsExceededError('cap', {history: [{role: 'user', content: 'query'}]} as any);
+    const run = mockRun().mockRejectedValueOnce(error).mockResolvedValueOnce(sdkStream(invalidSummary));
+    const result = await runtime.analyze('query', 'invalid-cap-summary', 'trace', {analysisMode: 'fast', providerId: null});
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(result.conclusion).toContain('Investigation incomplete; the cause is still unknown.');
+    expect(result).toMatchObject({partial: true, terminationReason: 'max_turns', outputOrigin: 'sdk_final',
+      completion: {status: 'incomplete', reason: 'turn_limit', conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)}});
+    const context = finalization.takeFinalizationContext(result)!;
+    finalizationContexts.push(context);
+    expect(context.getNativeDeclaration(result, new AbortController().signal)?.raw).toBe(invalidSummary);
+    expect(inspectCandidateProtocol(result.conclusion).status).toBe('invalid');
+    const delivery = context.deliveryContext;
+    if (delivery.entry === 'historical_restore' || !delivery.acceptedCandidate) throw new Error('Missing current candidate');
+    const issue = applyFinalResultQualityGate({result, context: {...delivery, entry: 'new_finalization',
+      acceptedCandidate: delivery.acceptedCandidate}});
+    expect(issue).toBeDefined();
+    expect(result.partial).toBe(true);
+    expect(result.deliveryAssurance.claims).not.toBe('passed');
+    expect(result.terminationMessage).toContain(issue!.message);
+    expect(result.conclusion).toContain('Investigation incomplete; the cause is still unknown.');
+  });
+  it('keeps the original turn-limit candidate when authorization changes during its summary', async () => {
+    const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
+    const run = mockRun().mockRejectedValueOnce(new MaxTurnsExceededError('cap'))
+      .mockResolvedValueOnce(sdkStream('A summary that must not be accepted after revocation.'));
+    const currentAuthorization = contextAuthorization.assertCurrentAnalysisContextAuthorization;
+    jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation((...args) => {
+      if (run.mock.calls.length >= 2) throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
+      return currentAuthorization(...args);
+    });
+    const result = await runtime.analyze('query', 'cap-summary-revoked', 'trace', {analysisMode: 'fast', providerId: null});
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({conclusion: '', rounds: 2, partial: true,
+      completion: {status: 'incomplete', reason: 'turn_limit', conclusionFingerprint: analysisDeliveryFingerprint('')}});
+  });
+  it('starts a fresh physical response and injects typed partial history instead of opaque SDK state', async () => {
     const runtime = createOpenAiRuntimeForTest(); const prepare = prepareStub(runtime);
     runtime.sessionMap.set('retry', {lastResponseId: 'expired', history: [{role: 'user', content: 'prior'}], updatedAt: Date.now()});
-    const run = mockRun(); run.mockRejectedValueOnce({status: 404, code: 'response_not_found', param: 'previous_response_id'}).mockResolvedValueOnce(sdkStream('recovered'));
-    const result = await runtime.analyze('query', 'retry', 'trace', {providerId: null});
-    expect(result.completion.status).toBe('completed'); expect(run).toHaveBeenCalledTimes(2);
+    const reader = createAnalysisHistoryReader({assertActive: () => undefined, getTurns: () => [
+      toAnalysisHistoryTurn({id: 'prior-limited', turnIndex: 0, query: 'why slow', traceId: 'trace', timestamp: 1,
+        result: {conclusion: 'Wait observed; cause unknown.', partial: true, completion: {status: 'incomplete'},
+          terminationReason: 'max_turns'}}),
+    ]});
+    const run = mockRun(sdkStream('followup'));
+    const result = await runtime.analyze('query', 'retry', 'trace', withAnalysisHistoryReader({providerId: null}, reader));
+    expect(result.completion.status).toBe('completed'); expect(run).toHaveBeenCalledTimes(1);
     expect(prepare).toHaveBeenCalledTimes(1); expect(intentTransport.runOpenAiIntentTransport).toHaveBeenCalledTimes(1);
-    expect(run.mock.calls[0][2]).toMatchObject({previousResponseId: 'expired'});
-    expect(run.mock.calls[1][2]).not.toHaveProperty('previousResponseId');
+    expect(run.mock.calls[0][2]).not.toHaveProperty('previousResponseId');
+    expect(run.mock.calls[0][1]).toContain('Wait observed; cause unknown.');
+    expect(run.mock.calls[0][1]).toContain('"partial":true');
+    expect(run.mock.calls[0][1]).not.toContain('expired');
   });
   it('does not treat prose describing a missing response as a retry authorization', () => {
     expect(__testing.isMissingOpenAIPreviousResponseError(new Error('No response found with id old'), 'old')).toBe(false);
@@ -511,7 +653,7 @@ describe('OpenAI bounded output-limit recovery', () => {
     ].map(value => `data: ${JSON.stringify(value)}\n\n`).join('') + 'data: [DONE]\n\n', {headers: {'content-type': 'text/event-stream'}});
     const fetchMock = jest.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(wire('source-call', {role: 'assistant', tool_calls: [{index: 0, id: 'source-call-1', type: 'function', function: {name: 'read_codebase_file', arguments: '{}'}}]}, 'tool_calls'))
-      .mockResolvedValueOnce(wire('limited-answer', {role: 'assistant', content: 'The source begins'}, 'length'))
+      .mockResolvedValueOnce(wire('limited-answer', {role: 'assistant', content: 'The source begins'}, maxTurns === 2 ? 'stop' : 'length'))
       .mockResolvedValueOnce(wire('complete-answer', {role: 'assistant', content: 'The complete answer uses the source already read.'}, 'stop'));
     const authorization = jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization');
     const updates: any[] = []; runtime.on('update', (update: unknown) => updates.push(update));
@@ -520,14 +662,23 @@ describe('OpenAI bounded output-limit recovery', () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(maxTurns);
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(authorization).toHaveBeenCalledWith(expect.objectContaining({codebaseIds: ['codebase-a'], runId: 'recovery-run'}),
+      expect.any(Object), expect.stringMatching(/^[a-f0-9]{64}$/));
+    const previousRequestOrder = fetchMock.mock.invocationCallOrder[maxTurns - 2];
+    const deliveryRequestOrder = fetchMock.mock.invocationCallOrder[maxTurns - 1];
+    expect(authorization.mock.invocationCallOrder.some(order => order > previousRequestOrder && order < deliveryRequestOrder)).toBe(true);
     if (maxTurns === 2) {
-      expect(authorization).not.toHaveBeenCalled();
       expect(result.conclusion).toBe('The source begins');
-      expect(result.completion).toMatchObject({status: 'incomplete', reason: 'output_limit'});
+      expect(result.completion).toMatchObject({status: 'incomplete', reason: 'turn_limit', sdkFinishReason: 'stop',
+        conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)});
+      expect(result).toMatchObject({partial: true, terminationReason: 'max_turns', outputOrigin: 'sdk_final'});
+      const lastRequest = JSON.parse(String(fetchMock.mock.calls[1][1]?.body));
+      expect(lastRequest.tool_choice).toBe('none');
+      expect(lastRequest.tools).toBeUndefined();
+      expect(lastRequest.messages).toContainEqual(expect.objectContaining({role: 'tool', tool_call_id: 'source-call-1', content: sourceResult}));
       expect(result.rounds).toBe(2);
       return;
     }
-    expect(authorization).toHaveBeenCalledTimes(1);
     const requests = fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
     expect(requests[2]).toMatchObject({model: 'pinned-primary', store: false, tool_choice: 'none', max_tokens: 1024});
     expect(requests[2].tools).toBeUndefined();
@@ -587,7 +738,7 @@ describe('OpenAI bounded output-limit recovery', () => {
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
     const run = mockRun(recoverableStream('original partial answer'));
     jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
-      throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
+      if (run.mock.calls.length > 0) throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
     });
     const result = await runtime.analyze('query', 'revoked-recovery', 'trace', {providerId: null});
     expect(run).toHaveBeenCalledTimes(1);
@@ -596,14 +747,16 @@ describe('OpenAI bounded output-limit recovery', () => {
     expect(result.terminationMessage).toBeUndefined();
   });
 
-  it('does not replay incomplete history anchored to an earlier remote response', async () => {
+  it('can repair current-run output without resuming an earlier remote response', async () => {
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime);
     runtime.sessionMap.set('remote-recovery', {lastResponseId: 'remote-earlier', updatedAt: Date.now()});
-    const run = mockRun(recoverableStream('original partial answer'));
+    const run = mockRun().mockResolvedValueOnce(recoverableStream('original partial answer'))
+      .mockResolvedValueOnce(sdkStream('current-run final answer'));
     const result = await runtime.analyze('query', 'remote-recovery', 'trace', {providerId: null});
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(run.mock.calls[0][2]).toMatchObject({previousResponseId: 'remote-earlier'});
-    expect(result.completion).toMatchObject({status: 'incomplete', reason: 'output_limit'});
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[0][2]).not.toHaveProperty('previousResponseId');
+    expect(run.mock.calls[1][2]).not.toHaveProperty('previousResponseId');
+    expect(result.completion).toMatchObject({status: 'completed'});
   });
 
   it('does not publish a late completion attempt after cancellation', async () => {
@@ -1025,7 +1178,9 @@ describe('OpenAI finalization handoff', () => {
       order.push('attach'); originalAttach(result, context);
     });
     const runtime = createOpenAiRuntimeForTest(); prepareStub(runtime); mockRun();
-    const options = {providerId: null, runId: 'current-run', analysisContextFingerprint: 'openai-auth-pin'};
+    const options = {providerId: null, runId: 'current-run', analysisContextFingerprint: '', codeAwareMode: 'off' as const};
+    const pinnedFingerprint = contextAuthorization.buildAnalysisContextAuthorizationFingerprint(options, resolveKnowledgeScope(options));
+    options.analysisContextFingerprint = pinnedFingerprint;
     const result = await runtime.analyze('query', 'finalization-once', 'trace', options);
     expect(order).toEqual(['close', 'attach']); expect(attach).toHaveBeenCalledTimes(1);
     expect(attach.mock.calls[0][0]).toBe(result);
@@ -1034,7 +1189,7 @@ describe('OpenAI finalization handoff', () => {
     expect(context.sourceScope).toBeUndefined(); // An absent third-party accessor is not proof that source was off.
     options.analysisContextFingerprint = 'later-auth-context';
     const providerQuery = context.getProviderQuery(new AbortController().signal);
-    expect(providerQuery).toEqual({text: 'query', analysisContextFingerprint: 'openai-auth-pin'});
+    expect(providerQuery).toEqual({text: 'query', analysisContextFingerprint: pinnedFingerprint});
     expect(Object.isFrozen(providerQuery)).toBe(true);
     expect(JSON.stringify(result)).not.toContain('"providerQuery"');
     expect(finalization.takeFinalizationContext(result)).toBeUndefined();
@@ -1072,6 +1227,8 @@ describe('OpenAI finalization handoff', () => {
     expect(reviewed).toMatchObject({status: 'ok', text: 'semantic review output'});
     expect(intentTransport.runOpenAiIntentTransport).toHaveBeenCalledTimes(2);
     const call = jest.mocked(intentTransport.runOpenAiIntentTransport).mock.calls[1][0];
+    expect(jest.mocked(intentTransport.runOpenAiIntentTransport).mock.calls[0][0].purpose).toBe('classification');
+    expect(call).not.toHaveProperty('purpose');
     expect(call).toMatchObject({config: {lightModel: 'pinned-primary', apiKey: 'test-only',
       baseURL: 'https://provider.invalid/v1', protocol: 'responses'}});
     if (maxOutputTokens === undefined) expect(call).not.toHaveProperty('maxOutputTokens');
@@ -1103,10 +1260,12 @@ describe('OpenAI finalization handoff', () => {
     store.registerEvidenceCapture(foreignId, captureEvidenceTable({columns: ['value'], rows: [[900]]}), {evidenceRefId: 'ev-foreign'});
     runtime.artifactStores.set('finalization-read', store); prepareStub(runtime); mockRun();
     const readView = jest.spyOn(store, 'createEvidenceReadView');
-    const result = await runtime.analyze('query', 'finalization-read', 'trace', {
+    const options = {
       providerId: null, runId: 'read-run', tenantId: 'tenant', workspaceId: 'workspace', userId: 'user',
-      analysisContextFingerprint: 'authorized-context',
-    });
+      analysisContextFingerprint: '', codeAwareMode: 'off' as const,
+    };
+    options.analysisContextFingerprint = contextAuthorization.buildAnalysisContextAuthorizationFingerprint(options, resolveKnowledgeScope(options));
+    const result = await runtime.analyze('query', 'finalization-read', 'trace', options);
     const context = takeContext(result);
     expect(readView.mock.calls[0][0]).toMatchObject({allowedTraces: [{traceId: 'trace', traceSide: 'current'}], ownerKey: expect.any(String)});
     expect(readView.mock.calls[0][0].ownerKey.length).toBeGreaterThan(0);

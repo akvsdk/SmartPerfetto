@@ -9,10 +9,13 @@ import {attachFinalizationContext, takeFinalizationContext} from '../../agentRun
 import type {IntentTransportInput, IntentTransportResult} from '../../agentRuntime/intentTransport';
 import {ArtifactStore} from '../../agentv3/artifactStore';
 import {buildStrategyRegistrySnapshotFromDefinitions, type StrategyDefinition} from '../../agentv3/strategyLoader';
+import * as strategyTemplates from '../../agentv3/strategyLoader';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import {createDataEnvelope} from '../../types/dataContract';
 import type {EvidenceScopeProvenanceV1, IdentityResolutionV1} from '../../types/identityContract';
 import {captureEvidenceTable} from '../evidence/evidenceCapture';
+import {attachInvestigationEvidence} from '../evidence/investigationEvidenceLedger';
+import type {EvidenceReadView} from '../evidence/evidenceReadView';
 import {finalizeAnalysisResult, type AnalysisFinalizationOwner} from '../finalizeAnalysisResult';
 import {clearAllCodeAwareOutputGuards, registerCodeAwareCanary,
   registerPrivateAnalysisQueryForEcho, registerOnDemandSourceLookupForEcho, sanitizeCodeAwareText} from '../security/codeAwareOutputRegistry';
@@ -110,6 +113,153 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
 }
 
 afterEach(() => {clearAllCodeAwareOutputGuards(); jest.useRealTimers();});
+
+describe('issued investigation ledger through finalization', () => {
+  function investigationRun(settings: {rows?: number; originRunId?: string; partialSibling?: boolean;
+    fakeLedger?: boolean; explanationOnly?: boolean; report?: boolean} = {}) {
+    const body = 'The captured value is 49. CPU evidence describes the selected window.';
+    const claimText = 'The captured value is 49.';
+    const contract: ConclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], claims: [{
+        id: 'count', kind: 'numeric', text: claimText, references: [{evidenceRefId: 'data:count', rowIndex: 0, column: 'count', value: 49}],
+        semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed', discourse: 'asserted',
+          quantifier: 'one', modality: 'certain', scope: {population: 'cited_rows',
+            subjectRefs: [{evidenceRefId: 'data:count', rowIndex: 0, column: 'count', value: 49}]},
+          numeric: {operator: 'eq', value: 49, unit: 'count'}}}]};
+    const result: AnalysisResult = {sessionId: 'investigation-integration', conclusion: body, success: true,
+      confidence: 0.8, findings: [], hypotheses: [], rounds: 1, totalDurationMs: 1,
+      conclusionContract: parseConclusionContractDeclaration(contract).contract};
+    const store = new ArtifactStore();
+    const count = createDataEnvelope({columns: ['count'], rows: [[49]]}, {type: 'sql_result', source: 'execute_sql',
+      title: 'Count', evidenceRefId: 'data:count', traceId: 'trace', traceSide: 'current', executionStatus: 'observed'});
+    store.registerStandaloneEvidenceCapture(captureEvidenceTable(count.data, {count: {unit: 'count',
+      origin: {kind: 'native_producer', definitionFingerprint: 'count-v1'}}}), {meta: count.meta, display: count.display, originRunId: 'run'});
+    if (!settings.explanationOnly) {
+      const originRunId = settings.originRunId || 'run';
+      store.observeInvestigationTool({toolCallId: 'system-call', toolName: 'fixture', params: {}, extra: {}, phase: 'started'}, originRunId);
+      store.observeInvestigationTool({toolCallId: 'system-call', toolName: 'fixture', params: {}, extra: {}, phase: 'completed',
+        result: {content: []}}, originRunId);
+      const data = {columns: ['start', 'end', 'cpu', 'freq', 'status'], rows: Array.from({length: settings.rows ?? 2}, (_, index) =>
+        [100 * Math.floor(index / 10), 100 * Math.floor(index / 10) + 100, index % 10, 1200,
+          settings.partialSibling && index === 1 ? 'partial' : 'observed'])};
+      const witness = captureEvidenceTable(data);
+      attachInvestigationEvidence(witness, {skillId: 'cpu_fixture', stepId: 'root', traceId: 'trace',
+        definitionFingerprint: 'producer-v1', selectedSqlHash: 'actual-sql', declaration: {
+          window: {start: 'start', end: 'end'}, identity: {cpu: 'cpu'}, metrics: [{domain: 'cpu_frequency',
+            metric_id: 'system.cpu.frequency.time_weighted', value: 'freq', unit: 'kHz', status: 'status', aggregation: 'window_time_weighted'}]}});
+      const envelope = createDataEnvelope(data, {type: 'skill_result', source: 'cpu_fixture', title: 'CPU',
+        traceId: 'trace', traceSide: 'current', sourceToolCallId: 'system-call', evidenceRefId: 'data:system', executionStatus: 'observed'});
+      store.registerStandaloneEvidenceCapture(witness, {meta: envelope.meta, display: envelope.display, originRunId});
+    }
+    const strategy: StrategyDefinition = {scene: 'general', classificationDescription: 'General.', strategyKind: 'normal',
+      priority: 1, effort: 'low', keywords: [], compoundPatterns: [], requiredCapabilities: [], optionalCapabilities: [],
+      phaseHints: [], planTemplate: null, verifierMisdiagnosisPatterns: [], content: 'General.', detailSections: [], sourcePath: '/fixture/general.strategy.md',
+      investigationContract: {schemaVersion: 1, profileRefs: [], requirements: [{id: 'system-frequency', domain: 'cpu_frequency',
+        description: 'Describe the selected CPU window.', required: true,
+        ...(settings.explanationOnly ? {} : {evidenceMetrics: ['system.cpu.frequency.time_weighted']})}]},
+      finalReportContract: settings.report ? {requiredSections: [{id: 'detail', label: 'Detail', required: true,
+        triggerPatterns: [], patterns: [], patternGroups: [], recoveryText: {zh: [], en: []}}]} : null};
+    const pinned = buildStrategyRegistrySnapshotFromDefinitions({definitions: [strategy], overlayGeneration: 'ledger-finalization'});
+    const candidate = {runId: 'run', attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: analysisDeliveryFingerprint(body)};
+    const actualView = store.createEvidenceReadView({ownerKey: 'run', currentRunId: 'run', allowedTraces: [{traceId: 'trace', traceSide: 'current'}]});
+    const originalLedger = actualView.investigationEvidence!();
+    const evidenceReadView: EvidenceReadView = settings.fakeLedger ? {...actualView,
+      investigationEvidence: () => JSON.parse(JSON.stringify(originalLedger))} : actualView;
+    const dispatch = jest.fn(async (input: IntentTransportInput): Promise<IntentTransportResult> => {
+      const snapshot = JSON.parse(input.prompt.slice(input.prompt.lastIndexOf('\n\n{') + 2));
+      const selected = snapshot.investigationEvidence?.records[0];
+      return {status: 'ok', text: JSON.stringify({schemaVersion: 'final_semantic_response@3',
+        bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: snapshot.body.length}]},
+        claims: [{claimId: 'count', consistency: 'consistent', contentLocations: [{text: claimText}], issues: []}], omissions: [],
+        requirements: (snapshot.reportRequirements?.requirements || []).map((requirement: {id: string}) => ({
+          requirementId: requirement.id, applicability: 'applicable', coverage: 'covered', contentLocations: [{text: snapshot.body}], claimIds: ['count']})),
+        investigation: snapshot.investigationRequirements.requirements.map((requirement: {id: string}) => ({
+          requirementId: requirement.id, applicability: 'applicable', coverage: 'covered', contentLocations: [{text: snapshot.body}],
+          evidenceRecordIds: selected ? [selected.recordId] : [], scopeMatch: selected ? 'matched' : 'unknown',
+          evidenceStatus: settings.explanationOnly ? 'not_applicable' : selected ? 'observed' : 'not_checked'}))})};
+    });
+    attachFinalizationContext(result, {runId: 'run', sessionId: result.sessionId, deadlineMs: Date.now() + 10_000,
+      strategyRegistry: pinned, traceIdentity: {currentTraceId: 'trace'},
+      turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: pinned.registryFingerprint,
+        taskKind: 'investigation', sceneId: 'general', scope: 'scene_wide', recommendedComplexity: 'full',
+        deliverable: settings.report ? 'report' : 'answer', evidenceAccess: 'existing_only'},
+      deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
+        completion: {...candidate, schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'completed'}}, evidenceReadView, dispatchText: dispatch});
+    const context = takeFinalizationContext(result)!;
+    const controller = new AbortController();
+    const owner: AnalysisFinalizationOwner = {runId: 'run', signal: controller.signal, isCurrent: () => true, assertAuthorized: () => {}};
+    return {result, context, dispatch, originalLedger,
+      run: () => finalizeAnalysisResult({result, context, owner, query: 'Describe the selected CPU window.', dataEnvelopes: [count]})};
+  }
+
+  it.each(['run', 'previous-run'])('preserves issued %s capture identity through the sole semantic review and delivery', async originRunId => {
+    const target = investigationRun({originRunId});
+    expect(target.context.investigationEvidence?.fingerprint).toBe(target.originalLedger.fingerprint);
+    const final = await target.run();
+    expect(target.dispatch).toHaveBeenCalledTimes(1);
+    expect(final.semanticAssessment?.status).toBe('checked');
+    expect(final.result.investigationAssessment?.evidenceRecords).toEqual(target.originalLedger.records);
+    expect(final.result.investigationAssessment?.evidenceRecords?.[0]).toMatchObject({originRunId,
+      origin: originRunId === 'run' ? 'current_run' : 'reused'});
+    expect(final.result.deliveryAssurance).toMatchObject({completion: 'passed', claims: 'passed', investigationEvidence: 'passed'});
+  });
+
+  it('rejects a serialized ledger while preserving original claim evidence and native completion', async () => {
+    const target = investigationRun({fakeLedger: true});
+    expect(target.context.investigationEvidence).toBeUndefined();
+    const final = await target.run();
+    expect(final.result.investigationAssessment?.evidenceRecords).toBeUndefined();
+    expect(final.result.deliveryAssurance).toMatchObject({completion: 'passed', claims: 'passed'});
+    expect(final.result.deliveryAssurance?.investigationEvidence).not.toBe('passed');
+  });
+
+  it('keeps explanations without capture obligations separate from fabricated acquisition', async () => {
+    const target = investigationRun({explanationOnly: true});
+    const final = await target.run();
+    expect(final.result.investigationAssessment?.evidenceRecords).toEqual([]);
+    expect(final.result.investigationAssessment?.requirements[0].acquisition).toBe('not_applicable');
+    expect(final.result.deliveryAssurance).toMatchObject({investigation: 'passed', investigationEvidence: 'not_applicable'});
+  });
+
+  it('expands a selected good CPU record to its partial sibling instead of accepting cherry-picked acquisition', async () => {
+    const target = investigationRun({partialSibling: true});
+    const final = await target.run();
+    expect(final.semanticAssessment?.status).toBe('checked');
+    expect(final.result.investigationAssessment?.requirements[0].acquisition).toBe('insufficient');
+    expect(final.result.deliveryAssurance).toMatchObject({completion: 'passed', claims: 'passed', investigationEvidence: 'coverage_incomplete'});
+  });
+
+  it('compacts 300 records without losing retained evidence or invalidating independent claims/report', async () => {
+    const target = investigationRun({rows: 300, report: true});
+    const final = await target.run();
+    expect(target.dispatch).toHaveBeenCalledTimes(1);
+    const input = target.dispatch.mock.calls[0][0];
+    const snapshot = JSON.parse(input.prompt.slice(input.prompt.lastIndexOf('\n\n{') + 2));
+    expect(snapshot.investigationEvidence.byteBudget).toBeLessThanOrEqual(64 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(snapshot.investigationEvidence), 'utf8')).toBeLessThanOrEqual(snapshot.investigationEvidence.byteBudget);
+    expect(snapshot.investigationEvidence.omittedRecordCount).toBeGreaterThan(0);
+    expect(snapshot.investigationEvidence.complete).toBe(false);
+    expect(snapshot.investigationEvidence.records.length + snapshot.investigationEvidence.omittedRecordCount).toBe(300);
+    expect(final.result.investigationAssessment?.evidenceRecords).toHaveLength(300);
+    expect(final.semanticAssessment?.status).toBe('checked');
+    expect(final.result.deliveryAssurance).toMatchObject({completion: 'passed', claims: 'passed', report: 'passed'});
+  });
+
+  it('delivers the accepted body when template loading throws during ledger sizing', async () => {
+    const target = investigationRun();
+    const originalBody = target.result.conclusion;
+    const loader = jest.spyOn(strategyTemplates, 'loadPromptTemplate').mockImplementation(() => {throw new Error('missing fixture template');});
+    try {
+      const final = await target.run();
+      expect(final.semanticAssessment).toMatchObject({status: 'unavailable', reason: 'missing_template'});
+      expect(final.result.conclusion).toBe(originalBody);
+      expect(final.result.deliveryAssurance?.completion).toBe('passed');
+      expect(final.result.investigationAssessment?.evidenceRecords).toHaveLength(2);
+      expect(final.result.deliveryAssurance?.investigationEvidence).not.toBe('passed');
+      expect(target.dispatch).not.toHaveBeenCalled();
+    } finally {loader.mockRestore();}
+  });
+});
 
 describe('shared final analysis boundary', () => {
   it('reviews source quotations and original declarations without an echo collision', async () => {

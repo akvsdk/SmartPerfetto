@@ -24,6 +24,16 @@ describe('CLI renderer', () => {
     });
   });
 
+  test('keeps investigation deficits separate from machine completion', () => {
+    const output = captureStdout(() => {
+      const renderer = createRenderer({verbose: false, useColor: false, format: 'json'});
+      renderer.printConclusion('done', {investigationAssurance: {investigation: 'passed', investigationEvidence: 'coverage_incomplete'}});
+      renderer.printCompletion({sessionId: 'system', sessionDir: '/tmp/system', reportPath: '/tmp/system/report.html', success: true});
+    });
+    expect(JSON.parse(output)).toMatchObject({ok: true, conclusion: 'done',
+      investigationAssurance: {investigation: 'passed', investigationEvidence: 'coverage_incomplete'}});
+  });
+
   test('renders NDJSON event, conclusion, and completion records', () => {
     const output = captureStdout(() => {
       const renderer = createRenderer({ verbose: false, useColor: false, format: 'ndjson' });
@@ -95,6 +105,44 @@ describe('CLI renderer', () => {
 
   test('rejects unknown output formats', () => {
     expect(() => parseOutputFormat('xml')).toThrow('Invalid --format value');
+  });
+
+  test('explains a quality failure without claiming that a narrative is missing', () => {
+    const output = captureStdout(() => {
+      const renderer = createRenderer({verbose: false, useColor: false});
+      renderer.printConclusion('Evidence and limitations are present.', {});
+      renderer.printCompletion({sessionId: 'gate', sessionDir: '/tmp/gate', reportPath: '/tmp/gate/report.html',
+        partial: true, hasConclusion: true, terminationReason: 'quality_gate_failed',
+        terminationMessage: '13 claims have invalid declarations or bindings.'});
+    });
+    expect(output).toMatch(/已有正文，但未通过质量校验|a narrative is available, but quality checks did not pass/);
+    expect(output).toContain('13 claims have invalid declarations or bindings.');
+    expect(output).not.toContain('结果为部分内容');
+  });
+
+  test('states that no deliverable was produced when a turn cap has no body', () => {
+    const output = captureStdout(() => {
+      const renderer = createRenderer({verbose: false, useColor: false});
+      renderer.printConclusion('   ', {confidence: 0});
+      renderer.printCompletion({sessionId: 'empty', sessionDir: '/tmp/empty', reportPath: '/tmp/empty/report.html',
+        partial: true, hasConclusion: false, terminationReason: 'max_turns'});
+    });
+    expect(output).toMatch(/未生成可交付结论|without a deliverable conclusion/);
+    expect(output).toContain('max_turns');
+    expect(output).not.toContain('(空)');
+    expect(output).not.toContain('结果为部分内容');
+  });
+
+  test.each(['json', 'ndjson'] as const)('preserves termination diagnostics in %s', format => {
+    const output = captureStdout(() => {
+      const renderer = createRenderer({verbose: false, useColor: false, format});
+      renderer.printConclusion('', {});
+      renderer.printCompletion({sessionId: 'empty', sessionDir: '/tmp/empty', reportPath: '/tmp/empty/report.html',
+        partial: true, hasConclusion: false, terminationReason: 'max_turns', terminationMessage: 'Turn budget exhausted.'});
+    });
+    const records = output.trim().split('\n').map(line => JSON.parse(line));
+    expect(records[records.length - 1]).toMatchObject({partial: true, hasConclusion: false,
+      terminationReason: 'max_turns', terminationMessage: 'Turn budget exhausted.'});
   });
 
   test('rejects ndjson for text/json-only commands', () => {

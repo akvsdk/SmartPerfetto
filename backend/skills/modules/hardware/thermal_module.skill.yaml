@@ -125,13 +125,17 @@ steps:
     name: "温度概览"
     sql: |
       SELECT
+        ct.id AS sensor_track_id,
         ct.name AS sensor_name,
+        ct.unit AS source_unit,
         COUNT(*) AS sample_count,
         CAST(MIN(c.value) AS INTEGER) AS min_temp,
         CAST(MAX(c.value) AS INTEGER) AS max_temp,
         CAST(AVG(c.value) AS INTEGER) AS avg_temp,
+        'arithmetic_sample_mean_not_time_weighted' AS aggregation_basis,
         CAST(MAX(c.value) - MIN(c.value) AS INTEGER) AS temp_range,
         CASE
+          WHEN ct.unit IS NULL OR ct.unit != 'C' THEN 'unit_unknown_or_unsupported'
           WHEN MAX(c.value) > 80 THEN 'critical'
           WHEN MAX(c.value) > 70 THEN 'warning'
           WHEN MAX(c.value) > 60 THEN 'elevated'
@@ -139,12 +143,14 @@ steps:
         END AS status
       FROM counter c
       JOIN counter_track ct ON c.track_id = ct.id
-      WHERE ct.name GLOB '*thermal*'
+      WHERE (ct.name GLOB '*thermal*'
         OR ct.name GLOB '*temp*'
         OR ct.name GLOB '*temperature*'
         OR ct.name GLOB '*tsens*'
-        OR ct.name GLOB '*Temp*'
-      GROUP BY ct.name
+        OR ct.name GLOB '*Temp*')
+        AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+        AND (${end_ts} IS NULL OR c.ts < ${end_ts})
+      GROUP BY ct.id, ct.name, ct.unit
       ORDER BY max_temp DESC
     display:
       level: key
@@ -157,14 +163,16 @@ steps:
         - key: sensor_name
           label: 传感器
         - key: avg_temp
-          label: 平均温度
-          format: "{{value}}°C"
+          label: 样本平均温度
+          format: "{{value}}"
         - key: max_temp
           label: 最高温度
-          format: "{{value}}°C"
+          format: "{{value}}"
+        - key: source_unit
+          label: 原始单位
         - key: status
           label: 状态
-    on_empty: "未找到温度数据，请确保 trace 包含 thermal/temperature 计数器"
+    on_empty: "窗口内未找到温度样本；检查 trace 是否包含 thermal/temperature 计数器。缺少单位时不进行摄氏温度阈值判断。"
 
   # Step 2: Temperature timeline
   - id: temperature_timeline
@@ -178,21 +186,28 @@ steps:
       thermal_samples AS (
         SELECT
           (c.ts - (SELECT start_ts FROM time_range)) / 1e9 as time_sec,
+          ct.id as sensor_track_id,
+          ct.unit as source_unit,
           ct.name as sensor_name,
           c.value as temperature
         FROM counter c
         JOIN counter_track ct ON c.track_id = ct.id
-        WHERE ct.name GLOB '*thermal*'
+        WHERE (ct.name GLOB '*thermal*'
           OR ct.name GLOB '*temp*'
-          OR ct.name GLOB '*temperature*'
+          OR ct.name GLOB '*temperature*')
+          AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR c.ts < ${end_ts})
       )
       SELECT
         CAST(time_sec AS INTEGER) as second,
+        sensor_track_id,
         sensor_name,
+        source_unit,
         CAST(AVG(temperature) AS INTEGER) as avg_temp,
+        'arithmetic_sample_mean_not_time_weighted' AS aggregation_basis,
         CAST(MAX(temperature) AS INTEGER) as max_temp
       FROM thermal_samples
-      GROUP BY CAST(time_sec AS INTEGER), sensor_name
+      GROUP BY CAST(time_sec AS INTEGER), sensor_track_id, sensor_name, source_unit
       ORDER BY second, sensor_name
       LIMIT 300
     display:
@@ -213,35 +228,44 @@ steps:
       high_temps AS (
         SELECT
           (c.ts - (SELECT start_ts FROM time_range)) / 1e9 as time_sec,
+          ct.id as sensor_track_id,
+          ct.unit as source_unit,
           ct.name as sensor_name,
           c.value as temperature
         FROM counter c
         JOIN counter_track ct ON c.track_id = ct.id
         WHERE (ct.name GLOB '*thermal*' OR ct.name GLOB '*temp*')
+          AND ct.unit = 'C'
+          AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR c.ts < ${end_ts})
           AND c.value > 60
       )
       SELECT
+        sensor_track_id,
         sensor_name,
+        source_unit,
         ROUND(MIN(time_sec), 2) as start_sec,
         ROUND(MAX(time_sec), 2) as end_sec,
         ROUND(MAX(time_sec) - MIN(time_sec), 2) as duration_sec,
+        'first_to_last_high_sample_span_not_continuous_hot_duration' AS duration_basis,
         CAST(MAX(temperature) AS INTEGER) as peak_temp,
         CAST(AVG(temperature) AS INTEGER) as avg_temp,
+        'arithmetic_sample_mean_not_time_weighted' AS aggregation_basis,
         COUNT(*) as sample_count
       FROM high_temps
-      GROUP BY sensor_name
+      GROUP BY sensor_track_id, sensor_name, source_unit
       HAVING COUNT(*) > 1
       ORDER BY peak_temp DESC
     display:
       level: detail
       layer: list
-      title: "高温时段"
+      title: "高温样本跨度"
     save_as: high_temp_periods
 
-  # Step 4: Thermal throttling events (from frequency drops)
+  # Step 4: Observed frequency drops; cause requires independent thermal evidence
   - id: throttling_events
     type: atomic
-    name: "热节流事件"
+    name: "频率骤降事件"
     sql: |
       WITH
       time_range AS (
@@ -250,29 +274,35 @@ steps:
       freq_changes AS (
         SELECT
           cct.cpu as cpu_id,
+          cct.id as frequency_track_id,
+          c.ts as ts,
           (c.ts - (SELECT start_ts FROM time_range)) / 1e9 as time_sec,
           c.value / 1000 as freq_mhz,
-          LAG(c.value / 1000) OVER (PARTITION BY cct.cpu ORDER BY c.ts) as prev_freq_mhz
+          LAG(c.value / 1000) OVER (PARTITION BY cct.id ORDER BY c.ts, c.id) as prev_freq_mhz
         FROM counter c
         JOIN cpu_counter_track cct ON c.track_id = cct.id
         WHERE cct.name = 'cpufreq'
       )
       SELECT
         cpu_id,
+        frequency_track_id,
+        ts,
         ROUND(time_sec, 2) as time_sec,
         CAST(prev_freq_mhz AS INTEGER) as prev_freq_mhz,
         CAST(freq_mhz AS INTEGER) as new_freq_mhz,
         CAST((prev_freq_mhz - freq_mhz) AS INTEGER) as drop_mhz,
         ROUND((prev_freq_mhz - freq_mhz) * 100.0 / prev_freq_mhz, 1) as drop_pct
       FROM freq_changes
-      WHERE prev_freq_mhz IS NOT NULL
+      WHERE (${start_ts} IS NULL OR ts >= ${start_ts})
+        AND (${end_ts} IS NULL OR ts < ${end_ts})
+        AND prev_freq_mhz IS NOT NULL
         AND freq_mhz < prev_freq_mhz * 0.7
       ORDER BY drop_mhz DESC
       LIMIT 30
     display:
       level: detail
       layer: list
-      title: "频率骤降事件 (可能的热节流)"
+      title: "频率骤降事件（原因待查）"
     save_as: throttling_events
 
   # Step 5: Cooling device activity
@@ -285,12 +315,15 @@ steps:
         CAST(MIN(c.value) AS INTEGER) AS min_level,
         CAST(MAX(c.value) AS INTEGER) AS max_level,
         CAST(AVG(c.value) AS INTEGER) AS avg_level,
+        'arithmetic_sample_mean_not_time_weighted' AS aggregation_basis,
         COUNT(*) AS sample_count
       FROM counter c
       JOIN counter_track ct ON c.track_id = ct.id
-      WHERE ct.name GLOB '*cooling*'
+      WHERE (ct.name GLOB '*cooling*'
         OR ct.name GLOB '*fan*'
-        OR ct.name GLOB '*cdev*'
+        OR ct.name GLOB '*cdev*')
+        AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+        AND (${end_ts} IS NULL OR c.ts < ${end_ts})
       GROUP BY ct.name
       ORDER BY avg_level DESC
     display:
@@ -315,7 +348,10 @@ steps:
           MAX(c.value) as max_temp
         FROM counter c
         JOIN counter_track ct ON c.track_id = ct.id
-        WHERE ct.name GLOB '*thermal*' OR ct.name GLOB '*temp*'
+        WHERE (ct.name GLOB '*thermal*' OR ct.name GLOB '*temp*')
+          AND ct.unit = 'C'
+          AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR c.ts < ${end_ts})
         GROUP BY CAST((c.ts - (SELECT start_ts FROM time_range)) / 1e9 AS INTEGER)
       ),
       freq_by_sec AS (
@@ -325,16 +361,20 @@ steps:
         FROM counter c
         JOIN cpu_counter_track cct ON c.track_id = cct.id
         WHERE cct.name = 'cpufreq'
+          AND (${start_ts} IS NULL OR c.ts >= ${start_ts})
+          AND (${end_ts} IS NULL OR c.ts < ${end_ts})
         GROUP BY CAST((c.ts - (SELECT start_ts FROM time_range)) / 1e9 AS INTEGER)
       )
       SELECT
         t.second,
         CAST(t.max_temp AS INTEGER) as max_temp,
+        'C' AS source_unit,
         f.avg_freq_mhz,
+        'same_second_sample_aggregation_not_causal_or_time_weighted' AS correlation_basis,
         CASE
-          WHEN t.max_temp > 70 AND f.avg_freq_mhz < 1500 THEN 'thermal_throttled'
-          WHEN t.max_temp > 60 AND f.avg_freq_mhz < 2000 THEN 'possible_throttle'
-          ELSE 'normal'
+          WHEN t.max_temp > 70 AND f.avg_freq_mhz < 1500 THEN 'high_temperature_with_low_sampled_frequency'
+          WHEN t.max_temp > 60 AND f.avg_freq_mhz < 2000 THEN 'elevated_temperature_with_low_sampled_frequency'
+          ELSE 'no_threshold_coincidence'
         END as status
       FROM thermal_by_sec t
       JOIN freq_by_sec f ON t.second = f.second
@@ -364,10 +404,10 @@ steps:
           - temp_overview.data[0]?.max_temp
 
       - condition: "throttling_events.data.length > 10"
-        diagnosis: "检测到 ${throttling_events.data.length} 次频率骤降，热节流显著影响性能"
+        diagnosis: "检测到 ${throttling_events.data.length} 次频率骤降；尚不能据此确定热节流或性能影响"
         confidence: high
         suggestions:
-          - "工作负载过高导致热积累"
+          - "结合直接 thermal throttling/cooling 事件和同窗口工作负载判断降频原因"
           - "考虑分散计算任务"
           - "优化算法减少 CPU 使用"
         evidence_fields:
@@ -375,7 +415,7 @@ steps:
           - throttling_events.data[0]?.drop_pct
 
       - condition: "high_temp_periods.data[0]?.duration_sec > 30"
-        diagnosis: "高温持续 ${high_temp_periods.data[0]?.duration_sec} 秒，散热不足"
+        diagnosis: "高温样本首尾跨度 ${high_temp_periods.data[0]?.duration_sec} 秒；不代表连续高温或散热不足"
         confidence: high
         suggestions:
           - "持续高温会加速热节流"
@@ -386,17 +426,17 @@ steps:
           - high_temp_periods.data[0]?.duration_sec
           - high_temp_periods.data[0]?.peak_temp
 
-      - condition: "thermal_cpu_correlation.data.filter(t => t.status === 'thermal_throttled').length > 5"
-        diagnosis: "温度与 CPU 频率呈明显负相关，热节流正在发生"
+      - condition: "thermal_cpu_correlation.data.filter(t => t.status === 'high_temperature_with_low_sampled_frequency').length > 5"
+        diagnosis: "同一秒内观测到高温和较低的频率样本；这种并存不能证明热节流或负相关"
         confidence: high
         suggestions:
-          - "高温直接导致 CPU 降频"
-          - "性能受限于散热能力"
+          - "查找温控限制、冷却状态或限频事件的直接证据"
+          - "结合目标任务窗口和负载变化检验性能影响"
         evidence_fields:
-          - thermal_cpu_correlation.data.filter(t => t.status === 'thermal_throttled').length
+          - thermal_cpu_correlation.data.filter(t => t.status === 'high_temperature_with_low_sampled_frequency').length
 
       - condition: "temp_overview.data[0]?.temp_range > 20"
-        diagnosis: "温度波动较大: 变化范围 ${temp_overview.data[0]?.temp_range}°C"
+        diagnosis: "温度计数器样本变化范围 ${temp_overview.data[0]?.temp_range}，原始单位 ${temp_overview.data[0]?.source_unit}"
         confidence: medium
         suggestions:
           - "工作负载不均匀"

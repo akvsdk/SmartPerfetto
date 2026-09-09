@@ -4,6 +4,8 @@
 
 import {createRuntimeToolResult, runtimeToolReceiptMetadata} from '../agentRuntime/runtimeToolResult';
 import type {RuntimeToolObserver} from '../agentRuntime/runtimeToolObserver';
+import type {AnalysisHistoryReader} from '../agentRuntime/analysisHistory';
+import {renderRequiredLocalizedStrategyTemplate} from './localizedStrategyTemplate';
 import { tool as sdkTool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { createHash } from 'crypto';
@@ -83,7 +85,6 @@ import {assessScrollingJankClaimBoundary} from '../services/scrollingJankClaimBo
 import { injectStdlibIncludes } from './sqlIncludeInjector';
 import { normalizeRawSql } from './rawSqlNormalizer';
 import {
-  buildStrategyDetailExcerpt,
   buildStrategyRegistrySnapshotFromDefinitions,
   getRegisteredScenes,
   getStrategyDetailByRef,
@@ -1190,6 +1191,10 @@ export interface ClaudeMcpServerOptions {
   toolObserver?: RuntimeToolObserver;
   /** Restrict-only typed turn policy; omitted preserves authorized evidence acquisition. */
   allowNewEvidence?: boolean;
+  /** Runtime lease: no tool body may execute after acquisition closes. */
+  canInvokeTool?: () => boolean;
+  /** Issued session-bound reader, never accepted from HTTP/SDK tool arguments. */
+  analysisHistoryReader?: AnalysisHistoryReader;
   strategyRegistry?: ReadonlyStrategyRegistrySnapshot;
   /** Callback when invoke_skill returns a successful result (used for entity capture) */
   onSkillResult?: (result: { skillId: string; displayResults: Array<{ stepId?: string; data?: any }> }) => void;
@@ -6202,7 +6207,6 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
 
-      const body = buildStrategyDetailExcerpt(detail, 6000);
       return {
         content: [{
           type: 'text' as const,
@@ -6211,9 +6215,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             informational: true,
             detailRef: detail.ref,
             title: detail.title,
-            content: body.excerpt,
-            contentTruncated: body.truncated,
-            contentMaxChars: body.maxChars,
+            content: detail.content,
+            contentTruncated: false,
             note: localize(
               outputLanguage,
               '此 detail 仅提供执行方法/SQL/检查表；必须通过 Skill/SQL/artifact 获取 trace 证据后才能完成阶段或写结论。',
@@ -7301,10 +7304,29 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
   // re-deciding policy. Registration order is preserved exactly to
   // keep SDK behavior identical to the pre-refactor toolEntries
   // array — trace regression validates that.
+  const readSessionHistory = options.analysisHistoryReader ? tool(
+    'read_session_history',
+    renderRequiredLocalizedStrategyTemplate('prompt-runtime-history-tool', outputLanguage, {}),
+    {
+      turnId: z.string().max(200).optional(),
+      offset: z.number().int().min(0).optional(),
+      limit: z.number().int().min(1).max(50).optional(),
+      textOffset: z.number().int().min(0).optional(),
+      maxChars: z.number().int().min(1).max(12000).optional(),
+    },
+    async request => {
+      try { return createRuntimeToolResult(options.analysisHistoryReader!.read(request)); }
+      catch { return createRuntimeToolResult({success: false, action_required: 'use_available_history',
+        unsupportedReason: 'analysis_history_unavailable'}, {isError: true}); }
+    },
+    {annotations: {readOnlyHint: true}},
+  ) : null;
   const registry = new McpToolRegistry({
     runManifestAttributionSink,
     toolObserver: options.toolObserver,
+    acquisitionObserver: event => { artifactStore?.observeInvestigationTool?.(event); },
     requestScope: toolRequestScope,
+    canInvokeTool: options.canInvokeTool,
   });
   const sourceOnlyPhase = sourceUsePolicy?.phase === 'automatic_enrichment' ||
     sourceUsePolicy?.phase === 'deep_enrichment';
@@ -7352,6 +7374,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     registry.registerSdk(recallSimilarResult, 'recall_similar_result', 'public', {evidenceEffect: 'acquire'});
     if (writeAnalysisNote) registry.registerSdk(writeAnalysisNote, 'write_analysis_note', 'internal', {evidenceEffect: 'none'});
     if (fetchArtifact) registry.registerSdk(fetchArtifact, 'fetch_artifact', 'public', {evidenceEffect: 'read_existing'});
+    if (readSessionHistory) registry.registerSdk(readSessionHistory, 'read_session_history', 'public', {evidenceEffect: 'read_existing'});
     if (submitPlan) registry.registerSdk(submitPlan, 'submit_plan', 'internal', {evidenceEffect: 'none'});
     if (updatePlanPhase) registry.registerSdk(updatePlanPhase, 'update_plan_phase', 'internal', {evidenceEffect: 'none'});
     if (revisePlan) registry.registerSdk(revisePlan, 'revise_plan', 'internal', {evidenceEffect: 'none'});

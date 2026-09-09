@@ -46,6 +46,9 @@ The [Android Performance Ecosystem](https://github.com/Gracker/android-performan
   clues. FrameTimeline provides outcome evidence; missing frames do not hide tasks.
 - Keeps Perfetto's timeline and SQL workflow, then adds an AI Assistant for
   evidence-backed conclusions, follow-up questions, comparisons, and reports.
+  At the turn limit, it delivers a conclusion from collected evidence with remaining
+  gaps. Follow-ups inherit authorized history in the same session, including after
+  reopening the page or restarting the backend.
 - Uses deterministic YAML Skills and Markdown strategies so factual evidence,
   model interpretation, and report provenance remain separate.
 - Optionally selects registered local source per run, uses bounded on-demand
@@ -123,6 +126,10 @@ For CLI use:
 smp run trace.pftrace "Analyze scrolling jank"
 ```
 
+Incomplete CLI runs show the termination reason and available diagnostics;
+a report body can still fail evidence or declaration checks. See the
+[CLI result guidance](docs/reference/cli.en.md#global-options).
+
 ## Documentation
 
 - Start here: [Documentation Center](docs/README.en.md),
@@ -154,3 +161,7 @@ support details are in [docs/sponsor.en.md](docs/sponsor.en.md).
 submodule remains under [Apache-2.0](https://github.com/google/perfetto/blob/main/LICENSE).
 For commercial licensing without AGPL obligations, contact the maintainer on
 WeChat: `553000664`.
+
+## System investigation across scenes
+
+Performance investigations relate critical tasks to CPU frequency, system load, thread states, CPU placement and scheduling evidence when relevant to the question. Root-cause strategy details are read in full. Answers report missing evidence explicitly; investigation coverage is assessed independently of report headings and native runtime completion. See [Basic Usage](docs/getting-started/usage.en.md).

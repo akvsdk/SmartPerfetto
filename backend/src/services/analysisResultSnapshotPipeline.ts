@@ -496,7 +496,7 @@ export function buildCompletedAnalysisResultSnapshot(
     sessionId: input.sessionId, success: input.success ?? true, findings: [], hypotheses: [],
     conclusion: input.conclusion ?? '', confidence: input.confidence ?? 0, rounds: 0, totalDurationMs: 0,
     turnIntent: input.turnIntent, completion: input.completion, outputOrigin: input.outputOrigin,
-    runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, deliveryAssurance: input.deliveryAssurance,
+    runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, investigationAssessment: input.investigationAssessment, deliveryAssurance: input.deliveryAssurance,
     conclusionContract: input.conclusionContract as AnalysisResult['conclusionContract'],
     claimSupport: input.claimSupport, claimVerificationResult: input.claimVerificationResult,
     sourceUseDecision: input.sourceUseDecision, sourceClaimVerificationResult: input.sourceClaimVerificationResult,
@@ -563,12 +563,8 @@ function ensureSnapshotParentGraph(
 
   if (input.userId) {
     db.prepare(`
-      INSERT INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
+      INSERT OR IGNORE INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        email = excluded.email,
-        display_name = excluded.display_name,
-        updated_at = excluded.updated_at
     `).run(
       input.userId,
       input.tenantId,
@@ -640,7 +636,7 @@ export function persistCompletedAnalysisResultSnapshot(
     confidence: input.confidence ?? 0, rounds: 0, totalDurationMs: 0,
     partial: input.partial, terminationReason: projectPrivateTerminationReason(input.terminationReason), terminationMessage: input.terminationMessage,
     turnIntent: input.turnIntent, completion: input.completion, outputOrigin: input.outputOrigin,
-    runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, deliveryAssurance: input.deliveryAssurance,
+    runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, investigationAssessment: input.investigationAssessment, deliveryAssurance: input.deliveryAssurance,
     conclusionContract: input.conclusionContract as AnalysisResult['conclusionContract'],
     claimSupport: input.claimSupport, claimVerificationResult: input.claimVerificationResult,
     sourceUseDecision: input.sourceUseDecision, sourceClaimVerificationResult: input.sourceClaimVerificationResult,
@@ -648,7 +644,7 @@ export function persistCompletedAnalysisResultSnapshot(
     analysisReceipt: input.analysisReceipt,
   }, outputLanguage) : undefined;
   const {turnIntent: _intent, completion: _completion, outputOrigin: _origin, runtimeAppendix: _appendix,
-    reportAssessment: _assessment, deliveryAssurance: _assurance, ...inputWithoutDelivery} = input;
+    reportAssessment: _assessment, investigationAssessment: _investigation, deliveryAssurance: _assurance, ...inputWithoutDelivery} = input;
   const durableInput: CompletedAnalysisSnapshotInput = input.privateKnowledge
     ? {
         ...inputWithoutDelivery,

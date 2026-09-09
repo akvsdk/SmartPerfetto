@@ -363,3 +363,7 @@ running directory. See [Application Updates](application-updates.en.md).
 | Run one deterministic analysis across local traces | `smp batch skill` |
 | Propose a config, then record from an Android device | `smp capture suggest/config/android` |
 | Integrate with scripts or platforms | API / CLI / MCP tools |
+
+## System evidence across scenes
+
+Reusable Skills provide system evidence; scene strategies select critical tasks and dependency chains. Startup, scrolling, input response, blocking and other performance investigations share scoped timing and identity semantics, with relevant Binder, lock, IO, memory, GPU or display evidence. Missing topology does not become little-core placement, and unknown scheduling policy does not become RT. Root-cause details remain fully readable, while reports retain all investigation dimensions and evidence references.

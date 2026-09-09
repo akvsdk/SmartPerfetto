@@ -280,6 +280,19 @@ describe('claim_verifier@2 reference cells', () => {
 });
 
 describe('finite numeric.cell proof', () => {
+  it.each([
+    {nanoseconds: 8_040_000, milliseconds: 8.04, status: 'proved'},
+    {nanoseconds: 8_040_000, milliseconds: 804, status: 'rejected'},
+    {nanoseconds: 16_700_000, milliseconds: 16.7, status: 'proved'},
+    {nanoseconds: 16_700_000, milliseconds: 167, status: 'rejected'},
+  ])('checks the declared conversion $nanoseconds ns to $milliseconds ms', ({nanoseconds, milliseconds, status}) => {
+    const evidence = metric({row: {value: nanoseconds}, expected: nanoseconds, fields: {value: literal({unit: 'ns'})}});
+    const result = verify(claim([evidence], {semantics: semantics(evidence, {
+      numeric: {operator: 'eq', value: milliseconds, unit: 'ms'},
+    })}));
+    expect(result.deterministicProof.status).toBe(status);
+  });
+
   it('converts a literal ms field to us and proves the complete typed proposition', () => {
     const evidence = metric();
     const result = verify(claim([evidence], {semantics: semantics(evidence)}));

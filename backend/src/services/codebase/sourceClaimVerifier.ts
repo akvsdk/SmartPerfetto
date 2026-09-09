@@ -515,6 +515,7 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
     conclusionContract: result.conclusionContract, claimSupport: result.claimSupport,
     claimVerificationResult: result.claimVerificationResult, sourceUseDecision: result.sourceUseDecision,
     sourceReferences: result.sourceReferences, sourceClaimVerificationResult: result.sourceClaimVerificationResult,
+    identityResolutions: result.identityResolutions,
   });
   const before = projectCodeAwareStructuredText(undefined, structure());
   const beforeFingerprint = analysisDeliveryFingerprint(before.value);
@@ -599,11 +600,12 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
   let deliveryContext = options.context;
   if (bodyChanged || structureChanged) {
     delete result.reportAssessment;
+    delete result.investigationAssessment;
     delete result.deliveryAssurance;
     if (bodyChanged) delete result.completion;
     if (deliveryContext && deliveryContext.entry !== 'historical_restore') {
       deliveryContext = {...deliveryContext, claimVerificationBinding: undefined, sourceVerificationBinding: undefined,
-        reportAssessment: undefined, evidenceRenderedProof: undefined};
+        reportAssessment: undefined, investigationAssessment: undefined, evidenceRenderedProof: undefined};
       if (bodyChanged) {
         const original = deliveryContext.acceptedCandidate;
         const nativeCompletion = deliveryContext.completion;

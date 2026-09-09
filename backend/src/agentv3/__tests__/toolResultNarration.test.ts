@@ -20,6 +20,13 @@ function mcpResult(body: unknown) {
 }
 
 describe('formatToolResultNarration', () => {
+  it('keeps the historical incompleteness visible without quoting its private body', () => {
+    for (const privateContext of [false, true]) {
+      expect(formatToolResultNarration({toolName: 'read_session_history', privateContext,
+        result: mcpResult({success: true, kind: 'turn', partial: true, text: 'SECRET_HISTORY_CANARY'})}))
+        .toBe('这轮历史结果尚未完整完成，已保留其限制供继续核查');
+    }
+  });
   it.each([true, undefined])('does not overwrite typed success=%s with a legacy failure field', success => {
     const result = createRuntimeToolResult({success: false, error: 'old failure', action_required: 'retry'}, {
       facts: success === undefined ? {} : {success},

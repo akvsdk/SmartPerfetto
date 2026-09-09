@@ -21,6 +21,7 @@ import {
   type PromptSegment,
 } from '../claudeSystemPrompt';
 import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes, loadPromptTemplate} from '../strategyLoader';
+import {resolveAnalysisInvestigationRequirements} from '../../agentRuntime/analysisInvestigationRequirements';
 import {CONCLUSION_CONTRACT_SIDECAR_MARKER, parseConclusionContractSidecar} from '../../agent/core/conclusionContract';
 import {runDeterministicClaimVerifier, SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../../services/verifier/deterministicClaimVerifier';
 import {bindCapturedAnchorFacts, captureEvidenceTable} from '../../services/evidence/evidenceCapture';
@@ -64,19 +65,19 @@ describe('typed prompt with real strategy assets', () => {
     }]}).claimResults[0].deterministicProof.status).toBe('rejected');
   });
 
-  it('delivers real scrolling investigation requirements without importing legacy report recipes', () => {
+  it.each(['scrolling', 'startup'])('delivers real %s investigation requirements without importing legacy report recipes', sceneId => {
     const registry = buildStrategyRegistrySnapshotFromDefinitions({
       definitions: getRegisteredScenes(), overlayGeneration: 'investigation-evidence-test',
     });
-    const scene = registry.getStrategy('scrolling')!;
-    expect(scene.investigationRequirements?.length).toBeGreaterThan(0);
-    expect(scene.investigationRequirements?.some(requirement => /main.thread/i.test(requirement))).toBe(true);
+    const scene = registry.getStrategy(sceneId)!;
+    expect(scene.investigationContract?.requirements.length).toBeGreaterThan(0);
+    expect(scene.investigationContract?.requirements.some(requirement => /main.thread/i.test(requirement.description))).toBe(true);
     for (const scope of ['bounded_question', 'scene_wide'] as const) {
       for (const deliverable of ['answer', 'report'] as const) {
         const context: ClaudeAnalysisContext = {
           query: 'Explain the selected main-thread initialization.', strategyRegistry: registry,
           turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', taskKind: 'investigation',
-            sceneId: 'scrolling', scope, recommendedComplexity: 'full', deliverable,
+            sceneId, scope, recommendedComplexity: 'full', deliverable,
             evidenceAccess: 'existing_only', registryFingerprint: registry.registryFingerprint},
           codeAwareMode: 'off', codebaseIds: [],
           selectionContext: {kind: 'area', startNs: 10, endNs: 20, tracks: [{uri: 'main', upid: 42, utid: 43}]},
@@ -87,15 +88,16 @@ describe('typed prompt with real strategy assets', () => {
           conversationSummary: 'Unverified prior context. '.repeat(20000),
           knowledgeBaseContext: 'Optional table reference. '.repeat(20000)}, budget);
         const requirementSegment = parts.segments.find(segment => segment.label === 'investigation_requirements')!;
-        expect(JSON.parse(requirementSegment.content).data).toEqual({sceneId: 'scrolling',
-          registryFingerprint: registry.registryFingerprint, requirements: scene.investigationRequirements});
+        expect(JSON.parse(requirementSegment.content).data).toEqual(resolveAnalysisInvestigationRequirements({
+          intent: context.turnIntent, strategyRegistry: registry,
+        }));
         expect(requirementSegment).toMatchObject({droppable: false, truncatable: false});
         expect(parts.segments.find(segment => segment.label === 'source_use_decision')).toBeUndefined();
         expect(JSON.parse(parts.segments.find(segment => segment.label === 'source_authorization')!.content).data)
           .toEqual({mode: 'off', codebaseIds: [], evidenceAccess: 'existing_only'});
         expect(JSON.parse(parts.segments.find(segment => segment.label === 'selection_context')!.content).data)
           .toEqual(context.selectionContext);
-        expect(parts.fullPrompt).not.toContain('#### Scrolling Core Strategy');
+        expect(parts.segments.some(segment => segment.label === 'scene_strategy_core')).toBe(false);
         expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(budget);
         expect(estimatePromptTokens(baseline.fullPrompt)).toBeLessThanOrEqual(MAX_PROMPT_TOKENS);
         expect(parts.droppedLabels).toContain('knowledge_base');
@@ -199,13 +201,22 @@ describe('typed prompt with real strategy assets', () => {
           panes: [{side: 'left', traceSide: 'current', traceId: 'trace-1', traceName: 'Description '.repeat(10_000)},
             {side: 'right', traceSide: 'reference', traceId: 'ref-2'}]}},
     };
-    const parts = buildSystemPromptParts(context, 4_000);
+    // Comparison now carries the same pinned evidence obligations as an investigation.
+    // Size the atomic context first; an arbitrary old 4k ceiling must not evict it.
+    const minimal = {...context, comparison: {...context.comparison!,
+      tracePairContext: {...context.comparison!.tracePairContext!, panes:
+        context.comparison!.tracePairContext!.panes.map(pane => ({...pane, traceName: undefined}))}}};
+    const budget = estimatePromptTokens(buildSystemPromptParts(minimal).fullPrompt) + 100;
+    expect(budget).toBeLessThan(MAX_PROMPT_TOKENS);
+    const parts = buildSystemPromptParts(context, budget);
     const identity = JSON.parse(parts.segments.find(segment => segment.label === 'comparison_identity')!.content).data;
     expect(identity.referenceTraceId).toBe('ref-2');
     expect(identity.tracePairContext.panes.map((pane: {traceId: string}) => pane.traceId)).toEqual(['trace-1', 'ref-2']);
     expect(identity.capabilityProbeStatus).toBe('not_checked');
     expect(parts.droppedLabels).toContain('comparison_details');
-    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(4_000);
+    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(budget);
+    expect(parts.droppedLabels).not.toContain('investigation_requirements');
+    expect(parts.truncatedLabels).not.toContain('investigation_requirements');
   });
 });
 
@@ -577,18 +588,26 @@ describe('system prompt token regression with real strategy files', () => {
   });
 
   it('keeps report contract when scene core is forcibly truncated under an artificial budget', () => {
+    const context = makeWorstCaseContext('startup');
+    const baseline = buildSystemPromptParts(context);
+    const fullCore = baseline.segments.find(segment => segment.label === 'scene_strategy_core')!;
+    // Leave room for the current non-trimmable obligations and only half of the
+    // scene core. A fixed 9k fixture can fall below the mandatory context alone.
+    const constrainedBudget = estimatePromptTokens(baseline.fullPrompt)
+      - Math.ceil(fullCore.estimatedTokens / 2);
     const parts = buildSystemPromptParts(
-      makeWorstCaseContext('startup'),
-      9_000,
+      context,
+      constrainedBudget,
       { truncateSceneCore: true },
     );
     const sceneCore = parts.segments.find(segment => segment.label === 'scene_strategy_core');
     const reportContract = parts.segments.find(segment => segment.label === 'report_contract');
     expect(parts.truncatedLabels).toEqual(expect.arrayContaining(['scene_strategy_core']));
-    expect(parts.truncatedLabels.every(label => (
-      label === 'scene_strategy_core' || label === 'selection_context'
-    ))).toBe(true);
-    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(9_000);
+    expect(parts.truncatedLabels.filter(label =>
+      label !== 'scene_strategy_core' && label !== 'selection_context',
+    )).toEqual([]);
+    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(constrainedBudget);
+    expect(constrainedBudget).toBeLessThan(MAX_PROMPT_TOKENS);
     expect(sceneCore?.truncated).toBe(true);
     expect(sceneCore?.originalEstimatedTokens).toBeGreaterThan(sceneCore?.estimatedTokens ?? 0);
     expect(reportContract?.droppable).toBe(false);

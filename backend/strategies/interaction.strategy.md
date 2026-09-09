@@ -3,6 +3,18 @@
 
 ---
 scene: interaction
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: interaction_critical_path
+      domain: critical_path
+      description: "Bind input event, receiving window, dispatch, app callback, state update and visible result. Select input/Main/render/SF tasks on that response path and distinguish ACK, focus and actual presentation."
+    - id: interaction_dependencies
+      domain: dependency_chain
+      description: "Use Binder, lock, queue, input dispatch and display dependencies only where they explain response latency; preserve missing endpoint or causal-link limitations."
 classification_description: "Discrete input or tap response, from input dispatch through application handling to presentation."
 priority: 4
 effort: medium

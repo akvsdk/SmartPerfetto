@@ -337,3 +337,7 @@ SmartPerfetto 支持多种运行方式：
 | 对多条本机 trace 跑同一个确定性分析 | `smp batch skill` |
 | 先生成采集配置、再从 Android 设备抓 trace | `smp capture suggest/config/android` |
 | 接入脚本或平台 | API / CLI / MCP 工具 |
+
+## 跨场景系统证据
+
+系统证据由可复用 Skill 提供，场景策略选择关键任务及依赖链。启动、滑动、输入响应、阻塞与其他性能场景采用统一时间范围和身份口径，并按相关性补充 Binder、锁、IO、内存、GPU 或显示链路。缺失拓扑不归入小核，未知调度策略不推断为 RT。根因详情完整可读；报告保留全部调查维度及证据引用。

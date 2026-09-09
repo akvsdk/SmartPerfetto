@@ -42,6 +42,19 @@ Options:
   -h, --help                display help for command
 ```
 
+并行回归可为每个任务传不同的 `--session-dir /tmp/smp-sessions/<case>`；
+后续 `ask`、`list`、`report` 也要使用同一目录。共享 SQLite 已有 5 秒锁等待，
+独立目录用于隔离测试状态，不能代替对持续锁冲突的排查。
+
+分析未完成时，CLI 显示终止原因及可用的具体诊断，并区分未生成正文与已有正文但
+质量校验失败。JSON/NDJSON 同样保留 `terminationMessage` 和 `hasConclusion`。
+`quality_gate_failed` 可能表示声明或证据绑定无效，不等同于缺少报告段落。
+总轮次预算大于一时预留一次无工具总结；触顶后基于已有返回数据说明发现、不足及
+下一步，仍标记 `partial` / `max_turns`。原截止时间、授权和显式费用预算继续生效。
+OpenCode 按观察到的实际轮次停止，若已过冲到没有剩余额度则保留结果而不追加调用。
+`smp ask` 把历史与新问题分开传递，保留历史完整性状态并允许按需回查更早正文；
+Trace 重载后的旧证据仍标为历史，不冒充新 Trace 的已核验事实。
+
 ## 核心工作流
 
 ```bash
@@ -415,3 +428,7 @@ REPL 内部命令：
 | `/focus` | 显示当前 session 状态 |
 | `/clear` | 清屏 |
 | `/exit` | 退出 |
+
+## 系统调查输出
+
+CLI 将系统调查覆盖与系统证据覆盖分别输出；缺失的历史字段显示尚未核验。机器输出的结论记录包含 `investigationAssurance`，不改变原始 conclusion 或 native completion。每轮额外保存 `NNN.investigation-assessment.json` 和 `NNN.delivery-assurance.json`，保留维度状态与证据引用，HTML 报告显示相同调查范围。恢复历史结果不会自动补采证据。

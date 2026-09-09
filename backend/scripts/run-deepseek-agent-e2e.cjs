@@ -27,6 +27,7 @@ const ALL_RUNTIME_KINDS = [
 ];
 const CONTEXT_SUITE_NAMES = ['context-source', 'context-rag', 'context-combined'];
 const SEMANTIC_DELTA_SUITE = 'code-aware-semantic-delta';
+const SYSTEM_ANALYSIS_SUITE = 'system-analysis';
 const SEMANTIC_DELTA_QUERIES = [
   {
     id: 'autonomous-diagnosis',
@@ -271,7 +272,34 @@ const suites = {
     output: 'test-output/code-aware-semantic-delta/real-provider',
     args: [],
   },
+  [SYSTEM_ANALYSIS_SUITE]: {label: 'declarative system investigation evidence gate', args: []},
 };
+
+function systemAnalysisScenarios() {
+  const directory = path.join(backendRoot, 'tests/e2e/system-analysis-fixtures');
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8'));
+  if (manifest.schemaVersion !== 1 || !Array.isArray(manifest.scenarios) || !manifest.scenarios.length) {
+    throw new Error('Invalid system-analysis scenario manifest');
+  }
+  const ids = new Set();
+  return manifest.scenarios.map(scenario => {
+    if (!scenario || typeof scenario.id !== 'string' || !/^[a-z][a-z0-9-]+$/.test(scenario.id) || ids.has(scenario.id) ||
+      !['real', 'constructed'].includes(scenario.evidenceTier) || typeof scenario.trace !== 'string' ||
+      typeof scenario.query !== 'string' || !scenario.query.trim() || typeof scenario.expectation !== 'string' ||
+      path.basename(scenario.expectation) !== scenario.expectation) throw new Error('Invalid system-analysis scenario');
+    ids.add(scenario.id);
+    const expectationPath = path.join(directory, scenario.expectation);
+    assertFile(expectationPath, 'system analysis expectation');
+    const output = `test-output/system-analysis/${scenario.id}.json`;
+    const args = ['--mode', 'full', '--provider-id', 'env', '--trace', scenario.trace, '--query', scenario.query,
+      '--output', output, '--require-non-partial', '--require-claim-verifier-ok', '--expectation-json', `@${expectationPath}`];
+    if (scenario.selectSlice) args.push('--select-slice-json', JSON.stringify(scenario.selectSlice));
+    if (scenario.referenceTrace) args.push('--reference-trace', scenario.referenceTrace,
+      '--trace-pair-layout', 'horizontal', '--trace-pair-workspace-open', '--trace-pair-active', 'current');
+    return {id: scenario.id, evidenceTier: scenario.evidenceTier, label: `${scenario.evidenceTier} system evidence: ${scenario.id}`,
+      output, args};
+  });
+}
 
 if (require.main === module) main();
 
@@ -310,6 +338,11 @@ function main() {
       throw new Error(`REAL PROVIDER NOT AVAILABLE: ${runtimeKind}: ${availability.reason}`);
     }
     for (const suiteName of suiteNames) {
+      if (suiteName === SYSTEM_ANALYSIS_SUITE) {
+        for (const scenario of systemAnalysisScenarios().filter(item => !options.systemScenario || item.id === options.systemScenario)) runSuite(suiteName, availability, runtimeKind,
+          runtimeKinds.length > 1 || options.runtime !== DEFAULT_RUNTIME, options.timeoutMs, scenario);
+        continue;
+      }
       runSuite(
         suiteName,
         availability,
@@ -320,7 +353,7 @@ function main() {
     }
   }
 
-  console.log(`\nDeepseek Agent SSE observed checks passed: ${runtimeKinds.join(', ')} / ${suiteNames.join(', ')}; semantic acceptance is recorded separately in each report.`);
+  console.log(`\nDeepseek Agent SSE observed checks passed: ${runtimeKinds.join(', ')} / ${suiteNames.join(', ')}${options.systemScenario ? ` / selected scenario=${options.systemScenario}` : ''}; semantic acceptance is recorded separately in each report.`);
 }
 
 function parseArgs(argv) {
@@ -331,6 +364,7 @@ function parseArgs(argv) {
   let preflight = false;
   let queryId;
   let condition;
+  let systemScenario;
   let outputDir = path.resolve(
     backendRoot,
     'test-output/code-aware-semantic-delta/real-provider',
@@ -355,6 +389,11 @@ function parseArgs(argv) {
       }
       runtime = parseRuntime(value);
       i += 1;
+      continue;
+    }
+    if (arg === '--system-scenario') {
+      systemScenario = argv[++i];
+      if (!systemScenario) throw new Error('--system-scenario requires a manifest scenario ID');
       continue;
     }
     if (arg === '--timeout-ms') {
@@ -411,7 +450,10 @@ function parseArgs(argv) {
     throw new Error(`${SEMANTIC_DELTA_SUITE} requires --repeat 5`);
   }
 
-  return { suite, runtime, timeoutMs, repeat, outputDir, preflight, queryId, condition, help: false };
+  if (systemScenario && (suite !== SYSTEM_ANALYSIS_SUITE || !systemAnalysisScenarios().some(item => item.id === systemScenario))) {
+    throw new Error('--system-scenario requires the system-analysis suite and an existing manifest ID');
+  }
+  return { suite, runtime, timeoutMs, repeat, outputDir, preflight, queryId, condition, systemScenario, help: false };
 }
 
 function parseSuite(value) {
@@ -450,7 +492,7 @@ function resolveRuntimeKinds(value) {
 }
 
 function printUsage() {
-  console.log('Usage: node scripts/run-deepseek-agent-e2e.cjs [--suite all|context|startup|scrolling|external-issue|dual-trace|context-source|context-rag|context-combined|code-aware-semantic-delta] [--runtime claude-agent-sdk|openai-agents-sdk|pi-agent-core|opencode|qoder-agent-sdk|all|all-deepseek] [--timeout-ms <number>] [--repeat 5] [--output-dir <path>]');
+  console.log('Usage: node scripts/run-deepseek-agent-e2e.cjs [--suite all|context|startup|scrolling|external-issue|dual-trace|context-source|context-rag|context-combined|code-aware-semantic-delta|system-analysis] [--runtime claude-agent-sdk|openai-agents-sdk|pi-agent-core|opencode|qoder-agent-sdk|all|all-deepseek] [--timeout-ms <number>] [--repeat 5] [--output-dir <path>]');
   console.log('');
   console.log('Runs SmartPerfetto Agent SSE E2E with Deepseek-backed SmartPerfetto runtimes.');
   console.log('');
@@ -460,6 +502,8 @@ function printUsage() {
   console.log('BYOK does not replace Qoder authentication.');
   console.log(`Each real SSE scenario has a ${DEFAULT_TIMEOUT_MS}ms default timeout; use --timeout-ms to override it.`);
   console.log('The code-aware semantic-delta suite requires --repeat 5 and writes paired-run plus aggregate JSON artifacts.');
+  console.log('The system-analysis suite uses declarative real startup/scrolling and explicitly constructed system/input/ANR scenarios. all/all-deepseek selects OpenAI, Pi and OpenCode; run Claude and Qoder explicitly for their independent evidence.');
+  console.log('Use --suite system-analysis --system-scenario <manifest ID> for one bounded Provider run; a selected scenario never represents full matrix acceptance.');
   console.log('For one diagnostic scenario, use --preflight --query-id autonomous-diagnosis|quantitative-only|explicit-source-location --condition A0|A2|A3 with one runtime. Preflight never counts as complete acceptance.');
 }
 
@@ -1086,8 +1130,8 @@ function loadBackendEnv() {
   require('dotenv').config({ path: envPath, quiet: true });
 }
 
-function runSuite(suiteName, availability, runtimeKind, runtimeSpecificOutput, timeoutMs) {
-  const suite = suites[suiteName];
+function runSuite(suiteName, availability, runtimeKind, runtimeSpecificOutput, timeoutMs, scenario) {
+  const suite = scenario ?? suites[suiteName];
   const suiteArgs = runtimeSpecificOutput
     ? withRuntimeOutputPath(suite.args, suite.output, runtimeKind)
     : suite.args;
@@ -1109,17 +1153,54 @@ function runSuite(suiteName, availability, runtimeKind, runtimeSpecificOutput, t
       throw result.error;
     }
     if (result.status !== 0) {
-      process.exit(result.status ?? 1);
+      process.exitCode = result.status ?? 1;
+      throw new Error(`Agent SSE verification exited with status ${result.status ?? 1}; inspect ${getOutputPathFromArgs(args)}`);
     }
   } finally {
-    fs.rmSync(isolatedRoot, {recursive: true, force: true});
+    // A killed verifier cannot execute its own finally. Preserve its task-owned
+    // logs here as well; failed copying keeps the recoverable isolated root.
+    if (preserveIsolatedSessionLogs(isolatedRoot, getOutputPathFromArgs(args))) {
+      fs.rmSync(isolatedRoot, {recursive: true, force: true});
+    }
+  }
+}
+
+function preserveIsolatedSessionLogs(isolatedRoot, outputPath) {
+  const directory = path.join(isolatedRoot, 'logs/sessions');
+  if (!fs.existsSync(directory)) return true;
+  if (!outputPath) return false;
+  const secrets = Object.entries(process.env).filter(([key, value]) =>
+    /key|token|password|secret|credential/i.test(key) && value && value.length >= 8).map(([, value]) => value);
+  const redact = value => {
+    if (typeof value === 'string') return secrets.reduce((text, secret) => text.split(secret).join('[REDACTED]'), value)
+      .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [REDACTED]');
+    if (Array.isArray(value)) return value.map(redact);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key,
+      /authorization|api[-_]?key|password|secret|credential|cookie|accessToken|refreshToken/i.test(key) ? '[REDACTED]' : redact(nested)]));
+  };
+  try {
+    const files = fs.readdirSync(directory).filter(file => file.startsWith('session_') && file.endsWith('.jsonl')).sort();
+    const output = path.resolve(backendRoot, `${outputPath}.isolated-session-log.jsonl`);
+    fs.mkdirSync(path.dirname(output), {recursive: true});
+    const entries = files.flatMap(file => fs.readFileSync(path.join(directory, file), 'utf8').split('\n').filter(Boolean)
+      .map(line => {
+        try {return JSON.stringify(redact(JSON.parse(line)));}
+        catch {return JSON.stringify({unparsedLine: true});}
+      }));
+    fs.writeFileSync(output, `${entries.join('\n')}\n`);
+    return true;
+  } catch {
+    console.error('[deepseek-e2e] session_log_copy_failed; isolated evidence retained');
+    return false;
   }
 }
 
 function withRuntimeOutputPath(args, outputPath, runtimeKind) {
   const next = [...args];
   const index = next.indexOf('--output');
-  const runtimeOutput = outputPath.replace(/-real\.json$/, `-${runtimeKind}-real.json`);
+  const runtimeOutput = outputPath.replace(/(-real)?\.json$/, (_match, realSuffix = '') =>
+    `-${runtimeKind}${realSuffix}.json`);
   if (index >= 0 && next[index + 1]) {
     next[index + 1] = runtimeOutput;
   } else {
@@ -1261,4 +1342,9 @@ module.exports = {
   runSemanticPairedAttempt,
   sameTraceOccurrence,
   scenarioSliceSelector,
+  systemAnalysisScenarios,
+  resolveRuntimeKinds,
+  runSuite,
+  preserveIsolatedSessionLogs,
+  withRuntimeOutputPath,
 };

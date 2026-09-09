@@ -94,7 +94,7 @@ describe('runtimeCommon', () => {
     expect([...cache.keys()]).toEqual(['b', 'c']);
   });
 
-  it('builds compact quick-mode local conversation context', () => {
+  it('builds typed quick history without promoting legacy completion or losing partial answers', () => {
     const context = buildQuickConversationContext([
       {
         id: 'turn-1',
@@ -118,10 +118,13 @@ describe('runtimeCommon', () => {
       },
     ], 'zh-CN');
 
-    expect(context).toContain('## 最近对话上下文');
+    expect(context).toContain('## 当前会话的历史上下文');
     expect(context).toContain('继续看上一轮');
-    expect(context).toContain('[high] 主线程阻塞');
-    expect(context).not.toContain('old answer');
+    expect(context).toContain('上一轮回答包含关键证据');
+    expect(context).toContain('"completionStatus":"unknown"');
+    expect(context).toContain('"partial":true');
+    expect(context).toContain('old answer');
+    expect(context).not.toContain('[high] 主线程阻塞');
   });
 
   it('builds compact quick-mode reusable memory context', () => {

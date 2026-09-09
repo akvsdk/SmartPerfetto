@@ -56,6 +56,26 @@ afterEach(async () => {
 });
 
 describe('analysis run store', () => {
+  it('creates missing user placeholders without replacing existing profile metadata on lifecycle writes', () => {
+    const runScope = scope();
+    persistAnalysisRunState(runScope, 'pending', {now: 1000});
+    const db = openEnterpriseDb();
+    try {
+      expect(db.prepare('SELECT email, display_name, updated_at FROM users WHERE id = ?').get(runScope.userId))
+        .toEqual({email: 'user-a@analysis-run.local', display_name: 'user-a', updated_at: 1000});
+      db.prepare('UPDATE users SET email = ?, display_name = ?, updated_at = ? WHERE id = ?')
+        .run('real@example.test', 'Real profile', 1500, runScope.userId);
+      for (const status of ['pending', 'running', 'completed'] as const) {
+        persistAnalysisRunState(runScope, status, {now: 2000});
+        expect(db.prepare('SELECT email, display_name, updated_at FROM users WHERE id = ?').get(runScope.userId))
+          .toEqual({email: 'real@example.test', display_name: 'Real profile', updated_at: 1500});
+      }
+      heartbeatAnalysisRun(runScope, 3000);
+      expect(db.prepare('SELECT email, display_name, updated_at FROM users WHERE id = ?').get(runScope.userId))
+        .toEqual({email: 'real@example.test', display_name: 'Real profile', updated_at: 1500});
+    } finally { db.close(); }
+  });
+
   it('persists run lifecycle and heartbeat with workspace scope', () => {
     const runScope = scope();
 

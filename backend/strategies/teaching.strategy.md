@@ -3,6 +3,18 @@
 
 ---
 scene: teaching
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: teaching_critical_path
+      domain: critical_path
+      description: "Distinguish conceptual explanation from a question about why an actual trace task is slow. Concepts need no collection; a concrete trace investigation follows the selected task/window and relevant system evidence."
+    - id: teaching_dependencies
+      domain: dependency_chain
+      description: "Keep implementation/source explanations separate from proof that an event occurred in this trace. Do not widen a bounded teaching question or collect evidence forbidden by existing_only."
 classification_description: "Explaining a trace concept, component role or mechanism using available context."
 priority: 3
 effort: medium

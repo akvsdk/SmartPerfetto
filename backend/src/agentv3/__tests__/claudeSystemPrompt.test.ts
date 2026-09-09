@@ -19,6 +19,7 @@ import type { ClaudeAnalysisContext } from '../types';
 import type {AnalysisTurnIntent} from '../../agentRuntime/analysisTurnIntent';
 import type {ReadonlyStrategyRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
 import type {StrategyDefinition} from '../strategyLoader';
+import {resolveAnalysisInvestigationRequirements} from '../../agentRuntime/analysisInvestigationRequirements';
 
 // Mock strategyLoader — return minimal templates
 jest.mock('../strategyLoader', () => ({
@@ -1014,10 +1015,10 @@ describe('typed turn prompt assembly', () => {
 
   function investigationFixture(overrides: Partial<AnalysisTurnIntent> = {}): ClaudeAnalysisContext {
     const context = fixture({taskKind: 'investigation', ...overrides});
-    context.strategyRegistry!.getStrategy('scrolling')!.investigationRequirements = [
-      'Explain observed main-thread tasks and states within the requested scope.',
-      'A doFrame interval alone does not prove a missed deadline.',
-    ];
+    context.strategyRegistry!.getStrategy('scrolling')!.investigationContract = {
+      schemaVersion: 1, profileRefs: [], requirements: [{id: 'task_state', domain: 'thread_state', required: true,
+        description: 'Explain observed main-thread tasks and states within scope. A doFrame interval alone does not prove a missed deadline.'}],
+    };
     return context;
   }
 
@@ -1028,10 +1029,9 @@ describe('typed turn prompt assembly', () => {
   ] as const)('supplies pinned investigation obligations for %s/%s/%s without legacy recipes', (scope, deliverable, recommendedComplexity) => {
     const context = investigationFixture({scope, deliverable, recommendedComplexity});
     const parts = buildSystemPromptParts(context);
-    expect(segmentData(parts, 'investigation_requirements')).toEqual({
-      sceneId: 'scrolling', registryFingerprint: 'pin-one',
-      requirements: context.strategyRegistry!.getStrategy('scrolling')!.investigationRequirements,
-    });
+    expect(segmentData(parts, 'investigation_requirements')).toEqual(resolveAnalysisInvestigationRequirements({
+      intent: context.turnIntent, strategyRegistry: context.strategyRegistry,
+    }));
     expect(parts.segments.find(segment => segment.label === 'investigation_requirements'))
       .toMatchObject({tier: 3, droppable: false, truncatable: false});
     expect(parts.segments.some(segment => segment.label === 'scene_strategy_core')).toBe(false);
@@ -1040,16 +1040,24 @@ describe('typed turn prompt assembly', () => {
       .toEqual(segmentData(parts, 'investigation_requirements'));
   });
 
-  it.each(['fact', 'acknowledgement', 'comparison'] as const)('does not attach investigation obligations to a %s turn', taskKind => {
+  it.each(['fact', 'acknowledgement'] as const)('does not attach investigation obligations to a %s turn', taskKind => {
     const context = investigationFixture({taskKind, evidenceAccess: 'existing_only'});
     expect(segmentData(buildSystemPromptParts(context), 'investigation_requirements')).toBeUndefined();
   });
 
+  it('attaches the same pinned obligations to a bounded comparison without granting new reads', () => {
+    const context = investigationFixture({taskKind: 'comparison', scope: 'bounded_question', evidenceAccess: 'existing_only'});
+    expect(segmentData(buildSystemPromptParts(context), 'investigation_requirements'))
+      .toEqual(resolveAnalysisInvestigationRequirements({intent: context.turnIntent, strategyRegistry: context.strategyRegistry}));
+    expect(segmentData(buildSystemPromptParts(context), 'turn_policy'))
+      .toMatchObject({taskKind: 'comparison', scope: 'bounded_question', evidenceAccess: 'existing_only'});
+  });
+
   it('does not invent investigation obligations for unavailable decisions or old strategy snapshots', () => {
     expect(segmentData(buildSystemPromptParts(investigationFixture({status: 'unavailable'})),
-      'investigation_requirements')).toBeUndefined();
+      'investigation_requirements')).toMatchObject({status: 'not_checked', reason: 'intent_unavailable', requirements: []});
     expect(segmentData(buildSystemPromptParts(fixture({taskKind: 'investigation'})),
-      'investigation_requirements')).toBeUndefined();
+      'investigation_requirements')).toMatchObject({status: 'not_checked', reason: 'contract_unavailable', requirements: []});
   });
 
   it('keeps investigation evidence, selection and authorization intact under prompt pressure', () => {
@@ -1068,7 +1076,7 @@ describe('typed turn prompt assembly', () => {
       codebaseIds: ['selected-source'], evidenceAccess: 'existing_only'});
     expect(segmentData(parts, 'selection_context')).toEqual(context.selectionContext);
     expect(segmentData(parts, 'investigation_requirements').requirements)
-      .toEqual(context.strategyRegistry!.getStrategy('scrolling')!.investigationRequirements);
+      .toEqual(context.strategyRegistry!.getStrategy('scrolling')!.investigationContract!.requirements);
     expect(parts.segments.some(segment => segment.label === 'source_use_decision')).toBe(false);
     expect(parts.droppedLabels).toContain('knowledge_base');
     expect(parts.truncatedLabels).toContain('conversation_context');

@@ -1,0 +1,172 @@
+{
+  "schemaVersion": 1,
+  "providerDefinitions": [
+    {
+      "id": "startup-real",
+      "tier": "real",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/real/android-startup-heavy/trace.pftrace",
+      "expectation": "startup-real.expectation.json"
+    },
+    {
+      "id": "scrolling-real",
+      "tier": "real",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/real/android-scroll-customer/trace.pftrace",
+      "expectation": "scrolling-real.expectation.json"
+    },
+    {
+      "id": "scheduler-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/system-scheduling-evidence/trace.pftrace",
+      "expectation": "scheduler-constructed.expectation.json"
+    },
+    {
+      "id": "input-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/input-interaction-latency/trace.pftrace",
+      "expectation": "input-constructed.expectation.json"
+    },
+    {
+      "id": "anr-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/binder-io-blocking/trace.pftrace",
+      "expectation": "anr-constructed.expectation.json"
+    },
+    {
+      "id": "game-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/rendering-jank/trace.pftrace",
+      "expectation": "game-constructed.expectation.json"
+    },
+    {
+      "id": "media-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/media-network-camera/trace.pftrace",
+      "expectation": "media-constructed.expectation.json"
+    },
+    {
+      "id": "io-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/binder-io-blocking/trace.pftrace",
+      "expectation": "io-constructed.expectation.json"
+    },
+    {
+      "id": "memory-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/memory-gc-pressure/trace.pftrace",
+      "expectation": "memory-constructed.expectation.json"
+    },
+    {
+      "id": "power-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/power-thermal/trace.pftrace",
+      "expectation": "power-constructed.expectation.json"
+    },
+    {
+      "id": "linux-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/linux-system-state/trace.pftrace",
+      "expectation": "linux-constructed.expectation.json"
+    },
+    {
+      "id": "network-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/media-network-camera/trace.pftrace",
+      "expectation": "network-constructed.expectation.json"
+    },
+    {
+      "id": "pipeline-constructed",
+      "tier": "constructed",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/.generated/constructed/rendering-jank/trace.pftrace",
+      "expectation": "pipeline-constructed.expectation.json"
+    },
+    {
+      "id": "startup-pair-real",
+      "tier": "real",
+      "scope": "bounded selected-window system evidence",
+      "fixture": "../Trace/real/android-startup-heavy/trace.pftrace",
+      "expectation": "startup-pair-real.expectation.json"
+    }
+  ],
+  "deterministicDefinitions": [
+    {
+      "id": "facts_and_acknowledgements",
+      "testFile": "src/agentRuntime/__tests__/analysisInvestigationRequirements.test.ts",
+      "testTitle": "exempts %s without an evidence scan",
+      "boundary": "Resolved fact/ack are exempt; configuration coverage is not an observation."
+    },
+    {
+      "id": "existing_only",
+      "testFile": "src/agentRuntime/__tests__/runtimeTurnPolicy.test.ts",
+      "testTitle": "never prefetches for existing_only with %s budget",
+      "boundary": "All budgets retain existing_only with no evidence prefetch."
+    },
+    {
+      "id": "reuse_and_unknown_origin",
+      "testFile": "src/services/__tests__/finalInvestigationContractGate.test.ts",
+      "testTitle": "does not count unknown provenance as current evidence and preserves reused evidence",
+      "boundary": "Existing records remain reused; unknown is not upgraded."
+    },
+    {
+      "id": "saved_results",
+      "testFile": "src/services/__tests__/comparisonAiConclusionService.test.ts",
+      "testTitle": "keeps saved producer rows out of the bounded prompt without losing the stored matrix",
+      "boundary": "Snapshot comparison retains stored investigation state; prompt excludes raw rows, no trace backfill."
+    },
+    {
+      "id": "historical_restore",
+      "testFile": "src/services/__tests__/finalInvestigationContractGate.test.ts",
+      "testTitle": "keeps old and missing assessments unverified and explicit exemptions separate",
+      "boundary": "Historic/missing assessments remain not_checked."
+    },
+    {
+      "id": "missing_data_explanation",
+      "testFile": "src/services/__tests__/finalInvestigationContractGate.test.ts",
+      "testTitle": "can cover an accurate partial-data explanation without claiming complete acquisition",
+      "boundary": "Covered content with insufficient acquisition stays distinct."
+    },
+    {
+      "id": "complete_population",
+      "testFile": "src/services/__tests__/finalInvestigationContractGate.test.ts",
+      "testTitle": "cannot cherry-pick a covered CPU when a sibling CPU has a gap or an invalid row was omitted",
+      "boundary": "An observed CPU cannot hide missing sibling coverage."
+    },
+    {
+      "id": "native_completion",
+      "testFile": "src/services/__tests__/finalInvestigationContractGate.test.ts",
+      "testTitle": "does not alter SDK completion, body or termination because investigation is missing",
+      "boundary": "Investigation assurance cannot rewrite SDK completion."
+    },
+    {
+      "id": "all_scene_configuration",
+      "testFile": "src/agentRuntime/__tests__/analysisInvestigationRequirements.test.ts",
+      "testTitle": "configures every built-in scene and only expands the selected scene profiles",
+      "boundary": "Includes overview/general/teaching and all scene metadata without pretending every scene ran on a device."
+    }
+  ],
+  "actualRuns": "Report from run artifacts only; this matrix declares coverage and never grants a passed result.",
+  "realDeviceGaps": [
+    "game",
+    "media",
+    "io",
+    "memory",
+    "power",
+    "linux",
+    "network",
+    "pipeline",
+    "input",
+    "anr"
+  ]
+}

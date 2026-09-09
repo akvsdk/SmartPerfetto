@@ -53,9 +53,14 @@ function addColumnIfMissing(
   column: string,
   definition: string,
 ): void {
-  if (!tableHasColumn(db, table, column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
+  // Migration 14 deliberately backfills outside a long transaction. Acquire
+  // the write lock before its schema check so concurrent openers cannot both
+  // observe a missing column. Inside a migration this becomes a savepoint.
+  db.transaction(() => {
+    if (!tableHasColumn(db, table, column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }).immediate();
 }
 
 export const ENTERPRISE_CORE_SCHEMA_TABLES = [
@@ -1217,11 +1222,15 @@ export function applyEnterpriseMinimalSchema(db: Database.Database): void {
       continue;
     }
     const tx = db.transaction(() => {
+      // The initial ledger is only a fast path: another process may have
+      // applied this migration while this connection waited for the lock.
+      if (db.prepare('SELECT version FROM enterprise_schema_migrations WHERE version = ?')
+        .get(step.version)) return;
       step.up(db);
       db.prepare(
         'INSERT INTO enterprise_schema_migrations (version, applied_at) VALUES (?, ?)',
       ).run(step.version, Date.now());
     });
-    tx();
+    tx.immediate();
   }
 }

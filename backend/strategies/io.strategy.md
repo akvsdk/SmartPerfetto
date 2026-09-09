@@ -3,6 +3,18 @@
 
 ---
 scene: io
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: io_critical_path
+      domain: critical_path
+      description: "Bind requesting task and relevant read/write, fsync, fault or block-layer interval. Separate CPU work and Runnable delay from uninterruptible wait, IO queue time, device service and post-completion scheduling."
+    - id: io_dependencies
+      domain: dependency_chain
+      description: "Require IO-specific evidence before interpreting D/DK as disk latency. Correlate memory pressure/reclaim and filesystem or device events without equating request duration with device time."
 classification_description: "Storage and filesystem activity, disk latency, synchronization and page-fault-related waits."
 priority: 5
 effort: medium

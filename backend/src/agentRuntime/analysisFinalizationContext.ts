@@ -15,6 +15,8 @@ import {readConclusionProtocolProjection, releaseConclusionProtocolProjection,
   type IssuedConclusionProtocolProjection, type NativeConclusionDeclaration} from '../services/security/conclusionProtocolProjection';
 import {analysisDeliveryFingerprint} from '../types/analysisDelivery';
 import {sanitizeSourceUseDecision} from '../services/codebase/sourceUseDecision';
+import {isIssuedInvestigationEvidenceSnapshot,
+  type InvestigationEvidenceSnapshot} from '../services/evidence/investigationEvidenceLedger';
 
 export interface FinalizationProviderQuery {
   /** The query accepted by this run's provider input authorization boundary. */
@@ -43,7 +45,7 @@ export interface RuntimeFinalizationContextInput {
 }
 
 interface ContextState {
-  value?: RuntimeFinalizationContextInput;
+  value?: RuntimeFinalizationContextInput & {investigationEvidence?: InvestigationEvidenceSnapshot};
   controller: AbortController;
 }
 
@@ -58,6 +60,7 @@ export interface RuntimeFinalizationContext {
   readonly sourceUse?: SourceUseDecisionV1;
   readonly sourceScope?: Readonly<SourceExecutionScopeV1>;
   readonly capabilityEvidence?: readonly DataEnvelope[];
+  readonly investigationEvidence?: InvestigationEvidenceSnapshot;
   readonly hasSemanticTransport: boolean;
   /** Input-role view, never a general exemption from output privacy projection. */
   getProviderQuery(signal: AbortSignal): Readonly<FinalizationProviderQuery> | undefined;
@@ -144,8 +147,17 @@ export function attachFinalizationContext(result: AnalysisResult, input: Runtime
       analysisDeliveryFingerprint(result.sourceUseDecision)) throw new Error('finalization_source_projection_mismatch');
     claimConclusionProtocolProjection(input.protocolProjection);
   }
+  let investigationEvidence: InvestigationEvidenceSnapshot | undefined;
+  try {
+    const snapshot = input.evidenceReadView?.investigationEvidence?.();
+    if (isIssuedInvestigationEvidenceSnapshot(snapshot) &&
+      (!snapshot.currentRunId || snapshot.currentRunId === input.runId)) investigationEvidence = freezeSnapshot(snapshot);
+  } catch {
+    // Missing observability cannot replace the actual runtime result or grant coverage.
+  }
   contexts.set(result, {controller: new AbortController(), value: {
     ...input,
+    investigationEvidence,
     turnIntent: freezeSnapshot(input.turnIntent),
     traceIdentity: freezeSnapshot(input.traceIdentity),
     deliveryContext: freezeSnapshot(input.deliveryContext),
@@ -161,7 +173,7 @@ export function takeFinalizationContext(result: AnalysisResult): RuntimeFinaliza
   const state = contexts.get(result);
   if (!state?.value) return undefined;
   contexts.delete(result);
-  const current = (): RuntimeFinalizationContextInput => {
+  const current = (): NonNullable<ContextState['value']> => {
     if (!state.value) throw new Error('finalization_context_disposed');
     return state.value;
   };
@@ -181,6 +193,7 @@ export function takeFinalizationContext(result: AnalysisResult): RuntimeFinaliza
     get sourceUse() { return current().sourceUse; },
     get sourceScope() { return current().sourceScope; },
     get capabilityEvidence() { return current().capabilityEvidence; },
+    get investigationEvidence() { return current().investigationEvidence; },
     get hasSemanticTransport() { return Boolean(current().dispatchText); },
     getProviderQuery(signal: AbortSignal) { return active(signal).providerQuery; },
     getNativeDeclaration(result: AnalysisResult, signal: AbortSignal) {

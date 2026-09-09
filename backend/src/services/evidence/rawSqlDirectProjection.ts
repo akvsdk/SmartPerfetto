@@ -121,7 +121,8 @@ const SYMBOL_PRECEDENCE: Readonly<Record<string, number>> = {
 class ReadParser {
   private index = 0;
   private hasAggregate = false;
-  constructor(private readonly tokens: readonly Token[]) {}
+  private hasSubquery = false;
+  constructor(private readonly tokens: readonly Token[], private readonly nestingDepth = 0) {}
   private peek(): Token | undefined {return this.tokens[this.index];}
   private take(): Token {return this.tokens[this.index++] ?? fail();}
   private word(value: string): boolean {
@@ -158,12 +159,36 @@ class ReadParser {
     const alias = this.alias();
     return {name: canonical(name), ...(schema ? {schema} : {}), ...(alias ? {alias: canonical(alias)} : {})};
   }
+  /** Opening parenthesis is consumed; validate the entire nested SELECT with the same grammar. */
+  private subquery(depth: number): boolean {
+    if (!keyword(this.peek(), 'select')) return false;
+    const nestingDepth = this.nestingDepth + depth + 1;
+    if (nestingDepth > RAW_SQL_DIRECT_PROJECTION_LIMITS.depth) fail('sql_depth_budget');
+    let parentheses = 0;
+    let end = this.index;
+    for (; end < this.tokens.length; end++) {
+      const token = this.tokens[end];
+      if (token.kind !== 'symbol') continue;
+      if (token.value === ';') fail();
+      if (token.value === '(') parentheses++;
+      if (token.value === ')') {
+        if (parentheses === 0) break;
+        parentheses--;
+      }
+    }
+    if (end === this.tokens.length) fail();
+    new ReadParser(this.tokens.slice(this.index, end), nestingDepth).parse();
+    this.index = end + 1;
+    this.hasSubquery = true;
+    return true;
+  }
   private primary(depth: number, allowStar = false): Expression {
-    if (depth > RAW_SQL_DIRECT_PROJECTION_LIMITS.depth) fail('sql_depth_budget');
+    if (this.nestingDepth + depth > RAW_SQL_DIRECT_PROJECTION_LIMITS.depth) fail('sql_depth_budget');
     if (this.symbol('+') || this.symbol('-') || this.symbol('~') || this.word('not')) {
       this.expression(8, depth + 1); return {};
     }
     if (this.symbol('(')) {
+      if (this.subquery(depth)) return {};
       this.expression(0, depth + 1); this.requireSymbol(')'); return {};
     }
     if (allowStar && this.symbol('*')) return {direct: {kind: 'star'}};
@@ -219,9 +244,11 @@ class ReadParser {
       if (operator === 'is') this.word('not');
       if (operator === 'in') {
         this.requireSymbol('(');
-        this.expression(0, depth + 1);
-        while (this.symbol(',')) this.expression(0, depth + 1);
-        this.requireSymbol(')');
+        if (!this.subquery(depth)) {
+          this.expression(0, depth + 1);
+          while (this.symbol(',')) this.expression(0, depth + 1);
+          this.requireSymbol(')');
+        }
       } else if (operator === 'between') {
         this.expression(4, depth + 1); this.requireWord('and'); this.expression(4, depth + 1);
       } else {
@@ -283,10 +310,10 @@ class ReadParser {
       this.expression();
       if (this.word('offset') || this.symbol(',')) this.expression();
     }
-    this.symbol(';');
+    if (this.nestingDepth === 0) this.symbol(';');
     if (this.index !== this.tokens.length) fail();
     return {pureRead: true, ...(relation ? {relation} : {}),
-      ...(preservesRows && !this.hasAggregate && relation ? {projections} : {reason: 'projection_not_direct'})};
+      ...(preservesRows && !this.hasAggregate && !this.hasSubquery && relation ? {projections} : {reason: 'projection_not_direct'})};
   }
 }
 

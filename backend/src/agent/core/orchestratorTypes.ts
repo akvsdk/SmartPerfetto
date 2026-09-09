@@ -237,6 +237,7 @@ export interface AnalysisResult {
   outputOrigin?: AnalysisOutputOrigin;
   runtimeAppendix?: AnalysisRuntimeAppendix;
   reportAssessment?: FinalReportAssessment;
+  investigationAssessment?: import('../../types/analysisInvestigationAssessment').FinalInvestigationAssessment;
   deliveryAssurance?: AnalysisDeliveryAssurance;
   conclusionContract?: ConclusionContract;
   claimSupport?: ClaimSupportV1[];

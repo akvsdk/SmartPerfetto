@@ -4,6 +4,8 @@
 
 import type {AnalysisResult} from '../../../agent/core/orchestratorTypes';
 import type {ConclusionContract} from '../../../agent/core/conclusionContract';
+import {analysisDeliveryFingerprint} from '../../../types/analysisDelivery';
+import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../../security/codeAwareOutputRegistry';
 import {
   SOURCE_USE_DECISION_SCHEMA_VERSION,
   sanitizeSourceReference,
@@ -12,6 +14,7 @@ import {
 } from '../sourceUseDecision';
 import {
   attachSourceUseToAnalysisResult,
+  finalizeSourceAwareAnalysisResultWithProjection,
   projectSafeSourceProvenance,
   verifySourceClaimBindings,
 } from '../sourceClaimVerifier';
@@ -648,5 +651,76 @@ describe('attachSourceUseToAnalysisResult', () => {
     expect(analysisResult.sourceReferences).toBeUndefined();
     expect(analysisResult.sourceClaimVerificationResult).toBeUndefined();
     expect(JSON.stringify(analysisResult.conclusionContract)).not.toContain(sourceReference.id);
+  });
+
+  test('invalidates investigation assessment and context when source contract changes without changing native completion', () => {
+    const sourceReference = reference();
+    const staleDecision = decision(sourceReference);
+    const assessment: NonNullable<AnalysisResult['investigationAssessment']> = {
+      schemaVersion: 1, status: 'checked', binding: {candidateRef: 'candidate', runId: 'run', attemptId: 'attempt',
+        conclusionFingerprint: '', conclusionContractFingerprint: '', evidenceFingerprint: '',
+        requirementsFingerprint: '', registryFingerprint: '', intentFingerprint: '', ledgerFingerprint: ''},
+      requirements: [{requirementId: 'old-scope', domain: 'scheduling', applicability: 'applicable', coverage: 'covered',
+        acquisition: 'observed', evidenceStatus: 'observed', scopeMatch: 'matched', contentLocations: [],
+        evidenceRecordIds: ['STALE_SOURCE_INVESTIGATION_REF']}], evidenceRecords: [],
+    };
+    const completion: NonNullable<AnalysisResult['completion']> = {schemaVersion: 1, runtimeKind: 'openai-agents-sdk',
+      status: 'completed', candidateRef: 'candidate', runId: 'run', attemptId: 'attempt', conclusionFingerprint: ''};
+    const result: AnalysisResult = {sessionId: 'source-investigation-invalidation', success: true, findings: [], hypotheses: [],
+      conclusion: 'Original answer remains unchanged.', confidence: 0.8, rounds: 1, totalDurationMs: 10,
+      completion, conclusionContract: {...contract(), sourceUseDecision: staleDecision, sourceReferences: [sourceReference]},
+      sourceUseDecision: staleDecision, investigationAssessment: assessment};
+    const projected = finalizeSourceAwareAnalysisResultWithProjection(result, undefined, {
+      context: {entry: 'runtime_draft', investigationAssessment: assessment},
+    });
+    expect(projected.result.investigationAssessment).toBeUndefined();
+    expect(projected.deliveryContext?.entry).toBe('runtime_draft');
+    expect(projected.deliveryContext && projected.deliveryContext.entry !== 'historical_restore'
+      ? projected.deliveryContext.investigationAssessment : undefined).toBeUndefined();
+    expect(JSON.stringify(projected)).not.toContain('STALE_SOURCE_INVESTIGATION_REF');
+    expect(projected.result.conclusion).toBe('Original answer remains unchanged.');
+    expect(projected.result.completion).toBe(completion);
+  });
+
+  test('invalidates investigation after identity-only projection with body, source and claims unchanged', () => {
+    const sessionId = 'identity-only-investigation-projection';
+    const secret = 'PRIVATE_IDENTITY_ONLY_VALUE';
+    const conclusion = 'The original task observation remains unchanged.';
+    const candidate = {candidateRef: 'candidate', runId: 'run', attemptId: 'attempt',
+      conclusionFingerprint: analysisDeliveryFingerprint(conclusion)};
+    const completion: NonNullable<AnalysisResult['completion']> = {...candidate, schemaVersion: 1,
+      runtimeKind: 'openai-agents-sdk', status: 'completed'};
+    const assessment: NonNullable<AnalysisResult['investigationAssessment']> = {
+      schemaVersion: 1, status: 'checked', binding: {...candidate, conclusionContractFingerprint: '', evidenceFingerprint: '',
+        requirementsFingerprint: '', registryFingerprint: '', intentFingerprint: '', ledgerFingerprint: ''},
+      requirements: [], evidenceRecords: [],
+    };
+    const result: AnalysisResult = {sessionId, success: true, findings: [], hypotheses: [], conclusion,
+      confidence: 0.8, rounds: 1, totalDurationMs: 10, completion, investigationAssessment: assessment,
+      identityResolutions: [{version: 'identity_contract@1', identityRefId: secret, target: {traceId: 'trace', source: 'selection'},
+        status: 'verified', processes: [], threads: [], warnings: []}]};
+    const originalIdentity = structuredClone(result.identityResolutions);
+    registerCodeAwareCanary(sessionId, secret);
+    try {
+      const projected = finalizeSourceAwareAnalysisResultWithProjection(result, undefined, {
+        context: {entry: 'runtime_draft', acceptedCandidate: candidate, completion, investigationAssessment: assessment},
+      });
+      expect(projected.result.identityResolutions).not.toEqual(originalIdentity);
+      expect(JSON.stringify(projected.result.identityResolutions)).not.toContain(secret);
+      expect(projected.result.conclusion).toBe(conclusion);
+      expect(projected.conclusionProjection.disposition).toBe('preserved');
+      expect(projected.result.conclusionContract).toBeUndefined();
+      expect(projected.result.claimSupport).toBeUndefined();
+      expect(projected.result.claimVerificationResult).toBeUndefined();
+      expect(projected.result.sourceUseDecision).toBeUndefined();
+      expect(projected.result.sourceReferences).toBeUndefined();
+      expect(projected.result.sourceClaimVerificationResult).toBeUndefined();
+      expect(projected.result.investigationAssessment).toBeUndefined();
+      expect(projected.deliveryContext && projected.deliveryContext.entry !== 'historical_restore'
+        ? projected.deliveryContext.investigationAssessment : undefined).toBeUndefined();
+      expect(projected.result.completion).toBe(completion);
+      expect(projected.deliveryContext && projected.deliveryContext.entry !== 'historical_restore'
+        ? projected.deliveryContext.completion : undefined).toBe(completion);
+    } finally {clearCodeAwareOutputGuards(sessionId);}
   });
 });

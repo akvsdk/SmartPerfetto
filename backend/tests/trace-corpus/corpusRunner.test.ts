@@ -3,6 +3,7 @@
 
 import path from 'path';
 import fs from 'fs';
+import {spawnSync} from 'child_process';
 import Database from 'better-sqlite3';
 import yaml from 'js-yaml';
 import {SkillEvaluator} from '../skill-eval/runner';
@@ -120,6 +121,30 @@ describe('SkillEvaluator step sequence identity admission', () => {
 });
 
 describe('Trace corpus regression runner', () => {
+  it.each([
+    ['case-not-in-generated-catalog'],
+    ['startup-lifecycle', 'case-not-in-generated-catalog'],
+  ])('rejects unknown explicitly requested cases before executing traces: %j', async (...caseIds) => {
+    await expect(runCorpusRegression(repoRoot, {caseIds, writeEvidence: false}))
+      .rejects.toThrow('Unknown requested corpus case(s): case-not-in-generated-catalog');
+  });
+
+  it('rejects an empty explicit case selection instead of reporting zero checks passed', async () => {
+    await expect(runCorpusRegression(repoRoot, {caseIds: [], writeEvidence: false}))
+      .rejects.toThrow('Explicit corpus case selection must not be empty');
+  });
+
+  it.each([['--case'], ['--case', '--quiet']])('rejects CLI selectors without a value: %j', (...args) => {
+    const result = spawnSync(process.execPath, [
+      require.resolve('tsx/cli'),
+      path.join(__dirname, 'trace_corpus_regression.ts'),
+      ...args,
+    ], {cwd: path.join(repoRoot, 'backend'), encoding: 'utf8', timeout: 30_000});
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--case requires a value');
+    expect(result.stdout).not.toContain('Trace corpus regression passed');
+  });
+
   it('loads the generated catalog and exact current coverage inventory', () => {
     const corpus = loadCorpus(repoRoot);
     const manifestTools = require(path.join(repoRoot, 'Trace/tools/lib/catalog.cjs')) as {

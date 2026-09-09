@@ -3,6 +3,18 @@
 
 ---
 scene: startup
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: startup_critical_path
+      domain: critical_path
+      description: "Bind the exact launch, UPID and startup interval; distinguish TTID, TTFD and framework completion. Follow main-thread phases and critical tasks using exclusive self time and state intervals. Explain how relevant system effects join the startup critical path."
+    - id: startup_dependencies
+      domain: dependency_chain
+      description: "Use launch phase, Binder, lock, GC, IO and render dependencies when supported. Preserve full root-cause details and unavailable fields; startup duration and hotspot names alone do not explain the launch."
 classification_description: "Application launch behavior and performance, including launch type and time to initial or full display."
 priority: 2
 effort: medium
@@ -79,6 +91,14 @@ final_report_contract:
       pattern_groups:
         - ['App\s*层', '应用\s*层', 'App\s+layer']
         - ['系统\s*/\s*平台\s*层', '系统\s*层', '平台\s*层', 'ROM\s*层', 'System/Platform', 'platform\s+layer']
+    - id: system_scheduling_evidence
+      label: 系统调度与资源证据
+      description: 'Explain startup per-CPU frequency/coverage/load, target runtime, placement/quadrants, task R/R+ handoffs, kernel priority and actual policy. For each relevant dimension give evidence, critical-path impact or a specific gap. Priority cannot prove FIFO/RR; occupancy cannot prove causality.'
+      pattern_groups:
+        - ['CPU', '频率', 'frequency']
+        - ['四象限', 'quadrant', '摆核', 'placement']
+        - ['Runnable', '抢占', 'preempt', '调度']
+        - ['优先级', 'priority', '调度策略', 'scheduling\s+policy']
     - id: startup_diagnostic_api_boundary
       label: 启动诊断 API/外部指标边界
       description: '当用户主动提到 ApplicationStartInfo、App Performance Score、Vitals、APM 或 A/B 时，区分当前 trace、诊断 API 记录、外部聚合/实验数据、版本/时钟边界和缺失证据。'
@@ -306,6 +326,8 @@ invoke_skill 返回 artifact 摘要（仅含列名和行数）。**必须用 fet
 | 主线程状态分布 | `main_thread_state` / "主线程状态" | **Q4 根因定位**：blocked_functions 列 |
 | 四象限分析 | `quadrant_analysis` / "四大象限" | 确定时间花在 Q1/Q2/Q3/Q4 哪里 |
 | CPU 频率 | `cpu_freq_analysis` / "CPU 频率" | 判断是否升频不足 |
+| 逐核系统上下文 | `per_cpu_system_context` | 逐 CPU 频率覆盖、忙碌度和目标运行时间；区分系统背景与目标归因 |
+| 抢占交接 | `preemption` | R+ 原始切出及紧接着运行的 task；无交接/优先级/等待记录时保留缺口 |
 | 可操作热点 | `actionable_main_thread_slices` / "可操作热点" | 确定优化目标（注意 self_ms 列） |
 | 主线程同步 Binder | `main_thread_sync_binder` / "同步 Binder" | Binder 阻塞量化 |
 | 主线程文件 IO | `main_thread_file_io` / "文件 IO" | 文件 IO 量化；D/DK 是否为 IO 需结合 `io_wait`/`blocked_function` |
@@ -333,11 +355,11 @@ invoke_skill 返回 artifact 摘要（仅含列名和行数）。**必须用 fet
 
 获取 `critical_tasks` artifact 后，按以下维度分析：
 
-1. **CPU 争抢诊断**：计算 `所有线程总CPU时间 / 启动墙钟时间` 得到并发度指标。> 2x → CPU 争抢激烈，需要减少并发；< 1.5x → 并行度不高，争抢可排除。**在结论的"可排除因素"中给出此数值**（如"CPU 争抢：并发度 = 总CPU 900ms / 墙钟 1338ms = 0.67x，可排除"）
-2. **JIT 竞争诊断**：如果 JIT 线程 CPU 时间 > 20ms 且大核占比 > 50% → JIT 在抢大核，建议使用 Baseline Profile
-3. **RenderThread 诊断**：如果 RenderThread 大核占比 < 30% → 首帧渲染被困在小核
-4. **摆核诊断**：如果主线程跨 cluster 迁移 > 10 次 → L2 Cache 反复失效
-5. **GC 线程诊断**：如果 GC 角色总 CPU 时间 > 启动时长的 10% → GC 压力大
+1. **并发运行情况**：`所有线程总CPU时间 / 启动墙钟时间` 表示窗口平均并行运行量。高低都不能单独证明或排除 CPU 争抢；须对齐关键线程 Runnable 区间、逐核忙碌情况及调度交接证据。
+2. **JIT 竞争候选**：检查 JIT 运行是否与关键线程调度延迟重合；CPU 时间和大核占比只描述占用。证实启动期编译开销后再评估 Baseline Profile。
+3. **RenderThread 诊断**：报告大小核驻留及频率，并关联首帧关键任务；低大核占比不独立证明被困小核或首帧变慢。
+4. **摆核诊断**：报告跨 cluster 迁移的时间和次数；缓存失效及其成本需要 PMU 或其他直接证据，不能由迁移次数推定。
+5. **GC 线程诊断**：区分后台 CPU 占用、主线程实际 GC 等待和关键路径影响，不能仅凭 CPU 时间阈值确定启动根因。
 
 获取 `thread_blocking_graph` artifact 后，按以下维度分析：
 
@@ -486,7 +508,7 @@ invoke_skill("startup_slow_reasons")
 - **SR13-SR14(Native库/WebView)**: 冷启动特有，受 page cache(B3) 影响大
 - **SR15(inflate)**: CPU-bound(A4)，检查 Q1 而非 Q4
 - **SR16(热节流)**: 系统因素(B4)，对比设备冷却后重测
-- **SR17(后台干扰)**: Runnable >10% 说明 CPU 被抢占(B9)
+- **SR17(后台干扰)**: Runnable 表示等待 CPU；核对 R+ 切出、同 CPU 直接交接和关键路径时间后再评估后台竞争(B9)，比例本身不能证明抢占。
 - **SR18(system_server锁)**: 间接影响 Binder 延迟(B6→B7)
 - **SR19(并发启动)**: Boot storm 场景(B12)，放大所有系统层问题
 - **SR20(fsync/数据库)**: 数据库初始化(A8)或 SP commit 在主线程
@@ -580,9 +602,9 @@ WebView 冷启动包含 Chromium 渲染引擎的初始化：
 execute_sql("SELECT name AS slice_name, dur / 1e6 AS dur_ms, thread_name FROM thread_slice WHERE process_name GLOB '<package>*' AND ts >= <startup_ts> AND ts < <startup_end_ts> AND (name GLOB '*WebViewChromium*' OR name GLOB '*v8.*' OR thread_name = 'CrRendererMain' OR name GLOB '*ParseHTML*' OR name GLOB '*Layout*' OR name GLOB '*DrawGL*' OR name GLOB '*WebView*') ORDER BY dur DESC LIMIT 20")
 ```
 
-**Phase 3 — 综合结论（基于根因诊断决策树，⚠️ 必须输出完整结构化报告）：**
+**Phase 3 — 综合结论（基于根因诊断决策树）：**
 
-⚠️ **结论是用户看到的最终输出，必须是完整的结构化报告**（概览表格 + 关键发现 + 根因分析树 + 优化建议）。严禁用 1-2 段简短摘要代替。如果分析轮次紧张，优先保证结论完整，可以跳过前面的可选分析步骤（Phase 2.7/2.8/2.9/2.10）。
+结论应完整回答当前问题：呈现相关指标、根因推理、系统证据和建议，或逐项解释证据缺口。完整场景调查覆盖所有适用维度；局部追问不扩展成全场景报告。下文组织形式是示例，不能因省略固定标题或表格而判断回答不完整，也不能以简洁为由删掉关键推理。
 <!-- /strategy-detail -->
 
 <!-- strategy-detail id="root_cause_tree" title="启动根因诊断决策树与最终报告结构" keywords="root cause,根因,self_ms,blocked_functions,phase breakdown,结论" -->
@@ -631,21 +653,23 @@ Android 启动有两个串行大阶段，**分析结论必须覆盖两个阶段*
 
 | 四象限 | 占比 | 含义 | 下一步 |
 |--------|------|------|--------|
-| Q1 大核运行 高 | >50% | CPU-bound，主线程在大核执行计算 | → 分析热点 slice 的计算密集度 |
-| Q2 小核运行 高 | >15% | 被调度到性能不足的小核 | → 检查进程优先级、是否有大核抢占、EAS/uclamp 配置 |
-| Q3 Runnable 高 | >5% | CPU 资源争抢，可运行但得不到 CPU | → 看调度延迟数据、核迁移次数、后台负载 |
-| Q4 Sleeping 高 | >25% | **主线程被阻塞**（最常见的根因来源） | → **必须看 blocked_functions 定位阻塞原因**（见第二步） |
+| Q1 大核运行 高 | >50% | 观测到较多大核执行时间 | → 对齐热点任务、频率和关键路径，判断执行成本 |
+| Q2 小核运行 高 | >15% | 观测到较多小核执行时间，尚不能判断供给不足 | → 检查拓扑来源、频率、优先级和关键任务的实际时限 |
+| Q3 Runnable 高 | >5% | 可运行但尚未获得 CPU；原因未定 | → 区分 R/R+，看局部调度延迟、直接交接及逐核负载 |
+| Q4 Sleeping 高 | >25% | 观测到较多睡眠/等待时间；具体原因未定 | → 结合 blocked_functions、Binder/锁/唤醒链及任务范围定位 |
+
+这些比例是排查提示，不是异常或因果判据。Q4a 的 D/DK 与 Q4b 的 S/I 应分别解释；无独立证据时保留等待原因未知。
 
 **第二步：当 Q4 占比高时，用线程状态 + blocked_functions 定位阻塞根因**
 
-主线程状态分布数据包含 state（Running/S/D/R）和 **blocked_functions** 列。这是最关键的诊断数据：
+主线程状态分布数据包含 state（Running/S/D/R）和 **blocked_functions** 列。下面是排查候选，blocked_function 是内核等待位置，不是完整调用栈；需要结合任务范围和实际事件验证具体机制：
 
 | 线程状态 | blocked_functions 特征 | 根因类型 | 典型场景 |
 |---------|----------------------|---------|---------|
-| S (Sleeping) | `futex_wait_queue` / `futex_wait` | **锁等待** | art_lock_contention、monitor 竞争、ReentrantLock、synchronized 块 |
-| S (Sleeping) | `binder_ioctl` / `binder_ioctl_write_read` | **同步 Binder 阻塞** | 跨进程 IPC 等待（客户端等待服务端响应） |
+| S (Sleeping) | `futex_wait_queue` / `futex_wait` | **futex 等待候选** | 结合锁竞争或唤醒事件确认对象、持有者和实际等待关系 |
+| S (Sleeping) | `binder_ioctl` / `binder_ioctl_write_read` | **Binder 路径等待候选** | 同步客户端等待需具体 transaction/reply、对端身份及区间证据 |
 | S (Sleeping) | `binder_wait_for_work` | **Binder 线程池空闲等待** | 正常行为。注意：如果在主线程看到此函数，说明主线程异常充当了 Binder 服务端 |
-| S (Sleeping) | `do_epoll_wait` / `ep_poll` | **Looper 空闲/等待事件** | 正常空闲（非问题）或等待异步回调 |
+| S (Sleeping) | `do_epoll_wait` / `ep_poll` | **等待事件** | 不能据此认定消息队列为空、启动已结束或等待没有影响 |
 | S (Sleeping) | `pipe_wait` / `pipe_read` | **管道等待** | 等待子线程/进程通信 |
 | S (Sleeping) | `SyS_nanosleep` / `hrtimer_nanosleep` | **主动 sleep** | 代码中的 Thread.sleep()/SystemClock.sleep() |
 | S (Sleeping) | `do_wait` / `wait_consider_task` | **等待子进程** | fork 后等待 |
@@ -743,9 +767,9 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
 - **厂商特定 Slice**：部分 OEM 有专有 trace 标记（如 OPPO `HyperBoost*`、vivo `TurboX*`、Xiaomi `MiBoost*`），可作为辅助分析信号
 - **Zygote fork 阶段**：冷启动的 pre-`bindApplication` 阶段（进程 fork ~50ms）通常不是瓶颈，但极端情况下（系统负载高）可能贡献显著延迟
 
-**⚠️ 输出结构必须完整遵循（禁止简短总结替代）：**
+**输出内容与组织示例：**
 
-以下输出结构是**硬性要求**，不允许用 1-2 段简短摘要代替。即使分析轮次接近上限，也必须输出完整结构。如果时间紧迫，宁可减少中间分析步骤（跳过 Phase 2.7/2.8 等可选步骤），也要保证结论输出完整。结论不完整将被验证器标记为 ERROR。
+以下结构用于组织完整的根因解释，标题、顺序和段落数量可调整。按当前问题范围覆盖启动关键路径及系统证据；简短概览不能替代相关详情。未完成的调查、缺少的字段和无法确认的因果关系应逐项说明，不能为了凑齐报告而补造事实。预算耗尽时保留实际完成状态和未完成项。
 
 1. **概览**：应用名、启动类型、总耗时、**TTID**、**TTFD**（如有）、**分析边界**、评级、数据质量提示
    - **分析边界**必须明确写出，格式示例：
@@ -762,10 +786,10 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
    **[CRITICAL] 标题 ← 根因 A9: SharedPreferences 阻塞**
    - 描述：XX slice 自身耗时 YY ms（self_percent ZZ%）[wall time AA ms]
    - 根因推理链：
-     ① 四象限显示 Q4=NN%（主线程大量时间被阻塞）
-     ② 线程状态：S(Sleeping) = XX ms >> D(IO) = YY ms → 阻塞主因是 S 状态
-     ③ blocked_functions 含 futex_wait_queue → 锁等待
-     ④ 结合热点 slice：该 slice 内部存在 [锁竞争/sleep/同步Binder/IO/page-cache 候选]
+     ① 四象限显示 Q4=NN%（主线程存在较多睡眠/等待时间）
+     ② 线程状态：S = XX ms、D/DK = YY ms，按任务区间分别定位，尚未确认具体原因
+     ③ blocked_functions 含 futex_wait_queue → futex 等待候选，需锁/唤醒证据
+     ④ 结合该热点 slice 内的状态及锁/Binder/IO事件建立关系；缺失的因果环节保持未知
    - SR 交叉验证：SR10 检测到 futex 等待 XX ms，与此发现一致
    - 结论：此 slice 慢的根因是 [具体根因]，不是 [排除的因素]
    - 建议：[可操作的优化建议]
@@ -799,9 +823,7 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
 
 4. **App/系统分层建议**（双视角，按预期收益排列）：
 
-   该小节是 startup 场景 Final Report Contract 的必选结构。最终报告必须显式输出标题 `### App/系统分层建议`（或同级清晰标题），并且在该标题下同时包含 `**[App 层]**` 与 `**[系统/平台层]**` 两个标签。即使其中一侧没有明确可操作问题，也必须写出“当前 trace 未发现可确认的可操作项 / 数据不足以判断”，不能省略该侧。
-
-   该小节必须放在长根因树、附录、逐 SQL 证据表之前；不要把分层建议藏在概览或根因叙述里。
+   完整场景报告应区分应用与系统的证据和建议；具体标题、标签和顺序可自行组织。某侧没有可操作项时，说明已检查的证据和边界；缺数据时逐项说明，不能用一句“系统正常”或“数据不足”代替相关维度。局部追问仅覆盖与问题有关的部分。
 
    **[App 层]**（应用开发者可直接实施）：
    - 收益估算基于 self_ms（不是 wall time）
@@ -814,9 +836,11 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
    | 维度 | 检查项 | 数据来源 |
    |------|--------|---------|
    | CPU 调度 | 主线程大小核摆放（Q2 占比）、核迁移频率 | 四象限分析、摆核时序（如 critical_tasks 缺失则标注） |
-   | CPU 频率 | 启动初期升频延迟、频率是否达峰 | CPU 频率分析（如 freq_rampup 缺失则仅看均频） |
+   | CPU 频率与负载 | 各 CPU 的频率覆盖、窗口频率/忙碌度、目标运行时间；区分全窗口与目标执行加权口径 | per_cpu_system_context、cpu_freq_analysis、freq_rampup；缺 counter 不写成 0MHz |
    | Binder 阻塞 | 主线程同步 Binder 中 system_server 响应延迟 | 主线程同步 Binder、Binder 阻塞分析 |
    | 调度延迟 | >8ms 严重延迟次数、整体调度质量 | sched_latency |
+   | 抢占交接 | R+ 切出时间、CPU、被抢占线程和紧接着运行的 task、原始 sched ID；解释关键路径影响所需的额外证据 | preemption、critical_tasks；无匹配交接时保留未知 |
+   | 优先级与策略 | 观测到的 kernel priority 范围及变化；实际调度策略、RT、nice、affinity/cgroup/uclamp 分开记录 | critical_tasks；没有直接策略记录时明确未知，禁止仅由 priority 推定 FIFO/RR |
 
    **条件触发**（仅当有对应数据或满足触发条件时分析，数据不足时输出"当前数据不足以判断"）：
 
@@ -833,16 +857,17 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
    ```
    **[系统/平台层] P1 — CPU 调度优化**
    - 发现：主线程启动前 200ms 被调度到小核（Q2=15%），核迁移 12 次
-   - 建议：配置 uclamp.min=512 确保启动关键路径获得大核调度；检查 EAS 是否正确识别前台启动场景
+   - 判断：摆核与迁移是观测，尚未证明其造成启动延迟
+   - 建议：关联关键任务的频率、Runnable 及抢占交接，取得 affinity/cgroup/uclamp 证据后再评估策略调整；不从占比直接指定 uclamp 或 RT 参数
 
    **[系统/平台层] P2 — 系统内存治理**
    - 发现：内存压力 moderate，2 次 LMK，Page Cache 被回收导致 D 状态放大
    - 建议：检查后台进程 oom_adj 策略；考虑在启动场景下临时提升 Page Cache 优先级
 
    **[系统/平台层] 可排除项**
-   - Thermal：prime 核均频 2499/2500MHz，无限频 ✓
-   - CPU 调度：主线程 100% 大核运行，无小核调度问题 ✓
-   - 调度延迟：max 0.67ms，0 次严重延迟 ✓
+   - 频率：已观测窗口内 prime 核均频 2499MHz；设备上限和温控状态未记录，不能据此排除限频
+   - 摆核：已覆盖主线程运行区间均在已识别的大核；仍需独立检查等待 CPU 的时间
+   - 调度延迟：已覆盖区间 max 0.67ms，0 次超过 8ms；是否影响首帧需与关键路径对齐
    ```
 
 ⚠️ **禁止的做法：**
@@ -850,7 +875,7 @@ TTID 和 TTFD 是两个不同的指标，必须区分：
 - 把四象限、线程状态、Binder、GC 当独立章节罗列，而不进行交叉引用
 - 忽略 blocked_functions 数据（这是定位 Q4 根因的关键）
 - 在证据中只复制 slice 列表，不做根因推理链
-- 把所有 Q4 时间统称为"休眠/阻塞"而不区分 S（锁/Binder/sleep）vs D（IO/页缺失）
+- 把 S/I 直接当作锁/Binder阻塞或队列空闲，或在没有 io_wait/blocked_function/IO 证据时把 D/DK 当成 IO 根因
 - 不区分 GC 在主线程还是后台线程
 - 把延迟归因（opinionated_breakdown）的 category 字段（IO/Layout/Other 等）当作真实的阻塞原因。这些 category 是 Perfetto 基于 slice 名称的**启发式分类**，不代表实际线程状态。例如 bind_application 被标记为 IO 类别，但实际阻塞原因可能是锁等待。**必须用线程状态数据（特别是 hot_slice_states）来验证真实根因**
 - 用 slice wall time 与全区间线程状态总量做直接数值对比来推断因果（如"inflate 479ms ≈ S状态 468ms 所以它是 S 状态的根因"）。wall time 包含所有线程状态，正确做法是使用 hot_slice_states 的 per-slice 状态分解

@@ -23,6 +23,15 @@ runtime_perfetto:
   rpc_api_version: 14
   stdlib_tree: 54fc9f0b5c8dedb8772283b6786753fbb918da0d
 sql_fragments:
+  backend/skills/fragments/system_thread_state_spans.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/system_thread_state_spans.sql
+  backend/skills/fragments/system_sched_spans.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/system_sched_spans.sql
+  backend/skills/fragments/system_cpu_frequency_spans.sql:
+    disposition: exported
+    destination: references/generated/runtime/fragments/system_cpu_frequency_spans.sql
   backend/skills/fragments/effective_target_processes.sql:
     disposition: exported
     destination: references/generated/runtime/fragments/effective_target_processes.sql
@@ -87,6 +96,26 @@ vendor_overrides:
     application_mode: advisory_only
     destination: references/generated/runtime/vendor-overrides/xiaomi-startup.json
 skills:
+  cpu_system_context_in_range:
+    source: backend/skills/atomic/cpu_system_context_in_range.skill.yaml
+    workflow: cpu-scheduling
+    disposition: exported
+    destination: references/generated/skills/cpu_system_context_in_range.md
+  thread_system_summary_in_range:
+    source: backend/skills/atomic/thread_system_summary_in_range.skill.yaml
+    workflow: cpu-scheduling
+    disposition: exported
+    destination: references/generated/skills/thread_system_summary_in_range.md
+  thread_preemption_handoffs_in_range:
+    source: backend/skills/atomic/thread_preemption_handoffs_in_range.skill.yaml
+    workflow: cpu-scheduling
+    disposition: exported
+    destination: references/generated/skills/thread_preemption_handoffs_in_range.md
+  thread_cpu_placement_timeline:
+    source: backend/skills/atomic/thread_cpu_placement_timeline.skill.yaml
+    workflow: cpu-scheduling
+    disposition: exported
+    destination: references/generated/skills/thread_cpu_placement_timeline.md
   android_bitmap_memory_per_process:
     source: backend/skills/atomic/android_bitmap_memory_per_process.skill.yaml
     workflow: memory
@@ -1377,6 +1406,10 @@ strategies:
     workflow: interaction
     disposition: exported
     destination: references/generated/strategies/interaction.strategy.md
+  backend/strategies/investigation-profiles.yaml:
+    workflow: trace-overview
+    disposition: exported
+    destination: references/generated/strategies/investigation-profiles.yaml.md
   backend/strategies/io.strategy.md:
     workflow: io-network-media
     disposition: exported
@@ -1573,6 +1606,24 @@ strategies:
   backend/strategies/prompt-runtime-fast-memory-zh.template.md:
     disposition: product-only
     reason: SmartPerfetto runtime session and memory orchestration
+  backend/strategies/prompt-runtime-history-en.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime session history projection
+  backend/strategies/prompt-runtime-history-zh.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime session history projection
+  backend/strategies/prompt-runtime-history-tool-en.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime session tool-history projection
+  backend/strategies/prompt-runtime-history-tool-zh.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime session tool-history projection
+  backend/strategies/prompt-runtime-turn-closeout-en.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime turn completion and session continuity orchestration
+  backend/strategies/prompt-runtime-turn-closeout-zh.template.md:
+    disposition: product-only
+    reason: SmartPerfetto runtime turn completion and session continuity orchestration
   backend/strategies/prompt-runtime-sql-pitfalls-en.template.md:
     disposition: product-only
     reason: SmartPerfetto runtime memory and SQL retry orchestration

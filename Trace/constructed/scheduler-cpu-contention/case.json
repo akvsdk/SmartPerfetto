@@ -14,7 +14,7 @@
   "trace": {
     "file": "trace.overlay.pftrace",
     "format": "perfetto-protobuf",
-    "sha256": "39334b08e4c4ca595e004c28d7beed702d66dd93aebc6f848c3445f02fe65f45",
+    "sha256": "80e8c763c38675a7a7f205f9834374009486e939192416ce05e6e2580a22f278",
     "materialization": "base-plus-overlay"
   },
   "android": {
@@ -292,7 +292,12 @@
           "high_freq_residency_sec",
           "high_freq_ratio_pct",
           "weighted_avg_freq_mhz",
-          "max_freq_mhz"
+          "max_freq_mhz",
+          "machine_id",
+          "frequency_coverage_pct",
+          "frequency_coverage_status",
+          "censored_interval_count",
+          "high_frequency_basis"
         ],
         "required_marker": "SmartPerfetto::CASE::scheduler-cpu-contention"
       },
@@ -394,7 +399,6 @@
           "end_ts": "${fixture_end}"
         },
         "required_steps": [
-          "init_cpu_topology",
           "cpu_utilization",
           "runqueue_depth",
           "thread_migrations"
@@ -409,10 +413,25 @@
         "expected_condition_skips": [],
         "semantic_step": "cpu_utilization",
         "required_columns": [
+          "window_id",
+          "window_start_ts",
+          "window_end_ts",
+          "machine_id",
           "core_type",
+          "topology_source",
+          "ucpus",
           "cpu_count",
+          "cluster_window_ns",
           "utilization_pct",
-          "total_time_ms"
+          "total_time_ms",
+          "sched_covered_ns",
+          "busy_ns",
+          "idle_ns",
+          "idle_identity_unknown_ns",
+          "unfinished_sched_ns",
+          "sched_coverage_pct",
+          "sched_evidence",
+          "utilization_basis"
         ],
         "required_marker": "SmartPerfetto::CASE::scheduler-cpu-contention"
       },
@@ -915,6 +934,14 @@
         "expected_condition_skips": [],
         "semantic_step": "root",
         "required_columns": [
+          "upid",
+          "utid",
+          "tid",
+          "window_start_ts",
+          "window_end_ts",
+          "runnable_preempted_ms",
+          "right_censored_count",
+          "latency_evidence",
           "thread_name",
           "runnable_count",
           "total_runnable_ms",
@@ -981,6 +1008,14 @@
         "expected_condition_skips": [],
         "semantic_step": "root",
         "required_columns": [
+          "upid",
+          "utid",
+          "tid",
+          "window_start_ts",
+          "window_end_ts",
+          "runnable_preempted_ms",
+          "right_censored_count",
+          "latency_evidence",
           "thread_name",
           "runnable_count",
           "total_runnable_ms",
@@ -1013,12 +1048,17 @@
         "expected_condition_skips": [],
         "semantic_step": "runnable_analysis",
         "required_columns": [
+          "upid",
           "utid",
+          "tid",
           "thread_name",
+          "window_start_ts",
+          "window_end_ts",
           "runnable_ms",
           "runnable_count",
           "avg_runnable_ms",
-          "max_runnable_ms"
+          "max_runnable_ms",
+          "preempted_runnable_ms"
         ],
         "required_marker": "SmartPerfetto::CASE::scheduler-cpu-contention"
       },
@@ -1040,6 +1080,16 @@
         "expected_condition_skips": [],
         "semantic_step": "root",
         "required_columns": [
+          "upid",
+          "utid",
+          "tid",
+          "window_start_ts",
+          "window_end_ts",
+          "state_covered_ns",
+          "state_evidence",
+          "uninterruptible_ms",
+          "runnable_preempted_ms",
+          "other_state_ms",
           "thread_name",
           "process_name",
           "is_main_thread",
@@ -1108,6 +1158,17 @@
         "expected_condition_skips": [],
         "semantic_step": "running_thread_quadrants",
         "required_columns": [
+          "window_id",
+          "window_start_ts",
+          "window_end_ts",
+          "upid",
+          "utid",
+          "role",
+          "state_covered_ns",
+          "total_observed_threads",
+          "sampling_evidence",
+          "unknown_running_ms",
+          "other_state_ms",
           "thread_name",
           "process_name",
           "tid",
@@ -1173,6 +1234,13 @@
         "expected_condition_skips": [],
         "semantic_step": "migration_analysis",
         "required_columns": [
+          "window_id",
+          "window_start_ts",
+          "window_end_ts",
+          "upid",
+          "utid",
+          "tid",
+          "migration_evidence",
           "thread_name",
           "migration_count",
           "big_to_little",

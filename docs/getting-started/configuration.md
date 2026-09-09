@@ -474,7 +474,15 @@ provider history；Artifact、DataEnvelope、报告和证据来源不会因此�
 |---|---|---|
 | `fast` | 默认 50 turns（`AGENT_QUICK_MAX_TURNS` 或 runtime-specific quick 配置可调），按请求注册轻量工具面 | 包名、进程、简单事实查询 |
 | `full` | 默认 100 turns（`AGENT_MAX_TURNS` 或 runtime-specific 配置可调），按能力注册完整工具面 | 启动、滑动、ANR、复杂根因分析 |
-| `auto` | 关键词规则、硬规则和轻量分类器自动选择 | 默认模式 |
+| `auto` | 统一语义意图分类器选择复杂度；不可用时使用明确 fallback | 默认模式 |
+
+100/50 是单次调查的安全预算，不是需要用满的目标。预算大于一时预留一次无工具总结，
+触顶后说明已有发现、证据不足和下一步；总结仍为部分完成。取消、超时、权限失效和
+费用限制不会因为收尾而被绕过。OpenCode 的轮次控制基于异步观察，可能过冲，实际轮数
+会保留。具体边界见 [轮次预算与收尾](../architecture/agent-runtime.md#轮次预算与收尾)。
+
+后续提问默认继承有界历史摘要，并可按需回查完整旧轮；来源、用户或 Trace 的权限边界
+不会因历史继承而扩大。更早正文不需要每轮全部发送给模型。
 
 前端会把选择持久化到 `localStorage['ai-analysis-mode']`。中途切换模式会清空当前 `agentSessionId`，让后端开启新的 SDK session。
 

@@ -515,7 +515,17 @@ DataEnvelopes, reports, or evidence provenance.
 |---|---|---|
 | `fast` | Default 50 turns (`AGENT_QUICK_MAX_TURNS` or a runtime-specific quick override), request-shaped lightweight tools | Package, process, simple facts |
 | `full` | Default 100 turns (`AGENT_MAX_TURNS` or a runtime-specific override), capability-shaped full tools | Startup, scrolling, ANR, complex root-cause analysis |
-| `auto` | Keyword rules, hard rules, and lightweight classifier choose the mode | Default mode |
+| `auto` | Shared semantic intent selects complexity; an explicit fallback applies when unavailable | Default mode |
+
+100/50 are safety budgets for one investigation, not targets to fill. A budget
+above one reserves one no-tool summary of findings, missing evidence and next steps;
+the result remains partial. Closeout cannot bypass cancellation, timeouts, permissions
+or cost limits. OpenCode observes turns asynchronously and may overshoot, with actual
+counts retained. See [Turn Budgets And Closeout](../architecture/agent-runtime.en.md#turn-budgets-and-closeout).
+
+Follow-up questions receive bounded history and can retrieve older turns on demand.
+History does not widen source, owner or trace permissions, and full older answers
+do not need to be sent to the model on every turn.
 
 The frontend persists the selected mode in `localStorage['ai-analysis-mode']`.
 

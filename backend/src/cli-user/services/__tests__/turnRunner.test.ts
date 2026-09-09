@@ -7,7 +7,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { ensureSessionLayout, sessionPaths, type CliPaths } from '../../io/paths';
 import { writeConfig } from '../../io/sessionStore';
-import { buildResumeContextQuery, continueSession, truncateAtBoundary } from '../turnRunner';
+import { readCliAnalysisHistory, continueSession, truncateAtBoundary } from '../turnRunner';
+import {toAnalysisHistoryTurn, renderAnalysisHistoryContext, createAnalysisHistoryReader} from '../../../agentRuntime/analysisHistory';
 import type { CliAnalyzeService, RunTurnOutput } from '../cliAnalyzeService';
 import type { Renderer } from '../../repl/renderer';
 import type { CliSessionConfig } from '../../types';
@@ -64,7 +65,7 @@ describe('truncateAtBoundary', () => {
   });
 });
 
-describe('buildResumeContextQuery', () => {
+describe('readCliAnalysisHistory', () => {
   let tmpDir: string;
   let paths: CliPaths;
 
@@ -82,7 +83,7 @@ describe('buildResumeContextQuery', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test('replays prior transcript turns before the follow-up question', () => {
+  test('reads legacy transcript as historical context without claiming completion', () => {
     const sp = sessionPaths(paths, 'agent-1');
     fs.mkdirSync(sp.dir, { recursive: true });
     fs.writeFileSync(sp.transcript, [
@@ -95,14 +96,10 @@ describe('buildResumeContextQuery', () => {
       '',
     ].join('\n'));
 
-    const query = buildResumeContextQuery(sp, '报告路径在哪里？');
-
-    expect(query).toContain('previous context below');
-    expect(query).toContain('Session id: agent-1');
-    expect(query).toContain(`Report path: ${sp.report}`);
-    expect(query).toContain('分析 Heavy launch');
-    expect(query).toContain('LoadSimulator_ActivityInit');
-    expect(query).toContain('用户新问题: 报告路径在哪里？');
+    const history = readCliAnalysisHistory(sp, 'trace-old');
+    expect(history).toEqual([expect.objectContaining({query: '分析 Heavy launch',
+      answer: '启动慢因是 LoadSimulator_ActivityInit 和 ChaosTask。', traceId: 'trace-old',
+      completionStatus: 'unknown', partial: true})]);
   });
 
   test('falls back to latest conclusion file when transcript is missing', () => {
@@ -110,16 +107,36 @@ describe('buildResumeContextQuery', () => {
     fs.mkdirSync(sp.dir, { recursive: true });
     fs.writeFileSync(sp.conclusion, '上一轮结论：主线程 CPU-bound。');
 
-    const query = buildResumeContextQuery(sp, '继续总结');
-
-    expect(query).toContain('上一轮结论：主线程 CPU-bound。');
-    expect(query).toContain('用户新问题: 继续总结');
+    expect(readCliAnalysisHistory(sp, 'trace-old')).toEqual([expect.objectContaining({
+      answer: '上一轮结论：主线程 CPU-bound。', completionStatus: 'unknown', partial: true})]);
   });
 
-  test('returns the user query unchanged when no prior context exists', () => {
+  test('returns no history when no prior context exists', () => {
     const sp = sessionPaths(paths, 'agent-3');
-    const query = buildResumeContextQuery(sp, 'plain question');
-    expect(query).toBe('plain question');
+    expect(readCliAnalysisHistory(sp, 'trace-old')).toEqual([]);
+  });
+
+  test('keeps incomplete metadata outside a truncated answer and allows an older turn to be read', () => {
+    const sp = sessionPaths(paths, 'agent-history');
+    fs.mkdirSync(sp.dir, {recursive: true});
+    const history = Array.from({length: 5}, (_, index) => toAnalysisHistoryTurn({
+      id: `run-${index}`, turnIndex: index, timestamp: index, traceId: 'trace-original', query: `q${index}`,
+      result: {conclusion: `${'正文'.repeat(6000)} original-${index}`, partial: true,
+        terminationReason: 'max_turns', conclusionContract: {uncertainties: ['尚无阻塞者证据'], nextSteps: ['检查主线程阻塞链']}}}));
+    fs.writeFileSync(sp.transcript, history.map((entry, index) => JSON.stringify({
+      turn: index + 1, timestamp: index, question: entry.query, conclusionMd: entry.answer, history: entry,
+    })).join('\n'));
+    const loaded = readCliAnalysisHistory(sp, 'trace-reloaded');
+    expect(loaded[4]).toMatchObject({traceId: 'trace-original', partial: true,
+      terminationReason: 'max_turns', uncertainties: ['尚无阻塞者证据'], nextSteps: ['检查主线程阻塞链']});
+    const preview = renderAnalysisHistoryContext(loaded, {outputLanguage: 'zh-CN', maxBytes: 12000});
+    expect(preview).toBeDefined();
+    expect(Buffer.byteLength(preview ?? '')).toBeLessThanOrEqual(12000);
+    expect(preview).toContain('max_turns');
+    const reader = createAnalysisHistoryReader({getTurns: () => loaded, assertActive: () => {}});
+    const page = reader.read({turnId: 'run-0', textOffset: 11000, maxChars: 3000});
+    expect(page).toMatchObject({success: true, partial: true, provenance: 'historical_context'});
+    expect(page.text).toContain('original-0');
   });
 });
 
@@ -233,6 +250,9 @@ describe('continueSession Level-3 lineage', () => {
     });
     expect(typeof saved.lineage?.at).toBe('number');
     const runInput = (service.runTurn as any).mock.calls[0][0];
+    expect(runInput.query).toBe('继续分析');
+    expect(runInput.history).toEqual([expect.objectContaining({query: '分析启动',
+      answer: '上一轮结论：主线程阻塞。', traceId: 'trace-old', completionStatus: 'unknown'})]);
     expect(runInput.sessionId).toBeUndefined();
     expect(runInput.lineage).toMatchObject({
       previousBackendSessionId: 'backend-old',

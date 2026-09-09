@@ -190,3 +190,35 @@ describe('HTMLReportGenerator code-aware rendering', () => {
     expect(html).not.toContain('Source Context');
   });
 });
+
+
+describe('investigation coverage presentation', () => {
+  it('shows content and evidence separately, with unassessed legacy fallback', () => {
+    const data = makeReportData({});
+    data.outputLanguage = 'en';
+    const generator = new HTMLReportGenerator();
+    expect(generator.generateAgentDrivenHTML(data)).toContain('System investigation coverage: Not checked');
+    data.result.deliveryAssurance = {schemaVersion: 1, entry: 'new_finalization', completion: 'passed',
+      claims: 'passed', source: 'not_applicable', identity: 'passed', report: 'not_applicable',
+      investigation: 'passed', investigationEvidence: 'coverage_incomplete'};
+    const html = generator.generateAgentDrivenHTML(data);
+    expect(html).toContain('System investigation coverage: Checked');
+    expect(html).toContain('System evidence coverage: Required dimensions remain incomplete');
+    expect(data.result.success).toBe(true);
+    data.result.investigationAssessment = {schemaVersion: 1, status: 'checked', binding: {
+      candidateRef: 'candidate', runId: 'run', attemptId: 'attempt', conclusionFingerprint: '',
+      conclusionContractFingerprint: '', evidenceFingerprint: '', requirementsFingerprint: '',
+      registryFingerprint: '', intentFingerprint: '', ledgerFingerprint: ''}, requirements: [],
+      evidenceRecords: Array.from({length: 25}, (_, index) => ({recordId: `record-${index}`, captureId: 'capture',
+        rowIndex: index, skillId: 'system', stepId: 'summary', definitionFingerprint: '', selectedSqlHash: '',
+        traceId: 'trace', traceSide: 'current' as const, origin: 'current_run' as const, domain: 'frequency',
+        metricId: 'system.cpu.frequency', status: 'observed' as const,
+        window: {start: '9007199254740993', end: '9007199254741093'}, value: index === 24 ? '<private>' : null,
+        unit: 'MHz'}))};
+    const detailed = generator.generateAgentDrivenHTML(data);
+    expect(detailed).toContain('record-24');
+    expect(detailed).toContain('9007199254740993');
+    expect(detailed).toContain('&lt;private&gt;');
+    expect(detailed).not.toContain('<private>');
+  });
+});

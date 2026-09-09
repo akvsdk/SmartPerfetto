@@ -8,7 +8,10 @@ import {runCorpusRegression} from './corpusRunner';
 function optionValues(name: string): string[] | undefined {
   const values: string[] = [];
   for (let index = 0; index < process.argv.length; index++) {
-    if (process.argv[index] === name && process.argv[index + 1]) values.push(process.argv[index + 1]);
+    if (process.argv[index] !== name) continue;
+    const value = process.argv[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${name} requires a value`);
+    values.push(value);
   }
   return values.length > 0 ? values : undefined;
 }

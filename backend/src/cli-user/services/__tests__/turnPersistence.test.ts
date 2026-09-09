@@ -138,6 +138,8 @@ describe('commitTurnOutputs', () => {
         },
       });
 
+      expect(JSON.parse(fs.readFileSync(path.join(sp.turnsDir, '001.investigation-assessment.json'), 'utf-8'))).toBeNull();
+      expect(JSON.parse(fs.readFileSync(path.join(sp.turnsDir, '001.delivery-assurance.json'), 'utf-8'))).toBeNull();
       const latest = JSON.parse(fs.readFileSync(path.join(sp.dir, 'analysis-receipt.json'), 'utf-8'));
       const turn = JSON.parse(fs.readFileSync(path.join(sp.turnsDir, '001.analysis-receipt.json'), 'utf-8'));
       const latestActions = JSON.parse(fs.readFileSync(path.join(sp.dir, 'ui-action-proposals.json'), 'utf-8'));
@@ -476,11 +478,12 @@ describe('commitTurnOutputs', () => {
       },
     };
 
+    const renderer = rendererStub();
     try {
       commitTurnOutputs({
         paths,
         sp,
-        renderer: rendererStub(),
+        renderer,
         sessionId,
         turn: 1,
         query: `query ${canary}`,
@@ -514,6 +517,8 @@ describe('commitTurnOutputs', () => {
         ...readTextFiles(paths.home),
       ].join('\n');
       expect(persistedText).not.toContain(canary);
+      expect(JSON.stringify(jest.mocked(renderer.printCompletion).mock.calls)).not.toContain(canary);
+      expect(renderer.printCompletion).toHaveBeenCalledWith(expect.objectContaining({terminationMessage: expect.any(String)}));
       expect(persistedText).toMatch(/原始内容未持久化|original content not persisted/);
       const privateReceipt = JSON.parse(
         fs.readFileSync(path.join(sp.dir, 'analysis-receipt.json'), 'utf-8'),
@@ -571,13 +576,16 @@ describe('commitTurnOutputs records a truncated run as truncated', () => {
         totalDurationMs: 1206000,
         partial: true,
         terminationReason: 'timeout',
+        terminationMessage: 'The request deadline elapsed.',
+        conclusionContract: {uncertainties: ['Missing blocking evidence'], nextSteps: ['Inspect the blocked interval']},
       },
     } as unknown as RunTurnOutput;
 
+    const renderer = rendererStub();
     commitTurnOutputs({
       paths,
       sp,
-      renderer: rendererStub(),
+      renderer,
       sessionId: 'session-partial',
       turn: 1,
       query: 'compare',
@@ -606,5 +614,14 @@ describe('commitTurnOutputs records a truncated run as truncated', () => {
 
     const index = JSON.parse(fs.readFileSync(paths.indexFile, 'utf-8'));
     expect(index.sessions['session-partial'].status).toBe('partial');
+    const transcript = JSON.parse(fs.readFileSync(sp.transcript, 'utf-8').trim());
+    expect(transcript.history).toMatchObject({partial: true, completionStatus: 'incomplete',
+      terminationReason: 'timeout', uncertainties: ['Missing blocking evidence'],
+      nextSteps: ['Inspect the blocked interval']});
+    expect(renderer.printCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      partial: true, hasConclusion: true, terminationReason: 'timeout',
+      terminationMessage: 'The request deadline elapsed.',
+    }));
+    fs.rmSync(home, {recursive: true, force: true});
   });
 });

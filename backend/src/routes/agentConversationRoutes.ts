@@ -6,6 +6,8 @@ import type express from 'express';
 
 import type {AnalysisOptions} from '../agent/core/orchestratorTypes';
 import {createAgentOrchestrator} from '../agentRuntime';
+import {toAnalysisHistoryTurn} from '../agentRuntime/analysisHistory';
+import {getConversationSessionStore, type ConversationSessionDescriptor} from '../services/conversationSessionStore';
 import {
   ConversationSessionService,
   type ConversationRun,
@@ -38,7 +40,7 @@ import {
   ownerFieldsFromContext,
   sendResourceNotFound,
 } from '../services/resourceOwnership';
-import {buildAnalysisContextAuthorizationFingerprint} from '../services/resolvedAnalysisContext';
+import {assertCurrentAnalysisContextAuthorization, buildAnalysisContextAuthorizationFingerprint} from '../services/resolvedAnalysisContext';
 import {knowledgeScopeFromRequestContext} from '../services/scopedKnowledgeStore';
 import {
   projectOwnerAnalysisError,
@@ -126,6 +128,26 @@ function runScope(
   };
 }
 
+function sessionDescriptor(session: ConversationSession, run: ConversationRun): ConversationSessionDescriptor {
+  if (!session.tenantId || !session.workspaceId || !session.userId || !session.runtimeKind ||
+    !session.providerSnapshotHash || !session.analysisContextFingerprint || session.providerId === undefined) {
+    throw new Error('conversation_recovery_context_missing');
+  }
+  const {finalResult: _result, recoveryStatus: _recovery, ...outcome} = run.outcome ?? {kind: 'cancelled' as const, message: ''};
+  return {version: 1, sessionId: session.sessionId, tenantId: session.tenantId, workspaceId: session.workspaceId,
+    userId: session.userId, traceContext: session.traceContext, providerId: session.providerId,
+    providerFollowsActive: session.providerFollowsActive ?? true, runtimeKind: session.runtimeKind,
+    providerSnapshotHash: session.providerSnapshotHash, analysisContextFingerprint: session.analysisContextFingerprint,
+    outputLanguage: session.outputLanguage, codeAwareMode: session.codeAwareMode,
+    codebaseIds: session.codebaseIds, knowledgeSourceIds: session.knowledgeSourceIds,
+    status: session.status, createdAt: session.createdAt, lastActivityAt: session.lastActivityAt,
+    lastRun: {runId: run.runId, query: runScope(session, run).query ?? '', turnIndex: run.turnIndex,
+      status: run.status, startedAt: run.startedAt, completedAt: run.completedAt,
+      ...(run.sourceUseMode === 'explicit' || session.knowledgeSourceIds?.length ? {sourceDerived: true} : {})},
+    ...(run.outcome ? {lastOutcome: outcome} : {}),
+  };
+}
+
 function settleRun(session: ConversationSession, run: ConversationRun): void {
   const timer = heartbeatTimers.get(run.runId);
   if (timer) clearInterval(timer);
@@ -141,6 +163,11 @@ function settleRun(session: ConversationSession, run: ConversationRun): void {
     ? projectOwnerAnalysisError(undefined, run.error, session.outputLanguage ?? configuredOutputLanguage())
     : run.error;
   persistAnalysisRunState(runScope(session, run), status, {error});
+  const descriptor = sessionDescriptor(session, run);
+  const turn = session.historyTurns.find(turn => turn.id === run.runId);
+  if (!turn) throw new Error('conversation_finalized_history_missing');
+  // Descriptor and the exact finalized public turn share one SQLite transaction.
+  getConversationSessionStore().save(descriptor, {...turn, query: descriptor.lastRun.query});
 }
 
 const conversationSessionService = new ConversationSessionService({
@@ -155,6 +182,7 @@ const conversationSessionService = new ConversationSessionService({
     const orchestrator = createAgentOrchestrator({
       traceProcessorService: getTraceProcessorService(),
       providerId: input.providerId,
+      runtimeOverride: input.runtimeKind,
       providerScope,
     });
     return new OrchestratorConversationRuntimeAdapter(orchestrator, {
@@ -168,6 +196,13 @@ const conversationSessionService = new ConversationSessionService({
   onRunStarted: (session, run) => {
     const scope = runScope(session, run);
     persistAnalysisRunState(scope, 'running');
+    const descriptor = sessionDescriptor(session, run);
+    getConversationSessionStore().save(descriptor, toAnalysisHistoryTurn({id: run.runId,
+      turnIndex: run.turnIndex, query: descriptor.lastRun.query, traceId: scope.traceId,
+      timestamp: run.startedAt, sourceDerived: descriptor.lastRun.sourceDerived,
+      analysisContextFingerprint: descriptor.analysisContextFingerprint,
+      result: {partial: true, completion: {status: 'unknown'}},
+    }));
     const timer = setInterval(() => heartbeatAnalysisRun(scope), CONVERSATION_RUN_HEARTBEAT_MS);
     timer.unref?.();
     heartbeatTimers.set(run.runId, timer);
@@ -231,6 +266,14 @@ async function startConversation(req: express.Request, res: express.Response): P
     const requestedSessionId = typeof req.body?.sessionId === 'string'
       ? req.body.sessionId.trim()
       : '';
+    const existing = requestedSessionId ? conversationSessionService.getSession(requestedSessionId) : undefined;
+    const persisted = requestedSessionId && !existing
+      ? getConversationSessionStore().load(ownerFieldsFromContext(requestContext), requestedSessionId) : undefined;
+    const previous = existing ?? persisted;
+    if (requestedSessionId && (!previous || !isOwnedByContext(previous, requestContext))) {
+      sendResourceNotFound(res, 'Conversation not found', 'CONVERSATION_NOT_FOUND');
+      return;
+    }
     const traceId = typeof req.body?.traceId === 'string' ? req.body.traceId.trim() : '';
     const providerId = req.body?.providerId === null
       ? null
@@ -238,7 +281,9 @@ async function startConversation(req: express.Request, res: express.Response): P
         ? req.body.providerId.trim()
         : undefined;
     const options = normalizeAnalyzeOptions(
-      {...(req.body?.options ?? {}), analysisMode: 'fast'},
+      {outputLanguage: previous?.outputLanguage, codeAwareMode: previous?.codeAwareMode,
+        codebaseIds: previous?.codebaseIds, knowledgeSourceIds: previous?.knowledgeSourceIds,
+        ...(req.body?.options ?? {}), analysisMode: 'fast'},
       {endpoint: '/analyze', hasReferenceTraceId: false, ...(traceId ? {traceId} : {})},
     );
     failureLanguage = options.outputLanguage ?? configuredOutputLanguage();
@@ -268,18 +313,7 @@ async function startConversation(req: express.Request, res: express.Response): P
       options,
       knowledgeScopeFromRequestContext(requestContext),
     );
-    const existing = requestedSessionId
-      ? conversationSessionService.getSession(requestedSessionId)
-      : undefined;
-    if (requestedSessionId && !existing) {
-      sendResourceNotFound(res, 'Conversation not found', 'CONVERSATION_NOT_FOUND');
-      return;
-    }
-    if (existing && !isOwnedByContext(existing, requestContext)) {
-      sendResourceNotFound(res, 'Conversation not found', 'CONVERSATION_NOT_FOUND');
-      return;
-    }
-    if (existing && providerId !== undefined && existing.providerId !== providerId) {
+    if (previous && providerId !== undefined && previous.providerId !== providerId) {
       res.status(409).json({
         success: false,
         code: 'CONVERSATION_PROVIDER_CHANGED',
@@ -287,7 +321,7 @@ async function startConversation(req: express.Request, res: express.Response): P
       });
       return;
     }
-    if (existing?.outputLanguage && existing.outputLanguage !== failureLanguage) {
+    if (previous?.outputLanguage && previous.outputLanguage !== failureLanguage) {
       res.status(409).json({
         success: false,
         code: 'CONVERSATION_LANGUAGE_CHANGED',
@@ -296,8 +330,8 @@ async function startConversation(req: express.Request, res: express.Response): P
       return;
     }
     if (
-      existing?.analysisContextFingerprint &&
-      existing.analysisContextFingerprint !== analysisContextFingerprint
+      previous?.analysisContextFingerprint &&
+      previous.analysisContextFingerprint !== analysisContextFingerprint
     ) {
       res.status(409).json({
         success: false,
@@ -309,13 +343,13 @@ async function startConversation(req: express.Request, res: express.Response): P
 
     const effectiveTraceContext: ConversationTraceContext = traceId
       ? {kind: 'attached', traceId}
-      : existing?.traceContext ?? {kind: 'none'};
+      : previous?.traceContext ?? {kind: 'none'};
     if (
-      existing &&
-      (existing.traceContext.kind !== effectiveTraceContext.kind ||
-        (existing.traceContext.kind === 'attached' &&
+      previous &&
+      (previous.traceContext.kind !== effectiveTraceContext.kind ||
+        (previous.traceContext.kind === 'attached' &&
           effectiveTraceContext.kind === 'attached' &&
-          existing.traceContext.traceId !== effectiveTraceContext.traceId))
+          previous.traceContext.traceId !== effectiveTraceContext.traceId))
     ) {
       res.status(409).json({
         success: false,
@@ -375,17 +409,17 @@ async function startConversation(req: express.Request, res: express.Response): P
     };
     const providerService = getProviderService();
     const activeProviderId = providerService.getRawEffectiveProvider(providerScope)?.id ?? null;
-    const providerFollowsActive = existing
-      ? existing.providerFollowsActive ?? true
+    const providerFollowsActive = previous
+      ? previous.providerFollowsActive ?? true
       : providerId === undefined;
-    const effectiveProviderId = existing
-      ? existing.providerId !== undefined
-        ? existing.providerId
+    const effectiveProviderId = previous
+      ? previous.providerId !== undefined
+        ? previous.providerId
         : activeProviderId
       : providerId !== undefined
         ? providerId
         : activeProviderId;
-    if (existing && providerFollowsActive && effectiveProviderId !== activeProviderId) {
+    if (previous && providerFollowsActive && effectiveProviderId !== activeProviderId) {
       res.status(409).json({
         success: false,
         code: 'CONVERSATION_PROVIDER_CHANGED',
@@ -410,8 +444,8 @@ async function startConversation(req: express.Request, res: express.Response): P
       return;
     }
     if (
-      existing?.providerSnapshotHash &&
-      existing.providerSnapshotHash !== providerPin.snapshotHash
+      previous?.providerSnapshotHash &&
+      previous.providerSnapshotHash !== providerPin.snapshotHash
     ) {
       res.status(409).json({
         success: false,
@@ -432,6 +466,12 @@ async function startConversation(req: express.Request, res: express.Response): P
       runtimeOptions,
       analysisContextFingerprint,
     };
+    assertCurrentAnalysisContextAuthorization(runtimeOptions, knowledgeScopeFromRequestContext(requestContext),
+      analysisContextFingerprint);
+    if (persisted) {
+      const history = getConversationSessionStore().listTurns(persisted);
+      conversationSessionService.restoreSession(persisted, history, turnInput);
+    }
     const receipt = conversationSessionService.startTurn(turnInput);
     void receipt.completion.catch(() => undefined);
     res.status(202).json({
@@ -460,20 +500,109 @@ async function startConversation(req: express.Request, res: express.Response): P
   }
 }
 
-function streamConversation(req: express.Request, res: express.Response): void {
-  const requestContext = requireConversationRunPermission(req, res);
-  if (!requestContext) return;
-  const session = conversationSessionService.getSession(routeParam(req.params.sessionId));
-  if (!session || !isOwnedByContext(session, requestContext)) {
+async function readAuthorizedConversation(req: express.Request, res: express.Response): Promise<ConversationSession | undefined> {
+  const context = requireConversationRunPermission(req, res);
+  if (!context) return undefined;
+  const sessionId = routeParam(req.params.sessionId);
+  const live = conversationSessionService.getSession(sessionId);
+  const stored = !live ? getConversationSessionStore().load(ownerFieldsFromContext(context), sessionId) : undefined;
+  const metadata = live ?? stored;
+  if (!metadata || !isOwnedByContext(metadata, context)) {
     sendResourceNotFound(res, 'Conversation not found', 'CONVERSATION_NOT_FOUND');
-    return;
+    return undefined;
   }
+  if (metadata.providerId === undefined || !metadata.runtimeKind || !metadata.providerSnapshotHash ||
+    !metadata.analysisContextFingerprint) {
+    res.status(409).json({success: false, code: 'CONVERSATION_RECOVERY_UNAVAILABLE',
+      error: 'The conversation is missing its pinned runtime or authorization context'});
+    return undefined;
+  }
+  const authorized = authorizeAnalysisContext({selection: metadata, scope: knowledgeScopeFromRequestContext(context),
+    outputLanguage: metadata.outputLanguage ?? configuredOutputLanguage(),
+    canReadRegisteredContext: hasRbacPermission(context, 'codebase:read')});
+  if (!authorized.allowed) {
+    res.status(authorized.httpStatus).json(authorized.payload); return undefined;
+  }
+  assertCurrentAnalysisContextAuthorization(metadata, knowledgeScopeFromRequestContext(context),
+    metadata.analysisContextFingerprint!);
+  if (metadata.traceContext.kind === 'attached' &&
+    !(await ensureTraceAccessible(req, res, metadata.traceContext.traceId))) return undefined;
+  // Recheck after the awaited access lookup, before loading any history or creating an SDK adapter.
+  assertCurrentAnalysisContextAuthorization(metadata, knowledgeScopeFromRequestContext(context),
+    metadata.analysisContextFingerprint!);
+  const provider = getProviderService();
+  const owner = ownerFieldsFromContext(context);
+  const pin = resolveProviderRuntimeSnapshot(provider, metadata.providerId, metadata.runtimeKind, owner);
+  if (pin.snapshotHash !== metadata.providerSnapshotHash || pin.snapshot.runtimeKind !== metadata.runtimeKind ||
+    (metadata.providerFollowsActive && (provider.getRawEffectiveProvider(owner)?.id ?? null) !== metadata.providerId)) {
+    res.status(409).json({success: false, code: 'CONVERSATION_PROVIDER_SNAPSHOT_CHANGED',
+      error: 'Start a new conversation after changing the AI provider configuration'});
+    return undefined;
+  }
+  if (live) return live;
+  const runtimeOptions: AnalysisOptions = {outputLanguage: stored!.outputLanguage, codeAwareMode: stored!.codeAwareMode,
+    codebaseIds: stored!.codebaseIds, knowledgeSourceIds: stored!.knowledgeSourceIds,
+    analysisContextFingerprint: stored!.analysisContextFingerprint};
+  return conversationSessionService.restoreSession(stored!, getConversationSessionStore().listTurns(stored!), {
+    query: '', sessionId, owner, traceContext: stored!.traceContext, providerId: stored!.providerId,
+    providerFollowsActive: stored!.providerFollowsActive, runtimeKind: stored!.runtimeKind,
+    providerSnapshotHash: stored!.providerSnapshotHash, analysisContextFingerprint: stored!.analysisContextFingerprint,
+    runtimeOptions,
+  });
+}
+
+function sourceHistoryTurnAccessible(session: ConversationSession, turnId: string | undefined): boolean {
+  const turn = session.historyTurns.find(candidate => candidate.id === turnId);
+  return Boolean(turn?.analysisContextFingerprint &&
+    turn.analysisContextFingerprint === session.analysisContextFingerprint);
+}
+
+function settledRunHistoryAccessible(session: ConversationSession, run: ConversationRun): boolean {
+  const turn = session.historyTurns.find(candidate => candidate.id === run.runId);
+  return run.status === 'running' || !(turn?.sourceDerived || run.sourceUseMode === 'explicit') ||
+    sourceHistoryTurnAccessible(session, run.runId);
+}
+
+function requireAccessibleSettledRunHistory(session: ConversationSession, run: ConversationRun, res: express.Response): boolean {
+  if (!settledRunHistoryAccessible(session, run)) {
+    res.status(409).json({success: false, code: 'CONVERSATION_HISTORY_SOURCE_UNAVAILABLE',
+      error: 'The source authorization for this historical turn is unavailable'});
+    return false;
+  }
+  return true;
+}
+
+async function getConversation(req: express.Request, res: express.Response): Promise<void> {
+  const session = await readAuthorizedConversation(req, res);
+  if (!session) return;
+  const history = session.history.filter(message => !message.sourceDerived ||
+    sourceHistoryTurnAccessible(session, message.turnId ?? message.turn?.id));
+  const latestRun = session.runs[session.runs.length - 1];
+  const controlsAccessible = !latestRun || settledRunHistoryAccessible(session, latestRun);
+  res.json({success: true, sessionId: session.sessionId, status: session.status, traceContext: session.traceContext,
+    history: history.slice(-200).map(({role, content, turnId, sourceDerived, turn}) => ({
+      role, content, turnId, sourceDerived,
+      ...(turn ? {turn: {id: turn.id, turnIndex: turn.turnIndex, partial: turn.partial, completionStatus: turn.completionStatus,
+        terminationReason: turn.terminationReason, terminationMessage: turn.terminationMessage,
+        uncertainties: turn.uncertainties, nextSteps: turn.nextSteps, evidence: turn.evidence}} : {}),
+    })), historyOmittedMessages: Math.max(0, history.length - 200),
+    historyUnavailableMessages: session.history.length - history.length, recoveryStatus: session.recoveryStatus,
+    ...(controlsAccessible ? {pendingQuestion: session.pendingQuestion,
+      recommendedFullAnalysis: Boolean(session.recommendedFullAnalysis),
+      fullHandoff: conversationSessionService.buildFullAnalysisHandoff(session.sessionId)} : {}),
+    activeRunId: session.activeRun?.runId});
+}
+
+async function streamConversation(req: express.Request, res: express.Response): Promise<void> {
+  const session = await readAuthorizedConversation(req, res);
+  if (!session) return;
   const runId = typeof req.query.runId === 'string' ? req.query.runId.trim() : '';
   const run = session.runs.find(candidate => candidate.runId === runId);
   if (!run) {
     sendResourceNotFound(res, 'Conversation run not found');
     return;
   }
+  if (!requireAccessibleSettledRunHistory(session, run, res)) return;
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -527,6 +656,9 @@ function streamConversation(req: express.Request, res: express.Response): void {
   heartbeat.unref?.();
   req.on('close', close);
   send('connected', {sessionId: session.sessionId, runId, status: run.status});
+  if (run.lifecycleSettled && run.events.length === 0 && run.outcome) {
+    send('run_completed', {sessionId: session.sessionId, runId, outcome: run.outcome, enrichmentPending: false});
+  }
   for (const event of [...run.events].sort((left, right) => left.seqId - right.seqId)) {
     sendRunEvent(event);
   }
@@ -565,14 +697,11 @@ async function cancelConversation(req: express.Request, res: express.Response): 
   }
 }
 
-function getFullHandoff(req: express.Request, res: express.Response): void {
-  const requestContext = requireConversationRunPermission(req, res);
-  if (!requestContext) return;
-  const session = conversationSessionService.getSession(routeParam(req.params.sessionId));
-  if (!session || !isOwnedByContext(session, requestContext)) {
-    sendResourceNotFound(res, 'Conversation not found', 'CONVERSATION_NOT_FOUND');
-    return;
-  }
+async function getFullHandoff(req: express.Request, res: express.Response): Promise<void> {
+  const session = await readAuthorizedConversation(req, res);
+  if (!session) return;
+  const latestRun = session.runs[session.runs.length - 1];
+  if (latestRun && !requireAccessibleSettledRunHistory(session, latestRun, res)) return;
   const handoff = conversationSessionService.buildFullAnalysisHandoff(session.sessionId);
   if (!handoff) {
     res.status(409).json({success: false, code: 'FULL_ANALYSIS_NOT_RECOMMENDED'});
@@ -581,11 +710,22 @@ function getFullHandoff(req: express.Request, res: express.Response): void {
   res.json({success: true, sessionId: session.sessionId, handoff});
 }
 
+function conversationReadRoute(handler: (req: express.Request, res: express.Response) => Promise<void>) {
+  return (req: express.Request, res: express.Response): void => {
+    void handler(req, res).catch(error => {
+      if (!res.headersSent) res.status(/not found/i.test(String(error)) ? 404 : 409).json({success: false,
+        code: 'CONVERSATION_RECOVERY_UNAVAILABLE', error: error instanceof Error ? error.message : String(error)});
+      else res.end();
+    });
+  };
+}
+
 export function registerAgentConversationRoutes(router: express.Router): void {
   router.post('/conversation', (req, res) => void startConversation(req, res));
-  router.get('/conversation/:sessionId/stream', streamConversation);
+  router.get('/conversation/:sessionId', conversationReadRoute(getConversation));
+  router.get('/conversation/:sessionId/stream', conversationReadRoute(streamConversation));
   router.post('/conversation/:sessionId/cancel', (req, res) => void cancelConversation(req, res));
-  router.get('/conversation/:sessionId/full-handoff', getFullHandoff);
+  router.get('/conversation/:sessionId/full-handoff', conversationReadRoute(getFullHandoff));
 }
 
 export function cleanupIdleAgentConversationSessions(): string[] {

@@ -13,11 +13,15 @@ import {
 import {
   collectAgentSseOracleRows,
   evaluateAgentSseExpectation,
+  evaluateAgentSseInvestigationExpectation,
   parseAgentSseExpectation,
   taskAcceptanceStatus,
   assertVerificationTraceReady,
   loadVerificationTracePair,
   collectSseSummary,
+  findSessionLogFile,
+  preserveVerificationSessionLog,
+  VerificationLifecycleError,
   recordVerificationFailureAndCancel,
   VerificationSseTimeoutError,
   VerificationSliceSelectionError,
@@ -533,6 +537,187 @@ function evaluate(terminal = terminalFixture()) {
     oracleRows: {frame_count: [{total_frames: 1912}]}});
 }
 
+describe('system investigation terminal acceptance', () => {
+  it('preserves isolated runtime session logs and lifecycle codes without credentials', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'verification-logs-'));
+    const previous = process.env.SMARTPERFETTO_BACKEND_LOG_DIR;
+    const oldKey = process.env.DEEPSEEK_API_KEY;
+    process.env.SMARTPERFETTO_BACKEND_LOG_DIR = path.join(directory, 'runtime-logs');
+    process.env.DEEPSEEK_API_KEY = 'provider-key-must-not-appear';
+    try {
+      fs.mkdirSync(path.join(process.env.SMARTPERFETTO_BACKEND_LOG_DIR, 'sessions'), {recursive: true});
+      const source = path.join(process.env.SMARTPERFETTO_BACKEND_LOG_DIR, 'sessions/session_owned_2026.jsonl');
+      fs.writeFileSync(source, JSON.stringify({level: 'error', error: {message: 'analysis_history_parent_not_authorized',
+        stack: 'HistoryStore.append -> persistence'}, data: {apiKey: 'another-secret', providerMessage: 'provider-key-must-not-appear'}}) + '\n');
+      expect(findSessionLogFile('owned')).toBe(source);
+      const outputPath = path.join(directory, 'artifact.json');
+      const result = preserveVerificationSessionLog(outputPath, 'owned');
+      expect(result.lifecycleErrorCode).toBe('analysis_history_parent_not_authorized');
+      const saved = fs.readFileSync(result.sessionLogFile!, 'utf8');
+      expect(saved).toContain('HistoryStore.append');
+      expect(saved).not.toContain('provider-key-must-not-appear');
+      expect(saved).not.toContain('another-secret');
+      const failure = await recordVerificationFailureAndCancel({baseUrl: 'http://invalid', outputPath, phase: 'analysis_stream',
+        startedAt: Date.now(), timeoutMs: 1, sessionId: 'owned', error: new VerificationLifecycleError('analysis_history_parent_not_authorized')});
+      expect(failure).toMatchObject({errorCode: 'analysis_history_parent_not_authorized', lifecycleErrorCode: 'analysis_history_parent_not_authorized'});
+    } finally {
+      if (previous === undefined) delete process.env.SMARTPERFETTO_BACKEND_LOG_DIR; else process.env.SMARTPERFETTO_BACKEND_LOG_DIR = previous;
+      if (oldKey === undefined) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = oldKey;
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
+  });
+
+  it('stops immediately on a structured lifecycle SSE error code', async () => {
+    const request = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      'event: error\ndata: {"code":"analysis_history_parent_not_authorized","message":"sensitive detail"}\n\n'));
+    try {
+      await expect(collectSseSummary('http://verifier.invalid', 'owned', 1000,
+        {requiredText: [], forbiddenText: []}, {runId: 'run'})).rejects.toMatchObject({code: 'analysis_history_parent_not_authorized'});
+    } finally {request.mockRestore();}
+  });
+
+  it('queries identical oracle SQL independently for both trace sides', async () => {
+    const pair = parseAgentSseExpectation({...expectation, facts: [expectation.facts[0],
+      {...expectation.facts[0], id: 'reference_frames', oracle: {...expectation.facts[0].oracle!, traceSide: 'reference'}}]});
+    const query = jest.fn(async (_sql: string, side: 'current' | 'reference') =>
+      ({columns: ['total_frames'], rows: [[side === 'current' ? 1912 : 700]]}));
+    expect(await collectAgentSseOracleRows(pair, query)).toEqual({frame_count: [{total_frames: 1912}], reference_frames: [{total_frames: 700}]});
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls.map(call => call[1])).toEqual(['current', 'reference']);
+  });
+
+  it('binds reference fact claims to the real reference trace instead of the current trace', () => {
+    const referenceExpected = parseAgentSseExpectation({...expectation, facts: [{...expectation.facts[0],
+      oracle: {...expectation.facts[0].oracle!, traceSide: 'reference'}}]});
+    const terminal = terminalFixture();
+    const anchor = terminal.claimSupport![0].anchors[0];
+    Object.assign(anchor.context, {traceId: 'reference-trace', traceSide: 'reference'});
+    const check = (referenceTraceId?: string) => evaluateAgentSseExpectation({terminal, expectation: referenceExpected,
+      traceId: 'trace-current', referenceTraceId, oracleRows: {frame_count: [{total_frames: 1912}]}}).checks['fact:frame_count'];
+    expect(check('reference-trace')).toBe(true);
+    expect(check()).toBe(false);
+    expect(check('wrong-reference')).toBe(false);
+    anchor.context.traceSide = 'current';
+    expect(check('reference-trace')).toBe(false);
+  });
+  it('loads every declarative real/constructed suite through the same closed expectation parser', () => {
+    const wrapper = require('../../../scripts/run-deepseek-agent-e2e.cjs');
+    for (const scenario of wrapper.systemAnalysisScenarios()) {
+      const value = scenario.args[scenario.args.indexOf('--expectation-json') + 1];
+      expect(parseAgentSseExpectation(JSON.parse(fs.readFileSync(value.slice(1), 'utf8'))).investigation?.requirements.length)
+        .toBeGreaterThan(0);
+    }
+  });
+  function fixture() {
+    const terminal = terminalFixture();
+    terminal.turnIntent = {...terminal.turnIntent!, taskKind: 'investigation'};
+    terminal.deliveryAssurance = {...terminal.deliveryAssurance!, investigation: 'passed', investigationEvidence: 'passed'};
+    const record = {recordId: 'capture:0:0', captureId: 'capture', rowIndex: 0, skillId: 'declared-producer', stepId: 'root',
+      definitionFingerprint: 'definition-hash', selectedSqlHash: 'sql-hash', traceId: 'trace-current', traceSide: 'current' as const,
+      originRunId: 'run', origin: 'current_run' as const, domain: 'thread_state', metricId: 'system.thread.state.duration',
+      status: 'observed' as const, window: {start: '100', end: '200'}, upid: 2, utid: 3, value: 100, unit: 'ns'};
+    terminal.investigationAssessment = {schemaVersion: 1, status: 'checked',
+      binding: {...terminal.completion!, registryFingerprint: terminal.turnIntent.registryFingerprint,
+        intentFingerprint: analysisDeliveryFingerprint(terminal.turnIntent),
+        conclusionContractFingerprint: analysisDeliveryFingerprint(terminal.conclusionContract),
+        requirementsFingerprint: 'requirements-hash', evidenceFingerprint: 'evidence-hash', ledgerFingerprint: 'ledger-hash',
+        evidenceRecordsFingerprint: analysisDeliveryFingerprint([record])},
+      requirements: [{requirementId: 'thread_state', domain: 'thread_state', applicability: 'applicable', coverage: 'covered',
+        contentLocations: [{start: 0, end: terminal.conclusion!.length}], evidenceRecordIds: [record.recordId], scopeMatch: 'matched',
+        evidenceStatus: 'observed', acquisition: 'observed'}], evidenceRecords: [record]};
+    const expected = parseAgentSseExpectation({...expectation, intent: {taskKind: 'investigation'}, investigation: {
+      contentAssurance: 'passed', evidenceAssurance: 'passed', assessmentStatus: 'checked', requirements: [{id: 'thread_state',
+        domain: 'thread_state', applicability: 'applicable', coverage: 'covered', acquisition: 'observed', scopeMatch: 'matched',
+        records: [{metricId: record.metricId, traceSide: 'current', origin: 'current_run', upid: 2, utid: 3,
+          window: {start: '100', end: '200'}, oracleScope: {factId: 'frame_count', startColumn: 'start', endColumn: 'end', upidColumn: 'upid', utidColumn: 'utid'}}]}]}});
+    const check = () => evaluateAgentSseInvestigationExpectation({terminal, expectation: expected.investigation!, traceId: 'trace-current',
+      oracleRows: {frame_count: [{start: '100', end: '200', upid: 2, utid: 3}]}});
+    return {terminal, expected, record, check};
+  }
+
+  it('accepts exact candidate, requirement and producer record bindings with an independent scope oracle', () => {
+    expect(Object.values(fixture().check()).every(Boolean)).toBe(true);
+  });
+
+  it('retains the final assessment and sanitized record projection from the terminal SSE event', async () => {
+    const {terminal} = fixture();
+    const request = jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      `event: analysis_completed\ndata: ${JSON.stringify(terminal)}\n\n`));
+    try {
+      const summary = await collectSseSummary('http://verifier.invalid', 'session', 1000,
+        {requiredText: [], forbiddenText: []}, {runId: 'run'});
+      expect(summary.terminalAnalysis?.investigationAssessment).toEqual(terminal.investigationAssessment);
+    } finally {request.mockRestore();}
+  });
+
+  it.each(['recordId', 'captureId', 'metricId', 'domain', 'traceId', 'traceSide', 'originRunId', 'window', 'upid', 'utid', 'status'])(
+    'rejects wrong %s even when the copied record fingerprint is refreshed', key => {
+      const {terminal, record, check} = fixture();
+      (record as any)[key] = key === 'window' ? {start: '101', end: '200'} : key === 'upid' || key === 'utid' ? 99 : 'wrong';
+      terminal.investigationAssessment!.binding.evidenceRecordsFingerprint = analysisDeliveryFingerprint([record]);
+      expect(Object.values(check()).every(Boolean)).toBe(false);
+    },
+  );
+
+  it.each(['candidateRef', 'runId', 'attemptId', 'conclusionFingerprint', 'intentFingerprint', 'registryFingerprint', 'conclusionContractFingerprint', 'evidenceRecordsFingerprint'])(
+    'rejects a stale %s binding', field => {
+      const {terminal, check} = fixture();
+      (terminal.investigationAssessment!.binding as any)[field] = 'stale';
+      expect(Object.values(check()).every(Boolean)).toBe(false);
+    },
+  );
+
+  it('rejects duplicate requirement/record IDs and unbound prose even when content mentions system analysis', () => {
+    const first = fixture();
+    first.terminal.investigationAssessment!.requirements = [...first.terminal.investigationAssessment!.requirements,
+      first.terminal.investigationAssessment!.requirements[0]];
+    expect(first.check()['investigation:uniqueRequirements']).toBe(false);
+    const second = fixture();
+    second.terminal.investigationAssessment!.evidenceRecords = [second.record, second.record];
+    expect(second.check()['investigation:uniqueRecords']).toBe(false);
+    const third = fixture();
+    third.terminal.conclusion = 'CPU frequency, scheduler, preemption: everything checked.';
+    third.terminal.investigationAssessment = undefined;
+    expect(Object.values(third.check()).every(Boolean)).toBe(false);
+  });
+
+  it('does not upgrade unknown or missing capture data to observed', () => {
+    const {terminal, check} = fixture();
+    terminal.investigationAssessment!.evidenceRecords = [];
+    expect(Object.values(check()).every(Boolean)).toBe(false);
+    terminal.investigationAssessment!.requirements = terminal.investigationAssessment!.requirements.map(row =>
+      ({...row, acquisition: 'unknown', evidenceStatus: 'unknown'}));
+    expect(check()['investigation:requirement:thread_state']).toBe(false);
+  });
+
+  it('validates reference side against its actual trace ID and preserves missing reference as unknown', () => {
+    const {terminal, expected, record} = fixture();
+    Object.assign(record, {traceSide: 'reference', traceId: 'reference-actual'});
+    expected.investigation!.requirements[0].records![0].traceSide = 'reference';
+    delete expected.investigation!.requirements[0].records![0].oracleScope;
+    terminal.investigationAssessment!.binding.evidenceRecordsFingerprint = analysisDeliveryFingerprint([record]);
+    const check = (referenceTraceId?: string) => evaluateAgentSseInvestigationExpectation({terminal, expectation: expected.investigation!,
+      traceId: 'trace-current', referenceTraceId, oracleRows: {frame_count: [{start: 100, end: 200, upid: 2, utid: 3}]}});
+    expect(Object.values(check('reference-actual')).every(Boolean)).toBe(true);
+    expect(Object.values(check()).every(Boolean)).toBe(false);
+  });
+
+  it('fails closed on misspelled fields, duplicate requirements, invalid windows and unknown oracle facts', () => {
+    const {expected} = fixture();
+    for (const change of [
+      (value: any) => {value.investigation.typo = true;},
+      (value: any) => {value.investigation.requirements.push(value.investigation.requirements[0]);},
+      (value: any) => {value.investigation.requirements[0].records[0].window.end = '100';},
+      (value: any) => {value.investigation.requirements[0].records[0].oracleScope.factId = 'missing';},
+      (value: any) => {value.investigation.requirements[0].acquisition = 'passed';},
+      (value: any) => {value.investigation.requirements[0].records[0].traceSide = 'reference';},
+    ]) {
+      const value = structuredClone(expected); change(value);
+      expect(() => parseAgentSseExpectation(value)).toThrow('Invalid --expectation-json');
+    }
+  });
+});
+
 describe('independent native row oracle', () => {
   afterEach(() => {jest.useRealTimers();});
   const nativeExpectation = () => parseAgentSseExpectation({schemaVersion: 1,
@@ -618,6 +803,63 @@ describe('independent native row oracle', () => {
         expectation: target.expectation, traceId: target.trace.id, service: service as any, scope, deadlineMs, signal,
       }, {prepareLeases, resolveIdentity: target.resolveIdentity, loadDocs: target.loadDocs})};
   }
+
+  function pairGroupFixture() {
+    const target = pinFixture();
+    const scope = {tenantId: 'test', workspaceId: 'test', userId: 'test'};
+    const traces = new Map(['current', 'reference'].map(side => [side, {id: `trace-${side}`, status: 'ready'}]));
+    const entries = ['current', 'reference'].map(side => ({side, privateProcessor: true,
+      lease: {id: `lease-${side}`, traceId: `trace-${side}`, mode: 'isolated'},
+      context: {traceId: `trace-${side}`, leaseId: `lease-${side}`, mode: 'isolated', leaseScope: scope,
+        holder: {holderType: 'agent_run', holderRef: 'oracle'}}}));
+    const observations = new Map(entries.map(entry => [entry.context.traceId,
+      {...target.observation, traceId: entry.context.traceId, instanceId: entry.lease.id, analysisRunPrivate: true}]));
+    const service = {getTrace: jest.fn((id: string) => [...traces.values()].find(trace => trace.id === id)),
+      getRunningNativeProcessorObservation: jest.fn((id: string, options: any) => {
+        expect(options.leaseId).toBe(`lease-${id.slice('trace-'.length)}`);
+        return observations.get(id);
+      }), getRunningCapabilityTraceProcessorInput: jest.fn(() => target.observation.binarySelection),
+      query: jest.fn(async (id: string, _sql: string, options: any) => {
+        expect(options.leaseId).toBe(`lease-${id.slice('trace-'.length)}`);
+        return {columns: ['dur', 'row_id'], rows: [[id === 'trace-current' ? 42_000_000 : 24_000_000, id === 'trace-current' ? 7 : 8]]};
+      })};
+    const group = {entries, assertCurrent: jest.fn(), run: jest.fn(async (callback: () => Promise<any>) => callback()), release: jest.fn()};
+    const expected = parseAgentSseExpectation({...target.expectation, facts: [target.expectation.facts[0],
+      {...target.expectation.facts[0], id: 'reference_duration', value: 24_000_000,
+        oracle: {...target.expectation.facts[0].oracle!, traceSide: 'reference'}}]});
+    const prepareLeases = jest.fn(async () => group as unknown as AnalysisRunTraceProcessorLeases);
+    const collect = () => collectAgentSseOracleEvidence({expectation: expected, traceId: 'trace-current', referenceTraceId: 'trace-reference',
+      service: service as any, scope, deadlineMs: Date.now() + 1000},
+      {prepareLeases, resolveIdentity: target.resolveIdentity, loadDocs: target.loadDocs});
+    return {traces, entries, service, group, prepareLeases, collect};
+  }
+
+  it('uses one authentic pair lease group with separate native pins and same-SQL results', async () => {
+    const pair = pairGroupFixture();
+    const result = await pair.collect();
+    expect(result.rows).toEqual({duration: [{dur: 42_000_000, row_id: 7}], reference_duration: [{dur: 24_000_000, row_id: 8}]});
+    expect(result.schemas.duration.traceId).toBe('trace-current');
+    expect(result.schemas.reference_duration.traceId).toBe('trace-reference');
+    expect(pair.prepareLeases).toHaveBeenCalledWith(expect.objectContaining({currentTraceId: 'trace-current', referenceTraceId: 'trace-reference'}));
+    expect(pair.service.query.mock.calls.map(call => call[0])).toEqual(['trace-current', 'trace-reference']);
+    expect(pair.group.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects swapped side leases and a reference registration replaced during the current query', async () => {
+    const swapped = pairGroupFixture();
+    swapped.entries[1].side = 'current';
+    await expect(swapped.collect()).rejects.toThrow('lease unavailable');
+    expect(swapped.group.release).toHaveBeenCalledTimes(1);
+    const replaced = pairGroupFixture();
+    const query = replaced.service.query.getMockImplementation()!;
+    replaced.service.query.mockImplementation(async (...args) => {
+      const result = await query(...args);
+      replaced.traces.set('reference', {id: 'trace-reference', status: 'ready'});
+      return result;
+    });
+    await expect(replaced.collect()).rejects.toThrow('registration changed');
+    expect(replaced.group.release).toHaveBeenCalledTimes(1);
+  });
 
   it('pins and queries inside one formally prepared oracle group, then releases it without exporting owner tokens', async () => {
     const target = groupFixture();

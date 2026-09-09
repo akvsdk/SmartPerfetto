@@ -39,6 +39,26 @@ describe('EnhancedSessionContext', () => {
       ctx = new EnhancedSessionContext('session-1', 'trace-1');
     });
 
+    test('keeps stable turn indices after eviction and restart without promoting unknown completion', () => {
+      for (let index = 0; index < 35; index++) {
+        ctx.addTurn(`question-${index}`, mockIntent, {success: true, findings: [], message: `answer-${index}`});
+      }
+      expect(ctx.getAllTurns()).toHaveLength(30);
+      expect(ctx.getAllTurns()[29].turnIndex).toBe(34);
+      const restored = EnhancedSessionContext.deserialize(ctx.serialize());
+      expect(restored.addTurn('next', mockIntent).turnIndex).toBe(35);
+      const history = restored.getAnalysisHistory();
+      expect(history[history.length - 1]).toMatchObject({turnIndex: 34, completionStatus: 'unknown', partial: true});
+    });
+
+    test('uses the original finalized run identity and source fingerprint in typed history', () => {
+      const created = ctx.addTurn('Q', mockIntent, {success: true, findings: [], message: 'A', sourceDerived: true,
+        analysisContextFingerprint: 'original-source-A', completion: {schemaVersion: 1, runtimeKind: 'openai-agents-sdk',
+          status: 'completed', runId: 'stable-run', attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: 'body'}});
+      expect(ctx.getAnalysisHistory()[0]).toMatchObject({id: 'stable-run', analysisContextFingerprint: 'original-source-A'});
+      expect(ctx.getAnalysisHistory()[0].id).not.toBe(created.id);
+    });
+
     test('should add conversation turn', () => {
       const turn = ctx.addTurn('What is causing the jank?', mockIntent);
 

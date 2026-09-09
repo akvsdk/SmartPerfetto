@@ -63,6 +63,33 @@ describe('raw SQL native provenance', () => {
     expect(readRawSqlCaptureFields(result)).toBeUndefined();
   });
 
+  it('keeps native duration and row authority for a simple query after a benign nested SELECT', async () => {
+    const native = createRawSqlNativeProvenance('nested-read', [bootstrapSql], 'trace');
+    await initializeRawSqlNativeProvenance(native.provenance, binary);
+    const nested = {columns: ['track_id'], rows: [[458]], durationMs: 1};
+    sealRawSqlNativeQuery(beginRawSqlNativeQuery(native.provenance,
+      'SELECT t.id AS track_id FROM track t WHERE t.id = (SELECT track_id FROM slice WHERE id = 50220)'), nested);
+    expect(readRawSqlNativeProvenanceSnapshot(native.provenance).status).toBe('trusted');
+    expect(readRawSqlCaptureMetadata(nested)).toBeUndefined();
+    const direct = {columns: ['id', 'dur'], rows: [[50220, 33000000]], durationMs: 1};
+    sealRawSqlNativeQuery(beginRawSqlNativeQuery(native.provenance, 'SELECT id, dur FROM slice WHERE id = 50220'), direct);
+    const witness = captureRawSqlEvidence(direct, {traceId: 'trace', traceSide: 'current'});
+    expect(capturedEvidenceTable(witness)?.fields.dur).toMatchObject({unit: 'ns', origin: {kind: 'native_producer'}});
+    expect(capturedNativeRow(witness, 0)).toMatchObject({relation: 'slice', id: 50220, traceId: 'trace', traceSide: 'current'});
+    expect(readRawSqlCaptureMetadata({...direct})).toBeUndefined();
+    expect(readRawSqlCaptureMetadata(JSON.parse(JSON.stringify(direct)))).toBeUndefined();
+  });
+
+  it.each(['SELECT dur FROM slice WHERE id = (SELECT run_metric(?))',
+    'SELECT dur FROM slice WHERE id IN (SELECT run_metric(?))',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM slice; SELECT run_metric(?))'])
+  ('revokes all later native proof before executing an opaque nested query: %s', async sql => {
+    const native = await ready();
+    beginRawSqlNativeQuery(native.provenance, sql);
+    expect(readRawSqlNativeProvenanceSnapshot(native.provenance).status).toBe('tainted');
+    expect(readRawSqlCaptureFields(capture(native))).toBeUndefined();
+  });
+
   it('handles prototype-named aliases as data keys', async () => {
     const result = capture(await ready(), 'SELECT dur AS "__proto__" FROM slice', ['__proto__']);
     const fields = readRawSqlCaptureFields(result)!;

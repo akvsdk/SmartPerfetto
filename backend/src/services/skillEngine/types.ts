@@ -16,6 +16,7 @@
 import type { ColumnDefinition } from '../../types/dataContract';
 import type { IdentityResolutionV1, EvidenceScopeMetadata, EvidenceScopeProvenanceV1, EvidenceScopeRole } from '../../types/identityContract';
 import type { EffectiveProcessScope } from '../processIdentity/effectiveProcessScope';
+import type { InvestigationEvidenceDeclaration } from '../evidence/investigationEvidenceLedger';
 
 export interface SqlProcessScopeDeclaration {
   role: EvidenceScopeRole;
@@ -194,6 +195,7 @@ export interface ExactSqlSource {
 }
 
 export interface AtomicStep {
+  investigation_evidence?: InvestigationEvidenceDeclaration;
   id: string;
   type: 'atomic';
   name?: string;
@@ -423,6 +425,7 @@ export interface SkillBatchAnalysisConfig {
 }
 
 export interface SkillDefinition {
+  investigation_evidence?: InvestigationEvidenceDeclaration;
   name: string;
   version: string;
   type: SkillType;

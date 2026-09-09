@@ -16,6 +16,7 @@ import {
   type OutputLanguage,
 } from '../agentv3/outputLanguage';
 import {renderRequiredLocalizedStrategyTemplate} from '../agentv3/localizedStrategyTemplate';
+import {renderAnalysisHistoryContext, toAnalysisHistoryTurn} from './analysisHistory';
 
 function freezeComparisonContext<T>(value: T, seen = new Set<object>()): T {
   if (!value || typeof value !== 'object' || seen.has(value)) return value;
@@ -143,7 +144,7 @@ export interface QuickConversationContextTurn {
   timestamp?: number;
   query: string;
   intent?: unknown;
-  result?: Pick<SubAgentResult, 'message'>;
+  result?: Pick<SubAgentResult, 'message' | 'partial' | 'completion' | 'terminationReason' | 'terminationMessage' | 'conclusionContract'>;
   findings?: Array<Pick<Finding, 'severity' | 'title'>>;
   turnIndex: number;
   completed: boolean;
@@ -157,40 +158,10 @@ export function buildQuickConversationContext(
   previousTurns: QuickConversationContextTurn[],
   outputLanguage: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
 ): string | undefined {
-  const turns = previousTurns.filter(turn => turn.completed).slice(-3);
-  if (turns.length === 0) return undefined;
-
-  const renderedTurns: string[] = [];
-
-  for (const turn of turns) {
-    const query = compactForPrompt(turn.query, 220);
-    const answer = compactForPrompt(turn.result?.message || '', 700);
-    const findings = (turn.findings ?? [])
-      .slice(0, 3)
-      .map(f => `[${f.severity}] ${compactForPrompt(f.title, 160)}`)
-      .filter(Boolean);
-
-    renderedTurns.push(renderRequiredLocalizedStrategyTemplate(
-      'prompt-runtime-conversation-turn',
-      outputLanguage,
-      {
-        turnNumber: turn.turnIndex + 1,
-        query,
-        answerLine: answer
-          ? `- ${localize(outputLanguage, '上轮回答', 'Previous answer')}: ${answer}`
-          : '',
-        findingsLine: findings.length > 0
-          ? `- ${localize(outputLanguage, '上轮发现', 'Previous findings')}: ${findings.join('; ')}`
-          : '',
-      },
-    ));
-  }
-
-  return renderRequiredLocalizedStrategyTemplate(
-    'prompt-runtime-conversation-context',
-    outputLanguage,
-    {turns: renderedTurns.join('\n\n')},
-  );
+  return renderAnalysisHistoryContext(previousTurns.filter(turn => turn.result).map(turn => toAnalysisHistoryTurn({
+    id: turn.id ?? `legacy-turn-${turn.turnIndex}`, turnIndex: turn.turnIndex,
+    query: turn.query, traceId: '', timestamp: turn.timestamp ?? 0, result: turn.result,
+  })), {outputLanguage});
 }
 
 export interface QuickMemoryContextInput {

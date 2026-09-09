@@ -235,8 +235,7 @@ worker path. The BYOK key reaches only the SDK `resolveModel` callback, not the
 SDK subprocess environment, diagnostics, or plaintext snapshots. Provider,
 base URL, and style remain non-secret snapshot inputs, while key changes update
 the secret fingerprint used by provider pinning, resume, external issue, and
-Self-Evolution proof boundaries. Public sessions may resume by Qoder SDK session
-id. A run authorized for private codebase or external knowledge never resumes
+Self-Evolution proof boundaries. Public logical follow-ups use product history and a fresh model context. A run authorized for private codebase or external knowledge never resumes
 or stores that opaque provider session, and its intermediate state is excluded
 from durable snapshots.
 
@@ -293,6 +292,24 @@ Bounded/unavailable intent does not trigger automatic prefetch. Planning is on
 demand; completed phases require real successful evidence or an explicit valid
 disposition. Unfinished exploration plans and hypotheses retain their state;
 they neither trigger automatic continuation nor determine answer completeness alone.
+
+## Turn Budgets And Closeout
+
+Full mode defaults to 100 turns and quick mode to 50; the five-turn quick target
+is advisory. A budget above one reserves one no-tool delivery call. Early normal
+completion adds no call. At investigation exhaustion, closeout uses the selected
+model, pinned provider, current authorization and original deadline to explain
+the supported findings, missing evidence and useful follow-up questions.
+It cannot query again or certify completion: `partial`, `turn_limit` completion
+and `max_turns` termination remain. No model semantic review follows this closeout;
+deterministic evidence checks can still run.
+
+A failed closeout retains the original candidate. Cancellation, timeout, revoked
+authorization or an exhausted explicit cost budget cannot start another call.
+A one-turn configuration has no extra delivery allowance. OpenCode stops acquisition
+after observing native messages and can overshoot between observations. It records
+actual turns and skips the summary when no allowance remains; this is not a strict
+model-call cap.
 
 ## SSE Events
 
@@ -370,14 +387,29 @@ natural-language conclusions.
 The route layer calls `orchestrator.takeSnapshot()` and restores with
 `restoreFromSnapshot()`.
 
-Claude runtime persists the Claude SDK session id. OpenAI runtime persists
-OpenAI history, the last response id, and reserved run state. Responses API can
-resume with `previousResponseId`; Chat Completions-compatible providers resume
-from full history.
+Each logical follow-up starts a fresh model context while retaining the logical
+session and provider/runtime pin. Native SDK context is used within the current
+investigation, without implicitly replaying older SDK sessions, `previousResponseId`
+or opaque transcripts across questions.
 
-Pi Agent Core, OpenCode, and Qoder store runtime-specific opaque state only where the
-adapter supports it. They still preserve provider/runtime identity so resume,
-reports, and snapshots do not silently switch to another engine.
+`analysisHistory.ts` supplies bounded, typed history to classification and analysis:
+the latest three questions and answers, the latest unfinished work, and an older-turn index.
+It preserves partial/unknown status, termination, uncertainties and next steps.
+The default analysis preview is bounded to 12,000 bytes, classification to 6,000;
+answer detail yields to completeness and open questions. `read_session_history`
+pages the full questions, answers and declared locators of the product-bound
+session. It accepts no owner/session selector and performs no new SQL acquisition.
+`fetch_artifact` remains the reader for available raw table evidence.
+
+Full history reuses `conversation_turns`. A Conversation descriptor and finalized
+turn are saved in one transaction using `runtime_snapshots` and the history table.
+Reopen/restart recovery validates tenant, workspace, current owner, trace, provider
+pin and source permissions before hydrating a logical session. A crashed running
+turn becomes interrupted, with no phantom execution. Write failure retains the
+answer and reports recovery unavailable. Source-derived history requires an exact
+match with its original authorization fingerprint; missing or changed scope is
+not resent to the model. History and locators cannot restore current execution
+witnesses or expand the current selection or proof scope.
 
 Snapshots also carry final-result quality fields such as conclusion contracts,
 claim verification results, and identity resolutions so resume, report export,
@@ -443,3 +475,9 @@ Authenticated `GET /api/runtime-health` exposes the selected runtime. Public
 
 This distinguishes provider connectivity from the runtime that will actually
 execute analysis.
+
+## System investigation acquisition and delivery boundaries
+
+Scene investigation obligations are pinned separately from report formatting. Ordinary answers and comparisons may also require system investigation. The shared tool observer and original execution captures provide trusted acquisition records; tool names, model declarations and truncated summaries cannot establish that a dimension was checked. Observer failure preserves the tool outcome, and absent records remain unknown / not_checked.
+
+Investigation interpretation reuses the same bounded no-tool semantic assessment at the product boundary. Acquisition and content coverage are separate and bound to the body, contract, intent, registry and ledger fingerprints. Coverage gaps cannot rewrite the conclusion, start a new acquisition loop or alter native SDK completion. Historical snapshots remain historical records and do not reissue current-run evidence authority.

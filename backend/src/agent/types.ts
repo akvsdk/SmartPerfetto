@@ -703,6 +703,7 @@ export interface SubAgentResult {
   outputOrigin?: import('../types/analysisDelivery').AnalysisOutputOrigin;
   runtimeAppendix?: import('../types/analysisDelivery').AnalysisRuntimeAppendix;
   reportAssessment?: import('../types/analysisDelivery').FinalReportAssessment;
+  investigationAssessment?: import('../types/analysisInvestigationAssessment').FinalInvestigationAssessment;
   deliveryAssurance?: import('../types/analysisDelivery').AnalysisDeliveryAssurance;
   sourceUseDecision?: import('../services/codebase/sourceUseDecision').SourceUseDecisionV1;
   sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;
@@ -719,6 +720,11 @@ export interface SubAgentResult {
   partial?: boolean;
   terminationReason?: string;
   terminationMessage?: string;
+  /** Explicit cross-turn metadata, independent of natural-language headings. */
+  uncertainties?: string[];
+  nextSteps?: string[];
+  sourceDerived?: boolean;
+  analysisContextFingerprint?: string;
 }
 
 // =============================================================================

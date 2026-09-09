@@ -148,12 +148,17 @@ function createRuntimeProvider(options) {
   const runtimeModels = createModels();
   const runtimeFaux = fauxProvider(options);
   runtimeModels.setProvider(runtimeFaux.provider);
+  const requests = [];
   return {
     runtimeFaux,
+    requests,
     loader: async () => ({
       model: runtimeFaux.getModel(),
       models: runtimeModels,
-      streamFn: runtimeModels.streamSimple.bind(runtimeModels),
+      streamFn: (runtimeModel, context, requestOptions) => {
+        requests.push({messages: structuredClone(context.messages)});
+        return runtimeModels.streamSimple(runtimeModel, context, requestOptions);
+      },
     }),
   };
 }
@@ -252,11 +257,22 @@ const resumedSnapshot = resumedRuntime.takeSnapshot(
   'trace-pi-real',
   createSnapshotFields(),
 );
-assert.ok(
-  resumedSnapshot.engineState?.kind === 'pi-agent-core' &&
-  resumedSnapshot.engineState.pi.opaque?.messageCount >
-    runtimeSnapshot.engineState.pi.opaque.messageCount,
+assert.equal(resumedSnapshot.engineState?.kind, 'pi-agent-core');
+assert.equal(
+  resumedSnapshot.engineState.pi.opaque?.messageCount,
+  runtimeSnapshot.engineState.pi.opaque.messageCount,
 );
+// A logical follow-up gets fresh native messages. Product-owned, bounded
+// history supplies continuity to both classification and the answer request.
+assert.equal(resumedRuntimeProvider.requests.length, 2);
+for (const request of resumedRuntimeProvider.requests) {
+  assert.equal(request.messages.length, 1);
+  assert.equal(request.messages[0].role, 'user');
+  const currentInput = JSON.stringify(request.messages[0].content);
+  assert.match(currentInput, /historical_context/);
+  assert.match(currentInput, /runtime-first/);
+  assert.match(currentInput, /completionStatus/);
+}
 
 resumedRuntimeProvider.runtimeFaux.setResponses([
   runtimeIntentResponse(), fauxAssistantMessage('private-runtime'),

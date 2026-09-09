@@ -14,6 +14,8 @@
  * is passed — ensures `smartperfetto analyze ... > log.txt` stays clean.
  */
 
+import {investigationStatusLines} from '../../services/analysisInvestigationPresentation';
+import type {AnalysisDeliveryAssurance} from '../../types/analysisDelivery';
 import type { StreamingUpdate } from '../../agent/types';
 import {localize, parseOutputLanguage} from '../../agentv3/outputLanguage';
 
@@ -50,6 +52,18 @@ function ansi(code: string, on: boolean): (s: string) => string {
   return (s) => (on ? `\x1b[${code}m${s}\x1b[0m` : s);
 }
 
+interface CompletionMetadata {
+  reportPath: string;
+  turnReportPath?: string;
+  sessionDir: string;
+  sessionId: string;
+  success?: boolean;
+  partial?: boolean;
+  terminationReason?: string;
+  terminationMessage?: string;
+  hasConclusion?: boolean;
+}
+
 export interface Renderer {
   format: OutputFormat;
   onEvent(update: StreamingUpdate): void;
@@ -59,11 +73,12 @@ export interface Renderer {
     rounds?: number;
     durationMs?: number;
     claimVerification?: ClaimVerificationSummary;
+    investigationAssurance?: Pick<AnalysisDeliveryAssurance, 'investigation' | 'investigationEvidence'>;
   }): void;
   /** Called on fatal errors that abort the run. */
   printError(message: string): void;
   /** Called last to summarize report path + any diagnostics. */
-  printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean; partial?: boolean; terminationReason?: string }): void;
+  printCompletion(meta: CompletionMetadata): void;
 }
 
 export function createRenderer(opts: RendererOptions): Renderer {
@@ -186,6 +201,7 @@ export function createRenderer(opts: RendererOptions): Renderer {
       rounds?: number;
       durationMs?: number;
       claimVerification?: ClaimVerificationSummary;
+      investigationAssurance?: Pick<AnalysisDeliveryAssurance, 'investigation' | 'investigationEvidence'>;
     }
   ): void {
     closeAnswerStream();
@@ -193,13 +209,18 @@ export function createRenderer(opts: RendererOptions): Renderer {
     console.log(`\n${cyan(bar)}`);
     console.log(bold('结论'));
     console.log(cyan(bar));
-    console.log(conclusion || dim('(空)'));
+    console.log(conclusion.trim() ? conclusion : dim(localize(
+      parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE),
+      '未生成可交付结论。', 'No deliverable conclusion was generated.',
+    )));
     console.log(cyan(bar));
     const bits: string[] = [];
     if (meta.confidence !== undefined) bits.push(`confidence ${(meta.confidence * 100).toFixed(0)}%`);
     if (meta.rounds !== undefined) bits.push(`${meta.rounds} rounds`);
     if (meta.durationMs !== undefined) bits.push(`${Math.round(meta.durationMs / 100) / 10}s`);
     if (bits.length) console.log(dim(bits.join(' · ')));
+    for (const line of investigationStatusLines(meta.investigationAssurance,
+      parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE))) console.log(dim(line));
   }
 
   function printError(message: string): void {
@@ -207,20 +228,24 @@ export function createRenderer(opts: RendererOptions): Renderer {
     console.error(red(`\n✗ ${message}`));
   }
 
-  function printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean; partial?: boolean; terminationReason?: string }): void {
+  function printCompletion(meta: CompletionMetadata): void {
     closeAnswerStream();
     // A truncated run reached this point with a plain green tick, which is the
     // same thing a complete run prints. Say which one happened.
-    const mark = meta.partial ? yellow('!') : green('✓');
+    const mark = meta.success === false ? red('✗') : meta.partial ? yellow('!') : green('✓');
     console.log(`\n${mark} session ${bold(meta.sessionId)}`);
-    if (meta.partial) {
+    if (meta.partial || meta.success === false) {
       const language = parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
       const reason = meta.terminationReason ? ` (${meta.terminationReason})` : '';
-      console.log(dim(localize(
-        language,
-        `  分析未完整结束，结果为部分内容${reason}`,
-        `  analysis did not finish; this is a partial result${reason}`,
-      )));
+      const message = meta.hasConclusion === false
+        ? localize(language, '分析已终止，未生成可交付结论', 'analysis stopped without a deliverable conclusion')
+        : meta.terminationReason === 'quality_gate_failed'
+          ? localize(language, '已有正文，但未通过质量校验', 'a narrative is available, but quality checks did not pass')
+          : localize(language, '分析未完整结束，结果为部分内容', 'analysis did not finish; this is a partial result');
+      console.log(dim(`  ${message}${reason}`));
+    }
+    if (meta.terminationMessage?.trim()) {
+      console.log(dim(`  ${meta.terminationMessage.trim()}`));
     }
     console.log(`  ${dim('dir:')}    ${meta.sessionDir}`);
     console.log(`  ${dim('report:')} ${meta.reportPath}`);
@@ -240,6 +265,7 @@ function createMachineRenderer(format: 'json' | 'ndjson'): Renderer {
     rounds?: number;
     durationMs?: number;
     claimVerification?: ClaimVerificationSummary;
+    investigationAssurance?: Pick<AnalysisDeliveryAssurance, 'investigation' | 'investigationEvidence'>;
   } | null = null;
 
   function emit(obj: Record<string, unknown>, stream: NodeJS.WriteStream = process.stdout): void {
@@ -262,6 +288,7 @@ function createMachineRenderer(format: 'json' | 'ndjson'): Renderer {
       rounds?: number;
       durationMs?: number;
       claimVerification?: ClaimVerificationSummary;
+      investigationAssurance?: Pick<AnalysisDeliveryAssurance, 'investigation' | 'investigationEvidence'>;
     },
   ): void {
     conclusionPayload = { conclusion, ...meta };
@@ -281,12 +308,14 @@ function createMachineRenderer(format: 'json' | 'ndjson'): Renderer {
     }, process.stderr);
   }
 
-  function printCompletion(meta: { reportPath: string; turnReportPath?: string; sessionDir: string; sessionId: string; success?: boolean; partial?: boolean; terminationReason?: string }): void {
+  function printCompletion(meta: CompletionMetadata): void {
     if (format === 'ndjson') {
       emit({
         ok: meta.success !== false,
         ...(meta.partial ? { partial: true } : {}),
         ...(meta.terminationReason ? { terminationReason: meta.terminationReason } : {}),
+        ...(meta.terminationMessage ? { terminationMessage: meta.terminationMessage } : {}),
+        ...(meta.hasConclusion !== undefined ? { hasConclusion: meta.hasConclusion } : {}),
         type: 'complete',
         sessionId: meta.sessionId,
         sessionDir: meta.sessionDir,
@@ -300,6 +329,8 @@ function createMachineRenderer(format: 'json' | 'ndjson'): Renderer {
       ok: meta.success !== false,
       ...(meta.partial ? { partial: true } : {}),
       ...(meta.terminationReason ? { terminationReason: meta.terminationReason } : {}),
+      ...(meta.terminationMessage ? { terminationMessage: meta.terminationMessage } : {}),
+      ...(meta.hasConclusion !== undefined ? { hasConclusion: meta.hasConclusion } : {}),
       sessionId: meta.sessionId,
       sessionDir: meta.sessionDir,
       reportPath: meta.reportPath,

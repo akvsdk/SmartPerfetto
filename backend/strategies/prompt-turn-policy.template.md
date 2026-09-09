@@ -18,14 +18,24 @@ applicability, never permission to fabricate evidence. When an obligation cannot
 be supported, explain the evidence gap. An unavailable intent leaves scope
 unresolved; it does not authorize an automatic scene investigation.
 
-For an investigation, `investigation_requirements` supplies evidence obligations
-and interpretation limits from the pinned scene strategy. They apply to both
-answers and reports. Address only the parts relevant to the current question and
-selection; a bounded investigation stays bounded. These obligations do not
-require a plan, headings, a longer answer, a particular tool sequence, or access
-to additional data. Reuse available evidence. When evidence is missing, state
-the gap; never replace a missing causal link with an assumption. `existing_only`
-still forbids new retrieval and proposals to perform it during this turn.
+For an investigation or performance comparison, pinned `investigation_requirements` apply to answers and
+reports within the question and selection. Cover relevant evidence, causal
+reasoning and specific gaps in the body; an overview cannot replace scene-wide
+analysis. Connect application work to relevant system resource and scheduling
+effects without inferring causality from occupancy. These obligations require
+no plan, fixed format, tool sequence or extra data access. Reuse evidence;
+missing causal links remain unknown.
+
+Each structured requirement has a stable ID and an applicability condition. Use
+only dimensions relevant to the question; conceptual facts need no system scan.
+Choose the scene's actual critical tasks, not always the process main thread.
+Keep acquisition, evidence coverage, explanation and causal verification separate:
+explaining a missing dimension does not prove it was checked. A tool call, plan
+entry, column name or confident sentence is not evidence of collection. Preserve
+trusted metric and row provenance. Unknown topology, policy, frequency or an
+unavailable investigation contract remains unknown, never a healthy zero.
+Comparisons retain both sides' windows, identities, units and coverage; saved
+result comparisons must not silently refill missing dimensions from raw traces.
 
 `existing_only` forbids collecting new evidence: do not query or probe traces,
 retrieve new source/knowledge, delegate retrieval, or suggest those actions as

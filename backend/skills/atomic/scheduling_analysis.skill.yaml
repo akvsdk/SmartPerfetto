@@ -40,6 +40,16 @@ display:
   level: detail
   format: table
   columns:
+    - {name: upid, label: "upid", type: number, hidden: true}
+    - {name: utid, label: "utid", type: number, hidden: true}
+    - {name: tid, label: "tid", type: number, hidden: true}
+    - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: state_covered_ns, label: "state_covered_ns", type: duration, unit: ns, hidden: true}
+    - {name: state_evidence, label: "state_evidence", type: string, hidden: true}
+    - {name: uninterruptible_ms, label: "uninterruptible_ms", type: number, hidden: true}
+    - {name: runnable_preempted_ms, label: "runnable_preempted_ms", type: number, hidden: true}
+    - {name: other_state_ms, label: "other_state_ms", type: number, hidden: true}
     - name: thread_name
       label: "线程"
       type: string
@@ -69,35 +79,36 @@ display:
       label: "长等待次数"
       type: number
 
+process_scope:
+  role: target
+  binding: effective_target_processes
+sql_fragments:
+  - fragments/effective_target_processes.sql
+  - fragments/system_thread_state_spans.sql
 sql: |
-  WITH target_threads AS (
-    SELECT t.utid, t.tid, t.name as thread_name, p.pid, p.name as process_name
-    FROM thread t
-    JOIN process p ON t.upid = p.upid
-    WHERE ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = ''
-  ),
-  thread_states AS (
-    SELECT
-      ts.utid,
-      ts.state,
-      ts.dur,
-      ts.ts
-    FROM thread_state ts
-    WHERE (${start_ts} IS NULL OR ts.ts >= ${start_ts})
-      AND (${end_ts} IS NULL OR ts.ts < ${end_ts})
-      AND ts.utid IN (SELECT utid FROM target_threads)
+  WITH system_windows AS (SELECT 0 AS window_id,
+    COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+    COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+  system_target_threads AS (
+    SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+    FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+    WHERE (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*')
   )
-  SELECT
-    tt.thread_name,
-    tt.process_name,
-    tt.tid = tt.pid as is_main_thread,
-    SUM(CASE WHEN tst.state = 'Running' THEN tst.dur ELSE 0 END) / 1e6 as running_ms,
-    SUM(CASE WHEN tst.state = 'R' THEN tst.dur ELSE 0 END) / 1e6 as runnable_ms,
-    SUM(CASE WHEN tst.state IN ('S', 'D') THEN tst.dur ELSE 0 END) / 1e6 as sleeping_ms,
-    MAX(CASE WHEN tst.state = 'R' THEN tst.dur ELSE 0 END) / 1e6 as max_runnable_ms,
-    COUNT(CASE WHEN tst.state = 'R' AND tst.dur > 5000000 THEN 1 END) as long_runnable_count
-  FROM target_threads tt
-  LEFT JOIN thread_states tst ON tt.utid = tst.utid
-  GROUP BY tt.utid
-  HAVING running_ms > 0 OR runnable_ms > 0
-  ORDER BY runnable_ms DESC
+  SELECT tt.upid,t.utid,t.tid,t.name AS thread_name,p.name AS process_name,t.tid=p.pid AS is_main_thread,
+    w.window_start_ts,w.window_end_ts,
+    SUM(CASE WHEN s.state='Running' THEN s.dur_ns ELSE 0 END)/1e6 AS running_ms,
+    SUM(CASE WHEN s.state IN ('R','R+') THEN s.dur_ns ELSE 0 END)/1e6 AS runnable_ms,
+    SUM(CASE WHEN s.state='R+' THEN s.dur_ns ELSE 0 END)/1e6 AS runnable_preempted_ms,
+    SUM(CASE WHEN s.state IN ('S','I') THEN s.dur_ns ELSE 0 END)/1e6 AS sleeping_ms,
+    SUM(CASE WHEN s.state IN ('D','DK') THEN s.dur_ns ELSE 0 END)/1e6 AS uninterruptible_ms,
+    SUM(CASE WHEN s.state NOT IN ('Running','R','R+','S','I','D','DK') THEN s.dur_ns ELSE 0 END)/1e6 AS other_state_ms,
+    MAX(CASE WHEN s.state IN ('R','R+') THEN s.dur_ns ELSE 0 END)/1e6 AS max_runnable_ms,
+    COUNT(CASE WHEN s.state IN ('R','R+') AND s.dur_ns>5000000 THEN 1 END) AS long_runnable_count,
+    SUM(s.dur_ns) AS state_covered_ns,
+    CASE WHEN COUNT(s.thread_state_id)=0 THEN 'unavailable'
+      WHEN SUM(s.dur_ns)<w.window_end_ts-w.window_start_ts THEN 'partial' ELSE 'observed' END AS state_evidence
+  FROM system_target_threads tt JOIN system_windows w ON tt.window_id=w.window_id
+  JOIN thread t ON t.utid=tt.utid JOIN process p ON p.upid=tt.upid
+  LEFT JOIN system_thread_state_spans s ON s.window_id=tt.window_id AND s.utid=tt.utid
+  GROUP BY tt.window_id,tt.utid
+  ORDER BY runnable_ms DESC,uninterruptible_ms DESC,running_ms DESC

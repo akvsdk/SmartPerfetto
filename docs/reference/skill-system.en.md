@@ -256,3 +256,11 @@ removing a pack does not keep stale content executable. Legacy global
 `/api/admin/skills` and the current `smp skill` CLI path remain built-in-only;
 CLI execution of workspace packs requires future explicit tenant/workspace
 context support.
+
+## System investigation evidence contract
+
+A scene Strategy references versioned profiles from `backend/strategies/investigation-profiles.yaml` through `investigation_contract`. `evidence_metrics` uses producer-declared metric IDs; display column names cannot confer semantic authority. Ordinary-answer investigation obligations are separate from `final_report_contract`.
+
+System SQL intersects requested windows, scheduling spans and frequency samples, preserving original and clipped timestamps, UTID/UPID, CPU/ucpu and topology provenance. Thread states distinguish Running, R/R+, S/I, D/DK and unknown coverage. Placement retains medium and unknown clusters. An exact same-ucpu next-task handoff establishes an observed switch, not its motive or all attributable waiting. Observed priority does not establish FIFO/RR/OTHER policy.
+
+`display.columns` projection must preserve identity, scope and provenance fields needed by downstream evidence reads. Composite Skills, artifact save/restore and fetch retain these facts. Formatted missing values cannot replace original typed nulls.

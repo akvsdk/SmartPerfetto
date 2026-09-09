@@ -4,7 +4,8 @@
 
 import {loadPromptTemplate, renderTemplate} from '../../agentv3/strategyLoader';
 import {parseConclusionContractSidecar} from '../../agent/core/conclusionContract';
-import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
+import type {AnalysisResult, AnalysisOptions} from '../../agent/core/orchestratorTypes';
+import {renderAnalysisHistoryContext, type AnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
 
 export type ConversationTraceContext =
   | {kind: 'none'}
@@ -13,8 +14,11 @@ export type ConversationTraceContext =
 export interface ConversationMessage {
   role: 'user' | 'assistant';
   content: string;
-  /** Source-derived assistant text stays out of later dormant primary prompts. */
+  /** Both sides of a source-derived turn stay out of dormant primary prompts. */
   sourceDerived?: boolean;
+  turnId?: string;
+  /** Public history metadata, never an execution witness or SDK transcript. */
+  turn?: AnalysisHistoryTurn;
 }
 
 export interface ConversationEvidenceRef {
@@ -35,6 +39,8 @@ interface ConversationOutcomeBase {
   evidence?: ConversationEvidenceRef[];
   /** Public finalized result only; runtime context and parser diagnostics stay private. */
   finalResult?: AnalysisResult;
+  /** Delivery succeeded, but this turn cannot currently be recovered after restart. */
+  recoveryStatus?: 'unavailable';
 }
 
 export type ConversationRuntimeOutcome =
@@ -232,23 +238,45 @@ export function parseConversationResponseWithProjection(
     issues: control.kind === 'answered' ? [] : [{code: 'invalid_control'}]};
 }
 
-function formatHistory(history: ConversationMessage[]): string {
-  if (history.length === 0) return '（这是本次对话的第一轮。）';
-  return history.slice(-12).map((message) => (
-    `${message.role === 'user' ? '用户' : '助手'}：${message.content}`
-  )).join('\n\n');
+/** Compatibility for older callers; current sessions carry finalized typed turns. */
+export function conversationMessagesToHistoryTurns(history: readonly ConversationMessage[]): AnalysisHistoryTurn[] {
+  const turns: AnalysisHistoryTurn[] = [];
+  let query: ConversationMessage | undefined;
+  for (const message of history) {
+    if (message.role === 'user') {
+      if (query) turns.push(legacyTurn(query, undefined, turns.length));
+      query = message;
+    } else {
+      const turn = message.turn ?? legacyTurn(query, message, turns.length);
+      turns.push({...turn, ...(query?.sourceDerived || message.sourceDerived ? {sourceDerived: true} : {})});
+      query = undefined;
+    }
+  }
+  if (query) turns.push(legacyTurn(query, undefined, turns.length));
+  return turns;
+}
+
+function legacyTurn(query: ConversationMessage | undefined, answer: ConversationMessage | undefined,
+  index: number): AnalysisHistoryTurn {
+  return {id: answer?.turnId ?? query?.turnId ?? `legacy-${index + 1}`, turnIndex: index + 1,
+    query: query?.content ?? '', answer: answer?.content ?? '', timestamp: 0, traceId: '',
+    partial: true, completionStatus: 'unknown', uncertainties: [], nextSteps: [], evidence: [],
+    ...(query?.sourceDerived || answer?.sourceDerived ? {sourceDerived: true} : {})};
 }
 
 export function buildConversationPrompt(input: {
   question: string;
   history: ConversationMessage[];
   traceContext: ConversationTraceContext;
+  historyTurns?: readonly AnalysisHistoryTurn[];
+  outputLanguage?: AnalysisOptions['outputLanguage'];
 }): string {
   const template = loadPromptTemplate('prompt-conversation');
   if (!template) throw new Error('Conversation prompt template is not configured');
   return renderTemplate(template, {
     question: input.question,
-    historySection: formatHistory(input.history),
+    historySection: renderAnalysisHistoryContext(input.historyTurns ?? conversationMessagesToHistoryTurns(input.history),
+      {outputLanguage: input.outputLanguage}) ?? '',
     traceContextNotice: input.traceContext.kind === 'attached'
       ? `当前已附加 Trace（ID: ${input.traceContext.traceId}）。只有来自该 Trace 或本轮工具结果的内容才能表述为 Trace 事实。`
       : '当前没有附加 Trace。可以讨论需求、Android 性能原理、分析方法和已授权源码，但必须明确说明没有 Trace 证据，且不要调用 Trace 工具。',

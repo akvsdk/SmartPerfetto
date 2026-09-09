@@ -54,18 +54,18 @@ dialogue:
     - id: high_runnable_time
       severity: warning
       titleTemplate: "Thread scheduling delay: {delay_ms}ms in runnable state"
-      descriptionTemplate: "Thread {tid} waited {delay_ms}ms in runnable state due to CPU contention"
+      descriptionTemplate: "Thread {tid} waited {delay_ms}ms in runnable state with cause requiring direct contention evidence"
       evidenceFields: [tid, delay_ms, core_type, waker_thread]
 
     - id: cpu_throttling
       severity: critical
-      titleTemplate: "CPU frequency throttled: avg {avg_freq_mhz}MHz"
-      descriptionTemplate: "CPU running at {avg_freq_mhz}MHz, below expected frequency"
+      titleTemplate: "Observed CPU frequency: avg {avg_freq_mhz}MHz"
+      descriptionTemplate: "Time-weighted CPU frequency is {avg_freq_mhz}MHz; thermal or policy limitation requires direct evidence"
       evidenceFields: [avg_freq_mhz, max_freq_mhz, throttle_reason]
 
     - id: small_core_bound
       severity: warning
-      titleTemplate: "Critical thread bound to small cores"
+      titleTemplate: "Observed small-core residency"
       descriptionTemplate: "Thread {tid} running on small cores ({small_core_pct}%)"
       evidenceFields: [tid, small_core_pct, big_core_pct]
 
@@ -123,22 +123,27 @@ steps:
   - id: runnable_analysis
     type: atomic
     name: "Runnable 状态分析"
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     sql: |
-      SELECT
-        utid,
-        thread.name AS thread_name,
-        CAST(SUM(dur) / 1e6 AS INTEGER) AS runnable_ms,
-        COUNT(*) AS runnable_count,
-        CAST(AVG(dur) / 1e6 AS REAL) AS avg_runnable_ms,
-        CAST(MAX(dur) / 1e6 AS REAL) AS max_runnable_ms
-      FROM thread_state
-      JOIN thread USING (utid)
-      WHERE state = 'R'
-        AND thread.name NOT LIKE '%Binder%'
-        AND dur > 1000000  -- > 1ms
-      GROUP BY utid
-      ORDER BY runnable_ms DESC
-      LIMIT 20
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*') AND (${tid} IS NULL OR t.tid=${tid})
+      )
+      SELECT s.upid,s.utid,t.tid,t.name AS thread_name,s.window_start_ts,s.window_end_ts,
+        SUM(s.dur_ns)/1e6 AS runnable_ms,COUNT(*) AS runnable_count,
+        AVG(s.dur_ns)/1e6 AS avg_runnable_ms,MAX(s.dur_ns)/1e6 AS max_runnable_ms,
+        SUM(CASE WHEN s.state='R+' THEN s.dur_ns ELSE 0 END)/1e6 AS preempted_runnable_ms
+      FROM system_thread_state_spans s JOIN thread t ON t.utid=s.utid
+      WHERE s.state IN ('R','R+') GROUP BY s.window_id,s.utid ORDER BY runnable_ms DESC
     display:
       level: detail
       layer: overview
@@ -150,24 +155,22 @@ steps:
   - id: cpu_frequency
     type: atomic
     name: "CPU 频率分析"
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/system_sched_spans.sql
+      - fragments/system_cpu_frequency_spans.sql
     sql: |
-      WITH
-      cpu_info AS (
-        SELECT cpu_id as cpu, core_type
-        FROM _cpu_topology
-      )
-      SELECT
-        cct.cpu,
-        COALESCE(ci.core_type, 'unknown') AS core_type,
-        CAST(AVG(c.value) / 1000 AS INTEGER) AS avg_freq_mhz,
-        CAST(MAX(c.value) / 1000 AS INTEGER) AS max_freq_mhz,
-        CAST(MIN(c.value) / 1000 AS INTEGER) AS min_freq_mhz
-      FROM counter c
-      JOIN cpu_counter_track cct ON c.track_id = cct.id
-      LEFT JOIN cpu_info ci ON cct.cpu = ci.cpu
-      WHERE cct.name = 'cpufreq'
-      GROUP BY cct.cpu
-      ORDER BY cct.cpu
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts)
+      SELECT f.window_id,f.window_start_ts,f.window_end_ts,f.ucpu,f.cpu,ct.core_type,ct.topology_source,
+        SUM(f.freq_khz*1.0*f.dur_ns)/SUM(f.dur_ns)/1000 AS avg_freq_mhz,
+        MAX(f.freq_khz)/1000.0 AS max_freq_mhz,MIN(f.freq_khz)/1000.0 AS min_freq_mhz,
+        SUM(f.dur_ns) AS frequency_covered_ns,
+        'observed_peak_not_hardware_limit' AS frequency_evidence
+      FROM system_cpu_frequency_spans f LEFT JOIN system_cpu_topology ct ON ct.ucpu=f.ucpu
+      GROUP BY f.window_id,f.ucpu ORDER BY f.ucpu
     display:
       level: detail
       layer: overview
@@ -179,25 +182,29 @@ steps:
   - id: core_distribution
     type: atomic
     name: "大小核分布"
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_sched_spans.sql
     sql: |
-      WITH
-      cpu_info AS (
-        SELECT cpu_id as cpu, core_type
-        FROM _cpu_topology
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*') AND (${tid} IS NULL OR t.tid=${tid})
       )
-      SELECT
-        thread.name AS thread_name,
-        CAST(SUM(CASE WHEN ci.core_type IN ('prime', 'big') THEN dur ELSE 0 END) * 100.0 / SUM(dur) AS INTEGER) AS big_core_pct,
-        CAST(SUM(CASE WHEN ci.core_type = 'little' THEN dur ELSE 0 END) * 100.0 / SUM(dur) AS INTEGER) AS small_core_pct,
-        CAST(SUM(dur) / 1e6 AS INTEGER) AS total_ms
-      FROM sched_slice
-      JOIN thread USING (utid)
-      LEFT JOIN cpu_info ci ON sched_slice.cpu = ci.cpu
-      WHERE thread.name IN ('RenderThread', 'main', 'UI Thread')
-        OR thread.name LIKE '%${package}%'
-      GROUP BY utid
-      HAVING total_ms > 10
-      ORDER BY total_ms DESC
+      SELECT s.upid,s.utid,t.tid,t.name AS thread_name,s.window_start_ts,s.window_end_ts,
+        SUM(CASE WHEN s.core_type IN ('prime','big','medium') THEN s.dur_ns ELSE 0 END)*100.0/SUM(s.dur_ns) AS big_core_pct,
+        SUM(CASE WHEN s.core_type='little' THEN s.dur_ns ELSE 0 END)*100.0/SUM(s.dur_ns) AS small_core_pct,
+        SUM(CASE WHEN s.core_type='unknown' THEN s.dur_ns ELSE 0 END)*100.0/SUM(s.dur_ns) AS unknown_core_pct,
+        SUM(s.dur_ns)/1e6 AS total_ms,MIN(s.priority) AS priority_min,MAX(s.priority) AS priority_max,
+        'not_recorded_in_sched_slice' AS scheduling_policy_evidence
+      FROM system_sched_spans s JOIN system_target_threads tt ON tt.window_id=s.window_id AND tt.utid=s.utid AND tt.upid=s.upid
+      JOIN thread t ON t.utid=s.utid GROUP BY s.window_id,s.utid ORDER BY total_ms DESC
     display:
       level: detail
       layer: list
@@ -212,17 +219,17 @@ steps:
     inputs: [runnable_data, freq_data, core_data]
     rules:
       - condition: "runnable_data.data[0]?.runnable_ms > 50"
-        diagnosis: "线程 ${runnable_data.data[0]?.thread_name} Runnable 等待时间过长 (${runnable_data.data[0]?.runnable_ms}ms)，存在 CPU 竞争"
+        diagnosis: "线程 ${runnable_data.data[0]?.thread_name} Runnable 等待时间过长 (${runnable_data.data[0]?.runnable_ms}ms)；需结合交接任务与唤醒证据确定原因"
         confidence: high
         suggestions:
           - "检查是否有后台线程占用 CPU"
-          - "考虑提升关键线程优先级"
+          - "核对已采集的调度策略、优先级与对端任务"
         evidence_fields:
           - runnable_data.data[0].thread_name
           - runnable_data.data[0].runnable_ms
 
       - condition: "freq_data.data.find(f => f.core_type === 'big')?.avg_freq_mhz < 1500"
-        diagnosis: "大核 CPU 频率较低 (${freq_data.data.find(f => f.core_type === 'big')?.avg_freq_mhz}MHz)，可能存在热节流或功耗限制"
+        diagnosis: "观测大核窗口均频 ${freq_data.data.find(f => f.core_type === 'big')?.avg_freq_mhz}MHz；需结合覆盖、容量和直接温控/策略证据解释"
         confidence: medium
         suggestions:
           - "检查设备温度"
@@ -232,11 +239,11 @@ steps:
           - freq_data.data[0].max_freq_mhz
 
       - condition: "core_data.data[0]?.small_core_pct > 50"
-        diagnosis: "主线程大部分时间运行在小核 (${core_data.data[0]?.small_core_pct}%)，性能受限"
+        diagnosis: "目标线程大部分时间运行在小核 (${core_data.data[0]?.small_core_pct}%)；单凭驻留比例不能确定性能损失"
         confidence: medium
         suggestions:
           - "检查 CPU 亲和性设置"
-          - "考虑使用 SCHED_FIFO 提升优先级"
+          - "若采集缺少 affinity/cgroup/uclamp，明确证据缺口，不据此修改调度策略"
         evidence_fields:
           - core_data.data[0].thread_name
           - core_data.data[0].small_core_pct

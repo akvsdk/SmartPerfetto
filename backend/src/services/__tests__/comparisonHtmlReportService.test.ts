@@ -77,6 +77,7 @@ describe('renderComparisonHtmlReport', () => {
     expect(html).toContain('<span>startup</span>');
     expect(html).toContain('-300');
     expect(html).toContain('Candidate is 300 ms faster.');
+    expect(html).toContain('System investigation coverage: Not checked');
     expect(html).not.toContain('<script>');
   });
 

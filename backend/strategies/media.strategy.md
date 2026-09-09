@@ -3,6 +3,18 @@
 
 ---
 scene: media
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: media_critical_path
+      domain: critical_path
+      description: "Identify audio, codec, camera, renderer and service tasks and their buffer deadlines. Bind producer/consumer roles across authorized processes; keep each task priority observation separate from actual scheduling policy."
+    - id: media_dependencies
+      domain: dependency_chain
+      description: "Follow buffer queue, service/Binder, GPU and display dependencies for underrun or late-frame explanations. Missing scheduler policy is unknown and never proof that RT should be enabled."
 classification_description: "Audio, video and camera pipelines, decoding, playback or capture behavior and performance."
 priority: 6
 effort: medium

@@ -3,6 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import {AsyncLocalStorage} from 'node:async_hooks';
+import {createAnalysisHistoryReader, withAnalysisHistoryReader} from '../../agentRuntime/analysisHistory';
 import type {AnalysisOptions, AnalysisResult, IOrchestrator} from '../../agent/core/orchestratorTypes';
 import type {StreamingUpdate} from '../../agent';
 import {
@@ -26,6 +27,7 @@ import {loadPromptTemplate, renderTemplate} from '../../agentv3/strategyLoader';
 import {validateDataEnvelope, type DataEnvelope} from '../../types/dataContract';
 import {
   buildConversationPrompt,
+  conversationMessagesToHistoryTurns,
   type ConversationEvidenceRef,
   type ConversationRuntimeOutcome,
 } from '../contracts/conversationContract';
@@ -161,14 +163,20 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
     const {runtimeSessionId} = state;
     const analysisOptions = this.options.analysisOptions ?? {};
     const primarySourceUse = this.resolvePrimarySourceUse(input.query);
+    // Registered knowledge is independently enabled by the authorized selection.
+    const includeSourceDerived = primarySourceUse !== 'dormant' || Boolean(analysisOptions.knowledgeSourceIds?.length);
     const privateKnowledge = analysisContextUsesPrivateKnowledge(analysisOptions);
     const outputLanguage = analysisOptions.outputLanguage ?? 'zh-CN';
-    const history = primarySourceUse === 'dormant' ? input.history.filter(message => !message.sourceDerived) : input.history;
-    if (privateKnowledge) {
-      for (const query of new Set([...history.filter(message => message.role === 'user').map(message => message.content), input.query])) {
-        registerPrivateAnalysisQueryForEcho(runtimeSessionId, query);
-      }
-    }
+    // Filter whole turns, including source-bearing user queries, on every read.
+    const historyReader = createAnalysisHistoryReader({
+      assertActive: () => this.assertActive(input, state),
+      getTurns: () => {
+        const turns = input.getHistoryTurns?.() ?? conversationMessagesToHistoryTurns(input.history);
+        return turns.filter(turn => !turn.sourceDerived || (includeSourceDerived &&
+          Boolean(turn.analysisContextFingerprint) &&
+          turn.analysisContextFingerprint === state.analysisContextFingerprint));
+      },
+    });
     const traceId = input.traceContext.kind === 'attached' ? input.traceContext.traceId : `conversation-no-trace:${input.sessionId}`;
     const narrative = new AnalysisNarrativeStreamProjection();
     let evidenceBinding: RuntimeEvidenceBinding | undefined;
@@ -192,6 +200,10 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
     this.orchestrator.on('update', onUpdate);
     try {
       this.assertActive(input, state);
+      if (privateKnowledge) {
+        const queries = [...historyReader.getTurns().map(turn => turn.query), input.query];
+        for (const query of new Set(queries)) registerPrivateAnalysisQueryForEcho(runtimeSessionId, query);
+      }
       const options: AnalysisOptions = {...analysisOptions, selectionContext: input.selectionContext, analysisMode: 'fast',
         assistantSurface: 'conversation', conversationTraceAttached: input.traceContext.kind === 'attached', runId: input.runId};
       const scope = {logicalSessionId: input.sessionId, traceId, options};
@@ -205,7 +217,8 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
         signal: state.controller.signal, assertAuthorized: () => this.assertActive(input, state)});
       const artifacts = await evidenceBinding.describeArtifacts();
       this.assertActive(input, state);
-      let prompt = buildConversationPrompt({question: input.query, history, traceContext: input.traceContext});
+      let prompt = buildConversationPrompt({question: input.query, history: [], historyTurns: [],
+        traceContext: input.traceContext, outputLanguage});
       if (artifacts.artifacts.length > 0) {
         const template = loadPromptTemplate('prompt-conversation-evidence-context');
         if (!template) throw new Error('Conversation evidence context template is not configured');
@@ -214,7 +227,7 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
           context: 'retained_artifacts', ...projectedArtifacts,
         })})}`;
       }
-      const runtimeOptions = evidenceBinding.options;
+      const runtimeOptions = withAnalysisHistoryReader(evidenceBinding.options, historyReader, {includeSourceDerived});
       const analysis = this.updateExecution.run(state, () => this.orchestrator.analyze(prompt,
         runtimeSessionId, traceId, runtimeOptions))
         .then(result => this.finalizeRuntimeResult(result, input, state, dataEnvelopes,
@@ -260,6 +273,7 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
       revokeCodeAwareOutputGuards(runtimeSessionId);
       state.release();
       if (this.runtimeSessions.get(input.runId) === state) this.runtimeSessions.delete(input.runId);
+      if (this.currentSessionRuns.get(input.sessionId) === state) this.currentSessionRuns.delete(input.sessionId);
     }
   }
 

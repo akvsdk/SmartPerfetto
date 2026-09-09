@@ -208,6 +208,7 @@ export function normalizeResultForReport(
     // Presentation normalization cannot re-sign an accepted candidate or its verdict.
     ...(bodyChanged ? {completion: undefined} : {}),
     ...(bodyChanged || contractChanged ? {reportAssessment: undefined} : {}),
+    ...(bodyChanged || contractChanged || verificationChanged ? {investigationAssessment: undefined} : {}),
     ...(bodyChanged || contractChanged || verificationChanged ? {deliveryAssurance: undefined} : {}),
   };
 }

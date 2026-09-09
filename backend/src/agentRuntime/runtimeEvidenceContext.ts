@@ -215,9 +215,11 @@ function createRunStore(run: RunState): ArtifactStore {
   const facade = Object.freeze({
     store: (...args: Parameters<ArtifactStore['store']>) => access(() => store.store(structuredClone(args[0]))),
     registerEvidenceCapture: (...args: Parameters<ArtifactStore['registerEvidenceCapture']>) =>
-      access(() => store.registerEvidenceCapture(args[0], args[1], structuredClone(args[2]))),
+      access(() => store.registerEvidenceCapture(args[0], args[1], {...structuredClone(args[2]), originRunId: run.input.runId})),
     registerStandaloneEvidenceCapture: (...args: Parameters<ArtifactStore['registerStandaloneEvidenceCapture']>) =>
-      access(() => store.registerStandaloneEvidenceCapture(args[0], structuredClone(args[1]))),
+      access(() => store.registerStandaloneEvidenceCapture(args[0], {...structuredClone(args[1]), originRunId: run.input.runId})),
+    observeInvestigationTool: (...args: Parameters<ArtifactStore['observeInvestigationTool']>) =>
+      access(() => store.observeInvestigationTool(args[0], run.input.runId)),
     updateQueryReview: (...args: Parameters<ArtifactStore['updateQueryReview']>) =>
       access(() => store.updateQueryReview(args[0], structuredClone(args[1]))),
     get: (...args: Parameters<ArtifactStore['get']>) => access(() => structuredClone(store.get(...args))),
@@ -236,8 +238,16 @@ function createRunStore(run: RunState): ArtifactStore {
         throw new Error('runtime_evidence_read_scope_mismatch');
       }
       // ArtifactStore fixes the admitted capture set here, before any async read.
-      const view = store.createEvidenceReadView(args[0]);
-      return Object.freeze({async resolveReferences(requests, signal) {
+      const view = store.createEvidenceReadView({...args[0], currentRunId: run.input.runId});
+      return Object.freeze({
+        investigationEvidence() {
+          assertRunActive(run);
+          const snapshot = view.investigationEvidence?.();
+          assertRunActive(run);
+          if (!snapshot) throw new Error('investigation_evidence_unavailable');
+          return snapshot;
+        },
+        async resolveReferences(requests, signal) {
         assertRunActive(run);
         const result = await view.resolveReferences(requests, signal);
         assertRunActive(run);

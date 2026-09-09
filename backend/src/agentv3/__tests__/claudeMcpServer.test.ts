@@ -1218,6 +1218,29 @@ describe('createClaudeMcpServer', () => {
         .toMatchObject({success: false, availableDetails: [{detailRef: 'general:pinned-detail', title: 'Pinned detail'}]});
     });
 
+    it.each(['pinned', 'startup'] as const)('returns complete %s strategy detail including its final sections', async source => {
+      const startup = getRegisteredScenes().find(def => def.scene === 'startup')!;
+      const original = startup.detailSections.find(detail => detail.id === 'root_cause_tree')!;
+      const content = source === 'startup' ? original.content
+        : `${'Pinned methodology.\n\n'.repeat(2000)}### Final system evidence\nFINAL_PINNED_DETAIL`;
+      const strategyRegistry = buildStrategyRegistrySnapshotFromDefinitions({
+        overlayGeneration: `complete-detail-${source}`,
+        definitions: [{...startup, detailSections: [{...original, content}]}],
+      });
+      const {tools} = createTestServer({sceneType: 'startup', strategyRegistry});
+      const result = await callTool(tools, 'lookup_strategy_detail', {detailRef: original.ref});
+      expect(content.length).toBeGreaterThan(6000);
+      expect(result).toMatchObject({success: true, informational: true, content, contentTruncated: false});
+      expect(result).not.toHaveProperty('contentMaxChars');
+      expect(String(result.content).endsWith(content.slice(-500))).toBe(true);
+      if (source === 'startup') expect(result.content).toContain('核心优先检查');
+      // Shared native adapters serialize this full result, not the SSE summary.
+      const serialized = runtimeToolSpec.stringifyRuntimeToolResult({
+        content: [{type: 'text', text: JSON.stringify(result)}],
+      });
+      expect(JSON.parse(serialized).content).toBe(content);
+    });
+
     it('keeps the same authorized capability set across response budgets', () => {
       const options = {
         referenceTraceId: 'reference-trace-456',

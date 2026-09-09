@@ -99,12 +99,8 @@ function ensureAnalysisRunGraph(
 
   if (scope.userId) {
     db.prepare(`
-      INSERT INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
+      INSERT OR IGNORE INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        email = excluded.email,
-        display_name = excluded.display_name,
-        updated_at = excluded.updated_at
     `).run(
       scope.userId,
       scope.tenantId,

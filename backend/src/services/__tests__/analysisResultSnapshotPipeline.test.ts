@@ -1278,3 +1278,29 @@ describe('analysis result snapshot pipeline', () => {
     expect(JSON.stringify(storedContract)).not.toContain('"mechanismStatus":"corroborated"');
   });
 });
+
+
+test('persists bound system investigation without new acquisition and preserves legacy absence', () => {
+  const conclusion = 'The task remained runnable; the blocker is not established.';
+  const candidate = {candidateRef: 'candidate-system', runId: 'run-system', attemptId: 'attempt-system',
+    conclusionFingerprint: analysisDeliveryFingerprint(conclusion)};
+  const investigationAssessment: import('../../types/analysisInvestigationAssessment').FinalInvestigationAssessment = {
+    schemaVersion: 1, status: 'checked', binding: {...candidate,
+      conclusionContractFingerprint: analysisDeliveryFingerprint(undefined),
+      evidenceFingerprint: analysisDeliveryFingerprint([]), requirementsFingerprint: analysisDeliveryFingerprint([]),
+      registryFingerprint: 'registry-system', intentFingerprint: analysisDeliveryFingerprint(undefined),
+      ledgerFingerprint: analysisDeliveryFingerprint('ledger-system')},
+    requirements: [{requirementId: 'scheduler', domain: 'thread_state', applicability: 'applicable', coverage: 'covered',
+      evidenceStatus: 'insufficient', acquisition: 'insufficient', scopeMatch: 'matched',
+      contentLocations: [{start: 0, end: conclusion.length}], evidenceRecordIds: ['capture-system']}]};
+  const input = {tenantId: 'tenant-system', workspaceId: 'workspace-system', traceId: 'trace-system',
+    sessionId: 'session-system', runId: 'run-system', query: 'Why did the task wait?', conclusion};
+  const snapshot = buildCompletedAnalysisResultSnapshot({...input, investigationAssessment,
+    deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'passed', claims: 'not_checked',
+      source: 'not_applicable', identity: 'passed', report: 'not_applicable',
+      investigation: 'passed', investigationEvidence: 'coverage_incomplete'}});
+  expect(snapshot?.summary.investigationAssessment).toEqual(investigationAssessment);
+  expect(snapshot?.summary.deliveryAssurance?.investigation).toBe('passed');
+  expect(snapshot?.summary.deliveryAssurance?.investigationEvidence).toBe('coverage_incomplete');
+  expect(buildCompletedAnalysisResultSnapshot(input)?.summary.investigationAssessment).toBeUndefined();
+});

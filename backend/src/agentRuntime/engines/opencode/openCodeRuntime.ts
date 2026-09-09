@@ -84,7 +84,13 @@ import {
   applyFinalResultQualityGate,
   type FinalResultComparisonIdentity,
 } from '../../../services/finalResultQualityGate';
-import {analysisContextUsesPrivateKnowledge} from '../../../services/resolvedAnalysisContext';
+import {analysisContextUsesPrivateKnowledge, assertCurrentAnalysisContextAuthorization,
+  buildAnalysisContextAuthorizationFingerprint} from '../../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../../services/scopedKnowledgeStore';
+import {createRuntimeAnalysisHistoryReader, renderAnalysisHistoryContext, toAnalysisHistoryTurn,
+  type AnalysisHistoryReader} from '../../analysisHistory';
+import {createRuntimeTurnCloseoutTape, resolveRuntimeTurnBudget} from '../../runtimeTurnCloseout';
+import type {RuntimeToolObserver} from '../../runtimeToolObserver';
 import { verifyConclusion } from '../claude/claudeVerifier';
 import { getExtendedKnowledgeBase } from '../../../services/sqlKnowledgeBase';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
@@ -103,13 +109,11 @@ import {
 } from '../../runtimePerformance';
 import { createAnalysisRunSpec, type AnalysisRunSpec } from '../../analysisRunSpec';
 import {
-  buildQuickConversationContext,
   buildRuntimeTracePairComparisonContext,
   buildRuntimeTracePairIdentityContext,
 } from '../../runtimePromptContext';
 import {
   buildQuickRunReceipt,
-  buildEntityContext,
   buildQuickMemoryContextPayload,
   captureSkillDisplayEntities,
   createRuntimeSkillNotesBudget,
@@ -1996,17 +2000,28 @@ async function resolveOpenCodeCurrentTurnMessages(options: {
   let messagesResponse = options.initialMessagesResponse;
   let limit = OPENCODE_MESSAGE_WINDOW_INITIAL_LIMIT;
   while (true) {
+    const rawWindowCount = getOpenCodeRawMessageWindowCount(messagesResponse);
     if (
-      !options.baselineWatermark ||
-      hasOpenCodeAssistantBaselineBoundary(messagesResponse, options.baselineWatermark)
+      options.baselineWatermark
+        ? hasOpenCodeAssistantBaselineBoundary(messagesResponse, options.baselineWatermark)
+        : rawWindowCount < limit
     ) {
-      return getOpenCodeAssistantMessagesAfterBaseline(
+      const currentMessages = getOpenCodeAssistantMessagesAfterBaseline(
         messagesResponse,
         options.baselineWatermark,
       );
+      // A fresh session still has a bounded messages API. Expand a full window
+      // before counting, and count each native message ID only once.
+      const seenIds = new Set<string>();
+      return [...currentMessages].reverse().filter(message => {
+        const id = getOpenCodeAssistantMessageId(message);
+        if (!id) return true;
+        if (seenIds.has(id)) return false;
+        seenIds.add(id);
+        return true;
+      }).reverse();
     }
 
-    const rawWindowCount = getOpenCodeRawMessageWindowCount(messagesResponse);
     if (rawWindowCount < limit) {
       throw new Error('OpenCode current-turn history no longer contains the restored assistant watermark');
     }
@@ -2035,8 +2050,10 @@ export async function runOpenCodePrompt(
     pollDelay?: (ms: number) => Promise<void>;
     adaptiveObservation?: boolean;
     maxSteps?: number;
+    onTurnLimit?: () => void;
   },
-): Promise<{ promptResponse?: unknown; messagesResponse?: unknown }> {
+): Promise<{ promptResponse?: unknown; messagesResponse?: unknown; turnLimitReached?: boolean;
+  turnLimitCandidate?: Record<string, unknown> }> {
   const {
     sessionId,
     projectDir,
@@ -2064,6 +2081,33 @@ export async function runOpenCodePrompt(
     } catch {
       // Runtime performance is internal observability only.
     }
+  };
+  let turnLimitCandidate: Record<string, unknown> | undefined;
+  const stopAtTurnLimit = async (messages: Record<string, unknown>[], baselineWatermark?: OpenCodeAssistantMessageWatermark) => {
+    if (options.maxSteps === undefined || messages.length < options.maxSteps) return false;
+    const latest = messages[messages.length - 1];
+    const info = latest && (isRecord(latest.info) ? latest.info : latest);
+    // An error or output-token limit does not authorize a budget closeout.
+    if (info?.error != null || info?.finish === 'length' || info?.finish === 'error') return false;
+    const naturalEnd = info?.finish === 'stop' || info?.finish === 'end_turn' || info?.finish === 'stop_sequence';
+    if (naturalEnd && messages.length === options.maxSteps) return false;
+    turnLimitCandidate = structuredClone([...messages].reverse().find(message => extractTextParts(message).trim()) ?? latest);
+    options.onTurnLimit?.();
+    if (opencode.client.session.abort) {
+      await awaitOperation(() => opencode.client.session.abort!({path: {id: sessionId}}));
+      if (opencode.client.session.messages) {
+        const finalMessages = await resolveOpenCodeCurrentTurnMessages({
+          initialMessagesResponse: await fetchMessagesWindow(OPENCODE_MESSAGE_WINDOW_INITIAL_LIMIT),
+          baselineWatermark, fetchWindow: limit => fetchMessagesWindow(limit),
+        });
+        if (finalMessages.length >= messages.length) messages.splice(0, messages.length, ...finalMessages);
+      }
+    } else {
+      // Old SDKs cannot cancel an active session; close the owned host before
+      // returning so it cannot keep acquiring data in the background.
+      await awaitOperation(() => opencode.server.close());
+    }
+    return true;
   };
   if (opencode.client.session.promptAsync && opencode.client.session.messages) {
     throwIfStopped();
@@ -2122,6 +2166,10 @@ export async function runOpenCodePrompt(
       const currentTurnMessagesResponse = openCodeAssistantMessagesResponse(newAssistantMessages);
       const latestAssistant = newAssistantMessages[newAssistantMessages.length - 1];
       const latestAssistantComplete = isOpenCodeAssistantMessageComplete(latestAssistant);
+      if (await stopAtTurnLimit(newAssistantMessages, baselineWatermark)) {
+        recordOpenCodeAssistantUsage(newAssistantMessages);
+        return {messagesResponse: openCodeAssistantMessagesResponse(newAssistantMessages), turnLimitReached: true, turnLimitCandidate};
+      }
       if (statusResponse !== undefined) {
         throwIfStopped();
         assertSdkSuccess(statusResponse, 'OpenCode session status');
@@ -2140,6 +2188,10 @@ export async function runOpenCodePrompt(
             fetchWindow: limit => fetchMessagesWindow(limit, 'OpenCode final messages'),
           });
           const latestCanonical = finalAssistantMessages[finalAssistantMessages.length - 1];
+          if (await stopAtTurnLimit(finalAssistantMessages, baselineWatermark)) {
+            recordOpenCodeAssistantUsage(finalAssistantMessages);
+            return {messagesResponse: openCodeAssistantMessagesResponse(finalAssistantMessages), turnLimitReached: true, turnLimitCandidate};
+          }
           if (
             latestCanonical &&
             (isOpenCodeAssistantMessageComplete(latestCanonical) ||
@@ -2205,7 +2257,9 @@ export async function runOpenCodePrompt(
     recordFirstAssistantMessage();
   }
   recordOpenCodeAssistantUsage(observedAssistantMessages);
-  return { promptResponse: openCodeAssistantMessagesResponse(promptAssistantMessages), messagesResponse };
+  const turnLimitReached = await stopAtTurnLimit(combinedMessages, baselineWatermark);
+  return { promptResponse: openCodeAssistantMessagesResponse(promptAssistantMessages), messagesResponse,
+    ...(turnLimitReached ? {turnLimitReached: true, turnLimitCandidate} : {}) };
 }
 
 export function getOpenCodePlanCompletionStatus(plan: AnalysisPlanV3 | null): AnalysisPlanCompletionStatus & {
@@ -2298,7 +2352,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           homeDir: restored.homeDir!,
           configDir: restored.configDir!,
         },
-        restoredOpenCodeSessionId: restored.openCodeSessionId,
+        // Reuse isolated provider directories, but logical history is injected
+        // from SmartPerfetto's authorized context into a fresh native session.
       };
     }
     if (restored) {
@@ -2571,7 +2626,17 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     let sdkPromise: Promise<OpenCodeSdkModule> | undefined;
     const loadSdk = () => sdkPromise ??= this.moduleLoader(this.env);
     const sessionContext = sessionContextManager.getOrCreate(sessionId, traceId);
-    const previousTurns = sessionContext.getAllTurns?.() || [];
+    const authorizationScope = resolveKnowledgeScope(options);
+    const authorizationFingerprint = options.analysisContextFingerprint ??
+      buildAnalysisContextAuthorizationFingerprint(options, authorizationScope);
+    const assertActive = () => {
+      executionLease.throwIfAborted();
+      assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+    };
+    const analysisHistoryReader = createRuntimeAnalysisHistoryReader({options, sessionId, traceId,
+      getTurns: () => sessionContext.getAnalysisHistory?.() ?? (sessionContext.getAllTurns?.() ?? [])
+        .map(turn => toAnalysisHistoryTurn({...turn, traceId, sourceDerived: turn.result?.sourceDerived,
+          analysisContextFingerprint: turn.result?.analysisContextFingerprint})), assertActive});
     const createNoToolsHost: OpenCodeIntentTransportInput['createClassifierHost'] = async ({signal, deadlineMs, model}) => {
       const sdk = await loadSdk();
       signal.throwIfAborted();
@@ -2606,7 +2671,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     const resolver = createAnalysisTurnIntentResolver({
       context: buildComplexityClassifierInput({
         query, sceneType: 'general', selectionContext: options.selectionContext,
-        hasReferenceTrace: Boolean(options.referenceTraceId), previousTurns,
+        hasReferenceTrace: Boolean(options.referenceTraceId), previousTurns: [], history: analysisHistoryReader.getTurns(),
         requestedMode: options.analysisMode ?? 'auto',
       }),
       signal: executionLease.signal,
@@ -2636,10 +2701,13 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       throw error;
     }
     executionLease.throwIfAborted();
+    const closeoutTape = createRuntimeTurnCloseoutTape();
+    let toolAdmissionsOpen = true;
     const prep = await this.prepareAnalysis(
       query, sessionId, traceId, options,
       `${modelConfig.model.providerID}/${modelConfig.model.modelID}`,
-      turnIntent, turnPolicy, resolver.strategyRegistry,
+      turnIntent, turnPolicy, resolver.strategyRegistry, analysisHistoryReader, closeoutTape.observe,
+      () => toolAdmissionsOpen,
     );
     executionLease.throwIfAborted();
     const resolveFinalReportSceneType = () => prep.sceneType;
@@ -2676,6 +2744,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     // SDK maxSteps forces a text-only iteration; it does not guarantee a total call cap.
     const quickBudget = resolveQuickTurnBudget({env: this.env, enforcement: 'timeout_only'});
     const maxSteps = prep.quickMode ? quickBudget.hardCapTurns : resolveAgentRuntimeBudgetConfig(this.env).maxTurns;
+    const turnBudget = resolveRuntimeTurnBudget(maxSteps);
     const promptTimeout = Math.min(
       numericEnv(this.env[OPENCODE_PROMPT_TIMEOUT_MS_ENV]) ?? DEFAULT_PROMPT_TIMEOUT_MS,
       prep.quickMode ? maxSteps * (numericEnv(this.env.OPENCODE_QUICK_PER_TURN_MS) ?? 30_000) : DEFAULT_PROMPT_TIMEOUT_MS,
@@ -2683,7 +2752,9 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     // The native answer and final semantic review share one absolute budget.
     const deadlineMs = Date.now() + promptTimeout;
     const runId = options.runId ?? crypto.randomUUID();
-    const attemptId = crypto.randomUUID();
+    let attemptId = crypto.randomUUID();
+    let turnLimitReached = false;
+    let closeoutAccepted = false;
     let acceptedMessage: Record<string, unknown> | undefined;
     let actualTurns = 0;
 
@@ -2703,7 +2774,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           this.env,
           bridge,
           turnIntent.status === 'unavailable' ? {...modelConfig, smallModel: undefined} : modelConfig,
-          maxSteps,
+          turnBudget.acquisitionTurns,
         ),
       });
       unownedOpenCodeInstance = opencode;
@@ -2771,7 +2842,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           sessionId: openCodeSessionId,
           projectDir: dirs.projectDir,
           timeoutMs: Math.max(1, deadlineMs - Date.now()),
-          maxSteps,
+          maxSteps: turnBudget.acquisitionTurns,
+          onTurnLimit: () => {toolAdmissionsOpen = false;},
           resumedSession: resumedPromptSession,
           signal: promptSession.abortController?.signal,
           isAborted: () => (
@@ -2798,11 +2870,13 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       messagesResponse = promptResult.messagesResponse;
       const observed = getOpenCodeAssistantMessages(messagesResponse);
       const direct = getOpenCodeAssistantMessages(promptResponse);
-      acceptedMessage = observed[observed.length - 1] ?? direct[direct.length - 1];
+      acceptedMessage = promptResult.turnLimitCandidate ?? observed[observed.length - 1] ?? direct[direct.length - 1];
       actualTurns = observed.length || direct.length;
+      turnLimitReached = promptResult.turnLimitReached === true;
       // Bind terminal facts to the actual native body before privacy projection.
       conclusion = acceptedMessage ? extractTextParts(acceptedMessage).trim() : '';
     } finally {
+      toolAdmissionsOpen = false;
       if (activeSession && !privateKnowledge && !executionLease.signal.aborted) {
         this.sessionOpaqueStates.set(sessionId, createOpenCodeOpaqueState(
           activeSession.openCodeSessionId,
@@ -2819,17 +2893,45 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       if (ephemeralRoot) fs.rmSync(ephemeralRoot, {recursive: true, force: true});
     }
 
+    if (turnLimitReached && turnBudget.deliveryTurns > 0
+      && actualTurns < turnBudget.totalTurns && Date.now() < deadlineMs) {
+      const closeoutPrompt = closeoutTape.buildPrompt({query, priorConclusion: conclusion, outputLanguage});
+      if (closeoutPrompt) {
+        try {
+          assertActive();
+          const closeoutAttemptId = crypto.randomUUID();
+          actualTurns++;
+          const closeout = await runOpenCodeIntentTransport({
+            prompt: closeoutPrompt, systemPrompt: prep.systemPrompt,
+            signal: executionLease.signal, deadlineMs, outputByteLimit: 64 * 1024,
+            model: modelConfig.model, createClassifierHost: createNoToolsHost,
+          });
+          assertActive();
+          if (closeout.status === 'ok') {
+            conclusion = closeout.text;
+            attemptId = closeoutAttemptId;
+            acceptedMessage = {info: {role: 'assistant', finish: closeout.finishReason ?? 'stop'},
+              parts: [{type: 'text', text: closeout.text}]};
+            closeoutAccepted = true;
+          }
+        } catch {
+          executionLease.throwIfAborted();
+          // A failed or no-longer-authorized closeout cannot replace the draft.
+        }
+      }
+    }
+
     const info = acceptedMessage && (isRecord(acceptedMessage.info) ? acceptedMessage.info : acceptedMessage);
     const finish = typeof info?.finish === 'string' ? info.finish : undefined;
     const sdkError = info?.error != null;
     const outputLimited = finish === 'length';
-    const turnLimited = finish === 'tool-calls' && actualTurns >= maxSteps;
+    const turnLimited = turnLimitReached;
     const completed = !sdkError && (finish === 'stop' || finish === 'end_turn' || finish === 'stop_sequence');
     const completion: AnalysisCompletion = {
       schemaVersion: 1, runtimeKind: prep.analysisRunSpec.runtime.kind,
       candidateRef: crypto.randomUUID(), runId, attemptId,
       conclusionFingerprint: analysisDeliveryFingerprint(conclusion),
-      status: sdkError ? 'failed' : completed ? 'completed' : outputLimited || turnLimited ? 'incomplete' : 'unknown',
+      status: sdkError ? 'failed' : turnLimited ? 'incomplete' : completed ? 'completed' : outputLimited ? 'incomplete' : 'unknown',
       ...(sdkError ? {reason: 'provider_error' as const}
         : outputLimited ? {reason: 'output_limit' as const}
         : turnLimited ? {reason: 'turn_limit' as const} : {}),
@@ -2845,6 +2947,11 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       turnIntent, completion, outputOrigin: acceptedMessage ? 'sdk_final' : 'assistant_stream',
       partial: partial || undefined,
       ...(turnLimited ? {terminationReason: 'max_turns' as const} : {}),
+      ...(turnLimited && !closeoutAccepted && actualTurns >= turnBudget.totalTurns ? {
+        terminationMessage: localize(outputLanguage,
+          'OpenCode 在两次状态观测之间已用完轮次预算，保留当前结果；未追加总结请求。',
+          'OpenCode exhausted the turn budget between observations; the current result is retained without an extra summary request.'),
+      } : {}),
       quickRun: prep.quickMode ? buildQuickRunReceipt({
         requestedMode: options.analysisMode ?? 'auto', turnIntent, budget: quickBudget,
         actualTurns, elapsedMs: Date.now() - startedAt,
@@ -2931,6 +3038,10 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
         partial: result.partial,
         terminationReason: result.terminationReason,
         terminationMessage: result.terminationMessage,
+        completion: result.completion,
+        conclusionContract: result.conclusionContract,
+        sourceDerived: privateKnowledge || undefined,
+        analysisContextFingerprint: options.analysisContextFingerprint,
       },
       result.findings,
     );
@@ -2959,7 +3070,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
         }, providerScope: scopeIdentity(this.input.providerScope),
           analysisContextFingerprint: options.analysisContextFingerprint ?? null}),
       })} : {}),
-      ...(result.success && result.completion?.status !== 'failed' && result.completion?.status !== 'cancelled' ? {
+      ...(result.success && result.completion?.status !== 'failed' && result.completion?.status !== 'cancelled'
+        && result.completion?.reason !== 'turn_limit' ? {
         providerQuery: {text: prep.analysisRunSpec.query.text, analysisContextFingerprint: options.analysisContextFingerprint},
         dispatchText: input => runOpenCodeIntentTransport({
           ...input, model: modelConfig.model, createClassifierHost: createNoToolsHost,
@@ -2978,6 +3090,9 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     turnIntent: AnalysisTurnIntent,
     turnPolicy: RuntimeTurnPolicy,
     strategyRegistry: ReadonlyStrategyRegistrySnapshot,
+    analysisHistoryReader: AnalysisHistoryReader,
+    toolObserver?: RuntimeToolObserver,
+    canInvokeTool?: () => boolean,
   ): Promise<OpenCodeAnalysisPreparation> {
     const outputLanguage = options.outputLanguage
       ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
@@ -2992,6 +3107,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       : {apps: [], method: 'none' as const};
     const effectivePackageName = options.packageName || focusResult.primaryApp;
     const analysisRunSpec = createAnalysisRunSpec({
+      history: analysisHistoryReader.getTurns(),
       query, sessionId, traceId, options, turnIntent,
       runtimeSelection: this.selection,
       engineCapabilities: getOpenCodeEngineCapabilities(this.selection.kind),
@@ -3043,14 +3159,6 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       }
     }
 
-    const previousFindings = previousTurns
-      .slice(-3)
-      .flatMap(turn => turn.findings);
-    const conversationSummary = previousTurns.length > 0
-      ? sessionContext.generatePromptContext(2000)
-      : undefined;
-    const entityContext = buildEntityContext(sessionContext.getEntityStore());
-
     const artifactStore = resolveRuntimeEvidenceStore(options, {sessionId, traceId},
       () => this.artifactStores.get(sessionId) ?? new ArtifactStore());
     this.artifactStores.set(sessionId, artifactStore);
@@ -3068,7 +3176,6 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       analysisPlan.history.push(analysisPlan.current);
       if (analysisPlan.history.length > 3) analysisPlan.history.shift();
     }
-    const previousPlan = analysisPlan.current ?? undefined;
     analysisPlan.current = null;
     resetPrePlanToolCallsForNewRun(analysisPlan);
 
@@ -3102,6 +3209,7 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     const withConfiguredSystemPrompt = (prompt: string): string => extraSystemPrompt
       ? `${prompt}\n\n${extraSystemPrompt}` : prompt;
     const { toolDefinitions, sourceUse } = createClaudeMcpServer({
+      toolObserver, canInvokeTool, analysisHistoryReader,
       strategyRegistry,
       conversationTraceAttached: options.assistantSurface === 'conversation'
         ? options.conversationTraceAttached === true
@@ -3143,6 +3251,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     const allowedToolNames = new Set(toolDefinitions.map(definition => definition.name));
 
     let prompt = query;
+    const historyContext = renderAnalysisHistoryContext(analysisHistoryReader.getTurns(), {outputLanguage});
+    if (historyContext) prompt = `${historyContext}\n\n${prompt}`;
     if (analysisRunSpec.traceContext.promptSection) {
       prompt = `${analysisRunSpec.traceContext.promptSection}\n\n${prompt}`;
     }
@@ -3162,10 +3272,6 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     }
 
     if (turnPolicy.onDemandContext) {
-      const quickConversationContext = buildQuickConversationContext(previousTurns, outputLanguage);
-      if (quickConversationContext) {
-        prompt = `${quickConversationContext}\n\n${prompt}`;
-      }
       const quickMemoryPayload = buildQuickMemoryContextPayload({
         patternContext: allowMemoryPrefetch
           ? buildPatternContextSection(traceFeatures, knowledgeScope) : undefined,
@@ -3179,7 +3285,6 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
           privateAnalysisContext,
         }) : undefined,
         sqlErrorFixPairs: recentSqlErrors,
-        recentSqlResultsContext: sessionContext.generateRecentSqlResultPromptContext(3),
         outputLanguage,
       });
       const quickMemoryContext = quickMemoryPayload.text;
@@ -3226,12 +3331,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       packageName: effectivePackageName,
       focusApps: focusResult.apps.length > 0 ? focusResult.apps : undefined,
       focusMethod: focusResult.method,
-      previousFindings,
-      conversationSummary,
       knowledgeBaseContext,
-      entityContext,
       sceneType,
-      analysisNotes: notes.length > 0 ? notes : undefined,
       sqlErrorFixPairs: recentSqlErrors
         .filter((entry: any) => entry.fixedSql)
         .slice(-3)
@@ -3251,8 +3352,6 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
         outputLanguage,
         privateAnalysisContext,
       }) : undefined,
-      previousPlan,
-      planHistory: analysisPlan.history.length > 0 ? analysisPlan.history : undefined,
       selectionContext: options.selectionContext,
       traceCompleteness,
       traceOs: traceInfo?.traceOs,

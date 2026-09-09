@@ -45,6 +45,9 @@ import type {AnalysisTurnIntentDecision} from '../../agentRuntime/analysisTurnIn
 import {resolveRuntimeTurnPolicy} from '../../agentRuntime/runtimeTurnPolicy';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import {takeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
+import type {AnalysisOptions} from '../../agent/core/orchestratorTypes';
+import {buildAnalysisContextAuthorizationFingerprint} from '../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../services/scopedKnowledgeStore';
 import {ArtifactStore} from '../artifactStore';
 import * as claudeMcpServer from '../claudeMcpServer';
 import * as claudeSystemPrompt from '../claudeSystemPrompt';
@@ -382,7 +385,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     expect(runtimeSnapshotCount()).toBe(0);
   });
 
-  it('forgets stale SDK mappings when the remote conversation is gone', () => {
+  it('starts fresh without deleting saved provider metadata for this session or its comparison', async () => {
     saveClaudeSessionMapToRuntimeSnapshots({
       tenantId: 'tenant-a',
       workspaceId: 'workspace-a',
@@ -409,24 +412,26 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     });
     expect(runtimeSnapshotCount()).toBe(2);
 
-    const runtime = new ClaudeRuntime({} as any, {
+    intentDecision = {...defaultIntent, taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer', evidenceAccess: 'existing_only'};
+    const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any, {
       enableVerification: false,
       enableSubAgents: false,
     });
 
-    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    claudeSdkMock.__setQueryImplementation(async function* () {
+      yield {type: 'result', subtype: 'success', num_turns: 1, result: 'Fresh provider answer.'};
+    });
     try {
-      (runtime as any).forgetSdkSessionMapping(
-        'session-a',
-        'session-a',
-        'Claude analysis error (error_during_execution): No conversation found with session ID: sdk-session-a',
-      );
-    } finally {
-      warnSpy.mockRestore();
-    }
-
-    expect(runtime.getSdkSessionId('session-a')).toBeUndefined();
-    expect(runtimeSnapshotCount()).toBe(1);
+      const result = await runtime.analyze('Question', 'session-a', 'trace-a', {analysisMode: 'full',
+        tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'});
+      expect(result.success).toBe(true);
+      const calls = claudeSdkMock.__getQueryCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0].options.resume).toBeUndefined();
+      expect(runtime.getSdkSessionId('session-a')).toBe('sdk-session-a');
+      expect(runtime.getSdkSessionId('session-a', 'trace-b')).toBe('sdk-session-b');
+      expect(runtimeSnapshotCount()).toBe(2);
+    } finally {sessionContextManager.remove('session-a');}
   });
 
   it('restores full-mode snapshot SDK mappings with the snapshot timestamp', () => {
@@ -759,7 +764,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     }
   });
 
-  it('preserves SDK conversation context across budget changes with current policy installed', async () => {
+  it('inherits product history across budget changes without resuming provider history', async () => {
     const runtime = new ClaudeRuntime({
       query: async () => ({ columns: ['cnt'], rows: [[0]] }),
     } as any, {
@@ -812,7 +817,8 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
 
     const calls = claudeSdkMock.__getQueryCalls();
     expect(calls).toHaveLength(1);
-    expect(calls[0].options.resume).toBe('full-sdk-session');
+    expect(calls[0].options.resume).toBeUndefined();
+    expect(calls[0].prompt).toContain('上一轮回答：主要包名是 com.example.app。');
     expect(calls[0].options.persistSession).toBe(true);
     expect(calls[0].options.allowedTools).toContain('mcp__smartperfetto__fetch_artifact');
     expect(calls[0].prompt).toContain('继续回答刚才的问题');
@@ -1275,16 +1281,18 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     });
     let context: ReturnType<typeof takeFinalizationContext>;
     try {
-      const options = {
+      const options: AnalysisOptions = {
         analysisMode: 'fast' as const, runId: 'actual-run', referenceTraceId: 'reference-trace',
-        analysisContextFingerprint: 'pinned-auth-context', tenantId: 'tenant-test', workspaceId: 'workspace-test', userId: 'user-test',
+        tenantId: 'tenant-test', workspaceId: 'workspace-test', userId: 'user-test',
       };
+      const pinnedFingerprint = buildAnalysisContextAuthorizationFingerprint(options, resolveKnowledgeScope(options));
+      options.analysisContextFingerprint = pinnedFingerprint;
       const result = await runtime.analyze('Question', sessionId, 'current-trace', options);
       context = takeFinalizationContext(result);
       expect(context).toBeDefined();
       options.analysisContextFingerprint = 'later-auth-context';
       const providerQuery = context!.getProviderQuery(new AbortController().signal);
-      expect(providerQuery).toEqual({text: 'Question', analysisContextFingerprint: 'pinned-auth-context'});
+      expect(providerQuery).toEqual({text: 'Question', analysisContextFingerprint: pinnedFingerprint});
       expect(Object.isFrozen(providerQuery)).toBe(true);
       expect(JSON.stringify(result)).not.toContain('"providerQuery"');
       expect(takeFinalizationContext(result)).toBeUndefined();
@@ -2023,140 +2031,12 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     ]);
   });
 
-  it('recovers a missing SDK conversation inside the active guard lease', async () => {
-    const runtime = new ClaudeRuntime({
-      query: async () => ({ columns: ['cnt'], rows: [[0]] }),
-      getTrace: () => ({ traceOs: 'android', traceFormat: 'perfetto' }),
-    } as any, {
-      enableVerification: false,
-      enableSubAgents: false,
-    });
-    (runtime as any).architectureCache.set('trace-claude-retry-guard', {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-    (runtime as any).sessionMap.set('session-claude-retry-guard', {
-      sdkSessionId: 'sdk-missing',
-      updatedAt: Date.now(),
-      mode: 'full',
-    });
-    const updates: any[] = [];
-    runtime.on('update', update => updates.push(update));
-    const focusSpy = jest.spyOn(focusAppDetector, 'detectFocusApps')
-      .mockResolvedValue({
-        apps: [{ packageName: 'com.example.app', processName: 'com.example.app', score: 1 }],
-        primaryApp: 'com.example.app',
-        method: 'process_track',
-      } as any);
-    const completenessSpy = jest.spyOn(traceCompletenessProber, 'probeTraceCompleteness')
-      .mockResolvedValue(undefined as any);
-    const registrySpy = jest.spyOn(skillLoader, 'ensureSkillRegistryInitialized')
-      .mockResolvedValue(undefined);
-    const knowledgeSpy = jest.spyOn(sqlKnowledgeBase, 'getExtendedKnowledgeBase')
-      .mockResolvedValue({ getContextForAI: () => 'SQL knowledge missing conversation context' } as any);
-    let sdkCalls = 0;
-    claudeSdkMock.__setQueryImplementation(async function* () {
-      sdkCalls += 1;
-      if (sdkCalls === 1) {
-        yield {
-          type: 'result',
-          subtype: 'error_during_execution',
-          errors: [{ message: 'No conversation found with session ID: sdk-missing' }],
-          session_id: 'sdk-missing',
-          num_turns: 0,
-        };
-        return;
-      }
-      yield {
-        type: 'result',
-        subtype: 'success',
-        session_id: 'sdk-recovered',
-        num_turns: 1,
-        result: [
-          '## 综合结论',
-          '',
-          'Claude missing SDK conversation recovery stayed inside the original guard lease.',
-          '',
-          '## 关键证据链',
-          '',
-          '- Local persisted context was reused without public analyze re-entry.',
-          '',
-          '## 优化建议',
-          '',
-          '- Continue with the recovered SDK session.',
-        ].join('\n'),
-      };
-    });
-    const runtimePerformanceRecorder = createRuntimePerformanceRecorder();
-
-    try {
-      const result = await withEffectiveRuntimeRegistrySnapshot(
-        createEffectiveRuntimeRegistrySnapshot(),
-        () => runtime.analyze(
-          '继续分析启动性能',
-          'session-claude-retry-guard',
-          'trace-claude-retry-guard',
-          {
-            analysisMode: 'full',
-            packageName: 'com.example.app',
-            runManifestAttributionSink: createNoopAttributionSink(runtimePerformanceRecorder),
-          },
-        ),
-      );
-
-      expect(result.success).toBe(true);
-      const calls = claudeSdkMock.__getQueryCalls();
-      expect(calls).toHaveLength(2);
-      expect(calls[0].options.resume).toBe('sdk-missing');
-      expect(calls[1].options.resume).toBeUndefined();
-      expect(focusSpy).toHaveBeenCalledTimes(1);
-      expect(completenessSpy).toHaveBeenCalledTimes(1);
-      expect(registrySpy).toHaveBeenCalled();
-      expect(knowledgeSpy).toHaveBeenCalledTimes(1);
-      const phases = runtimePerformanceRecorder.seal().phases;
-      for (const phaseName of [
-        'classification',
-        'focus',
-        'architecture',
-        'completeness',
-        'skill_registry',
-        'knowledge',
-        'sdk_start',
-        'finalization',
-      ]) {
-        expect(phases.filter(phase => phase.name === phaseName)).toHaveLength(1);
-      }
-      expect(phases.filter(phase => phase.name === 'provider')).toEqual([
-        expect.objectContaining({ name: 'provider', outcome: 'error' }),
-        expect.objectContaining({ name: 'provider', outcome: 'ok' }),
-      ]);
-      expect((runtime as any).sessionMap.get('session-claude-retry-guard')).toEqual(expect.objectContaining({
-        sdkSessionId: 'sdk-recovered',
-        mode: 'full',
-      }));
-      expect(updates).toContainEqual(expect.objectContaining({
-        type: 'degraded',
-        content: expect.objectContaining({
-          fallback: 'fresh_sdk_session_after_missing_conversation',
-        }),
-      }));
-    } finally {
-      focusSpy.mockRestore();
-      completenessSpy.mockRestore();
-      registrySpy.mockRestore();
-      knowledgeSpy.mockRestore();
-      sessionContextManager.remove('session-claude-retry-guard');
-    }
-  });
-
-  it('does not recover an expired SDK session after the SDK reports completed work', async () => {
+  it('starts fresh despite a saved provider session and does not retry missing-session errors', async () => {
     intentDecision = {...defaultIntent, taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'};
-    const sessionId = 'session-claude-missing-after-work';
+    const sessionId = 'session-claude-missing-saved';
     const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
       {enableSubAgents: false});
     (runtime as any).sessionMap.set(sessionId, {sdkSessionId: 'sdk-missing', updatedAt: Date.now(), mode: 'full'});
-    const retry = jest.spyOn(runtime as any, 'retryWithoutSdkResume');
     claudeSdkMock.__setQueryImplementation(async function* () {
       yield {type: 'result', subtype: 'error_during_execution', num_turns: 1,
         errors: [{message: 'No conversation found with session ID: sdk-missing'}]};
@@ -2164,58 +2044,112 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     try {
       const result = await runtime.analyze('Question', sessionId, 'trace', {analysisMode: 'fast'});
       expect(result).toMatchObject({success: false, rounds: 1, completion: {status: 'failed', reason: 'provider_error'}});
-      expect(retry).not.toHaveBeenCalled();
-      expect(claudeSdkMock.__getQueryCalls()).toHaveLength(1);
-    } finally {retry.mockRestore(); sessionContextManager.remove(sessionId);}
+      const calls = claudeSdkMock.__getQueryCalls();
+      expect(calls).toHaveLength(1);
+      expect(calls[0].options.resume).toBeUndefined();
+    } finally {sessionContextManager.remove(sessionId);}
   });
 
-  it('does not start a second Claude provider when cancelled during missing SDK recovery', async () => {
-    const sessionId = 'session-claude-retry-cancel';
-    const traceId = 'trace-claude-retry-cancel';
-    const runtime = new ClaudeRuntime({
-      query: async () => ({ columns: ['cnt'], rows: [[0]] }),
-      getTrace: () => ({ traceOs: 'android', traceFormat: 'perfetto' }),
-    } as any, {
-      enableVerification: false,
-      enableSubAgents: false,
+  it.each([true, false])('reserves one isolated summary and keeps turn-limit provenance (summary succeeds: %p)', async summarySucceeds => {
+    const sessionId = `claude-turn-closeout-${summarySucceeds}`;
+    const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
+      {enableSubAgents: false, maxTurns: 3, model: 'pinned-main', maxBudgetUsd: 1});
+    const mcpSpy = jest.spyOn(claudeMcpServer, 'createClaudeMcpServer');
+    let calls = 0;
+    claudeSdkMock.__setQueryImplementation(async function* (params) {
+      calls++;
+      if (calls === 1) {
+        expect(params.options.maxTurns).toBe(2);
+        const mcp = mcpSpy.mock.calls.slice(-1)[0]![0];
+        await mcp.toolObserver?.({phase: 'started', toolCallId: 'query-1', toolName: 'execute_sql', params: {}, extra: {}});
+        await mcp.toolObserver?.({phase: 'completed', toolCallId: 'query-1', toolName: 'execute_sql', params: {}, extra: {},
+          result: {content: [{type: 'text', text: JSON.stringify({columns: ['dur_ms'], rows: [[42]]})}]}});
+        yield {type: 'assistant', message: {content: [{type: 'text', text: 'Observed duration is 42 ms; cause is unresolved.'}]}};
+        yield {type: 'result', subtype: 'error_max_turns', num_turns: 2, total_cost_usd: 0.25};
+      } else {
+        expect(params.options).toMatchObject({model: 'pinned-main', maxTurns: 1,
+          tools: [], allowedTools: [], mcpServers: {}, persistSession: false, maxBudgetUsd: 0.75});
+        expect(params.options.resume).toBeUndefined();
+        expect(params.prompt).toContain('42');
+        expect(params.prompt).toContain('execute_sql');
+        expect(mcpSpy.mock.calls.slice(-1)[0]![0].canInvokeTool?.()).toBe(false);
+        yield summarySucceeds
+          ? {type: 'result', subtype: 'success', is_error: false, stop_reason: 'end_turn',
+            result: 'Duration is 42 ms. Cause remains unresolved; next ask for the main-thread interval.'}
+          : {type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['summary failed']};
+      }
     });
-    (runtime as any).architectureCache.set(traceId, {
-      type: 'STANDARD',
-      confidence: 0.9,
-      evidence: [],
-    });
-    (runtime as any).sessionMap.set(sessionId, {
-      sdkSessionId: 'sdk-missing',
-      updatedAt: Date.now(),
-      mode: 'full',
-    });
-    const originalRetryWithoutSdkResume = (runtime as any).retryWithoutSdkResume.bind(runtime);
-    jest.spyOn(runtime as any, 'retryWithoutSdkResume').mockImplementation(async (params: unknown) => {
-      await originalRetryWithoutSdkResume(params);
-      await (runtime as any).executionGuard.abortSession(sessionId);
-    });
-    claudeSdkMock.__setQueryImplementation(async function* () {
-      yield {
-        type: 'result',
-        subtype: 'error_during_execution',
-        errors: [{ message: 'No conversation found with session ID: sdk-missing' }],
-        session_id: 'sdk-missing',
-        num_turns: 0,
-      };
-    });
+    try {
+      const result = await runtime.analyze('Investigate duration', sessionId, 'trace', {analysisMode: 'full'});
+      expect(calls).toBe(2);
+      expect(result).toMatchObject({partial: true, rounds: 3, terminationReason: 'max_turns',
+        completion: {status: 'incomplete', reason: 'turn_limit'}});
+      expect(result.conclusion).toBe(summarySucceeds
+        ? 'Duration is 42 ms. Cause remains unresolved; next ask for the main-thread interval.'
+        : 'Observed duration is 42 ms; cause is unresolved.');
+      expect(result.completion?.attemptId).toContain(summarySucceeds ? 'turn-closeout:1' : ':main:');
+      const lastTurn = sessionContextManager.getOrCreate(sessionId, 'trace').getAllTurns().slice(-1)[0]!;
+      expect(lastTurn.result).toMatchObject({partial: true, completion: {status: 'incomplete', reason: 'turn_limit'}});
+    } finally {mcpSpy.mockRestore(); sessionContextManager.remove(sessionId);}
+  });
 
-    const result = await runtime.analyze(
-      '继续分析启动性能',
-      sessionId,
-      traceId,
-      {
-        analysisMode: 'full',
-        packageName: 'com.example.app',
-      },
-    );
-    expect(result.success).toBe(false);
-    expect(result.completion).toMatchObject({status: 'cancelled', reason: 'cancelled'});
-    expect(claudeSdkMock.__getQueryCalls()).toHaveLength(1);
+  it('does not exceed a configured dollar budget when the native cost receipt is missing', async () => {
+    const sessionId = 'claude-cost-unknown';
+    const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
+      {enableSubAgents: false, maxTurns: 3, maxBudgetUsd: 1});
+    claudeSdkMock.__setQueryImplementation(async function* () {
+      yield {type: 'result', subtype: 'error_max_turns', num_turns: 2};
+    });
+    try {
+      const result = await runtime.analyze('Investigate duration', sessionId, 'trace', {analysisMode: 'full'});
+      expect(claudeSdkMock.__getQueryCalls()).toHaveLength(1);
+      expect(result).toMatchObject({partial: true, rounds: 2, completion: {reason: 'turn_limit'}});
+    } finally {sessionContextManager.remove(sessionId);}
+  });
+
+  it.each([{maxTurns: 1, reportedTurns: 1}, {maxTurns: 3, reportedTurns: 3}])(
+    'does not add a summary when the total budget has no room: %p', async ({maxTurns, reportedTurns}) => {
+      const sessionId = 'claude-no-summary-room';
+      const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
+        {enableSubAgents: false, maxTurns});
+      claudeSdkMock.__setQueryImplementation(async function* () {
+        yield {type: 'assistant', message: {content: [{type: 'text', text: 'Only a partial observation.'}]}};
+        yield {type: 'result', subtype: 'error_max_turns', num_turns: reportedTurns};
+      });
+      try {
+        const result = await runtime.analyze('Investigate duration', sessionId, 'trace', {analysisMode: 'full'});
+        expect(claudeSdkMock.__getQueryCalls()).toHaveLength(1);
+        expect(result).toMatchObject({partial: true, rounds: reportedTurns, completion: {reason: 'turn_limit'}});
+      } finally {sessionContextManager.remove(sessionId);}
+    },
+  );
+
+  it('counts a cancelled closeout and retains the original acquired answer', async () => {
+    const sessionId = 'claude-cancel-closeout';
+    const summaryStarted = createDeferred<void>();
+    const summaryAborted = createDeferred<void>();
+    const runtime = new ClaudeRuntime({query: async () => ({columns: [], rows: []}), getTrace: () => undefined} as any,
+      {enableSubAgents: false, maxTurns: 3});
+    let calls = 0;
+    claudeSdkMock.__setQueryImplementation(async function* (params) {
+      if (++calls === 1) {
+        yield {type: 'assistant', message: {content: [{type: 'text', text: 'Acquired answer before cancellation.'}]}};
+        yield {type: 'result', subtype: 'error_max_turns', num_turns: 2};
+        return;
+      }
+      params.options.abortController.signal.addEventListener('abort', () => summaryAborted.resolve(), {once: true});
+      summaryStarted.resolve();
+      await summaryAborted.promise;
+      yield {type: 'result', subtype: 'success', is_error: false, result: 'Late summary must not win.'};
+    });
+    const analysis = runtime.analyze('Investigate duration', sessionId, 'trace', {analysisMode: 'full'});
+    await summaryStarted.promise;
+    await runtime.abortSession(sessionId);
+    const result = await analysis;
+    expect(result).toMatchObject({success: false, partial: true, rounds: 3,
+      conclusion: 'Acquired answer before cancellation.', completion: {status: 'cancelled', reason: 'cancelled'}});
+    expect(calls).toBe(2);
+    sessionContextManager.remove(sessionId);
   });
 
   it('does not publish a Claude turn or correction when cancelled during final verification', async () => {
@@ -3238,7 +3172,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
       expect(result.success).toBe(true);
       const [call] = claudeSdkMock.__getQueryCalls();
       expect(call.options.model).toBe('provider-claude-main');
-      expect(call.options.maxTurns).toBe(4);
+      expect(call.options.maxTurns).toBe(3);
       expect(call.options.effort).toBe('max');
       expect(call.options.pathToClaudeCodeExecutable).toBe('/tmp/global-main-claude');
       expect(call.options.env.CLAUDE_MODEL).toBe('provider-claude-main');

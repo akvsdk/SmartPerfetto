@@ -31,7 +31,8 @@ import { ClaudeRuntime } from '../../agentRuntime/engines/claude';
 import { ENTERPRISE_FEATURE_FLAG_ENV } from '../../config';
 import { resetAgentEventStoreForTests } from '../../services/agentEventStore';
 import { resetAnalysisRunStoreForTests } from '../../services/analysisRunStore';
-import { ENTERPRISE_DB_PATH_ENV } from '../../services/enterpriseDb';
+import { ENTERPRISE_DB_PATH_ENV, openEnterpriseDb } from '../../services/enterpriseDb';
+import {AnalysisHistoryStore, resetAnalysisHistoryStoreForTests} from '../../services/analysisHistoryStore';
 import { clearRunManifestLifecyclesForTests } from '../../services/selfEvolution/runManifestLifecycle';
 import {
   getRunManifestStore,
@@ -109,12 +110,154 @@ afterEach(() => {
   SessionPersistenceService.resetForTests();
   resetAgentEventStoreForTests();
   resetAnalysisRunStoreForTests();
+  resetAnalysisHistoryStoreForTests();
   clearRunManifestLifecyclesForTests();
   resetRunManifestStoreForTests();
   restoreEnvironment();
 });
 
 describe('agent analyze cancellation races', () => {
+  it.each([false, true])('persists local admitted parents and final history without enterprise journaling (rejectParents=%s)', async rejectParents => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-local-history-'));
+    let sessionId: string | undefined;
+    let db: ReturnType<typeof openEnterpriseDb> | undefined;
+    try {
+      const traceId = 'local-history-trace';
+      const tracePath = path.join(tmpDir, 'local.trace');
+      await fs.writeFile(tracePath, 'fixture trace');
+      delete process.env.SMARTPERFETTO_API_KEY;
+      process.env.SMARTPERFETTO_SSO_TRUSTED_HEADERS = 'true';
+      process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'false';
+      process.env[ENTERPRISE_DB_PATH_ENV] = path.join(tmpDir, 'enterprise.sqlite');
+      process.env[ENTERPRISE_DATA_DIR_ENV] = path.join(tmpDir, 'data');
+      process.env.UPLOAD_DIR = path.join(tmpDir, 'uploads');
+      process.env.SMARTPERFETTO_AGENT_RUNTIME = 'claude-agent-sdk';
+      process.env.SMARTPERFETTO_AI_ENABLED = 'true';
+      db = openEnterpriseDb();
+      db.prepare(`INSERT INTO organizations (id, name, status, plan, created_at, updated_at)
+        VALUES ('tenant-a', 'Tenant A', 'active', 'enterprise', 100, 100)`).run();
+      db.prepare(`INSERT INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
+        VALUES ('analyst-user', 'tenant-a', 'real-profile@example.test', 'Real Analyst', 'idp-real', 100, 150)`).run();
+      const expectedProfile = {email: 'real-profile@example.test', display_name: 'Real Analyst', idp_subject: 'idp-real', created_at: 100, updated_at: 150};
+      if (rejectParents) db.exec(`CREATE TRIGGER reject_local_parent BEFORE INSERT ON analysis_runs
+        BEGIN SELECT RAISE(ABORT, 'test parent write rejected'); END`);
+      const service = new TraceProcessorService(process.env.UPLOAD_DIR);
+      const trace = service.registerStoredTrace({id: traceId, filename: 'local.trace', size: 13, filePath: tracePath});
+      await writeTraceMetadata({id: traceId, filename: trace.filename, size: trace.size,
+        uploadedAt: new Date().toISOString(), status: 'ready', path: tracePath,
+        tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'analyst-user'});
+      const referenceTraceId = 'local-history-reference';
+      const referencePath = path.join(tmpDir, 'reference.trace');
+      await fs.writeFile(referencePath, 'reference fixture');
+      const reference = service.registerStoredTrace({id: referenceTraceId, filename: 'reference.trace', size: 17, filePath: referencePath});
+      await writeTraceMetadata({id: referenceTraceId, filename: reference.filename, size: reference.size,
+        uploadedAt: new Date().toISOString(), status: 'ready', path: referencePath,
+        tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'analyst-user'});
+      jest.spyOn(service, 'getOrLoadTrace').mockImplementation(async id => id === referenceTraceId ? reference : trace);
+      let failedTraceId: string | undefined;
+      let failedRunId: string | undefined;
+      jest.spyOn(service, 'ensureProcessorForLease').mockImplementation(async (id, leaseId, _mode, leaseScope) => {
+        if (id === failedTraceId) {
+          const lease = getTraceProcessorLeaseStore().getLeaseById(leaseScope!, leaseId)!;
+          failedRunId = lease.holders[0].metadata?.runId as string | undefined;
+          throw new Error('fixture lease preparation failed');
+        }
+        return readyProcessor(id);
+      });
+      jest.spyOn(service, 'runWithLeases').mockImplementation(async (_contexts, callback) => callback());
+      jest.spyOn(service, 'cleanupLeaseProcessor').mockReturnValue(true);
+      setTraceProcessorServiceForTests(service);
+      const persist = jest.spyOn(persistence, 'persistAgentTurn');
+      const analyze = jest.spyOn(ClaudeRuntime.prototype, 'analyze').mockImplementation(async (_query, id, _traceId, options) => {
+        // This assertion runs inside the runtime, after authentic HTTP admission.
+        const parent = db!.prepare(`SELECT s.created_by, s.trace_id, r.id FROM analysis_runs r
+          JOIN analysis_sessions s ON s.id = r.session_id WHERE r.id = ?`).get(options!.runId!);
+        if (rejectParents) expect(parent).toBeUndefined();
+        else expect(parent).toEqual({created_by: 'analyst-user', trace_id: traceId, id: options!.runId});
+        expect(db!.prepare('SELECT email, display_name, idp_subject, created_at, updated_at FROM users WHERE id = ?').get('analyst-user'))
+          .toEqual(expectedProfile);
+        const conclusion = 'Local history completion fixture';
+        return {sessionId: id!, success: true, findings: [], hypotheses: [], conclusion, confidence: 1,
+          rounds: 1, totalDurationMs: 1, completion: {schemaVersion: 1, runtimeKind: 'claude-agent-sdk',
+            status: 'completed', runId: options!.runId!, attemptId: 'attempt-local', candidateRef: 'candidate-local',
+            conclusionFingerprint: analysisDeliveryFingerprint(conclusion)}};
+      });
+      jest.spyOn(ClaudeRuntime.prototype, 'cleanupSession').mockImplementation(() => undefined);
+      jest.spyOn(finalization, 'finalizeAnalysisResult').mockImplementation(async input => {
+        input.owner.assertAuthorized(); input.context?.dispose(); return {result: input.result};
+      });
+      const app = makeApp();
+      const response = await analystHeaders(request(app).post('/api/agent/v1/analyze')).send({traceId, referenceTraceId, query: 'Return the local fixture'});
+      if (response.status !== 200) throw new Error(JSON.stringify(response.body));
+      sessionId = response.body.sessionId;
+      const runId = response.body.runId;
+      let status: request.Response | undefined;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        status = await analystHeaders(request(app).get(`/api/agent/v1/${sessionId}/status`));
+        if (['completed', 'failed'].includes(status.body.status)) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(analyze).toHaveBeenCalledTimes(1);
+      expect(persist).toHaveBeenCalled();
+      const historyScope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'analyst-user', sessionId: sessionId!, traceId, runId};
+      const history = new AnalysisHistoryStore(db);
+      if (rejectParents) {
+        expect(status!.body).toMatchObject({status: 'failed', error: 'analysis_history_parent_not_authorized'});
+        expect(history.list(historyScope)).toEqual([]);
+      } else {
+        expect(status!.body.status).toBe('completed');
+        const turns = history.list(historyScope);
+        expect(turns).toHaveLength(1);
+        expect(turns[0]).toMatchObject({answer: 'Local history completion fixture', completionStatus: 'completed'});
+        for (const mismatch of [{userId: 'other'}, {workspaceId: 'other'}, {tenantId: 'other'}, {traceId: 'other'}, {runId: 'other'}]) {
+          expect(() => history.append({...historyScope, ...mismatch}, {...turns[0], traceId: mismatch.traceId ?? traceId}))
+            .toThrow('analysis_history_parent_not_authorized');
+        }
+        expect(db.prepare('SELECT email, display_name, idp_subject, created_at, updated_at FROM users WHERE id = ?').get('analyst-user'))
+          .toEqual(expectedProfile);
+        expect(db.prepare('SELECT DISTINCT event_type FROM agent_events WHERE run_id = ?').all(runId))
+          .toEqual([{event_type: 'analysis_completed'}]);
+        // The same session already has one admitted run. A later failed admission
+        // must not inherit that readiness, and a following retry must still work.
+        for (const failureSide of [traceId, referenceTraceId]) {
+          failedTraceId = failureSide;
+          failedRunId = undefined;
+          const requestBody = {traceId, referenceTraceId, query: 'Retry local history fixture'};
+          const before = analyze.mock.calls.length;
+          const failed = await analystHeaders(request(app).post(`/api/agent/v1/sessions/${sessionId}/runs`)).send(requestBody);
+          if (failed.status !== 409) throw new Error(JSON.stringify(failed.body));
+          expect(failed.body.error).toBe('fixture lease preparation failed');
+          expect(failedRunId).toBeDefined();
+          expect(db.prepare('SELECT id FROM analysis_runs WHERE id = ?').get(failedRunId!)).toBeUndefined();
+          expect(analyze).toHaveBeenCalledTimes(before);
+          expect(history.list(historyScope)).toHaveLength(before);
+          failedTraceId = undefined;
+          const retried = await analystHeaders(request(app).post(`/api/agent/v1/sessions/${sessionId}/runs`)).send(requestBody);
+          expect(retried.status).toBe(200);
+          expect(retried.body.sessionId).toBe(sessionId);
+          expect(retried.body.runId).not.toBe(failedRunId);
+          for (let attempt = 0; attempt < 100; attempt++) {
+            status = await analystHeaders(request(app).get(`/api/agent/v1/${sessionId}/status`));
+            if (['completed', 'failed'].includes(status.body.status)) break;
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          expect(status!.body.status).toBe('completed');
+          expect(history.list(historyScope)).toHaveLength(before + 1);
+          expect(db.prepare('SELECT id FROM analysis_runs WHERE id = ?').get(retried.body.runId)).toBeDefined();
+          expect(db.prepare('SELECT email, display_name, idp_subject, created_at, updated_at FROM users WHERE id = ?').get('analyst-user'))
+            .toEqual(expectedProfile);
+        }
+      }
+      expect(process.env[ENTERPRISE_FEATURE_FLAG_ENV]).toBe('false');
+    } finally {
+      if (sessionId) { agentRoutesCancellationTestSeam.deleteSession(sessionId); sessionContextManager.remove(sessionId); }
+      getTraceProcessorLeaseStore().close(); setTraceProcessorLeaseStoreForTests(null);
+      resetAnalysisHistoryStoreForTests(); resetAnalysisRunStoreForTests(); resetAgentEventStoreForTests();
+      db?.close();
+      await fs.rm(tmpDir, {recursive: true, force: true});
+    }
+  });
+
   it.each(['ordinary', 'smart'] as const)('uses a private run lease for personal %s analysis without enabling enterprise', async preset => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-personal-analysis-lease-'));
     let sessionId: string | undefined;
@@ -326,7 +469,7 @@ describe('agent analyze cancellation races', () => {
     }
   });
 
-  it('does not start the runtime when its run is cancelled while lease startup is pending', async () => {
+  it.each([false, true])('does not start the runtime when its run is cancelled while lease startup is pending (enterprise=%s)', async enterprise => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-agent-lease-cancel-'));
     const app = makeApp();
     let sessionId: string | undefined;
@@ -354,7 +497,7 @@ describe('agent analyze cancellation races', () => {
       await fs.writeFile(tracePath, 'trace bytes');
       delete process.env.SMARTPERFETTO_API_KEY;
       process.env.SMARTPERFETTO_SSO_TRUSTED_HEADERS = 'true';
-      process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'true';
+      process.env[ENTERPRISE_FEATURE_FLAG_ENV] = String(enterprise);
       process.env[ENTERPRISE_DB_PATH_ENV] = path.join(tmpDir, 'enterprise.sqlite');
       process.env[ENTERPRISE_DATA_DIR_ENV] = path.join(tmpDir, 'data');
       process.env.UPLOAD_DIR = path.join(tmpDir, 'uploads');
@@ -517,6 +660,11 @@ describe('agent analyze cancellation races', () => {
       expect(analyzeResponse.body.runId).toBe(runId);
       expect(analyzeSpy).not.toHaveBeenCalled();
       expect(runWithLeaseSpy).not.toHaveBeenCalled();
+      if (!enterprise) {
+        const db = openEnterpriseDb();
+        try { expect(db.prepare('SELECT id FROM analysis_runs WHERE id = ?').get(runId)).toBeUndefined(); }
+        finally { db.close(); }
+      }
 
       const statusResponse = await analystHeaders(request(app).get(`/api/agent/v1/${sessionId}/status`));
       expect(statusResponse.status).toBe(200);
@@ -541,7 +689,7 @@ describe('agent analyze cancellation races', () => {
     }
   });
 
-  it('does not project a runtime success that arrives after the exact run was cancelled', async () => {
+  it.each([false, true])('does not project a runtime success that arrives after the exact run was cancelled (enterprise=%s)', async enterprise => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-agent-late-success-'));
     const app = makeApp();
     let sessionId: string | undefined;
@@ -568,7 +716,7 @@ describe('agent analyze cancellation races', () => {
       const referenceTraceId = 'trace-late-runtime-success-reference';
       delete process.env.SMARTPERFETTO_API_KEY;
       process.env.SMARTPERFETTO_SSO_TRUSTED_HEADERS = 'true';
-      process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'true';
+      process.env[ENTERPRISE_FEATURE_FLAG_ENV] = String(enterprise);
       process.env[ENTERPRISE_DB_PATH_ENV] = path.join(tmpDir, 'enterprise.sqlite');
       process.env[ENTERPRISE_DATA_DIR_ENV] = path.join(tmpDir, 'data');
       process.env.UPLOAD_DIR = path.join(tmpDir, 'uploads');

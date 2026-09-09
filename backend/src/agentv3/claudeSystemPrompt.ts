@@ -31,6 +31,7 @@ import {
   QUICK_TRIAGE_MAX_FACT_BULLETS,
 } from './quickAnswerContract';
 import {resolveRuntimeTurnPolicy} from '../agentRuntime/runtimeTurnPolicy';
+import {resolveAnalysisInvestigationRequirements} from '../agentRuntime/analysisInvestigationRequirements';
 import {CONCLUSION_CONTRACT_SIDECAR_MARKER} from '../agent/core/conclusionContract';
 import {SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../services/verifier/deterministicClaimVerifier';
 
@@ -695,12 +696,10 @@ function buildTypedTurnSystemPromptParts(
       requiredCapabilities: strategy.requiredCapabilities, optionalCapabilities: strategy.optionalCapabilities,
     });
   }
-  if (intent.status === 'resolved' && intent.taskKind === 'investigation'
-    && strategy?.investigationRequirements?.length) {
-    data(3, 'investigation_requirements', {
-      sceneId: strategy.scene, registryFingerprint: registry.registryFingerprint,
-      requirements: strategy.investigationRequirements,
-    });
+  if (intent.taskKind === 'investigation' || intent.taskKind === 'comparison') {
+    data(3, 'investigation_requirements', resolveAnalysisInvestigationRequirements({
+      intent, strategyRegistry: registry,
+    }));
   }
   if (intent.status === 'resolved' && policy.requiresReport) {
     const contract = getFinalReportContract(intent.sceneId, registry);

@@ -37,8 +37,22 @@ describe('conversation contract', () => {
     expect(noTrace).toContain('当前没有附加 Trace');
     expect(noTrace).toContain('不要调用 Trace 工具');
     expect(attached).toContain('当前已附加 Trace（ID: trace-1）');
-    expect(attached).toContain('用户：先看主线程');
+    expect(attached).toContain('先看主线程');
+    expect(attached).toContain('historical_context');
     expect(attached).not.toMatch(/15\s*秒|两轮工具|2\s*次工具/);
+  });
+
+  it('bounds old history without truncating the current user question', () => {
+    const question = 'CURRENT_QUERY_'.repeat(2_000);
+    const history = Array.from({length: 60}, (_, index) => [
+      {role: 'user' as const, content: `question-${index}`},
+      {role: 'assistant' as const, content: `answer-${index}:` + 'x'.repeat(20_000)},
+    ]).flat();
+    const prompt = buildConversationPrompt({question, history, traceContext: {kind: 'none'}});
+    expect(prompt).toContain(question);
+    expect(prompt).toContain('question-59');
+    expect(Buffer.byteLength(prompt.replace(question, ''))).toBeLessThan(18_000);
+    expect(prompt).not.toContain('x'.repeat(5_000));
   });
 
   it('strips the control marker and returns a logical clarification pause', () => {

@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+import {describe, expect, it, jest} from '@jest/globals';
+import {createAnalysisHistoryReader, createRuntimeAnalysisHistoryReader, renderAnalysisHistoryContext,
+  resolveAnalysisHistoryReader, toAnalysisHistoryTurn, withAnalysisHistoryReader, type AnalysisHistoryTurn} from '../analysisHistory';
+import {AnalysisHistoryStore, parseAnalysisHistoryTurn} from '../../services/analysisHistoryStore';
+
+function turn(index = 0): AnalysisHistoryTurn {
+  return toAnalysisHistoryTurn({id: `run-${index}`, turnIndex: index, traceId: 'trace', timestamp: index,
+    query: `question-${index}`, result: {message: `answer-${index}`,
+      completion: {status: 'completed'}, conclusionContract: {uncertainties: [], nextSteps: []}}});
+}
+
+describe('typed analysis history', () => {
+  it('carries product-resolved source activation through real runtime wrappers without sourceUsePolicy', () => {
+    const source = {...turn(), sourceDerived: true, analysisContextFingerprint: 'scope-A', answer: 'AUTHORIZED_SOURCE_HISTORY'};
+    const missingFingerprint = {...turn(1), sourceDerived: true, answer: 'LEGACY_PRIVATE_HISTORY'};
+    const publicTurn = turn(2);
+    let productActive = true;
+    let runtimeActive = true;
+    const productReader = createAnalysisHistoryReader({getTurns: () => [source, missingFingerprint, publicTurn],
+      assertActive: () => {if (!productActive) throw new Error('product_revoked');}});
+    const baseOptions = {analysisContextFingerprint: 'scope-A', codeAwareMode: 'provider_send' as const, codebaseIds: ['A']};
+    const bound = withAnalysisHistoryReader(baseOptions, productReader, {includeSourceDerived: true});
+    expect(bound).not.toHaveProperty('sourceUsePolicy');
+    const runtime = createRuntimeAnalysisHistoryReader({options: {...bound}, sessionId: 'physical-run', traceId: 'trace',
+      getTurns: () => [], assertActive: () => {if (!runtimeActive) throw new Error('runtime_revoked');}});
+    expect(runtime.getTurns()).toEqual([source, publicTurn]);
+    expect(String(runtime.read({turnId: source.id}).text)).toContain('AUTHORIZED_SOURCE_HISTORY');
+    expect(runtime.read({turnId: missingFingerprint.id})).toMatchObject({success: false});
+    expect(renderAnalysisHistoryContext(runtime.getTurns())).toContain('AUTHORIZED_SOURCE_HISTORY');
+    const changedScope = createRuntimeAnalysisHistoryReader({options: {...bound, analysisContextFingerprint: 'scope-B'},
+      sessionId: 'physical-B', traceId: 'trace', getTurns: () => [], assertActive: () => {}});
+    expect(changedScope.getTurns()).toEqual([publicTurn]);
+    const dormant = createRuntimeAnalysisHistoryReader({options: withAnalysisHistoryReader(baseOptions, productReader,
+      {includeSourceDerived: false}), sessionId: 'physical-dormant', traceId: 'trace', getTurns: () => [],
+      assertActive: () => {}, includeSourceDerived: true});
+    expect(dormant.getTurns()).toEqual([publicTurn]);
+    const restricted = createRuntimeAnalysisHistoryReader({options: bound, sessionId: 'restricted', traceId: 'trace',
+      getTurns: () => [], assertActive: () => {}, includeSourceDerived: false});
+    expect(restricted.getTurns()).toEqual([publicTurn]);
+    runtimeActive = false;
+    expect(() => runtime.read({turnId: source.id})).toThrow('runtime_revoked');
+    runtimeActive = true;
+    productActive = false;
+    expect(() => runtime.read({turnId: source.id})).toThrow('product_revoked');
+  });
+
+  it('does not recreate product activation or a reader from serialized options', () => {
+    const source = {...turn(), sourceDerived: true, analysisContextFingerprint: 'scope-A'};
+    const bound = withAnalysisHistoryReader({analysisContextFingerprint: 'scope-A', codeAwareMode: 'provider_send' as const,
+      codebaseIds: ['A']}, createAnalysisHistoryReader({getTurns: () => [source], assertActive: () => {}}), {includeSourceDerived: true});
+    const json = JSON.parse(JSON.stringify(bound));
+    // Ordinary string keys are neither the issued reader nor the product decision.
+    const runtime = createRuntimeAnalysisHistoryReader({options: {...json, includeSourceDerived: true},
+      sessionId: 's', traceId: 'trace', getTurns: () => [source], assertActive: () => {}});
+    expect(runtime.getTurns()).toEqual([]);
+  });
+
+  it('retains canonical artifactRefs and row selectors through conversion, persistence parsing and full pages', () => {
+    const entry = toAnalysisHistoryTurn({id: 'located', turnIndex: 0, timestamp: 1, traceId: 'trace', query: 'Q',
+      result: {message: 'A', completion: {status: 'completed'}, conclusionContract: {claims: [
+        {artifactRefs: [{artifactId: 'art-1', rowSelector: {utid: 42, name: 'worker', active: true}, verified: true}]},
+        {references: [{evidenceRefId: 'ev-2', sourceRef: 'source-2', rowSelector: {id: 7}, column: 'duration', value: 123, witness: 'fake'}]},
+      ]}}});
+    const expected = [{artifactId: 'art-1', rowSelector: {utid: 42, name: 'worker', active: true}},
+      {evidenceRefId: 'ev-2', sourceRef: 'source-2', rowSelector: {id: 7}, column: 'duration'}];
+    expect(entry.evidence).toEqual(expected);
+    const parsed = parseAnalysisHistoryTurn(JSON.parse(JSON.stringify(entry)))!;
+    expect(parsed.evidence).toEqual(expected);
+    const page = createAnalysisHistoryReader({getTurns: () => [parsed], assertActive: () => {}}).read({turnId: entry.id});
+    expect(JSON.parse(String(page.text)).evidence).toEqual(expected);
+    expect(String(page.text)).not.toContain('witness');
+    expect(String(page.text)).not.toContain('verified');
+  });
+
+  it.each(['archive', 'bound'] as const)('gates %s source history by its original exact fingerprint and current lease', mode => {
+    const secret = {...turn(0), sourceDerived: true, analysisContextFingerprint: 'source-A', answer: 'SOURCE_A_SECRET'};
+    const legacyPrivate = {...turn(1), sourceDerived: true, answer: 'MISSING_FINGERPRINT_SECRET'};
+    const ordinary = {...turn(2), answer: 'PUBLIC_CONTEXT'};
+    const archive = jest.spyOn(AnalysisHistoryStore.prototype, 'list').mockReturnValue([secret, legacyPrivate, ordinary]);
+    let active = true;
+    const assertActive = () => {if (!active) throw new Error('revoked');};
+    const boundReader = createAnalysisHistoryReader({getTurns: () => [secret, legacyPrivate, ordinary], assertActive: () => {}});
+    const make = (fingerprint?: string, includeSourceDerived = true) => {
+      const options = {tenantId: 't', workspaceId: 'w', userId: 'u', analysisContextFingerprint: fingerprint};
+      return createRuntimeAnalysisHistoryReader({options: mode === 'bound' ? withAnalysisHistoryReader(options, boundReader) : options,
+        sessionId: 's', traceId: 'trace', getTurns: () => [], assertActive, includeSourceDerived});
+    };
+    try {
+      for (const fingerprint of ['source-B', undefined, '']) {
+        const reader = make(fingerprint);
+        expect(reader.getTurns().map(item => item.id)).toEqual([ordinary.id]);
+        expect(reader.read({turnId: secret.id})).toMatchObject({success: false});
+        expect(reader.read({turnId: legacyPrivate.id})).toMatchObject({success: false});
+      }
+      const same = make('source-A');
+      expect(same.getTurns().map(item => item.id)).toEqual([secret.id, ordinary.id]);
+      const page = same.read({turnId: secret.id});
+      expect(page).toMatchObject({success: true});
+      expect(String(page.text)).toContain('SOURCE_A_SECRET');
+      expect(String(page.text)).not.toContain('analysisContextFingerprint');
+      expect(make('source-A', false).getTurns()).toEqual([ordinary]);
+      active = false;
+      expect(() => same.read({turnId: secret.id})).toThrow('revoked');
+      expect(() => same.getTurns()).toThrow('revoked');
+    } finally {archive.mockRestore();}
+  });
+
+  it('merges only stable run identities and keeps a fresh index-zero result newest', () => {
+    const old = {...turn(7), id: 'old-run', timestamp: 100};
+    const newest = {...turn(0), id: 'new-run', timestamp: 200, partial: true, completionStatus: 'incomplete' as const,
+      terminationReason: 'turn_limit', uncertainties: ['NEW_MISSING_WORK']};
+    const sameIndexOld = {...turn(0), id: 'different-old-run', timestamp: 50};
+    const archive = jest.spyOn(AnalysisHistoryStore.prototype, 'list').mockReturnValue([sameIndexOld, old]);
+    try {
+      const reader = createRuntimeAnalysisHistoryReader({options: {tenantId: 't', workspaceId: 'w', userId: 'u'},
+        sessionId: 's', traceId: 'trace', getTurns: () => [{...old, answer: 'unfinalized draft'}, newest], assertActive: () => {}});
+      expect(reader.getTurns()).toEqual([sameIndexOld, old, newest]);
+      expect(reader.read({}).entries).toEqual(expect.arrayContaining([expect.objectContaining({id: newest.id})]));
+      const preview = renderAnalysisHistoryContext(reader.getTurns(), {outputLanguage: 'en', maxBytes: 2500})!;
+      expect(preview).toContain('new-run');
+      expect(preview).toContain('NEW_MISSING_WORK');
+      expect(preview).not.toContain('unfinalized draft');
+    } finally {archive.mockRestore();}
+  });
+
+  it('preserves partial and missing work without headings or success inference', () => {
+    const entry = toAnalysisHistoryTurn({id: 'limited', turnIndex: 2, traceId: 'trace', timestamp: 1, query: 'Why?',
+      result: {conclusion: 'A natural answer without headings.', partial: true,
+        completion: {status: 'incomplete', reason: 'turn_limit'}, terminationMessage: 'budget reached',
+        conclusionContract: {uncertainties: ['GPU evidence missing'], nextSteps: ['Inspect the fence'],
+          claims: [{references: [{artifactId: 'art-1', rowIndex: 0, column: 'duration', verified: true}]}]}}});
+    expect(entry).toMatchObject({partial: true, completionStatus: 'incomplete', terminationReason: 'turn_limit',
+      uncertainties: ['GPU evidence missing'], nextSteps: ['Inspect the fence'], evidence: [{artifactId: 'art-1', rowIndex: 0, column: 'duration'}]});
+    const legacy = toAnalysisHistoryTurn({id: 'legacy', turnIndex: 0, timestamp: 0, traceId: 'trace', query: 'Q', result: {message: 'All done'}});
+    expect(legacy).toMatchObject({partial: true, completionStatus: 'unknown'});
+    expect(parseAnalysisHistoryTurn({...entry, proof: 'forged'})).not.toHaveProperty('proof');
+  });
+
+  it('pages the complete turn including long text and late uncertainties with no new acquisition', () => {
+    const entry = {...turn(), answer: 'Answer 中文 '.repeat(1000), uncertainties: ['early', 'late'], nextSteps: ['follow up']};
+    const assertActive = jest.fn();
+    const reader = createAnalysisHistoryReader({getTurns: () => [entry], assertActive});
+    expect(reader.read({})).toMatchObject({kind: 'index', totalTurns: 1, entries: [{id: 'run-0'}]});
+    let offset: number | null = 0;
+    let text = '';
+    while (offset !== null) {
+      const page = reader.read({turnId: entry.id, textOffset: offset, maxChars: 127});
+      text += page.text;
+      offset = page.nextTextOffset as number | null;
+    }
+    expect(JSON.parse(text)).toEqual(entry);
+    expect(assertActive).toHaveBeenCalled();
+    expect(reader.read({turnId: 'another-session-id'})).toMatchObject({success: false, error: 'analysis_history_turn_unavailable'});
+    expect(() => reader.read({limit: 0})).toThrow('invalid_page');
+  });
+
+  it('checks active authorization on every read and does not expose mutable backing data', () => {
+    let active = true;
+    const entry = turn();
+    const reader = createAnalysisHistoryReader({getTurns: () => [entry], assertActive: () => {if (!active) throw new Error('revoked');}});
+    reader.getTurns()[0].answer = 'changed';
+    expect(reader.getTurns()[0].answer).toBe('answer-0');
+    active = false;
+    expect(() => reader.read({turnId: entry.id})).toThrow('revoked');
+  });
+
+  it('carries issued readers through spreads but rejects forged symbols and ignores JSON claims', () => {
+    const reader = createAnalysisHistoryReader({getTurns: () => [turn()], assertActive: () => {}});
+    const fallback = createAnalysisHistoryReader({getTurns: () => [], assertActive: () => {}});
+    const options = withAnalysisHistoryReader({}, reader);
+    expect(resolveAnalysisHistoryReader({...options}, fallback)).toBe(reader);
+    expect(resolveAnalysisHistoryReader(JSON.parse(JSON.stringify(options)), fallback)).toBe(fallback);
+    const symbol = Object.getOwnPropertySymbols(options)[0];
+    expect(() => resolveAnalysisHistoryReader({[symbol]: {}}, fallback)).toThrow('binding_invalid');
+  });
+
+  it('filters dormant source-derived history from both prompt and on-demand reads', () => {
+    const reader = createRuntimeAnalysisHistoryReader({options: {codeAwareMode: 'off'}, sessionId: 's', traceId: 'trace',
+      getTurns: () => [{...turn(0), sourceDerived: true}, turn(1), {...turn(2), traceId: 'other-trace'}], assertActive: () => {}});
+    expect(reader.getTurns().map(item => item.id)).toEqual(['run-1']);
+    expect(reader.read({turnId: 'run-0'})).toMatchObject({success: false});
+  });
+
+  it('keeps the latest unfinished work before prose under a CJK byte budget', () => {
+    const entries = Array.from({length: 40}, (_, i) => ({...turn(i), answer: '长回答'.repeat(800)}));
+    entries[35] = {...entries[35], partial: true, completionStatus: 'incomplete', terminationReason: 'turn_limit',
+      uncertainties: ['GPU_MISSING'], nextSteps: ['FOLLOW_UP']};
+    const context = renderAnalysisHistoryContext(entries, {outputLanguage: 'en', maxBytes: 3000})!;
+    expect(Buffer.byteLength(context)).toBeLessThanOrEqual(3000);
+    expect(context).toContain('run-35');
+    expect(context).toContain('turn_limit');
+    expect(context).toContain('GPU_MISSING');
+    expect(context).toContain('read_session_history');
+    expect(context).toContain('"truncated":true');
+  });
+});

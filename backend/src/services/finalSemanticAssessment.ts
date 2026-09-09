@@ -16,6 +16,10 @@ import {
 } from '../types/analysisDelivery';
 import type {SourceUseDecisionV1} from './codebase/sourceUseDecision';
 import {isPlainJsonObject} from '../utils/isPlainJsonObject';
+import {resolveAnalysisInvestigationRequirements} from '../agentRuntime/analysisInvestigationRequirements';
+import type {ResolvedAnalysisInvestigationRequirements} from '../types/analysisInvestigation';
+import type {InvestigationContentAssessment} from '../types/analysisInvestigationAssessment';
+import {compactInvestigationEvidence, type CompactInvestigationEvidenceSnapshot} from './evidence/investigationEvidenceLedger';
 
 export const FINAL_SEMANTIC_RULE_VERSION = 'final_semantics@1';
 export const FINAL_SEMANTIC_INPUT_BYTE_LIMIT = 128 * 1024;
@@ -37,6 +41,8 @@ export interface FinalSemanticSnapshot {
   capabilitySnapshot?: unknown;
   reportRequirements?: PinnedAnalysisReportRequirements;
   caseRetrieval?: AnalysisCaseRetrievalState;
+  investigationRequirements?: ResolvedAnalysisInvestigationRequirements;
+  investigationEvidence?: CompactInvestigationEvidenceSnapshot;
 }
 
 export interface FinalSemanticAssessmentInput {
@@ -89,6 +95,11 @@ export interface FinalSemanticAssessment {
   readonly claims: readonly SemanticClaimAssessment[];
   readonly omissions: ReadonlyArray<{readonly code: 'undeclared_claim'; readonly contentLocations: readonly SemanticContentLocation[]}>;
   readonly requirements: readonly AnalysisReportRequirementAssessment[];
+  /** Independent coverage; an old response never certifies this new dimension. */
+  readonly investigation?: {
+    readonly status: 'not_checked' | 'checked' | 'coverage_incomplete';
+    readonly requirements: readonly InvestigationContentAssessment[];
+  };
 }
 
 interface CapturedSnapshot {
@@ -226,6 +237,12 @@ function inputIsBound(captured: CapturedSnapshot, context: RuntimeFinalizationCo
   } else if (pin && (pin.sceneId !== intent.sceneId || pin.registryFingerprint !== captured.registryFingerprint)) return false;
   if (pin && (!Array.isArray(pin.requirements) || pin.requirements.some(requirement => !nonempty(requirement.id)) ||
     new Set(pin.requirements.map(requirement => requirement.id)).size !== pin.requirements.length)) return false;
+  const investigation = resolveAnalysisInvestigationRequirements({intent, strategyRegistry: context.strategyRegistry});
+  if ((snapshot.investigationRequirements || investigation.status === 'resolved') &&
+    !sameValues(snapshot.investigationRequirements, investigation)) return false;
+  if (snapshot.investigationEvidence && (!context.investigationEvidence ||
+    !sameValues(snapshot.investigationEvidence, compactInvestigationEvidence(context.investigationEvidence,
+      snapshot.investigationEvidence.byteBudget)))) return false;
   return true;
 }
 
@@ -300,12 +317,13 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
   const fence = /^```(?:json)?\s*\n([\s\S]*)\n```$/.exec(text);
   let value: unknown;
   try { value = JSON.parse(fence ? fence[1] : text); } catch { return undefined; }
-  if (!record(value) || !keys(value, ['schemaVersion', 'bodyCoverage', 'claims', 'omissions', 'requirements']) ||
-    !member(value.schemaVersion, ['final_semantic_response@1', 'final_semantic_response@2']) || !record(value.bodyCoverage) ||
+  if (!record(value) || !keys(value, ['schemaVersion', 'bodyCoverage', 'claims', 'omissions', 'requirements',
+    ...(value.schemaVersion === 'final_semantic_response@3' ? ['investigation'] : [])]) ||
+    !member(value.schemaVersion, ['final_semantic_response@1', 'final_semantic_response@2', 'final_semantic_response@3']) || !record(value.bodyCoverage) ||
     !keys(value.bodyCoverage, ['status', 'reviewedSpans']) || !member(value.bodyCoverage.status, ['complete', 'incomplete']) ||
     !Array.isArray(value.claims) || !Array.isArray(value.omissions) || !Array.isArray(value.requirements)) return undefined;
   const {body, conclusionContract: contract} = captured.snapshot;
-  const locationFormat = value.schemaVersion === 'final_semantic_response@2' ? 'exact_quote' : 'offsets_with_text';
+  const locationFormat = value.schemaVersion === 'final_semantic_response@1' ? 'offsets_with_text' : 'exact_quote';
   const reviewedSpans = parseLocations(value.bodyCoverage.reviewedSpans, body, 'offsets');
   if (!reviewedSpans || reviewedSpans.some((item, index) => index > 0 && item.start < reviewedSpans[index - 1].end) ||
     (value.bodyCoverage.status === 'complete' && !wholeBodyCovered(reviewedSpans, body.length))) return undefined;
@@ -369,6 +387,8 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
       coverage: item.coverage, contentLocations: locations, claimIds: item.claimIds as string[]});
   }
   if (seenRequirements.size !== requirementMap.size) return undefined;
+  const investigation = parseInvestigationResponse(value, captured);
+  if (!investigation) return undefined;
   const declarationCoverage = (captured.snapshot.declarationBindingEligibility === 'eligible' || declarations.size === 0) &&
     !hasOwn(contract ?? {}, 'rawClaims') && !contract?.parseIssues?.length &&
     contract?.bindingEligibility !== 'ineligible' && claims.every(claim => claim.consistency !== 'unknown');
@@ -384,7 +404,44 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
   return freezeJson({schemaVersion: 'final_semantic_assessment@1', ruleVersion: FINAL_SEMANTIC_RULE_VERSION,
     binding, status: incomplete ? 'coverage_incomplete' : 'checked',
     consistency: omissions.length || claims.some(claim => claim.consistency === 'inconsistent') ? 'inconsistent' :
-      incomplete ? 'unknown' : 'consistent', coverage, claims, omissions, requirements});
+      incomplete ? 'unknown' : 'consistent', coverage, claims, omissions, requirements, investigation});
+}
+
+function parseInvestigationResponse(value: Record<string, unknown>, captured: CapturedSnapshot):
+  NonNullable<FinalSemanticAssessment['investigation']> | undefined {
+  if (value.schemaVersion !== 'final_semantic_response@3') return {status: 'not_checked', requirements: []};
+  if (!Array.isArray(value.investigation)) return undefined;
+  const pin = captured.snapshot.investigationRequirements;
+  const required = pin?.status === 'resolved' ? pin.requirements : [];
+  const definitions = new Map(required.map(item => [item.id, item]));
+  const records = new Set(captured.snapshot.investigationEvidence?.records.map(item => item.recordId) ?? []);
+  const seen = new Set<string>();
+  const rows: InvestigationContentAssessment[] = [];
+  for (const item of value.investigation) {
+    if (!record(item) || !keys(item, ['requirementId', 'applicability', 'coverage', 'contentLocations',
+      'evidenceRecordIds', 'scopeMatch', 'evidenceStatus']) || !nonempty(item.requirementId) ||
+      !definitions.has(item.requirementId) || seen.has(item.requirementId) ||
+      !member(item.applicability, ['applicable', 'not_applicable', 'unknown']) ||
+      !member(item.coverage, ['covered', 'missing', 'unknown']) ||
+      !member(item.scopeMatch, ['matched', 'mismatched', 'unknown']) ||
+      !member(item.evidenceStatus, ['observed', 'insufficient', 'not_checked', 'failed', 'not_applicable', 'unknown']) ||
+      !Array.isArray(item.evidenceRecordIds) || item.evidenceRecordIds.some(id => !nonempty(id) || !records.has(id)) ||
+      new Set(item.evidenceRecordIds).size !== item.evidenceRecordIds.length) return undefined;
+    const locations = parseLocations(item.contentLocations, captured.snapshot.body, 'exact_quote');
+    const definition = definitions.get(item.requirementId)!;
+    if (!locations || (!definition.condition && captured.intent.scope === 'scene_wide' && item.applicability !== 'applicable') ||
+      (item.applicability !== 'applicable' && item.coverage !== 'unknown') ||
+      ((item.coverage === 'covered' || item.applicability === 'not_applicable') && !locations.length) ||
+      (item.evidenceStatus === 'observed' && (!item.evidenceRecordIds.length || item.scopeMatch !== 'matched'))) return undefined;
+    seen.add(item.requirementId);
+    rows.push({requirementId: item.requirementId, applicability: item.applicability, coverage: item.coverage,
+      contentLocations: locations, evidenceRecordIds: item.evidenceRecordIds as string[],
+      scopeMatch: item.scopeMatch, evidenceStatus: item.evidenceStatus});
+  }
+  if (seen.size !== definitions.size) return undefined;
+  return {status: pin?.status !== 'resolved' ? 'not_checked' : rows.some(item =>
+    definitions.get(item.requirementId)?.required !== false && (item.applicability === 'unknown' ||
+      item.applicability === 'applicable' && item.coverage === 'unknown')) ? 'coverage_incomplete' : 'checked', requirements: rows};
 }
 
 /** One semantic request per captured runtime context; this service never reads evidence. */

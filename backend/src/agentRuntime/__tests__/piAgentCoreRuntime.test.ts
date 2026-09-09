@@ -46,6 +46,7 @@ import * as systemPromptModule from '../../agentv3/claudeSystemPrompt';
 import {registerCodeAwareCanary, revokeCodeAwareOutputGuards, clearCodeAwareOutputGuards} from '../../services/security/codeAwareOutputRegistry';
 import * as sourceProjectionModule from '../../services/codebase/sourceClaimVerifier';
 import * as contextAuthorization from '../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../services/scopedKnowledgeStore';
 import {renderConclusionContractSidecar, type ConclusionContract} from '../../agent/core/conclusionContract';
 import {inspectCandidateProtocol} from '../../services/canonicalAnalysisResult';
 import * as qualityGateModule from '../../services/finalResultQualityGate';
@@ -2763,7 +2764,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(traceProcessorService.query).not.toHaveBeenCalled();
   });
 
-  it('hydrates Pi agent-core transcript state from opaque snapshots on follow-up', async () => {
+  it('inherits logical history without replaying Pi opaque transcripts on follow-up', async () => {
     FakePiAgent.promptMessages = [
       {
         role: 'assistant',
@@ -2824,18 +2825,13 @@ describe('experimental Pi agent-core runtime contract', () => {
     const restoredAgent = FakePiAgent.instances[1];
     expect(restoredAgent.options).toMatchObject({
       initialState: expect.objectContaining({
-        messages: [
-          {
-            role: 'assistant', stopReason: 'stop',
-            content: [{ type: 'text', text: 'First Pi answer' }],
-          },
-        ],
+        messages: [],
       }),
     });
     expect(restoredAgent.prompts[0]).toContain('follow-up question');
-    expect(restoredAgent.state.systemPrompt).toContain('first question');
+    expect(restoredAgent.prompts[0]).toContain('first question');
+    expect(restoredAgent.prompts[0]).toContain('First Pi answer');
     expect(restoredAgent.state.messages).toEqual([
-      {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'First Pi answer'}]},
       {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'Second Pi answer'}]},
     ]);
   });
@@ -3165,10 +3161,18 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(trace.query).not.toHaveBeenCalled();
   });
 
-  it('bounds the native main turn loop and records the exact tool-use candidate as incomplete', async () => {
+  it('reserves one no-tool closeout using the pinned provider while retaining incomplete status', async () => {
     passVerification();
+    const trace = createFakeTraceProcessorService();
+    trace.query.mockResolvedValue({columns: ['duration_ms'], rows: [{duration_ms: 23}], durationMs: 1});
+    piClassifierResponses.push(
+      {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: JSON.stringify(piClassifierDecision)}]},
+      {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: 'Observed 23 ms. The cause remains unknown; next ask for the main-thread interval.'}]},
+    );
     let dispatched = 0;
     FakePiAgent.promptHandler = async agent => {
+      const sql = agent.state.tools.find((tool: any) => tool.name === 'execute_sql') as any;
+      await sql.execute('closeout-evidence', {sql: 'SELECT 23 AS duration_ms'});
       while (true) {
         dispatched++;
         const message = {role: 'assistant', stopReason: 'toolUse', content: [{type: 'text', text: `attempt ${dispatched}`} ]};
@@ -3177,11 +3181,39 @@ describe('experimental Pi agent-core runtime contract', () => {
         if (dispatched > 5) throw new Error('native turn guard was not enforced');
       }
     };
-    const result = await typedRuntime({env: {AGENT_QUICK_MAX_TURNS: '2'}}).analyze('继续收集', 'typed-pi-cap', 'trace-pi', {analysisMode: 'fast'});
-    expect(dispatched).toBe(2);
-    expect(result).toMatchObject({conclusion: 'attempt 2', rounds: 2, partial: true,
-      terminationReason: 'max_turns', completion: {status: 'incomplete', reason: 'turn_limit', sdkFinishReason: 'toolUse'},
+    const result = await typedRuntime({trace, env: {AGENT_QUICK_MAX_TURNS: '2'}}).analyze('继续收集', 'typed-pi-cap', 'trace-pi', {analysisMode: 'fast'});
+    expect(dispatched).toBe(1);
+    expect(result).toMatchObject({conclusion: 'Observed 23 ms. The cause remains unknown; next ask for the main-thread interval.', rounds: 2, partial: true,
+      outputOrigin: 'sdk_final',
+      terminationReason: 'max_turns', completion: {status: 'incomplete', reason: 'turn_limit', sdkFinishReason: 'stop', attemptId: 'closeout-2'},
       quickRun: {enforcement: 'turn_cap', actualTurns: 2, hardCapTurns: 2}});
+    expect(piClassifierCalls).toHaveLength(2);
+    expect(piClassifierCalls[1].model).toBe(piClassifierCalls[0].model);
+    expect(piClassifierCalls[1].context.tools).toEqual([]);
+    expect(piClassifierCalls[1].context.messages[0].content).toContain('attempt 1');
+    expect(piClassifierCalls[1].context.messages[0].content).toContain('duration_ms');
+    expect(piClassifierCalls[1].context.messages[0].content).toContain('23');
+    expect(piClassifierCalls[1].options).toMatchObject({maxRetries: 0});
+    expect(piClassifierCalls[1].options.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each([1, 2])('never exceeds total Pi budget %s when closeout fails or is unavailable', async maxTurns => {
+    passVerification();
+    piClassifierResponses.push(
+      {role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: JSON.stringify(piClassifierDecision)}]},
+      new Error('closeout provider failure'),
+    );
+    FakePiAgent.promptHandler = async agent => {
+      const message = {role: 'assistant', stopReason: 'toolUse', content: [{type: 'text', text: 'Retained evidence'}]};
+      agent.emitForTest({type: 'turn_end', message});
+      expect(await (agent.options?.shouldStopAfterTurn as any)({message})).toBe(true);
+      return [message];
+    };
+    const result = await typedRuntime({env: {AGENT_QUICK_MAX_TURNS: String(maxTurns)}})
+      .analyze('继续', `typed-pi-closeout-failure-${maxTurns}`, 'trace-pi', {analysisMode: 'fast'});
+    expect(result).toMatchObject({conclusion: 'Retained evidence', rounds: maxTurns, partial: true,
+      completion: {status: 'incomplete', reason: 'turn_limit', attemptId: '1'}});
+    expect(piClassifierCalls).toHaveLength(maxTurns);
   });
 
   it('applies the selected quick deadline to the whole run and keeps timeout provenance', async () => {
@@ -3250,7 +3282,9 @@ describe('experimental Pi agent-core runtime contract', () => {
     const first = kind === 'sidecar-only' ? protocolSidecar : protocolSidecar.replace('"focused_answer"', '"invalid-mode"');
     const complete = `The marker is present.\n${protocolSidecar}`;
     let originalPrompt = '';
+    const authorizationChecksAtDispatch: number[] = [];
     FakePiAgent.promptHandler = async (agent, _input, index) => {
+      authorizationChecksAtDispatch.push(authorization.mock.calls.length);
       if (index === 1) originalPrompt = agent.state.systemPrompt;
       else {
         expect(agent.state.tools).toEqual([]);
@@ -3264,7 +3298,10 @@ describe('experimental Pi agent-core runtime contract', () => {
     try {
       const result = await runtime.analyze('query', `pi-protocol-${kind}`, 'trace-pi', {runId: `pi-protocol-${kind}`});
       expect(FakePiAgent.instances[0].promptCount).toBe(2);
-      expect(authorization).toHaveBeenCalledTimes(1);
+      expect(authorizationChecksAtDispatch[0]).toBeGreaterThan(0);
+      expect(authorizationChecksAtDispatch[1]).toBeGreaterThan(authorizationChecksAtDispatch[0]);
+      expect(authorization.mock.calls.every(([selection, scope, fingerprint]) => fingerprint ===
+        contextAuthorization.buildAnalysisContextAuthorizationFingerprint(selection, scope))).toBe(true);
       expect(inspectCandidateProtocol(result.conclusion).canonicalBody.trim()).toBe('The marker is present.');
       expect(result.completion).toMatchObject({status: 'completed', attemptId: '2', conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)});
       const context = takeFinalizationContext(result)!;
@@ -3315,9 +3352,15 @@ describe('experimental Pi agent-core runtime contract', () => {
 
   it('does not redispatch Pi source context after authorization changes', async () => {
     passVerification();
-    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: protocolSidecar}]}];
-    const authorization = jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
-      throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
+    let revoked = false;
+    FakePiAgent.promptHandler = async () => {
+      revoked = true;
+      return [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: protocolSidecar}]}];
+    };
+    const realAuthorization = contextAuthorization.assertCurrentAnalysisContextAuthorization;
+    const authorization = jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation((...args) => {
+      if (revoked) throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
+      return realAuthorization(...args);
     });
     try {
       const result = await typedRuntime().analyze('query', 'pi-protocol-revoked', 'trace-pi');
@@ -3525,9 +3568,12 @@ describe('experimental Pi agent-core runtime contract', () => {
     try {
       const options = {
         analysisMode: 'fast' as const, runId: 'pi-finalization-run', referenceTraceId: 'trace-reference',
+        codeAwareMode: 'off' as const,
         tenantId: 'tenant-pi', workspaceId: 'workspace-pi', userId: 'user-pi',
-        analysisContextFingerprint: 'pi-auth-pin',
+        analysisContextFingerprint: '',
       };
+      const analysisContextFingerprint = contextAuthorization.buildAnalysisContextAuthorizationFingerprint(options, resolveKnowledgeScope(options));
+      options.analysisContextFingerprint = analysisContextFingerprint;
       const result = await runtime.analyze('context only', sessionId, 'trace-current', options);
       const projected = observation.assertReturnedContext(result);
       expect(takeFinalizationContext({...result})).toBeUndefined();
@@ -3535,7 +3581,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       expect(context).toBeDefined();
       options.analysisContextFingerprint = 'later-auth-context';
       const providerQuery = context.getProviderQuery(new AbortController().signal);
-      expect(providerQuery).toEqual({text: 'context only', analysisContextFingerprint: 'pi-auth-pin'});
+      expect(providerQuery).toEqual({text: 'context only', analysisContextFingerprint});
       expect(Object.isFrozen(providerQuery)).toBe(true);
       expect(JSON.stringify(result)).not.toContain('"providerQuery"');
       expect(takeFinalizationContext(result)).toBeUndefined();

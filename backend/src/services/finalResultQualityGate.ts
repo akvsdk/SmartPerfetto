@@ -8,6 +8,7 @@ import type {
 } from '../agent/core/orchestratorTypes';
 import {localize, type OutputLanguage} from '../agentv3/outputLanguage';
 import {assessFinalReportContract, type FinalReportContractAssessmentResult} from './finalReportContractGate';
+import {assessFinalInvestigationContract, type FinalInvestigationContractResult} from './finalInvestigationContractGate';
 import {verifySourceClaimBindingsForResult} from './codebase/sourceClaimVerifier';
 import {isUnusedSourceDecision} from './codebase/sourceUseDecision';
 import {assessScrollingJankClaimBoundary} from './scrollingJankClaimBoundary';
@@ -1242,6 +1243,7 @@ export interface FinalResultQualityAssessment {
   selectedIssue?: FinalResultQualityIssue;
   assurance: AnalysisDeliveryAssurance;
   report: FinalReportContractAssessmentResult;
+  investigation?: FinalInvestigationContractResult;
   sourceClaimVerification?: ReturnType<typeof verifySourceClaimBindingsForResult>;
 }
 
@@ -1451,6 +1453,13 @@ export function assessFinalResultQualityAssessment(
     conclusion: result.conclusion, conclusionContract: result.conclusionContract, context,
   });
   assurance.report = report.status;
+  const investigation = assessFinalInvestigationContract({
+    conclusion: result.conclusion, conclusionContract: result.conclusionContract, context,
+  });
+  assurance.investigation = investigation.status;
+  assurance.investigationEvidence = investigation.evidenceStatus;
+  // Investigation gaps are independent assurance. They never restart the runtime
+  // or manufacture an incomplete SDK receipt after a delivered answer.
   if (report.missingSections.length > 0) issues.push({
     code: 'scene_contract_incomplete',
     message: '语义评估确认当前报告缺少已适用的内容要求。',
@@ -1469,7 +1478,7 @@ export function assessFinalResultQualityAssessment(
       code: 'comparison_identity_incomplete', message: '双 Trace 对比尚缺两侧身份的核验证据。',
     });
   }
-  return {issues, selectedIssue: issues[0], assurance, report, sourceClaimVerification};
+  return {issues, selectedIssue: issues[0], assurance, report, investigation, sourceClaimVerification};
 }
 
 /** Compatibility projection; callers needing assurance consume the full assessment. */
@@ -1488,6 +1497,7 @@ export function applyFinalResultQualityGate(input: FinalResultQualityInput): Fin
   result.outputOrigin = current ? context.outputOrigin : undefined;
   result.turnIntent = current ? context.turnIntent : undefined;
   result.reportAssessment = current ? assessment.report.acceptedAssessment : undefined;
+  result.investigationAssessment = current ? assessment.investigation?.acceptedAssessment : undefined;
   if (assessment.sourceClaimVerification) {
     result.sourceClaimVerificationResult = assessment.sourceClaimVerification;
   }

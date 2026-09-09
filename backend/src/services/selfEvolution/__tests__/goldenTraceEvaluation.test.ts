@@ -283,20 +283,51 @@ describe('golden trace deterministic scorer', () => {
 describe('golden trace registry compiler', () => {
   it('unifies the constructed catalog, scenarios, coverage, golden facts, and splits', () => {
     const registry = loadGoldenTraceRegistry();
-    expect(registry.cases).toHaveLength(14);
-    expect(registry.cases.flatMap(item => item.goldenPoints ?? []))
-      .toHaveLength(33);
+    const authored = JSON.parse(fs.readFileSync(path.resolve(
+      __dirname, '../../../../strategies/golden-trace-eval.registry.json',
+    ), 'utf8')) as {cases: Array<{
+      caseId: string; catalogAlias: string; goldenPoints: string[];
+      split: string; expectedScene: string; query: string; analysisMode: string;
+    }>};
+    const catalog = JSON.parse(fs.readFileSync(path.resolve(
+      __dirname, '../../../../../Trace/catalog.json',
+    ), 'utf8')) as {cases: Array<{
+      id: string; kind: string; trace: {sha256: string};
+      coverage: {expectations: Array<{id: string}>};
+    }>};
+    expect(authored.cases.map(item => item.catalogAlias).sort()).toEqual(
+      catalog.cases.filter(item => item.kind === 'constructed').map(item => item.id).sort(),
+    );
+    expect(registry.cases.map(item => item.caseId).sort()).toEqual(
+      authored.cases.map(item => item.caseId).sort(),
+    );
+    for (const sourceCase of authored.cases) {
+      const compiled = registry.cases.find(item => item.caseId === sourceCase.caseId)!;
+      const sourceTrace = catalog.cases.find(item => item.id === sourceCase.catalogAlias)!;
+      expect(compiled).toMatchObject({
+        catalogAlias: sourceCase.catalogAlias,
+        goldenPoints: sourceCase.goldenPoints,
+        split: sourceCase.split,
+        expectedScene: sourceCase.expectedScene,
+        query: sourceCase.query,
+        analysisMode: sourceCase.analysisMode,
+      });
+      expect(compiled.goldenPoints).toEqual(sourceCase.goldenPoints);
+      expect(compiled.traces).toEqual([{
+        role: 'current', catalogAlias: sourceCase.catalogAlias, contentHash: sourceTrace.trace.sha256,
+      }]);
+      expect(compiled.groundTruth.requiredEvidence).toEqual(sourceTrace.coverage.expectations.map(item => ({
+        id: item.id, kind: 'coverage_expectation', locator: `${sourceCase.catalogAlias}:${item.id}`,
+      })));
+    }
     expect(registry.cases.flatMap(item => item.groundTruth.requiredFacts)
       .filter(fact => fact.evaluation === 'semantic')).toHaveLength(0);
-    expect(registry.cases.flatMap(item => item.groundTruth.requiredEvidence))
-      .toHaveLength(261);
-    expect(registry.cases.filter(item => item.split === 'train')).toHaveLength(6);
-    expect(registry.cases.filter(item => item.split === 'validation')).toHaveLength(4);
-    expect(registry.cases.filter(item => item.split === 'holdout')).toHaveLength(4);
-    expect(new Set(registry.cases.map(item => item.caseId)).size).toBe(14);
+    expect(new Set(registry.cases.map(item => item.caseId)).size).toBe(authored.cases.length);
+    const expectedEvidenceCount = catalog.cases.filter(item => item.kind === 'constructed')
+      .reduce((count, item) => count + item.coverage.expectations.length, 0);
     expect(new Set(registry.cases.flatMap(item =>
       item.groundTruth.requiredEvidence.map(evidence => evidence.locator))).size)
-      .toBe(261);
+      .toBe(expectedEvidenceCount);
   });
 
   it('compiles duration and identity facts but never absolute timestamps or causal edges', () => {

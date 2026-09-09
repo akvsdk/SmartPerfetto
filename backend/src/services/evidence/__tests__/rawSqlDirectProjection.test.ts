@@ -195,7 +195,7 @@ describe('raw SQL direct projection', () => {
     "SELECT 1; SELECT run_metric('android/startup.sql')",
     'SELECT 1;;', 'SELECT 1; /* comment */ DELETE FROM slice',
     'WITH slice AS (SELECT 1 AS dur) SELECT dur FROM slice',
-    'SELECT dur FROM (SELECT 1 AS dur)', 'SELECT (SELECT dur FROM slice)',
+    'SELECT dur FROM (SELECT 1 AS dur)',
     'SELECT dur FROM slice UNION SELECT 1', 'SELECT dur FROM slice INTERSECT SELECT 1',
     'SELECT dur FROM slice EXCEPT SELECT 1',
     "SELECT run_metric('android/startup.sql')", 'SELECT RUN_METRIC(?)',
@@ -209,7 +209,6 @@ describe('raw SQL direct projection', () => {
     'SELECT main.slice.dur FROM main.slice',
     'SELECT * FROM slice INDEXED BY some_index',
     'SELECT dur FROM slice OFFSET 1', 'SELECT dur FROM slice ORDER BY ts unexpected',
-    'SELECT dur FROM slice WHERE id IN (SELECT id FROM slice)',
     'SELECT dur FROM slice WHERE id IN other_table',
     'SELECT dur FROM slice WHERE name REGEXP ?',
     'SELECT dur FROM slice ORDER BY name COLLATE unknown_collation',
@@ -218,7 +217,6 @@ describe('raw SQL direct projection', () => {
     'SELECT dur, count(*) OVER () FROM slice',
     'SELECT dur, unknown_function(ts) AS end_ts FROM slice',
     'SELECT dur, abs(unknown_function(ts)) AS end_ts FROM slice',
-    'SELECT dur, (SELECT ts FROM slice) AS other_ts FROM slice',
     'SELECT dur, 1 AS flag FROM slice UNION SELECT dur, 2 FROM slice',
     'SELECT * AS renamed FROM slice',
     'CREATE PERFETTO FUNCTION abs(x LONG) RETURNS LONG AS SELECT run_metric(?)',
@@ -233,6 +231,53 @@ describe('raw SQL direct projection', () => {
     expect(parsed.pureRead).toBe(false);
     expect(parsed.projections).toBeUndefined();
     expect(resolveRawSqlDirectProjection(parsed, ['dur'], columns)).toBeUndefined();
+  });
+
+  it.each([
+    'SELECT (SELECT dur FROM slice)',
+    'SELECT t.id AS track_id, t.name AS track_name, t.type AS track_type FROM track t WHERE t.id = (SELECT track_id FROM slice WHERE id = 50220)',
+    'SELECT dur FROM slice WHERE id IN (SELECT id FROM slice WHERE dur > 0)',
+    'SELECT dur FROM slice WHERE id NOT IN (SELECT id FROM slice WHERE dur < 0)',
+    'SELECT dur, (SELECT ts FROM slice LIMIT 1) AS other_ts FROM slice',
+    'SELECT dur FROM slice WHERE id = coalesce((SELECT id FROM slice LIMIT 1), 0)',
+    'SELECT dur FROM slice WHERE id IN (SELECT id FROM slice WHERE id = (SELECT id FROM slice LIMIT 1))',
+    `SELECT dur FROM slice WHERE id = (/* ) ; ( */ SELECT id FROM slice WHERE name = 'a); SELECT run_metric(''x'')' LIMIT 1)`,
+    `SELECT dur FROM slice WHERE id = (SELECT id AS "x);(" FROM slice -- ) ;\nLIMIT 1)`,
+  ])('admits a fully parsed benign subquery without assigning outer row or unit lineage: %s', sql => {
+    const parsed = analyzeRawSqlDirectProjection(sql);
+    expect(parsed).toMatchObject({pureRead: true, reason: 'projection_not_direct'});
+    expect(parsed.projections).toBeUndefined();
+    expect(resolveRawSqlDirectProjection(parsed, ['dur'], columns)).toBeUndefined();
+  });
+
+  it.each([
+    'SELECT dur FROM slice WHERE id = (SELECT run_metric(?))',
+    'SELECT dur FROM slice WHERE id IN (SELECT abs(run_metric(?)))',
+    'SELECT dur FROM slice WHERE id = (SELECT unknown_function(id) FROM slice)',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM custom_table_function(?))',
+    'SELECT dur FROM slice WHERE id = (WITH x AS (SELECT 1) SELECT * FROM x)',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM slice;)',
+    'SELECT dur FROM slice WHERE id IN (SELECT id FROM slice; DROP TABLE slice)',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM slice) ; SELECT run_metric(?)',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM slice UNION SELECT id FROM slice)',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM slice trailing tokens)',
+    'SELECT dur FROM slice WHERE id = (SELECT id FROM slice',
+    'SELECT dur FROM slice WHERE id IN (SELECT id FROM slice,)',
+  ])('does not hide opaque or malformed operations inside subqueries: %s', sql => {
+    expect(analyzeRawSqlDirectProjection(sql).pureRead).toBe(false);
+  });
+
+  it('retains global token/byte budgets and cumulative expression depth across nested parsers', () => {
+    expect(analyzeRawSqlDirectProjection(`SELECT (SELECT '${'字'.repeat(RAW_SQL_DIRECT_PROJECTION_LIMITS.bytes / 2)}')`))
+      .toEqual({pureRead: false, reason: 'sql_byte_budget'});
+    expect(analyzeRawSqlDirectProjection(`SELECT (SELECT ${Array(5_000).fill('1').join(' + ')})`))
+      .toEqual({pureRead: false, reason: 'sql_token_budget'});
+    const depth = RAW_SQL_DIRECT_PROJECTION_LIMITS.depth;
+    expect(analyzeRawSqlDirectProjection(`SELECT ${'(SELECT '.repeat(depth + 1)}1${')'.repeat(depth + 1)}`))
+      .toEqual({pureRead: false, reason: 'sql_depth_budget'});
+    expect(analyzeRawSqlDirectProjection(`SELECT ${'(SELECT - '.repeat(depth)}1${')'.repeat(depth)}`))
+      .toEqual({pureRead: false, reason: 'sql_depth_budget'});
+    expect(analyzeRawSqlDirectProjection(`SELECT ${'(SELECT '.repeat(depth)}1${')'.repeat(depth)}`).pureRead).toBe(true);
   });
 
   it('fails closed at UTF-8 byte, token and nested expression budgets', () => {

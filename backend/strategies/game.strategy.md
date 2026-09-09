@@ -3,6 +3,18 @@
 
 ---
 scene: game
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: game_critical_path
+      domain: critical_path
+      description: "Identify actual engine/GameThread, render/raster and workload phases with deadline windows. Do not assume tid equals pid identifies the only critical thread; retain foreground, worker and system peer roles."
+    - id: game_dependencies
+      domain: dependency_chain
+      description: "Connect CPU execution to GPU work, fences and presentation, with thermal and energy context when observed. Frame pacing, GPU saturation and CPU scheduling are distinct claims."
 classification_description: "Game workload frame pacing, CPU/GPU performance and sustained rendering behavior."
 priority: 4
 effort: medium

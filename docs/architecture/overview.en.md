@@ -131,12 +131,14 @@ share a trace prerequisite:
   returns coarse status only and never exposes ports, credentials, file paths,
   or cross-tenant details.
 
-In OIDC mode, session, trace, lease, connection, run/receipt, and transient
-connection state remain in page memory only. Persisted messages first remove
-runtime bindings and raw private prompts; authorized source quotations in analysis
-results remain readable. Messages use a tenant/user/workspace-
-scoped namespace; changing identity or workspace cannot restore another
-scope's history. Logout, 401, cross-tab authority invalidation, identity/context
+In OIDC mode, physical session, trace, lease, connection, run/receipt, and transient
+connection state remain in page memory. The browser may retain a logical
+conversationId locator bound to the exact tenant/user/workspace and backend URL.
+Restore requires backend authorization before cached messages can become trusted
+history. Persisted messages remove runtime bindings and raw private prompts;
+source history additionally requires current authorization and its original exact
+analysis-context fingerprint. Changing identity or workspace cannot restore
+another scope's history. Logout, 401, cross-tab authority invalidation, identity/context
 changes, and page disposal abort start/stream work, advance the runtime
 generation, and clear page state so late results cannot write into a new
 identity.
@@ -146,6 +148,23 @@ shared helper does not add cookie credentials unconditionally, and a non-OIDC
 401 is not treated as OIDC authority loss. This integration adds no environment
 variables or configuration keys; providers, runtimes, and endpoints continue
 to come from the existing configuration sources.
+
+## Turn Limits and Follow-ups
+
+The five runtimes share acquisition budgets and closeout state. Budgets above one
+reserve the last call for a tool-free conclusion from returned facts, remaining
+gaps, and next steps. Cancellation, deadlines, revoked authority, and provider
+errors do not trigger another summary. Delivery retains `incomplete/turn_limit`;
+text delivery does not establish complete evidence. OpenCode stops after observing
+the limit, records actual overshoot, and cannot add a summary after an overshoot.
+
+Each user question starts a fresh physical model context. Within the same logical
+session, owner, trace, provider, and source authorization checks precede a bounded
+preview of recent conclusions, gaps, and evidence locators. `read_session_history`
+pages older records without creating current-run verification witnesses. A single
+database transaction persists the logical descriptor and full turn records, so
+page reopening and backend restart share one recovery path. The CLI reuses the
+same typed history contract. See [Agent Runtime Architecture](agent-runtime.en.md).
 
 ## Main Analysis Data Flow
 
@@ -365,3 +384,9 @@ subpaths or features. Only entries marked `classification_role: variant` and
 `primary_eligible: true` in the catalog may become the primary classification.
 Run `npm run check:rendering-pipelines` to verify the upstream pin, hashes, and
 all active references.
+
+## System investigation contract
+
+`investigation-profiles.yaml` and scene Strategies declare investigation obligations, resolved and pinned to the turn through the registry fingerprint. Shared Skills or trusted equivalent SQL produce scoped original evidence; acquisition records and the final explanation are assessed separately. `investigationAssessment` travels through SSE, reports, snapshots and comparison summaries. `deliveryAssurance.investigation` and `investigationEvidence` remain independent of completion, report and claims.
+
+Persisted declarations cannot create acquisition authority. Private projection or changes to the body, claims, identity, intent or evidence invalidate positive investigation assessments and clear stale references. Historical restoration does not acquire new evidence; legacy results remain unknown.

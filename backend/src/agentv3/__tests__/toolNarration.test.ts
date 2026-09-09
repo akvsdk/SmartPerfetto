@@ -9,6 +9,10 @@ import {
 } from '../toolNarration';
 
 describe('toolNarration', () => {
+  it('describes historical recall without exposing an internal turn locator', () => {
+    expect(formatToolCallNarration('read_session_history', {turnId: 'private-turn-canary'}))
+      .toBe('回查本次会话的历史结论与未完成项');
+  });
   it('describes submit_plan with phase goals', () => {
     const text = formatToolCallNarration('submit_plan', {
       phases: [

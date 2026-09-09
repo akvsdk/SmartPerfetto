@@ -3,6 +3,18 @@
 
 ---
 scene: memory
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: memory_critical_path
+      domain: critical_path
+      description: "Select allocation, GC, reclaim, page-fault or LMK windows and their actual tasks. Relate observed memory pressure and task states; use CPU frequency only where execution slowdown is relevant."
+    - id: memory_dependencies
+      domain: dependency_chain
+      description: "Keep memory growth, leakage, OOM/LMK, reclaim and GC evidence distinct. A high allocation count or concurrent pressure alone does not establish a latency or failure cause."
 classification_description: "Memory usage, allocation, garbage collection, pressure, leaks and memory-related process termination."
 priority: 4
 effort: medium

@@ -3,6 +3,18 @@
 
 ---
 scene: anr
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: anr_critical_path
+      domain: critical_path
+      description: "Confirm ANR type, target UPID and timeout window. Identify blocked task, main-thread work and relevant owner/peer tasks rather than equating the longest wait with the full timeout."
+    - id: anr_dependencies
+      domain: dependency_chain
+      description: "Trace Binder transactions, lock ownership, IO and wakeup dependencies where available; distinguish observed waiting from an established blocking chain and from ANR trigger attribution."
 classification_description: "Application unresponsiveness, ANR triggers, deadlocks and timeout-related blocking."
 priority: 1
 effort: medium

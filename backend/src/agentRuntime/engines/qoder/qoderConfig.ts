@@ -136,7 +136,7 @@ export interface QoderRuntimeConfig {
 
 export function resolveQoderRuntimeConfig(env: EnvLike = process.env): QoderRuntimeConfig {
   return {
-    maxTurns: numericEnv(env[QODER_MAX_TURNS_ENV]) ?? 100,
+    maxTurns: numericEnv(env[QODER_MAX_TURNS_ENV]) ?? numericEnv(env.AGENT_MAX_TURNS) ?? 100,
     quickMaxTurns: numericEnv(env[QODER_QUICK_MAX_TURNS_ENV]) ?? 50,
     fullPerTurnMs: numericEnv(env[QODER_FULL_PER_TURN_MS_ENV]) ?? 60_000,
     quickPerTurnMs: numericEnv(env[QODER_QUICK_PER_TURN_MS_ENV]) ?? 40_000,

@@ -35,6 +35,12 @@ function createSdkModule(label: string): QoderSdkModule & { label: string } {
 }
 
 describe('Qoder runtime configuration', () => {
+  it('inherits the shared full-turn limit unless Qoder supplies an override', () => {
+    expect(resolveQoderRuntimeConfig({AGENT_MAX_TURNS: '17'}).maxTurns).toBe(17);
+    expect(resolveQoderRuntimeConfig({AGENT_MAX_TURNS: '17', QODER_MAX_TURNS: '4'}).maxTurns).toBe(4);
+    expect(resolveQoderRuntimeConfig({AGENT_MAX_TURNS: 'invalid'}).maxTurns).toBe(100);
+  });
+
   beforeEach(() => {
     resetQoderSdkModuleCache();
   });

@@ -5,6 +5,7 @@
 import type { Finding } from '../agent/types';
 import type { SceneType } from './sceneClassifier';
 import type { ComplexityClassifierInput, SelectionContext } from './types';
+import {renderAnalysisHistoryContext, type AnalysisHistoryTurn} from '../agentRuntime/analysisHistory';
 
 const RECENT_TURN_LIMIT = 3;
 const RECENT_FINDING_LIMIT = 5;
@@ -21,7 +22,9 @@ interface BuildComplexityClassifierInputParams {
   sceneType: SceneType;
   selectionContext?: SelectionContext;
   hasReferenceTrace: boolean;
-  previousTurns: PriorTurn[];
+  previousTurns?: PriorTurn[];
+  /** Already scoped by the current runtime reader; even [] suppresses legacy history. */
+  history?: readonly AnalysisHistoryTurn[];
   requestedMode?: ComplexityClassifierInput['requestedMode'];
 }
 
@@ -42,7 +45,16 @@ function formatFindingSummary(finding: Finding): string | null {
 export function buildComplexityClassifierInput(
   params: BuildComplexityClassifierInputParams,
 ): ComplexityClassifierInput {
-  const recentTurns = params.previousTurns.slice(-RECENT_TURN_LIMIT);
+  if (params.history !== undefined) {
+    return {query: params.query, sceneType: params.sceneType, hasSelectionContext: !!params.selectionContext,
+      selectionContext: params.selectionContext, hasReferenceTrace: params.hasReferenceTrace,
+      hasExistingFindings: false, hasPriorFullAnalysis: false,
+      previousQueries: [], previousFindings: [], previousFindingDetails: [], previousEntities: [],
+      historyContext: renderAnalysisHistoryContext(params.history, {outputLanguage: 'en', maxBytes: 6000}) ?? '',
+      ...(params.requestedMode ? {requestedMode: params.requestedMode} : {})};
+  }
+  const previousTurns = params.previousTurns ?? [];
+  const recentTurns = previousTurns.slice(-RECENT_TURN_LIMIT);
   const recentFullTurns = recentTurns.filter(isFullLikeTurn);
   const previousFindings = recentTurns
     .flatMap(turn => turn.findings ?? [])
@@ -51,7 +63,7 @@ export function buildComplexityClassifierInput(
     .slice(-RECENT_FINDING_LIMIT);
   const previousFindingDetails = recentTurns.flatMap((turn, index) =>
     (turn.findings ?? []).filter(finding => finding.title?.trim()).map(finding => ({
-      turnIndex: params.previousTurns.length - recentTurns.length + index,
+      turnIndex: previousTurns.length - recentTurns.length + index,
       ...(turn.id ? {turnId: turn.id} : {}),
       ...(finding.id ? {id: finding.id} : {}),
       title: finding.title.trim().slice(0, 240),
@@ -61,7 +73,7 @@ export function buildComplexityClassifierInput(
   const previousEntities = recentTurns.flatMap((turn, index) =>
     (turn.intent?.referencedEntities ?? []).flatMap(entity =>
       typeof entity.id === 'string' || (typeof entity.id === 'number' && Number.isFinite(entity.id))
-        ? [{turnIndex: params.previousTurns.length - recentTurns.length + index, type: entity.type, id: entity.id}]
+        ? [{turnIndex: previousTurns.length - recentTurns.length + index, type: entity.type, id: entity.id}]
         : [])).slice(-10);
 
   return {

@@ -3,6 +3,18 @@
 
 ---
 scene: scroll_response
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: scroll_response_critical_path
+      domain: critical_path
+      description: "Bind the first relevant MOVE to the first corresponding visible update, keeping event and frame identities. Follow input/Main/render/SF tasks and scheduling on that first-response path."
+    - id: scroll_response_dependencies
+      domain: dependency_chain
+      description: "Without actual present evidence report a candidate response bound, not confirmed display latency. Do not impose a fixed frame budget or infer response from FPS."
 classification_description: "The initial response to starting a scroll gesture, including time to the first visual update."
 priority: 3
 effort: medium

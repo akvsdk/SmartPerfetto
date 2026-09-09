@@ -594,6 +594,35 @@ describe('agent route private projections', () => {
     expect(data.resultContract).toBeUndefined();
   });
 
+  it('drops untrusted investigation metadata from persisted private SSE without relying on live redaction guards', () => {
+    const secret = 'UNREGISTERED_PRIVATE_INVESTIGATION_SECRET';
+    const session = {sessionId, codeAwareMode: 'provider_send', codebaseIds: ['cb-private']} as any;
+    const hash = analysisDeliveryFingerprint('retained');
+    const eventData = JSON.stringify({data: {success: true, conclusion: 'Stored conclusion',
+      investigationAssessment: {schemaVersion: 1, status: 'checked', binding: {
+        candidateRef: 'candidate', runId: 'run', attemptId: 'attempt', conclusionFingerprint: hash,
+        conclusionContractFingerprint: hash, evidenceFingerprint: hash, requirementsFingerprint: hash,
+        registryFingerprint: 'registry', intentFingerprint: hash, ledgerFingerprint: hash, evidenceRecordsFingerprint: hash},
+        requirements: [{requirementId: secret, domain: secret, applicability: 'applicable', coverage: 'covered',
+          evidenceStatus: 'observed', acquisition: 'observed', scopeMatch: 'matched',
+          contentLocations: [{start: 0, end: 3}], evidenceRecordIds: [secret]}],
+        evidenceRecords: [{recordId: secret, captureId: secret, rowIndex: 0, evidenceRefId: secret,
+          artifactId: secret, sourceToolCallId: secret, skillId: 'system', stepId: 'summary',
+          definitionFingerprint: hash, selectedSqlHash: hash, traceId: secret, traceSide: 'current',
+          originRunId: secret, origin: 'current_run', domain: 'frequency', metricId: 'system.cpu.frequency',
+          status: 'observed', window: {start: 0, end: 100}, value: secret}]},
+      deliveryAssurance: {schemaVersion: 1, entry: 'new_finalization', completion: 'passed', claims: 'passed',
+        source: 'passed', identity: 'passed', report: 'passed', investigation: 'passed', investigationEvidence: 'passed'},
+    }});
+    const projected = agentRoutesPrivacyProjectionTestSeam.sanitizePersistedAnalysisCompletedEvent(
+      session, {eventType: 'analysis_completed', eventData} as any);
+    const data = JSON.parse(projected.eventData).data;
+    expect(data.investigationAssessment).toBeUndefined();
+    expect(data.deliveryAssurance).toBeUndefined();
+    expect(projected.eventData).not.toContain(secret);
+    expect(data.success).toBe(false);
+  });
+
   it('persists generic private run metadata and projected replay events in enterprise SQLite', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'private-route-db-'));
     const originalEnterprise = process.env[ENTERPRISE_FEATURE_FLAG_ENV];

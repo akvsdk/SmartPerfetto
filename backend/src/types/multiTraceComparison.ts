@@ -127,6 +127,7 @@ export interface AnalysisSummary {
   outputOrigin?: import('./analysisDelivery').AnalysisOutputOrigin;
   runtimeAppendix?: import('./analysisDelivery').AnalysisRuntimeAppendix;
   reportAssessment?: import('./analysisDelivery').FinalReportAssessment;
+  investigationAssessment?: import('./analysisInvestigationAssessment').FinalInvestigationAssessment;
   deliveryAssurance?: import('./analysisDelivery').AnalysisDeliveryAssurance;
   sourceUseDecision?: import('../services/codebase/sourceUseDecision').SourceUseDecisionV1;
   sourceClaimVerificationResult?: import('../services/codebase/sourceClaimVerifier').SourceClaimVerificationResult;
@@ -289,6 +290,9 @@ export interface ComparisonMatrixInput {
   createdBy?: string;
   createdAt: number;
   traceMetadata: TraceComparisonMetadata;
+  /** Historical source-run coverage; never current comparison acquisition proof. */
+  investigationAssessment?: import('./analysisInvestigationAssessment').FinalInvestigationAssessment;
+  investigationAssurance?: Pick<import('./analysisDelivery').AnalysisDeliveryAssurance, 'investigation' | 'investigationEvidence'>;
 }
 
 export interface ComparisonMatrixCell {

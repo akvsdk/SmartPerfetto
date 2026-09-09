@@ -43,6 +43,7 @@ const requiredFiles = [
   'skills/atomic/longest_process_slices.skill.yaml',
   'skills/composite/scrolling_analysis.skill.yaml',
   'strategies/scrolling.strategy.md',
+  'strategies/investigation-profiles.yaml',
   'knowledge/android-internals-capability-map.yaml',
   'knowledge/aiw-pack/1.root.json',
   'knowledge/aiw-pack/knowledge-packs.lock.json',

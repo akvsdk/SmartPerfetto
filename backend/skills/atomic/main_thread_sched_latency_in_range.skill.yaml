@@ -43,6 +43,14 @@ display:
   layer: deep
   title: "主线程调度延迟"
   columns:
+    - {name: upid, label: "upid", type: number, hidden: true}
+    - {name: utid, label: "utid", type: number, hidden: true}
+    - {name: tid, label: "tid", type: number, hidden: true}
+    - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+    - {name: runnable_preempted_ms, label: "runnable_preempted_ms", type: number, hidden: true}
+    - {name: right_censored_count, label: "right_censored_count", type: number, hidden: true}
+    - {name: latency_evidence, label: "latency_evidence", type: string, hidden: true}
     - name: thread_name
       label: "线程"
       type: string
@@ -68,35 +76,32 @@ display:
       label: ">8ms 次数"
       type: number
 
+
 process_scope:
   role: target
   binding: effective_target_processes
 sql_fragments:
   - fragments/effective_target_processes.sql
-
+  - fragments/system_thread_state_spans.sql
 sql: |
-  WITH main_thread AS (
-    SELECT t.utid
-    FROM thread t
-    JOIN effective_target_processes p ON t.upid = p.upid
-    WHERE (${__process_scope.upid} IS NOT NULL OR '${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*')
-      AND t.tid = p.pid
+  WITH system_windows AS (SELECT 0 AS window_id,
+    COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+    COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+  system_target_threads AS (
+    SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+    FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+    WHERE (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*') AND t.tid=p.pid
   )
-  SELECT
-    'MainThread' as thread_name,
-    COUNT(*) as runnable_count,
-    ROUND(SUM(ts.dur) / 1e6, 2) as total_runnable_ms,
-    ROUND(MAX(ts.dur) / 1e6, 2) as max_latency_ms,
-    ROUND(AVG(ts.dur) / 1e6, 2) as avg_latency_ms,
-    SUM(CASE WHEN ts.dur > 2000000 THEN 1 ELSE 0 END) as long_wait_count,
-    SUM(CASE WHEN ts.dur > 8000000 THEN 1 ELSE 0 END) as severe_count
-  FROM thread_state ts
-  JOIN main_thread mt ON ts.utid = mt.utid
-  WHERE (${start_ts} IS NULL OR ts.ts >= ${start_ts})
-    AND (${end_ts} IS NULL OR ts.ts < ${end_ts})
-    AND ts.state IN ('R', 'R+')
-  GROUP BY 1
-  HAVING total_runnable_ms > 0.01
-
+  SELECT s.upid,s.utid,t.tid,t.name AS thread_name,s.window_start_ts,s.window_end_ts,
+    COUNT(*) AS runnable_count,SUM(s.dur_ns)/1e6 AS total_runnable_ms,
+    MAX(s.dur_ns)/1e6 AS max_latency_ms,AVG(s.dur_ns)/1e6 AS avg_latency_ms,
+    SUM(CASE WHEN s.dur_ns>2000000 THEN 1 ELSE 0 END) AS long_wait_count,
+    SUM(CASE WHEN s.dur_ns>8000000 THEN 1 ELSE 0 END) AS severe_count,
+    SUM(CASE WHEN s.state='R+' THEN s.dur_ns ELSE 0 END)/1e6 AS runnable_preempted_ms,
+    SUM(CASE WHEN s.right_censored THEN 1 ELSE 0 END) AS right_censored_count,
+    'window_clipped_runnable_intervals' AS latency_evidence
+  FROM system_thread_state_spans s JOIN thread t ON t.utid=s.utid
+  WHERE s.state IN ('R','R+')
+  GROUP BY s.window_id,s.utid ORDER BY total_runnable_ms DESC
 output:
   format: structured

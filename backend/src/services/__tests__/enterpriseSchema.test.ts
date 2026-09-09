@@ -3,6 +3,9 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import Database from 'better-sqlite3';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import {
   applyEnterpriseMinimalSchema,
   ENTERPRISE_CORE_SCHEMA_TABLES,
@@ -84,6 +87,90 @@ describe('enterprise core schema', () => {
   afterEach(() => {
     db?.close();
     db = undefined;
+  });
+
+  test('rechecks pending migrations after another connection applies the stale ledger snapshot', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-migration-race-'));
+    const first = new Database(path.join(dir, 'sessions.db'));
+    const second = new Database(path.join(dir, 'sessions.db'));
+    const prepare = first.prepare.bind(first);
+    let interleaved = false;
+    const spy = jest.spyOn(first, 'prepare').mockImplementation(((sql: string) => {
+      const statement = prepare(sql);
+      if (sql.trim() === 'SELECT version FROM enterprise_schema_migrations' && !interleaved) {
+        const all = statement.all.bind(statement);
+        jest.spyOn(statement, 'all').mockImplementation(() => {
+          const stale = all();
+          interleaved = true;
+          applyEnterpriseMinimalSchema(second);
+          return stale;
+        });
+      }
+      return statement;
+    }) as typeof first.prepare);
+    try {
+      expect(() => applyEnterpriseMinimalSchema(first)).not.toThrow();
+      expect(interleaved).toBe(true);
+      expect(first.prepare('SELECT version FROM enterprise_schema_migrations ORDER BY version').all())
+        .toEqual(second.prepare('SELECT version FROM enterprise_schema_migrations ORDER BY version').all());
+      expect(first.inTransaction).toBe(false);
+      expectColumns(first, 'memory_entries', ['rag_index_state']);
+    } finally {
+      spy.mockRestore();
+      first.close();
+      second.close();
+      fs.rmSync(dir, {recursive: true, force: true});
+    }
+  });
+
+  test('locks the nontransactional backfill column check before a competing ALTER', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-column-race-'));
+    const first = new Database(path.join(dir, 'sessions.db'));
+    // An upgraded database, unlike a fresh one, does not already have the
+    // materialized RAG columns in the initial CREATE TABLE definition.
+    first.exec(`
+      CREATE TABLE enterprise_schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+      CREATE TABLE memory_entries (
+        id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+        scope TEXT NOT NULL, source_run_id TEXT, content_json TEXT NOT NULL,
+        embedding_ref TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
+    `);
+    const markMigration = first.prepare('INSERT INTO enterprise_schema_migrations VALUES (?, 1)');
+    for (let version = 1; version <= 13; version++) markMigration.run(version);
+    const second = new Database(path.join(dir, 'sessions.db'), {timeout: 0});
+    const prepare = first.prepare.bind(first);
+    let competingError: string | undefined;
+    let attempted = false;
+    const spy = jest.spyOn(first, 'prepare').mockImplementation(((sql: string) => {
+      const statement = prepare(sql);
+      if (sql === 'PRAGMA table_info(memory_entries)' && !attempted) {
+        const all = statement.all.bind(statement);
+        jest.spyOn(statement, 'all').mockImplementation(() => {
+          const columns = all();
+          attempted = true;
+          try {
+            second.exec('ALTER TABLE memory_entries ADD COLUMN rag_registry_origin TEXT');
+          }
+          catch (error) { competingError = `${(error as {code?: string}).code}: ${(error as Error).message}`; }
+          return columns;
+        });
+      }
+      return statement;
+    }) as typeof first.prepare);
+    try {
+      expect(() => applyEnterpriseMinimalSchema(first)).not.toThrow();
+      expect(attempted).toBe(true);
+      expect(competingError).toMatch(/^SQLITE_BUSY:/);
+      expect(first.inTransaction).toBe(false);
+      expectColumns(first, 'memory_entries', ['rag_registry_origin', 'rag_index_state']);
+      expect(() => applyEnterpriseMinimalSchema(second)).not.toThrow();
+    } finally {
+      spy.mockRestore();
+      first.close();
+      second.close();
+      fs.rmSync(dir, {recursive: true, force: true});
+    }
   });
 
   test('creates the §10.2 core enterprise tables and key columns', () => {

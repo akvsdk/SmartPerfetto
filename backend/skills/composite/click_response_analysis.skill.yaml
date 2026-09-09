@@ -554,6 +554,12 @@ steps:
   # ========== 输入期间主线程状态分析（深度 JOIN）==========
   - id: input_thread_state
     type: atomic
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     name: "输入期间主线程状态"
     optional: true
     display:
@@ -561,6 +567,11 @@ steps:
       layer: list
       title: "输入处理期间主线程状态"
       columns:
+        - {name: window_id, label: "window_id", type: number, hidden: true}
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, hidden: true}
         - name: event_type
           label: "事件类型"
           type: string
@@ -582,10 +593,10 @@ steps:
           type: string
     sql: |
       WITH main_thread AS (
-        SELECT t.utid, p.name as process_name
+        SELECT t.utid, p.upid, p.name as process_name
         FROM thread t
-        JOIN process p ON t.upid = p.upid
-        WHERE p.name = '${target_process.data[0].process_name}'
+        JOIN effective_target_processes p ON t.upid = p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR p.name = '${target_process.data[0].process_name}')
           AND t.tid = p.pid
         LIMIT 1
       ),
@@ -602,25 +613,22 @@ steps:
           AND total_latency_dur > ${thread_state_min_dur_ms|50} * 1000000  -- > thread state threshold
         ORDER BY total_latency_dur DESC
         LIMIT 10
+      ),
+      system_windows AS (
+        SELECT ROW_NUMBER() OVER (ORDER BY input_ts,input_end_ts,event_type) AS window_id,
+          MAX(input_ts,COALESCE(${start_ts},input_ts)) AS window_start_ts,
+          MIN(input_end_ts,COALESCE(${end_ts},input_end_ts)) AS window_end_ts,event_type,total_latency_dur
+        FROM slow_inputs
+      ),
+      system_target_threads AS (
+        SELECT w.window_id,t.upid,t.utid,'main' AS role FROM system_windows w CROSS JOIN main_thread t
       )
-      SELECT
-        si.event_type,
-        si.total_latency_dur / 1e6 as input_dur_ms,
-        ts.state,
-        SUM(
-          CASE
-            WHEN ts.ts + ts.dur <= si.input_ts THEN 0
-            WHEN ts.ts >= si.input_end_ts THEN 0
-            ELSE MIN(ts.ts + ts.dur, si.input_end_ts) - MAX(ts.ts, si.input_ts)
-          END
-        ) / 1e6 as state_dur_ms,
-        ts.blocked_function
-      FROM slow_inputs si
-      JOIN thread_state ts ON ts.utid = (SELECT utid FROM main_thread)
-      WHERE ts.ts + ts.dur > si.input_ts
-        AND ts.ts < si.input_end_ts
-      GROUP BY si.input_ts, ts.state, ts.blocked_function
-      ORDER BY si.total_latency_dur DESC, state_dur_ms DESC
+      SELECT s.window_id,s.upid,s.utid,w.event_type,w.total_latency_dur/1e6 AS input_dur_ms,
+        s.state,SUM(s.dur_ns)/1e6 AS state_dur_ms,s.blocked_function,
+        w.window_start_ts,w.window_end_ts
+      FROM system_thread_state_spans s JOIN system_windows w ON w.window_id=s.window_id
+      GROUP BY s.window_id,s.upid,s.utid,s.state,s.blocked_function
+      ORDER BY w.total_latency_dur DESC,state_dur_ms DESC
       LIMIT 30
     save_as: input_thread_state
     condition: input_check.data[0]?.status === 'available' && target_process.data.length > 0

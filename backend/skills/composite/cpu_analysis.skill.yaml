@@ -138,15 +138,24 @@ steps:
         - name: process_name
           label: "进程名"
           type: string
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_sched_spans.sql
     sql: |
-      WITH
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      clipped_sched AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_sched_spans s),
       cpu_by_process AS (
         SELECT
           p.upid as upid,
           SUM(ss.dur) as cpu_dur
-        FROM sched_slice ss
+        FROM clipped_sched ss
         JOIN thread t ON ss.utid = t.utid
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE (${start_ts} IS NULL OR ss.ts + ss.dur > ${start_ts})
           AND (${end_ts} IS NULL OR ss.ts < ${end_ts})
         GROUP BY p.upid
@@ -157,9 +166,9 @@ steps:
           p.pid,
           p.name as process_name,
           COALESCE(cb.cpu_dur, 0) as cpu_dur
-        FROM process p
+        FROM effective_target_processes p
         LEFT JOIN cpu_by_process cb USING (upid)
-        WHERE (('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
+        WHERE (${__process_scope.upid} IS NOT NULL OR ('${package}' = '' OR p.name = '${package}' OR p.name GLOB '${package}:*') OR '${package}' = '')
           -- 避免 package 为空时选到内核线程 (kworker 等)
           AND p.name NOT GLOB 'kworker*'
           AND p.name NOT GLOB 'swapper*'
@@ -205,6 +214,9 @@ steps:
       layer: overview
       title: "大小核分布（基于 capacity）"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
         - name: core_type
           label: "核心类型"
           type: string
@@ -228,30 +240,42 @@ steps:
         - name: core_count
           label: "核心数"
           type: number
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_sched_spans.sql
     sql: |
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      clipped_sched AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_sched_spans s)
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
         CASE ct.core_type
           WHEN 'prime' THEN 'prime (超大核)'
           WHEN 'big' THEN 'big (大核)'
           WHEN 'medium' THEN 'medium (中核)'
-          ELSE 'little (小核)'
+          WHEN 'little' THEN 'little (小核)' ELSE 'unknown (核类型未知)'
         END as core_type,
         ct.capacity,
         SUM(ss.dur) / 1e6 as total_time_ms,
         ROUND(100.0 * SUM(ss.dur) / (
-          SELECT SUM(dur) FROM sched_slice ss2
+          SELECT SUM(dur) FROM clipped_sched ss2
           JOIN thread t2 ON ss2.utid = t2.utid
-          JOIN process p2 ON t2.upid = p2.upid
+          JOIN effective_target_processes p2 ON t2.upid = p2.upid
           WHERE p2.upid = ${target_process.data[0].upid}
             AND (${start_ts} IS NULL OR ss2.ts + ss2.dur > ${start_ts})
             AND (${end_ts} IS NULL OR ss2.ts < ${end_ts})
         ), 1) as percent,
         COUNT(*) as slice_count,
         COUNT(DISTINCT ss.cpu) as core_count
-      FROM sched_slice ss
+      FROM clipped_sched ss
       JOIN thread t ON ss.utid = t.utid
-      JOIN process p ON t.upid = p.upid
-      JOIN _cpu_topology ct ON ss.cpu = ct.cpu_id
+      JOIN effective_target_processes p ON t.upid = p.upid
+      LEFT JOIN system_cpu_topology ct ON ss.ucpu = ct.ucpu
       WHERE p.upid = ${target_process.data[0].upid}
         AND (${start_ts} IS NULL OR ss.ts + ss.dur > ${start_ts})
         AND (${end_ts} IS NULL OR ss.ts < ${end_ts})
@@ -283,6 +307,10 @@ steps:
       layer: overview
       title: "线程 CPU 使用 Top10"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
         - name: tid
           label: "TID"
           type: number
@@ -310,8 +338,21 @@ steps:
           label: "大核占比"
           type: percentage
           format: percentage
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_sched_spans.sql
     sql: |
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      clipped_sched AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_sched_spans s)
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        t.utid AS utid,
         t.tid,
         t.name as thread_name,
         SUM(ss.dur) / 1e6 as cpu_time_ms,
@@ -319,11 +360,11 @@ steps:
         ROUND(AVG(ss.dur) / 1e6, 3) as avg_slice_ms,
         CASE t.tid WHEN p.pid THEN 'main' ELSE 'worker' END as thread_type,
         -- 大核使用率
-        ROUND(100.0 * SUM(CASE WHEN ct.core_type IN ('big', 'prime') THEN ss.dur ELSE 0 END) / NULLIF(SUM(ss.dur), 0), 1) as big_core_percent
-      FROM sched_slice ss
+        ROUND(100.0 * SUM(CASE WHEN ct.core_type IN ('big', 'prime', 'medium') THEN ss.dur ELSE 0 END) / NULLIF(SUM(ss.dur), 0), 1) as big_core_percent
+      FROM clipped_sched ss
       JOIN thread t ON ss.utid = t.utid
-      JOIN process p ON t.upid = p.upid
-      JOIN _cpu_topology ct ON ss.cpu = ct.cpu_id
+      JOIN effective_target_processes p ON t.upid = p.upid
+      LEFT JOIN system_cpu_topology ct ON ss.ucpu = ct.ucpu
       WHERE p.upid = ${target_process.data[0].upid}
         AND (${start_ts} IS NULL OR ss.ts + ss.dur > ${start_ts})
         AND (${end_ts} IS NULL OR ss.ts < ${end_ts})
@@ -356,6 +397,10 @@ steps:
       layer: overview
       title: "主线程状态"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
         - name: state
           label: "状态码"
           type: string
@@ -378,15 +423,33 @@ steps:
         - name: io_wait
           label: "io_wait"
           type: number
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     sql: |
-      WITH main_thread AS (
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE p.upid=${target_process.data[0].upid} AND (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*')
+      ),
+      clipped_states AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_thread_state_spans s),
+      main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE p.upid = ${target_process.data[0].upid} AND t.tid = p.pid
         LIMIT 1
       )
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        (SELECT utid FROM main_thread) AS utid,
         ts.state,
         CASE ts.state
           WHEN 'Running' THEN 'Running (CPU执行中)'
@@ -399,7 +462,7 @@ steps:
         END as state_desc,
         SUM(ts.dur) / 1e6 as total_dur_ms,
         ROUND(100.0 * SUM(ts.dur) / (
-          SELECT SUM(ts2.dur) FROM thread_state ts2
+          SELECT SUM(ts2.dur) FROM clipped_states ts2
           WHERE ts2.utid = (SELECT utid FROM main_thread)
             AND (${start_ts} IS NULL OR ts2.ts + ts2.dur > ${start_ts})
             AND (${end_ts} IS NULL OR ts2.ts < ${end_ts})
@@ -407,7 +470,7 @@ steps:
         COUNT(*) as count,
         -- IO 等待详情
         CASE WHEN ts.state IN ('D', 'DK') THEN COALESCE(ts.io_wait, 0) ELSE NULL END as io_wait
-      FROM thread_state ts
+      FROM clipped_states ts
       WHERE ts.utid = (SELECT utid FROM main_thread)
         AND (${start_ts} IS NULL OR ts.ts + ts.dur > ${start_ts})
         AND (${end_ts} IS NULL OR ts.ts < ${end_ts})
@@ -441,6 +504,10 @@ steps:
       layer: list
       title: "调度延迟分析（Runnable 等待）"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
         - name: wait_ms
           label: "等待时间"
           type: duration
@@ -468,15 +535,33 @@ steps:
         - name: severity
           label: "严重程度"
           type: string
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     sql: |
-      WITH main_thread AS (
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE p.upid=${target_process.data[0].upid} AND (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*')
+      ),
+      clipped_states AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_thread_state_spans s),
+      main_thread AS (
         SELECT t.utid, t.name
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE p.upid = ${target_process.data[0].upid} AND t.tid = p.pid
         LIMIT 1
       )
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        (SELECT utid FROM main_thread) AS utid,
         ts.dur / 1e6 as wait_ms,
         ts.ts / 1e6 as ts_ms,
         printf('%d', ts.ts) as ts_str,
@@ -490,7 +575,7 @@ steps:
           WHEN ts.dur / 1e6 > ${sched_delay_critical_ms|16} / 2 THEN 'warning'
           ELSE 'normal'
         END as severity
-      FROM thread_state ts
+      FROM clipped_states ts
       LEFT JOIN thread waker_t ON ts.waker_utid = waker_t.utid
       LEFT JOIN process waker_p ON waker_t.upid = waker_p.upid
       WHERE ts.utid = (SELECT utid FROM main_thread)
@@ -512,6 +597,10 @@ steps:
       layer: list
       title: "主线程运行核心分布"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
         - name: cpu
           label: "CPU"
           type: number
@@ -534,28 +623,41 @@ steps:
           label: "调度次数"
           type: number
           format: compact
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_sched_spans.sql
     sql: |
-      WITH main_thread AS (
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      clipped_sched AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_sched_spans s),
+      main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE p.upid = ${target_process.data[0].upid} AND t.tid = p.pid
         LIMIT 1
       )
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        (SELECT utid FROM main_thread) AS utid,
         ss.cpu,
         ct.capacity,
         ct.core_type,
         SUM(ss.dur) / 1e6 as total_time_ms,
         ROUND(100.0 * SUM(ss.dur) / (
-          SELECT SUM(ss2.dur) FROM sched_slice ss2
+          SELECT SUM(ss2.dur) FROM clipped_sched ss2
           WHERE ss2.utid = (SELECT utid FROM main_thread)
             AND (${start_ts} IS NULL OR ss2.ts + ss2.dur > ${start_ts})
             AND (${end_ts} IS NULL OR ss2.ts < ${end_ts})
         ), 1) as percent,
         COUNT(*) as slice_count
-      FROM sched_slice ss
-      JOIN _cpu_topology ct ON ss.cpu = ct.cpu_id
+      FROM clipped_sched ss
+      LEFT JOIN system_cpu_topology ct ON ss.ucpu = ct.ucpu
       WHERE ss.utid = (SELECT utid FROM main_thread)
         AND (${start_ts} IS NULL OR ss.ts + ss.dur > ${start_ts})
         AND (${end_ts} IS NULL OR ss.ts < ${end_ts})
@@ -574,6 +676,10 @@ steps:
       layer: list
       title: "主线程阻塞函数"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
         - name: blocked_function
           label: "阻塞函数"
           type: string
@@ -605,15 +711,33 @@ steps:
         - name: evidence_strength
           label: "证据强度"
           type: string
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     sql: |
-      WITH main_thread AS (
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE p.upid=${target_process.data[0].upid} AND (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*')
+      ),
+      clipped_states AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_thread_state_spans s),
+      main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE p.upid = ${target_process.data[0].upid} AND t.tid = p.pid
         LIMIT 1
       )
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        (SELECT utid FROM main_thread) AS utid,
         ts.blocked_function,
         ts.state,
         COALESCE(ts.io_wait, 0) as io_wait,
@@ -642,7 +766,7 @@ steps:
         SUM(ts.dur) / 1e6 as total_dur_ms,
         ROUND(AVG(ts.dur) / 1e6, 2) as avg_dur_ms,
         ROUND(MAX(ts.dur) / 1e6, 2) as max_dur_ms
-      FROM thread_state ts
+      FROM clipped_states ts
       WHERE ts.utid = (SELECT utid FROM main_thread)
         AND ts.blocked_function IS NOT NULL
         AND ts.dur > 1000000  -- > 1ms
@@ -664,6 +788,9 @@ steps:
       layer: list
       title: "CPU 频率使用分布"
       columns:
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: ucpu, label: "ucpu", type: number, hidden: true}
         - name: cpu
           label: "CPU"
           type: number
@@ -686,21 +813,34 @@ steps:
           label: "占比"
           type: percentage
           format: percentage
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_sched_spans.sql
+      - fragments/system_cpu_frequency_spans.sql
     sql: |
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      clipped_sched AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_sched_spans s),
+      clipped_frequency AS (SELECT f.*,f.clipped_start_ts AS ts,f.dur_ns AS dur,f.freq_khz AS freq FROM system_cpu_frequency_spans f)
       SELECT
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        cf.ucpu AS ucpu,
         cf.cpu,
         ct.capacity,
         ct.core_type,
         cf.freq / 1000 as freq_mhz,
         SUM(cf.dur) / 1e6 as duration_ms,
         ROUND(100.0 * SUM(cf.dur) / (
-          SELECT SUM(cf2.dur) FROM cpu_frequency_counters cf2
+          SELECT SUM(cf2.dur) FROM clipped_frequency cf2
           WHERE cf2.cpu = cf.cpu
             AND (${start_ts} IS NULL OR cf2.ts + cf2.dur > ${start_ts})
             AND (${end_ts} IS NULL OR cf2.ts < ${end_ts})
         ), 1) as percent
-      FROM cpu_frequency_counters cf
-      JOIN _cpu_topology ct ON cf.cpu = ct.cpu_id
+      FROM clipped_frequency cf
+      LEFT JOIN system_cpu_topology ct ON cf.ucpu = ct.ucpu
       WHERE (${start_ts} IS NULL OR cf.ts + cf.dur > ${start_ts})
         AND (${end_ts} IS NULL OR cf.ts < ${end_ts})
       GROUP BY cf.cpu, cf.freq
@@ -720,6 +860,10 @@ steps:
       layer: list
       title: "主线程唤醒者分析"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
         - name: waker_thread
           label: "唤醒线程"
           type: string
@@ -743,15 +887,33 @@ steps:
         - name: irq_wakeups
           label: "IRQ 唤醒"
           type: number
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     sql: |
-      WITH main_thread AS (
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE p.upid=${target_process.data[0].upid} AND (${__process_scope.upid} IS NOT NULL OR '${package}'='' OR p.name='${package}' OR p.name GLOB '${package}:*')
+      ),
+      clipped_states AS (SELECT s.*,s.clipped_start_ts AS ts,s.dur_ns AS dur FROM system_thread_state_spans s),
+      main_thread AS (
         SELECT t.utid
         FROM thread t
-        JOIN process p ON t.upid = p.upid
+        JOIN effective_target_processes p ON t.upid = p.upid
         WHERE p.upid = ${target_process.data[0].upid} AND t.tid = p.pid
         LIMIT 1
       )
       SELECT
+        ${target_process.data[0].upid} AS upid,
+        (SELECT window_start_ts FROM system_windows) AS window_start_ts, (SELECT window_end_ts FROM system_windows) AS window_end_ts,
+        (SELECT utid FROM main_thread) AS utid,
         waker_t.name as waker_thread,
         waker_p.name as waker_process,
         COUNT(*) as wakeup_count,
@@ -759,7 +921,7 @@ steps:
         ROUND(AVG(ts.dur) / 1e6, 2) as avg_wait_ms,
         -- IRQ context
         SUM(CASE WHEN ts.irq_context = 1 THEN 1 ELSE 0 END) as irq_wakeups
-      FROM thread_state ts
+      FROM clipped_states ts
       JOIN thread waker_t ON ts.waker_utid = waker_t.utid
       JOIN process waker_p ON waker_t.upid = waker_p.upid
       WHERE ts.utid = (SELECT utid FROM main_thread)

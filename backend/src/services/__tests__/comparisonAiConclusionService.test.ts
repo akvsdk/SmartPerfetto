@@ -345,3 +345,20 @@ describe('client disconnect detection semantics', () => {
     expect(signalFor(false).aborted).toBe(true);
   });
 });
+
+
+test('keeps saved producer rows out of the bounded prompt without losing the stored matrix', async () => {
+  const result = comparisonResult();
+  const captured = result.matrix.inputSnapshots[0];
+  captured.investigationAssessment = {schemaVersion: 1, status: 'not_checked', binding: {
+    candidateRef: '', runId: '', attemptId: '', conclusionFingerprint: '', conclusionContractFingerprint: '',
+    evidenceFingerprint: '', requirementsFingerprint: '', registryFingerprint: '', intentFingerprint: '', ledgerFingerprint: ''},
+    requirements: [], evidenceRecords: [{value: 'large-original-row-marker'} as never]};
+  let prompt = '';
+  await generateAiComparisonConclusion({result, query: 'Compare saved results',
+    client: {complete: async input => {prompt = input.prompt; return {text: '{}'};}}});
+  expect(prompt).toContain('startup.total_ms');
+  expect(prompt).toContain('investigationAssessment');
+  expect(prompt).not.toContain('large-original-row-marker');
+  expect(captured.investigationAssessment.evidenceRecords?.[0].value).toBe('large-original-row-marker');
+});

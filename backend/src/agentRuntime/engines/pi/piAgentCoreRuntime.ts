@@ -9,6 +9,10 @@ import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisCandi
 import {attachFinalizationContext} from '../../analysisFinalizationContext';
 import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
 import {resolveRuntimeTurnPolicy, type RuntimeTurnPolicy} from '../../runtimeTurnPolicy';
+import {createRuntimeTurnCloseoutTape, resolveRuntimeTurnBudget} from '../../runtimeTurnCloseout';
+import {createRuntimeAnalysisHistoryReader, renderAnalysisHistoryContext, toAnalysisHistoryTurn,
+  type AnalysisHistoryReader} from '../../analysisHistory';
+import type {RuntimeToolObserver} from '../../runtimeToolObserver';
 import {runIntentTransport, type IntentTransportInput} from '../../intentTransport';
 import {runPiIntentTransport} from './piIntentTransport';
 import {buildComplexityClassifierInput} from '../../../agentv3/queryComplexityContext';
@@ -119,7 +123,6 @@ import {
 } from '../../runtimeKinds';
 import {
   buildQuickRunReceipt,
-  buildEntityContext,
   buildQuickMemoryContextPayload,
   captureSkillDisplayEntities,
   createRuntimeSkillNotesBudget,
@@ -1417,7 +1420,9 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       });
       return [];
     }
-    return Array.isArray(opaque.messages) ? [...opaque.messages] : [];
+    // Logical history is supplied by the scoped SmartPerfetto context. Native
+    // transcripts may contain stale selections and unbounded tool payloads.
+    return [];
   }
 
   private rememberOpaqueState(sessionId: string, agent: PiAgentCoreAgent): void {
@@ -1625,7 +1630,19 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     const startedAt = Date.now();
     const outputLanguage = options.outputLanguage
       ?? parseOutputLanguage(this.env.SMARTPERFETTO_OUTPUT_LANGUAGE);
-    const previousTurns = sessionContextManager.getOrCreate(sessionId, traceId).getAllTurns?.() ?? [];
+    const sessionContext = sessionContextManager.getOrCreate(sessionId, traceId);
+    const privateAnalysisContext = analysisContextUsesPrivateKnowledge(options);
+    const authorizationScope = resolveKnowledgeScope(options);
+    const authorizationFingerprint = options.analysisContextFingerprint ??
+      buildAnalysisContextAuthorizationFingerprint(options, authorizationScope);
+    const analysisHistoryReader = createRuntimeAnalysisHistoryReader({options, sessionId, traceId,
+      getTurns: () => sessionContext.getAnalysisHistory?.() ?? (sessionContext.getAllTurns?.() ?? [])
+        .map(turn => toAnalysisHistoryTurn({...turn, traceId, sourceDerived: turn.result?.sourceDerived,
+          analysisContextFingerprint: turn.result?.analysisContextFingerprint})),
+      assertActive: () => {
+        executionLease.throwIfAborted();
+        assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+      }});
     const modelConfig = resolvePiAgentCoreModel(this.env, false);
     // Pi accepts one complete configured model, not an ID-only light-model override.
     // The same pinned native provider is reused by classification and the main Agent.
@@ -1634,7 +1651,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     const intentResolver = createAnalysisTurnIntentResolver({
       context: buildComplexityClassifierInput({
         query, sceneType: 'general', selectionContext: options.selectionContext,
-        hasReferenceTrace: Boolean(options.referenceTraceId), previousTurns,
+        hasReferenceTrace: Boolean(options.referenceTraceId), previousTurns: [], history: analysisHistoryReader.getTurns(),
         requestedMode: options.analysisMode ?? 'auto',
       }),
       signal: executionLease.signal,
@@ -1660,20 +1677,20 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       throw error;
     }
     executionLease.throwIfAborted();
+    const closeoutTape = createRuntimeTurnCloseoutTape();
+    let toolAdmissionsOpen = true;
     const prep = await this.prepareAnalysis(
       query, sessionId, traceId, options, providerRuntime.model.id,
-      executionLease, turnIntent, policy, intentResolver.strategyRegistry,
+      executionLease, turnIntent, policy, intentResolver.strategyRegistry, analysisHistoryReader, closeoutTape.observe,
+      () => toolAdmissionsOpen,
     );
     onSourceUseReady(prep.sourceUse, prep.artifactStore);
     executionLease.throwIfAborted();
-    const privateAnalysisContext = analysisContextUsesPrivateKnowledge(options);
-    const authorizationScope = resolveKnowledgeScope(options);
-    const authorizationFingerprint = options.analysisContextFingerprint ??
-      buildAnalysisContextAuthorizationFingerprint(options, authorizationScope);
     if (privateAnalysisContext) this.sessionOpaqueStates.delete(sessionId);
 
     const quickBudget = resolveQuickTurnBudget({env: this.env, enforcement: 'turn_cap'});
     const maxTurns = prep.quickMode ? quickBudget.hardCapTurns : resolveAgentRuntimeBudgetConfig(this.env).maxTurns;
+    const turnBudget = resolveRuntimeTurnBudget(maxTurns);
     let rounds = 0;
     let turnLimitReached = false;
     let correctionInProgress = false;
@@ -1682,6 +1699,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     let acceptedAttemptId = 'main';
     let acceptedTurnLimitReached = false;
     let acceptedText = '';
+    let closeoutAccepted = false;
     const agent = new Agent({
       initialState: {
         systemPrompt: prep.systemPrompt,
@@ -1698,16 +1716,18 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       thinkingBudgets: modelConfig.thinkingBudgets,
       // Pi calls this after the real assistant/tool turn, before dispatching another.
       shouldStopAfterTurn: ({message}: {message: Record<string, unknown>}) => {
-        if (rounds < maxTurns) return false;
+        if (rounds < turnBudget.acquisitionTurns) return false;
         const toolCall = Array.isArray(message.content) && message.content.some(part => part?.type === 'toolCall');
         const finished = message.stopReason === 'stop' && !message.errorMessage
           && message.deferred === undefined && !toolCall;
-        turnLimitReached = !finished;
+        turnLimitReached = !finished && message.stopReason !== 'error'
+          && message.stopReason !== 'aborted' && message.stopReason !== 'length'
+          && !message.errorMessage;
         return true;
       },
       beforeToolCall: async ({toolCall}: {toolCall?: {name?: string}}) => {
         executionLease.throwIfAborted();
-        if (!toolCall?.name || !prep.allowedToolNames.has(toolCall.name)) {
+        if (turnLimitReached || !toolCall?.name || !prep.allowedToolNames.has(toolCall.name)) {
           return {block: true, reason: 'Tool is not in the SmartPerfetto request-scoped allowlist.'};
         }
         return undefined;
@@ -1726,15 +1746,18 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     void providerIdle.promise.catch(() => undefined);
     const runProviderPrompt = async (prompt: string) => {
       executionLease.throwIfAborted();
-      if (rounds >= maxTurns) { turnLimitReached = true; return undefined; }
+      if (rounds >= turnBudget.acquisitionTurns) { turnLimitReached = true; return undefined; }
       const boundary = agent.state.messages?.length ?? 0;
       const attemptId = `${++attempt}`;
       const beforeRounds = rounds;
-      await runPiProviderPromptWithSupervision({agent, prompt, providerIdle, executionLease, abortJoinTimeoutMs});
+      try {
+        await runPiProviderPromptWithSupervision({agent, prompt, providerIdle, executionLease, abortJoinTimeoutMs});
+      } finally {
+        // An attempted provider turn consumes budget even if it fails.
+        if (rounds === beforeRounds) rounds++;
+      }
       executionLease.throwIfAborted();
       const assistant = latestAssistantMessage((agent.state.messages ?? []).slice(boundary));
-      // Custom adapters without turn events still consumed a dispatched attempt.
-      if (rounds === beforeRounds) rounds++;
       return {assistant, attemptId, text: extractAssistantText(assistant).trim(), turnLimitReached};
     };
     const runId = executionLease.key.runId!;
@@ -1769,7 +1792,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
           deliveryContext: {entry: 'runtime_draft', turnIntent,
             acceptedCandidate: candidateIdentity(text, attemptId),
             completion: completionFor(assistant, text, attemptId, limited),
-            outputOrigin: completionFor(assistant, text, attemptId, limited).status === 'completed'
+            outputOrigin: closeoutAccepted || completionFor(assistant, text, attemptId, limited).status === 'completed'
               ? 'sdk_final' : 'assistant_stream'},
         });
         const nativeProtocol = inspectCandidateProtocol(text);
@@ -1813,11 +1836,42 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
         providerPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
         throw error;
       }
+      toolAdmissionsOpen = false;
+      if (acceptedTurnLimitReached && turnBudget.deliveryTurns > 0
+        && rounds < turnBudget.totalTurns && Date.now() < getRunDeadlineMs()) {
+        const closeoutPrompt = closeoutTape.buildPrompt({query, priorConclusion: acceptedText, outputLanguage});
+        if (closeoutPrompt) {
+          try {
+            executionLease.throwIfAborted();
+            assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+            agent.state.tools = [];
+            const closeoutAttemptId = `closeout-${++attempt}`;
+            rounds++;
+            const closeout = await runPiIntentTransport({
+              prompt: closeoutPrompt, systemPrompt: prep.systemPrompt,
+              signal: executionLease.signal, deadlineMs: getRunDeadlineMs(),
+              outputByteLimit: 64 * 1024, providerRuntime,
+            });
+            executionLease.throwIfAborted();
+            assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+            if (closeout.status === 'ok') {
+              acceptedText = closeout.text;
+              acceptedAttemptId = closeoutAttemptId;
+              acceptedAssistant = {role: 'assistant', stopReason: closeout.finishReason ?? 'stop',
+                content: [{type: 'text', text: closeout.text}]};
+              closeoutAccepted = true;
+            }
+          } catch {
+            executionLease.throwIfAborted();
+            // Preserve the original candidate if optional delivery fails.
+          }
+        }
+      }
       verification = await verifyCandidate(acceptedText, acceptedAssistant, acceptedAttemptId, acceptedTurnLimitReached);
       const issues = [...verification.heuristicIssues, ...(verification.llmIssues ?? [])];
       const actionable = issues.filter(issue => issue.severity === 'error' && issue.recoveryKind &&
         issue.type !== 'plan_deviation' && issue.type !== 'unresolved_hypothesis');
-      if (actionable.length > 0 && rounds < maxTurns
+      if (actionable.length > 0 && rounds < turnBudget.acquisitionTurns
         && completionFor(acceptedAssistant, acceptedText, acceptedAttemptId, acceptedTurnLimitReached).status === 'completed') {
         const originalTools = agent.state.tools;
         const originalSystemPrompt = agent.state.systemPrompt;
@@ -1856,6 +1910,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       }
     } finally {
       acceptingProviderEvents = false;
+      toolAdmissionsOpen = false;
       if (privateAnalysisContext || executionLease.signal.aborted) this.sessionOpaqueStates.delete(sessionId);
       else this.rememberOpaqueState(sessionId, agent);
       providerIdle.clear();
@@ -1879,7 +1934,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       sessionId, success: completion.status !== 'failed' && completion.status !== 'cancelled', findings,
       hypotheses: prep.hypotheses.map(h => toRuntimeProtocolHypothesis(h, 'pi-agent-core')),
       conclusion, turnIntent, completion,
-      outputOrigin: completion.status === 'completed' ? 'sdk_final' : 'assistant_stream',
+      outputOrigin: closeoutAccepted || completion.status === 'completed' ? 'sdk_final' : 'assistant_stream',
       confidence: estimateAnalysisConfidence({findings, partial}),
       rounds, totalDurationMs: Date.now() - startedAt,
       partial: partial || undefined, terminationReason,
@@ -1914,6 +1969,9 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       agentId: 'pi-agent-core', success: result.success, findings: result.findings,
       confidence: result.confidence, message: result.conclusion, partial: result.partial,
       terminationReason: result.terminationReason, terminationMessage: result.terminationMessage,
+      completion: result.completion, conclusionContract: result.conclusionContract,
+      sourceDerived: privateAnalysisContext || undefined,
+      analysisContextFingerprint: options.analysisContextFingerprint,
     }, result.findings);
     const deadlineMs = getRunDeadlineMs();
     if (projected.deliveryContext) {
@@ -1946,6 +2004,9 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     turnIntent: AnalysisTurnIntent,
     policy: RuntimeTurnPolicy,
     strategyRegistry: ReadonlyStrategyRegistrySnapshot,
+    analysisHistoryReader: AnalysisHistoryReader,
+    toolObserver?: RuntimeToolObserver,
+    canInvokeTool?: () => boolean,
   ): Promise<PiAnalysisPreparation> {
     executionLease.throwIfAborted();
     const outputLanguage = options.outputLanguage
@@ -1960,6 +2021,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     executionLease.throwIfAborted();
     const effectivePackageName = options.packageName || focusResult.primaryApp;
     const analysisRunSpec = createAnalysisRunSpec({
+      history: analysisHistoryReader.getTurns(),
       query,
       sessionId,
       traceId,
@@ -2031,14 +2093,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       }
     }
 
-    const previousFindings = previousTurns
-      .slice(-3)
-      .flatMap(turn => turn.findings);
-    const conversationSummary = previousTurns.length > 0
-      ? sessionContext.generatePromptContext(2000)
-      : undefined;
     const entityStore = sessionContext.getEntityStore();
-    const entityContext = buildEntityContext(entityStore);
 
     const watchdogWarning: { current: string | null } = { current: null };
     const knowledgeScope = analysisRunSpec.scopes.knowledge;
@@ -2086,7 +2141,6 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       analysisPlan.history.push(analysisPlan.current);
       if (analysisPlan.history.length > 3) analysisPlan.history.shift();
     }
-    const previousPlan = analysisPlan.current ?? undefined;
     analysisPlan.current = null;
     resetPrePlanToolCallsForNewRun(analysisPlan);
 
@@ -2103,6 +2157,7 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     uncertaintyFlags.splice(0);
 
     const { toolDefinitions, sourceUse } = createClaudeMcpServer({
+      toolObserver, canInvokeTool, analysisHistoryReader,
       conversationTraceAttached: options.assistantSurface === 'conversation'
         ? options.conversationTraceAttached === true
         : undefined,
@@ -2156,6 +2211,8 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     ));
 
     let prompt = query;
+    const historyContext = renderAnalysisHistoryContext(analysisHistoryReader.getTurns(), {outputLanguage});
+    if (historyContext) prompt = `${historyContext}\n\n${prompt}`;
     if (analysisRunSpec.traceContext.promptSection) {
       prompt = `${analysisRunSpec.traceContext.promptSection}\n\n${prompt}`;
     }
@@ -2179,12 +2236,8 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       packageName: effectivePackageName,
       focusApps: focusResult.apps.length > 0 ? focusResult.apps : undefined,
       focusMethod: focusResult.method,
-      previousFindings,
-      conversationSummary,
       knowledgeBaseContext,
-      entityContext,
       sceneType,
-      analysisNotes: notes.length > 0 ? notes : undefined,
       sqlErrorFixPairs: recentSqlErrors
         .filter((entry: any) => entry.fixedSql)
         .slice(-3)
@@ -2202,8 +2255,6 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
         outputLanguage,
         privateAnalysisContext,
       }) : undefined,
-      previousPlan,
-      planHistory: analysisPlan.history.length > 0 ? analysisPlan.history : undefined,
       selectionContext: options.selectionContext,
       traceCompleteness,
       traceOs: traceInfo?.traceOs,

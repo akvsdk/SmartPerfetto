@@ -836,3 +836,11 @@ Skill Pack。`list_skills` 会返回外部 pack 的 `origin` metadata，
 因此启用、禁用或删除 pack 后不会继续执行旧内容。旧版全局 `/api/admin/skills`
 和当前 `smp skill` CLI 路径仍只使用内置 Skill；CLI 执行 workspace pack 需要未来显式
 tenant/workspace 上下文支持。
+
+## 系统调查证据合同
+
+场景 Strategy 的 `investigation_contract` 引用 `backend/strategies/investigation-profiles.yaml` 中的版本化 profile；`evidence_metrics` 使用生产者声明的 metric ID，不从显示列名推断语义。普通回答的调查义务与 `final_report_contract` 分开。
+
+系统 SQL 必须对请求窗口、调度片段和频率样本做区间交集，保留原始时间及裁剪时间、UTID/UPID、CPU/ucpu 和拓扑来源。线程状态区分 Running、R/R+、S/I、D/DK 与未知覆盖。CPU 驻留保留 medium 和 unknown；精确同 ucpu 的 next-task handoff 仅证明切换观测，不证明抢占动机或全部等待归因。priority 观测不等于 FIFO/RR/OTHER 等策略。
+
+`display.columns` 的投影不得丢弃后续证据读取需要的身份、范围及来源字段。复合 Skill、artifact 保存恢复和 fetch 必须保留这些事实；格式化缺失值不能替代原始 typed null。

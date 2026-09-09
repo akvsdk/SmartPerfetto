@@ -194,6 +194,19 @@ scene 必须属于本 run 固定的 registry。声明通过 schema 校验不等�
 intent 不自动预取；计划按需产生，阶段完成标记必须有真实成功证据或明确处置。
 未结束的探索计划和假设保留原状态，不自动触发续跑，也不单独决定回答是否完整。
 
+## 轮次预算与收尾
+
+完整模式默认 100 轮，快速模式默认 50 轮；5 轮 quick target 仅为软目标。
+总预算大于 1 时预留一次无工具收尾，正常提前完成不额外调用模型。调查触顶后，
+收尾使用本轮固定的模型、Provider、授权与原始截止时间，基于已返回数据和已有正文
+说明有限结论、证据不足及下一轮可追问的问题。它不会继续查询，也不会把调查升级为
+完成；`partial`、`completion.reason=turn_limit` 和 `terminationReason=max_turns` 保留。
+触顶后不再追加模型语义审核，确定性证据检查仍可执行。
+
+收尾失败保留原候选；取消、超时、授权失效或已耗尽的显式费用预算不会启动额外调用。
+只有 1 轮的配置没有额外收尾额度。OpenCode 通过观察原生消息停止采集，可能在两次观察
+之间过冲；实际轮数照实记录，已无剩余额度时不再请求总结，不能将它宣称为严格调用硬上限。
+
 ## SSE 事件
 
 所有 runtime 都向路由层发同一类 SmartPerfetto streaming update：
@@ -216,7 +229,7 @@ Pi Agent Core 的真实模型路径复用 SmartPerfetto 的 scene strategy、系
 
 OpenCode 路径同样只允许 custom provider。它可以使用带 `providerID` / `modelID` / `baseUrl` / `apiKey` 的 `SMARTPERFETTO_OPENCODE_MODEL_JSON`，也可以回退到 OpenAI-compatible 的 `OPENAI_*` env/provider 字段。SmartPerfetto 不复用用户自己的 OpenCode CLI 登录态、配置文件或 project extension；回滚路径是把 custom provider 或 `SMARTPERFETTO_AGENT_RUNTIME` 切回 `claude-agent-sdk` / `openai-agents-sdk`。
 
-Qoder 在 Provider Manager 中同样只允许 custom provider，也可以通过 env 显式选择。SDK 默认不安装，用户必须先审阅条款，再通过 `qoder:install -- --accept-terms` 或显式 module path opt in。`resolveModel` BYOK 由 `QODER_BYOK_API_KEY`、`QODER_BYOK_PROVIDER`、`QODER_MODEL` 及可选 base URL/style/light model 组成；配置不完整时 fail closed。BYOK 只替换模型 provider，不替代 Qoder PAT 或本机 `qodercli` 登录认证。Provider Manager 仅允许 Qoder custom profile 的 `custom.envOverrides` 写入这四个 BYOK 值，不允许借此覆盖 CLI、SDK module 或 worker path。BYOK key 只进入 SDK 的 `resolveModel` 回调，不进入 SDK 子进程 env、诊断或明文快照；provider/base/style 进入非密钥快照，key 只参与 secret fingerprint，确保 provider pin、resume、外部 Issue 和 Self-Evolution proof 能检测配置变化。公开分析可按 Qoder SDK session id 恢复；一旦请求获准访问私有 codebase 或外部知识源，就不会恢复或保存该 provider opaque session，也不会把中间状态写入 durable snapshot。
+Qoder 在 Provider Manager 中同样只允许 custom provider，也可以通过 env 显式选择。SDK 默认不安装，用户必须先审阅条款，再通过 `qoder:install -- --accept-terms` 或显式 module path opt in。`resolveModel` BYOK 由 `QODER_BYOK_API_KEY`、`QODER_BYOK_PROVIDER`、`QODER_MODEL` 及可选 base URL/style/light model 组成；配置不完整时 fail closed。BYOK 只替换模型 provider，不替代 Qoder PAT 或本机 `qodercli` 登录认证。Provider Manager 仅允许 Qoder custom profile 的 `custom.envOverrides` 写入这四个 BYOK 值，不允许借此覆盖 CLI、SDK module 或 worker path。BYOK key 只进入 SDK 的 `resolveModel` 回调，不进入 SDK 子进程 env、诊断或明文快照；provider/base/style 进入非密钥快照，key 只参与 secret fingerprint，确保 provider pin、resume、外部 Issue 和 Self-Evolution proof 能检测配置变化。公开分析的逻辑续问使用产品历史并建立新模型上下文；一旦请求获准访问私有 codebase 或外部知识源，就不会恢复或保存该 provider opaque session，也不会把中间状态写入 durable snapshot。
 
 ## Final Result 与质量产物
 
@@ -261,11 +274,22 @@ witness、受信单位/字段语义或覆盖时保留候选/未知状态；
 
 统一快照由 route 层调用 `orchestrator.takeSnapshot()` 生成，恢复时调用 `restoreFromSnapshot()`。
 
-Claude runtime 持久化 `sdkSessionId` 并通过 Claude SDK resume 恢复上下文。
+每个逻辑追问使用新的模型上下文，保持逻辑 session 与 Provider/runtime 绑定。
+原生 SDK 上下文只在本轮调查内部使用，不通过旧 SDK session、`previousResponseId`
+或 opaque transcript 隐式带入整段前史。
 
-OpenAI runtime 持久化 `openAIHistory`、`openAILastResponseId` 和预留的 `openAIRunState`。恢复后优先用 SDK history 继续多轮对话；Responses API 可附带 `previousResponseId`，Chat Completions-compatible provider 使用完整 history。
+`analysisHistory.ts` 为分类器和主分析提供同一套有界历史：最近 3 轮问答、最近未完成项和
+更早轮次索引，明确保留 partial/unknown、终止原因、不足和下一步。默认主分析预览
+最多 12,000 bytes、分类器 6,000 bytes；详细正文优先让位于完成状态和未完成项。
+`read_session_history` 只读取产品绑定的当前会话，可按轮分页回查完整问答与声明定位；
+它不接受用户/会话选择器，也不执行新 SQL。`fetch_artifact` 仍负责读取可用的原始表格。
 
-Pi Agent Core、OpenCode 和 Qoder 只在 adapter 支持且不涉及私有知识时保存 runtime-specific opaque state，但仍会保留 provider/runtime identity，避免 resume、report 或 snapshot 静默切到另一个引擎。
+完整历史复用 `conversation_turns` 保存；Conversation descriptor 与最终轮记录在
+同一事务中写入 `runtime_snapshots` 和历史表。重开/重启后，先验证 tenant、workspace、
+当前 owner、Trace、Provider pin 和来源权限，再恢复逻辑会话。旧 running 状态恢复为
+interrupted，不重放不存在的执行。写入失败保留回答并报告恢复不可用。
+来源派生历史必须匹配原轮授权指纹；缺失或变化时不再次发送给模型。历史记录和定位符
+不恢复当前执行 witness，也不自动扩大本轮时间选区或证明范围。
 
 快照还会携带 final result 质量相关字段，例如 conclusion contract、claim verification result 和 identity resolutions，以便 resume、report export 和 analysis-result comparison 复用。
 
@@ -313,3 +337,9 @@ provider/runtime identity 都必须按 comparison identity 读写。
 ```
 
 这能区分“Provider 连接测试通过”和“真实分析 runtime 已切换”这两件事。
+
+## 系统调查的采集与交付边界
+
+场景调查要求与报告格式要求分开固定，普通 answer 与 comparison 也可需要系统调查。统一工具 observer 与原始执行 capture 提供可信采集记录；工具名称、模型自述和截断后的摘要不能证明维度已检查。observer 失败不改变工具自身结果，缺记录保持 unknown / not_checked。
+
+最终调查解释复用产品边界内同一次无工具语义评估。采集状态与内容覆盖分别输出，绑定正文、contract、intent、registry 与 ledger fingerprint。覆盖缺口不会重写结论、触发补查循环或改变 SDK 原生 completion。历史快照只作为历史记录，不重新签发当前运行的证据权威。

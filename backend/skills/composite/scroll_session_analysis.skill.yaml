@@ -68,6 +68,57 @@ context:
   - refresh_rate_hz
 
 steps:
+  - id: system_context_window
+    type: atomic
+    process_scope:
+      role: identity_metadata
+    name: "系统证据窗口"
+    display: false
+    sql: |
+      SELECT ${start_ts} AS start_ts, ${end_ts} AS end_ts
+    save_as: system_context_window
+
+  - id: system_cpu_context
+    type: skill
+    name: "窗口 CPU 系统上下文"
+    skill: cpu_system_context_in_range
+    optional: true
+    params:
+      start_ts: "${system_context_window.data[0].start_ts}"
+      end_ts: "${system_context_window.data[0].end_ts}"
+    save_as: system_cpu_context
+    display:
+      level: detail
+      layer: deep
+
+  - id: system_task_summary
+    type: skill
+    name: "目标任务系统状态"
+    skill: thread_system_summary_in_range
+    optional: true
+    params:
+      start_ts: "${system_context_window.data[0].start_ts}"
+      end_ts: "${system_context_window.data[0].end_ts}"
+      package: "${package}"
+    save_as: system_task_summary
+    display:
+      level: detail
+      layer: deep
+
+  - id: system_task_handoffs
+    type: skill
+    name: "目标任务调度交接"
+    skill: thread_preemption_handoffs_in_range
+    optional: true
+    params:
+      start_ts: "${system_context_window.data[0].start_ts}"
+      end_ts: "${system_context_window.data[0].end_ts}"
+      package: "${package}"
+    save_as: system_task_handoffs
+    display:
+      level: detail
+      layer: deep
+
   # ========== 完整区间帧统计 ==========
   - id: full_session_stats
     type: atomic

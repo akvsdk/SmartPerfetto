@@ -48,6 +48,8 @@ import * as finalResultQualityGate from '../../services/finalResultQualityGate';
 import * as providerManager from '../../services/providerManager';
 import * as sourceClaimVerifier from '../../services/codebase/sourceClaimVerifier';
 import * as finalizationContext from '../analysisFinalizationContext';
+import {buildAnalysisContextAuthorizationFingerprint} from '../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../services/scopedKnowledgeStore';
 import {ArtifactStore} from '../../agentv3/artifactStore';
 import {
   clearCodeAwareOutputGuards,
@@ -377,6 +379,9 @@ function createNativeIntentHarness(input: {
   answer?: string;
   finish?: string;
   nativeError?: boolean;
+  closeoutAnswer?: string;
+  closeoutError?: boolean;
+  mainMessages?: Record<string, unknown>[];
   beforeClassifierReply?: () => Promise<void>;
   beforeAnswerReply?: () => Promise<void>;
   env?: Record<string, string>;
@@ -392,6 +397,7 @@ function createNativeIntentHarness(input: {
   const directories: string[] = [];
   const serverCloses: Array<ReturnType<typeof jest.fn>> = [];
   const aborts: Array<ReturnType<typeof jest.fn>> = [];
+  const messageReadLimits: number[] = [];
   let tools: any[] = [];
   const moduleLoader = jest.fn<OpenCodeSdkModuleLoader>(async () => ({
     createOpencodeWithEnv: async (options: Record<string, unknown>) => {
@@ -409,6 +415,15 @@ function createNativeIntentHarness(input: {
             return {data: {id: `native-${index}`}};
           },
           abort,
+          ...(index === 1 && input.mainMessages ? {
+            promptAsync: async (request: unknown) => {prompts.push(request); await input.beforeAnswerReply?.(); return {};},
+            messages: async (request: {query?: {limit?: number}}) => {
+              const limit = request.query?.limit ?? 50;
+              messageReadLimits.push(limit);
+              return {data: [...input.mainMessages!].reverse().slice(0, limit)};
+            },
+            status: async () => ({data: {[`native-${index}`]: {type: 'busy'}}}),
+          } : {}),
           prompt: async request => {
             prompts.push(request);
             if (index === 0) {
@@ -419,6 +434,12 @@ function createNativeIntentHarness(input: {
                   time: {completed: Date.now()}, modelID: 'light-model'},
                 parts: [{type: 'text', text: JSON.stringify(input.decision ?? BOUNDED_INTENT)}],
               }};
+            }
+            if (index > 1) {
+              if (input.closeoutError) throw new Error('closeout provider failure');
+              return {data: {info: {id: 'closeout-message', role: 'assistant', finish: 'stop',
+                time: {completed: Date.now()}, modelID: 'main-model'},
+                parts: [{type: 'text', text: input.closeoutAnswer ?? 'The cause remains unknown; ask about the main-thread interval.'}]}};
             }
             await input.beforeAnswerReply?.();
             return {data: {
@@ -450,10 +471,89 @@ function createNativeIntentHarness(input: {
     }) as any,
   });
   return {runtime, traceProcessor, configs, prompts, directories, serverCloses, aborts,
-    moduleLoader, bridgeClose, getTools: () => tools};
+    moduleLoader, bridgeClose, messageReadLimits, getTools: () => tools};
 }
 
 describe('OpenCode native turn intent and delivery', () => {
+  it.each([false, true])('uses one pinned no-tool closeout and counts its attempt even on failure: %s', async closeoutError => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({finish: 'tool-calls', answer: 'Only the frame interval is known.',
+      closeoutAnswer: 'The frame interval is known. The cause is unverified; inspect the main-thread interval next.',
+      closeoutError, env: {AGENT_QUICK_MAX_TURNS: '2'}});
+    const result = await harness.runtime.analyze('Continue the diagnosis', `closeout-${closeoutError}`, 'trace-opencode', {analysisMode: 'fast'});
+    expect(result).toMatchObject({partial: true, rounds: 2, terminationReason: 'max_turns',
+      completion: {status: 'incomplete', reason: 'turn_limit'},
+      quickRun: {hardCapTurns: 2, actualTurns: 2}});
+    expect(result.conclusion).toBe(closeoutError ? 'Only the frame interval is known.'
+      : 'The frame interval is known. The cause is unverified; inspect the main-thread interval next.');
+    expect(harness.prompts).toHaveLength(3);
+    expect(harness.configs.map(config => config.agent.smartperfetto.maxSteps)).toEqual([1, 1, 1]);
+    expect(harness.prompts[2].body.model).toEqual(harness.prompts[1].body.model);
+    expect(Object.values(harness.prompts[2].body.tools).every(value => value === false)).toBe(true);
+    expect(harness.prompts[2].body.parts[0].text).toContain('Only the frame interval is known.');
+    expect(harness.aborts[1]).toHaveBeenCalledTimes(1);
+    expect(harness.bridgeClose).toHaveBeenCalledTimes(1);
+    expect(finalizationContext.takeFinalizationContext(result)?.hasSemanticTransport).toBe(false);
+  }));
+
+  it('does not expand a one-turn OpenCode budget with a hidden closeout call', async () => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({finish: 'tool-calls', answer: 'Partial finding', env: {AGENT_QUICK_MAX_TURNS: '1'}});
+    const result = await harness.runtime.analyze('Continue', 'closeout-one', 'trace-opencode', {analysisMode: 'fast'});
+    expect(result).toMatchObject({conclusion: 'Partial finding', rounds: 1, partial: true,
+      completion: {status: 'incomplete', reason: 'turn_limit'}});
+    expect(harness.prompts).toHaveLength(2);
+  }));
+
+  it('skips closeout when native turns between observations already consume the total budget', async () => withBackendDataDir(async () => {
+    const harness = createNativeIntentHarness({env: {AGENT_QUICK_MAX_TURNS: '3'},
+      mainMessages: [1, 2, 3, 4].map(index => ({info: {role: 'assistant', finish: 'tool-calls', id: `overshoot-${index}`},
+        parts: [{type: 'text', text: `Finding ${index}`}]}))});
+    const result = await harness.runtime.analyze('Investigate', 'overshoot', 'trace-opencode', {analysisMode: 'fast'});
+    expect(result).toMatchObject({conclusion: 'Finding 4', rounds: 4, partial: true,
+      completion: {status: 'incomplete', reason: 'turn_limit'}, terminationReason: 'max_turns'});
+    expect(result.terminationMessage).toContain('OpenCode');
+    expect(harness.prompts).toHaveLength(2);
+    expect(harness.aborts[1]).toHaveBeenCalledTimes(1);
+  }));
+
+  it.each([99, 103])('expands a fresh full-run window and counts %s unique native turns', async actualTurns => withBackendDataDir(async () => {
+    const mainMessages = Array.from({length: actualTurns}, (_, index) => ({
+      info: {role: 'assistant', finish: 'tool-calls', id: `full-cap-${index + 1}`},
+      parts: [{type: 'text', text: `Full finding ${index + 1}`}],
+    }));
+    // The provider may repeat a message in a paged response; that is one turn.
+    mainMessages.splice(20, 0, mainMessages[20]);
+    const harness = createNativeIntentHarness({env: {AGENT_MAX_TURNS: '100'}, mainMessages});
+    const result = await harness.runtime.analyze('Investigate full trace', `full-cap-${actualTurns}`, 'trace-opencode', {analysisMode: 'full'});
+    const closeoutAllowed = actualTurns < 100;
+    expect(result).toMatchObject({rounds: actualTurns + (closeoutAllowed ? 1 : 0), partial: true,
+      completion: {status: 'incomplete', reason: 'turn_limit'}, terminationReason: 'max_turns'});
+    expect(harness.messageReadLimits).toEqual([50, 100, 200, 50, 100, 200]);
+    expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(99);
+    expect(harness.prompts).toHaveLength(closeoutAllowed ? 3 : 2);
+    if (!closeoutAllowed) expect(result.conclusion).toBe(`Full finding ${actualTurns}`);
+    expect(harness.aborts[1]).toHaveBeenCalledTimes(1);
+  }));
+
+  it('aborts active OpenCode acquisition on observed cap and retains multiple turns between polls', async () => {
+    const messages = [1, 2, 3, 4].map(index => ({info: {role: 'assistant', finish: 'tool-calls', id: `cap-${index}`},
+      parts: [{type: 'text', text: `Observed ${index}`}]}));
+    const events: string[] = [];
+    const readMessages = jest.fn(async () => ({data: [...messages].reverse()}));
+    const abort = jest.fn(async () => {events.push('abort'); return {};});
+    const pollDelay = jest.fn(async () => undefined);
+    const result = await runOpenCodePrompt({server: {url: 'http://127.0.0.1:4106', close: jest.fn(() => undefined)},
+      client: {session: {create: jest.fn(async () => ({data: {id: 'cap'}})), prompt: jest.fn(async () => ({})), promptAsync: async () => ({}),
+        messages: readMessages, status: async () => ({data: {cap: {type: 'busy'}}}), abort}}},
+    {path: {id: 'cap'}, body: {parts: [{type: 'text', text: 'Investigate'}]}}, {
+      sessionId: 'cap', projectDir: '/tmp/opencode-cap', timeoutMs: 1000, resumedSession: false,
+      maxSteps: 2, onTurnLimit: () => {events.push('tools-closed');}, pollDelay,
+    });
+    expect(result).toMatchObject({turnLimitReached: true, messagesResponse: {data: messages}});
+    expect(events).toEqual(['tools-closed', 'abort']);
+    expect(readMessages).toHaveBeenCalledTimes(2);
+    expect(pollDelay).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('keeps pending exploration advisory after native completion or failure: failed=%s', async nativeError => withBackendDataDir(async () => {
     const body = 'The observed value is 17.';
     const harness = createNativeIntentHarness({answer: body, nativeError, beforeAnswerReply: async () => {
@@ -493,17 +593,22 @@ describe('OpenCode native turn intent and delivery', () => {
           modelID: 'main-model', smallModel: 'light-model', name: 'Pinned provider',
           baseURL: 'http://127.0.0.1:9999/v1', apiKey: 'fixture-api-key'}),
       }});
-      const options = {runId: 'final-run', referenceTraceId: 'trace-reference', analysisContextFingerprint: 'opencode-auth-pin'};
+      const options = {runId: 'final-run', referenceTraceId: 'trace-reference', codeAwareMode: 'off' as const,
+        tenantId: 'tenant-opencode', workspaceId: 'workspace-opencode', userId: 'user-opencode',
+        analysisContextFingerprint: ''};
+      const analysisContextFingerprint = buildAnalysisContextAuthorizationFingerprint(options, resolveKnowledgeScope(options));
+      options.analysisContextFingerprint = analysisContextFingerprint;
       const result = await harness.runtime.analyze('same scope', 'final-context', 'trace-opencode', options);
       expect(attach).toHaveBeenCalledTimes(1);
       expect(attach.mock.calls[0][0]).toBe(result);
       expect(finalizationContext.takeFinalizationContext({...result})).toBeUndefined();
       context = finalizationContext.takeFinalizationContext(result);
       expect(context).toBeDefined();
-      expect(context?.sourceScope).toBeUndefined(); // The test's explicit fingerprint cannot authorize the actual MCP selection.
+      expect(context?.sourceScope).toMatchObject({codeAwareMode: 'off', selectedCodebaseIds: [],
+        hasCodebaseAccess: false, analysisContextFingerprint});
       options.analysisContextFingerprint = 'later-auth-context';
       const providerQuery = context!.getProviderQuery(new AbortController().signal);
-      expect(providerQuery).toEqual({text: 'same scope', analysisContextFingerprint: 'opencode-auth-pin'});
+      expect(providerQuery).toEqual({text: 'same scope', analysisContextFingerprint});
       expect(Object.isFrozen(providerQuery)).toBe(true);
       expect(JSON.stringify(result)).not.toContain('"providerQuery"');
       expect(finalizationContext.takeFinalizationContext(result)).toBeUndefined();
@@ -677,7 +782,7 @@ describe('OpenCode native turn intent and delivery', () => {
     expect(result.completion).toMatchObject({status: 'completed', runId: 'current-run',
       sdkFinishReason: 'stop', conclusionFingerprint: analysisDeliveryFingerprint(answer)});
     expect(result.outputOrigin).toBe('sdk_final');
-    expect(harness.configs.map(config => config.agent.smartperfetto.maxSteps)).toEqual([1, 9]);
+    expect(harness.configs.map(config => config.agent.smartperfetto.maxSteps)).toEqual([1, 8]);
     expect(harness.prompts).toHaveLength(2);
     expect(harness.traceProcessor.query).not.toHaveBeenCalled();
     expect(harness.serverCloses.every(close => close.mock.calls.length === 1)).toBe(true);
@@ -693,7 +798,7 @@ describe('OpenCode native turn intent and delivery', () => {
     expect(harness.configs[0]).toMatchObject({model: 'smartperfetto/light-model', mcp: {}, instructions: [],
       provider: {smartperfetto: {models: {'light-model': {id: 'light-model'}}}}});
     expect(Object.values(harness.configs[0].tools).every(value => value === false)).toBe(true);
-    expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(3);
+    expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(2);
     expect(harness.getTools().map(tool => tool.name)).toEqual(expect.arrayContaining([
       'submit_plan', 'execute_sql_on', 'compare_skill', 'execute_sql', 'fetch_artifact',
     ]));
@@ -784,7 +889,7 @@ describe('OpenCode native turn intent and delivery', () => {
       await harness.runtime.analyze('same scope', `intent-config-${source}`, 'trace-opencode', {analysisMode: 'full'});
       expect(harness.prompts[1].body.system).toContain(`configured-${source}-instruction`);
       expect(harness.prompts[0].body.system).not.toContain(`configured-${source}-instruction`);
-      expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(9);
+      expect(harness.configs[1].agent.smartperfetto.maxSteps).toBe(8);
     } finally {
       provider?.mockRestore();
     }
@@ -3158,7 +3263,7 @@ describe('experimental OpenCode runtime contract', () => {
 
 
 
-  it('hydrates OpenCode opaque session state and prompts the restored session', async () => {
+  it('restores OpenCode provider directories while creating a fresh native session', async () => {
     await withBackendDataDir(async (dataDir) => {
       const firstRecord = {
         closeCount: 0,
@@ -3260,13 +3365,10 @@ describe('experimental OpenCode runtime contract', () => {
 
       await restoredRuntime.analyze('follow-up OpenCode question', 'session-opencode-resume', 'trace-opencode');
 
-      expect(restoredRecord.createCalls).toBe(0);
-      expect(restoredRecord.getInput).toEqual({
-        path: { id: 'ses-opencode-original' },
-        query: { directory: opaque?.projectDir },
-      });
+      expect(restoredRecord.createCalls).toBe(1);
+      expect(restoredRecord.getInput).toBeUndefined();
       expect(restoredRecord.promptInput).toMatchObject({
-        path: { id: 'ses-opencode-original' },
+        path: { id: 'ses-opencode-new' },
         query: { directory: opaque?.projectDir },
       });
       expect(restoredRecord.homeAtCreate).toBe(opaque?.homeDir);
@@ -3785,7 +3887,7 @@ describe('experimental OpenCode runtime contract', () => {
     });
   });
 
-  it('degrades OpenCode restore when the third-party session is unavailable', async () => {
+  it('keeps product metadata and starts fresh without attempting a previous third-party session', async () => {
     await withBackendDataDir(async () => {
       const runtime = new OpenCodeRuntime(createFakeRuntimeInput(), {
         moduleLoader: async () => ({
@@ -3806,23 +3908,24 @@ describe('experimental OpenCode runtime contract', () => {
         'trace-opencode',
         createSnapshotFields(),
       );
+      snapshot.analysisNotes.push({section: 'observation', content: 'Retained product observation', priority: 'low', timestamp: 1});
 
       const createCalls: unknown[] = [];
       const updates: any[] = [];
+      const getPreviousSession = jest.fn(async () => {throw new Error('missing session');});
+      const promptFreshSession = jest.fn(async (_input: unknown) => ({data: {info: {role: 'user'}, parts: []}}));
       const restoredRuntime = new OpenCodeRuntime(createFakeRuntimeInput(), {
         moduleLoader: async () => ({
           createOpencodeWithEnv: jest.fn(async () => ({
             server: { url: 'http://127.0.0.1:4107', close: jest.fn(() => undefined) },
             client: {
               session: {
-                get: jest.fn(async () => {
-                  throw new Error('missing session');
-                }),
+                get: getPreviousSession,
                 create: jest.fn(async (input: unknown) => {
                   createCalls.push(input);
                   return { data: { id: 'ses-opencode-fresh' } };
                 }),
-                prompt: jest.fn(async () => ({ data: { info: { role: 'user' }, parts: [] } })),
+                prompt: promptFreshSession,
               },
             },
           })),
@@ -3834,17 +3937,10 @@ describe('experimental OpenCode runtime contract', () => {
       await restoredRuntime.analyze('follow-up', 'session-opencode-missing', 'trace-opencode');
 
       expect(createCalls).toHaveLength(1);
-      expect(updates).toEqual(expect.arrayContaining([
-        expect.objectContaining({
-          type: 'degraded',
-          content: expect.objectContaining({
-            module: 'opencode',
-            fallback: 'fresh_session',
-            reason: 'session_restore_failed',
-            message: 'OpenCode session state unavailable; started a fresh OpenCode session with SmartPerfetto context.',
-          }),
-        }),
-      ]));
+      expect(getPreviousSession).not.toHaveBeenCalled();
+      expect(promptFreshSession).toHaveBeenCalledWith(expect.objectContaining({path: {id: 'ses-opencode-fresh'}}));
+      expect(restoredRuntime.getSessionNotes('session-opencode-missing')).toEqual(snapshot.analysisNotes);
+      expect(updates.some(update => update.type === 'degraded')).toBe(false);
     });
   });
 

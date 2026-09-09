@@ -6,7 +6,7 @@
 # CPU 负载区间分析（Composite Skill）
 # =============================================================================
 # 分析指定时间范围内各 CPU 核心的负载情况
-# v2.0: 复用 _cpu_topology 视图替代内联 CTE，统一核心分类
+# Reuses canonical sched spans, native idle identity and capacity topology.
 
 name: cpu_load_in_range
 version: "2.0"
@@ -33,59 +33,51 @@ inputs:
     required: true
 
 steps:
-  - id: init_cpu_topology
-    type: skill
-    name: "初始化 CPU 拓扑"
-    skill: cpu_topology_view
-    display:
-      level: hidden
-    optional: true
-
   - id: cpu_utilization
     type: atomic
     name: "CPU 利用率"
     display:
       level: detail
       title: "CPU 利用率"
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/system_sched_spans.sql
     sql: |
-      WITH
-      cpu_time AS (
-        SELECT
-          ss.cpu,
-          COALESCE(ct.core_type, 'unknown') as core_type,
-          ss.utid,
-          -- clamp dur 到范围内，处理跨边界的 sched_slice
-          SUM(MIN(ss.ts + ss.dur, ${end_ts}) - MAX(ss.ts, ${start_ts})) as total_dur
-        FROM sched_slice ss
-        LEFT JOIN _cpu_topology ct ON ss.cpu = ct.cpu_id
-        WHERE (ss.ts + ss.dur) > ${start_ts}
-          AND ss.ts < ${end_ts}
-        GROUP BY ss.cpu, ss.utid
-      ),
-      cpu_total AS (
-        SELECT
-          cpu,
-          core_type,
-          SUM(total_dur) as cpu_total_dur
-        FROM cpu_time
-        GROUP BY cpu
+      WITH system_windows AS (
+        SELECT 0 AS window_id, ${start_ts} AS window_start_ts, ${end_ts} AS window_end_ts
+      ), cpu_time AS (
+        SELECT window_id, ucpu, SUM(dur_ns) AS sched_covered_ns,
+          SUM(CASE WHEN is_idle = 0 THEN dur_ns ELSE 0 END) AS busy_ns,
+          SUM(CASE WHEN is_idle = 1 THEN dur_ns ELSE 0 END) AS idle_ns,
+          SUM(CASE WHEN is_idle IS NULL THEN dur_ns ELSE 0 END) AS idle_identity_unknown_ns,
+          SUM(CASE WHEN is_unfinished THEN dur_ns ELSE 0 END) AS unfinished_sched_ns
+        FROM system_sched_spans GROUP BY window_id, ucpu
       )
-      SELECT
-        ct.core_type,
-        COUNT(DISTINCT ct.cpu) as cpu_count,
-        -- utid != 0 implies non-idle work in sched_slice (0 is usually swapper)
-        ROUND(100.0 * SUM(CASE WHEN ctime.utid != 0 THEN ctime.total_dur ELSE 0 END) / NULLIF(SUM(ct.cpu_total_dur), 0), 1) as utilization_pct,
-        ROUND(SUM(ct.cpu_total_dur) / 1e6, 2) as total_time_ms
-      FROM cpu_total ct
-      LEFT JOIN cpu_time ctime ON ct.cpu = ctime.cpu
-      GROUP BY ct.core_type
-      ORDER BY
-        CASE ct.core_type
-          WHEN 'prime' THEN 1
-          WHEN 'big' THEN 2
-          WHEN 'medium' THEN 3
-          ELSE 4
-        END
+      SELECT w.window_id, w.window_start_ts, w.window_end_ts,
+        c.machine_id, c.core_type, c.topology_source,
+        GROUP_CONCAT(c.ucpu) AS ucpus, COUNT(*) AS cpu_count,
+        COUNT(*) * (w.window_end_ts - w.window_start_ts) AS cluster_window_ns,
+        ROUND(100.0 * SUM(s.busy_ns) /
+          NULLIF(COUNT(*) * (w.window_end_ts - w.window_start_ts), 0), 1) AS utilization_pct,
+        ROUND(SUM(s.sched_covered_ns) / 1e6, 2) AS total_time_ms,
+        COALESCE(SUM(s.sched_covered_ns), 0) AS sched_covered_ns,
+        SUM(s.busy_ns) AS busy_ns, SUM(s.idle_ns) AS idle_ns,
+        SUM(s.idle_identity_unknown_ns) AS idle_identity_unknown_ns,
+        SUM(s.unfinished_sched_ns) AS unfinished_sched_ns,
+        100.0 * COALESCE(SUM(s.sched_covered_ns), 0) /
+          NULLIF(COUNT(*) * (w.window_end_ts - w.window_start_ts), 0) AS sched_coverage_pct,
+        CASE WHEN SUM(s.sched_covered_ns) IS NULL THEN 'unavailable'
+          WHEN SUM(s.sched_covered_ns) > COUNT(*) * (w.window_end_ts - w.window_start_ts) THEN 'unsupported'
+          WHEN SUM(s.idle_identity_unknown_ns) > 0
+            OR SUM(s.sched_covered_ns) < COUNT(*) * (w.window_end_ts - w.window_start_ts) THEN 'partial'
+          ELSE 'observed' END AS sched_evidence,
+        'known_nonidle_duration_over_cpu_count_times_window;_partial_coverage_is_lower_bound' AS utilization_basis
+      FROM system_windows w CROSS JOIN system_cpu_topology c
+      LEFT JOIN cpu_time s ON s.window_id = w.window_id AND s.ucpu = c.ucpu
+      WHERE w.window_end_ts > w.window_start_ts
+      GROUP BY w.window_id, c.machine_id, c.core_type, c.topology_source
+      ORDER BY c.machine_id, c.core_type
     save_as: utilization
 
   - id: runqueue_depth
@@ -94,20 +86,37 @@ steps:
     display:
       level: detail
       title: "运行队列"
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/system_sched_spans.sql
     sql: |
+      WITH system_windows AS (
+        SELECT 0 AS window_id, ${start_ts} AS window_start_ts, ${end_ts} AS window_end_ts
+      ), track_identity AS (
+        SELECT t.id AS track_id, t.cpu, t.machine_id,
+          COUNT(ct.ucpu) AS cpu_mapping_count,
+          CASE WHEN COUNT(ct.ucpu) = 1 THEN MIN(ct.ucpu) END AS ucpu,
+          CASE WHEN COUNT(ct.ucpu) = 1 THEN MIN(ct.core_type) ELSE 'unknown' END AS core_type,
+          CASE WHEN COUNT(ct.ucpu) = 1 THEN MIN(ct.topology_source) ELSE 'cpu_identity_unavailable' END AS topology_source
+        FROM cpu_counter_track t LEFT JOIN system_cpu_topology ct
+          ON ct.cpu = t.cpu AND ct.machine_id IS t.machine_id
+        WHERE t.name = 'runqueue_length'
+        GROUP BY t.id, t.cpu, t.machine_id
+      )
       SELECT
-        t.cpu,
-        COALESCE(ct.core_type, 'unknown') as core_type,
+        t.track_id, t.cpu, t.ucpu, t.machine_id, t.core_type, t.topology_source, t.cpu_mapping_count,
         ROUND(AVG(c.value), 2) as avg_runqueue,
-        MAX(c.value) as max_runqueue
+        MAX(c.value) as max_runqueue,
+        COUNT(*) AS sample_count,
+        MIN(c.ts) AS first_sample_ts, MAX(c.ts) AS last_sample_ts,
+        'arithmetic_sample_mean_not_time_weighted' AS aggregation_basis
       FROM counter c
-      JOIN cpu_counter_track t ON c.track_id = t.id
-      LEFT JOIN _cpu_topology ct ON t.cpu = ct.cpu_id
-      WHERE t.name = 'runqueue_length'
-        AND c.ts >= ${start_ts}
+      JOIN track_identity t ON c.track_id = t.track_id
+      WHERE c.ts >= ${start_ts}
         AND c.ts < ${end_ts}
-      GROUP BY t.cpu
-      ORDER BY t.cpu
+      GROUP BY t.track_id
+      ORDER BY t.machine_id, t.cpu, t.track_id
     save_as: runqueue
     optional: true
 
@@ -117,28 +126,47 @@ steps:
     display:
       level: summary
       title: "线程迁移"
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/system_sched_spans.sql
     sql: |
-      WITH
-      migrations AS (
+      WITH system_windows AS (
+        SELECT 0 AS window_id, ${start_ts} AS window_start_ts, ${end_ts} AS window_end_ts
+      ), runs AS (
         SELECT
-          utid,
-          cpu,
-          LAG(cpu) OVER (PARTITION BY utid ORDER BY ts) as prev_cpu
-        FROM sched_slice
-        WHERE (ts + dur) > ${start_ts}
-          AND ts < ${end_ts}
+          s.id AS sched_id, s.ts, s.dur, s.utid, s.ucpu,
+          ct.ucpu AS mapped_ucpu, ct.machine_id, ct.cluster_id, ct.core_type,
+          LAG(s.ucpu) OVER ordered_runs AS prev_ucpu,
+          LAG(ct.ucpu) OVER ordered_runs AS prev_mapped_ucpu,
+          LAG(ct.machine_id) OVER ordered_runs AS prev_machine_id,
+          LAG(ct.cluster_id) OVER ordered_runs AS prev_cluster_id,
+          LAG(ct.core_type) OVER ordered_runs AS prev_core_type,
+          LAG(CASE WHEN s.dur >= 0 THEN s.ts + s.dur END) OVER ordered_runs AS prev_end_ts
+        FROM sched_slice s JOIN thread t ON t.utid = s.utid AND t.is_idle = 0
+        LEFT JOIN system_cpu_topology ct ON ct.ucpu = s.ucpu
+        WHERE s.ts < ${end_ts} AND s.dur >= -1 AND s.dur != 0
+        WINDOW ordered_runs AS (PARTITION BY s.utid ORDER BY s.ts, s.id)
+      ), transitions AS (
+        SELECT * FROM runs WHERE ts >= ${start_ts} AND ts < ${end_ts}
+          AND prev_ucpu IS NOT NULL AND ucpu != prev_ucpu
+      ), migrations AS (
+        SELECT * FROM transitions WHERE mapped_ucpu IS NOT NULL AND prev_mapped_ucpu IS NOT NULL
+          AND machine_id IS prev_machine_id AND prev_end_ts <= ts
       )
       SELECT
         COUNT(*) as migration_count,
-        SUM(CASE
-          WHEN (prev_cpu IN (SELECT cpu_id FROM _cpu_topology WHERE core_type IN ('medium', 'little'))
-                AND cpu IN (SELECT cpu_id FROM _cpu_topology WHERE core_type IN ('prime', 'big')))
-               OR (prev_cpu IN (SELECT cpu_id FROM _cpu_topology WHERE core_type IN ('prime', 'big'))
-                   AND cpu IN (SELECT cpu_id FROM _cpu_topology WHERE core_type IN ('medium', 'little')))
-          THEN 1 ELSE 0
-        END) as cross_cluster_migrations
+        COALESCE(SUM(CASE WHEN cluster_id IS NOT NULL AND prev_cluster_id IS NOT NULL
+          AND cluster_id != prev_cluster_id THEN 1 ELSE 0 END), 0) AS cross_cluster_migrations,
+        COALESCE(SUM(CASE WHEN (prev_core_type = 'little' AND core_type IN ('medium','big','prime'))
+          OR (core_type = 'little' AND prev_core_type IN ('medium','big','prime')) THEN 1 ELSE 0 END), 0) AS little_big_group_migrations,
+        (SELECT COUNT(*) FROM runs WHERE ts >= ${start_ts} AND ts < ${end_ts}) AS observed_run_count,
+        (SELECT COUNT(*) FROM transitions) - COUNT(*) AS unresolved_transition_count,
+        CASE WHEN NOT EXISTS(SELECT 1 FROM runs WHERE ts >= ${start_ts} AND ts < ${end_ts}) THEN 'no_observed_runs'
+          WHEN (SELECT COUNT(*) FROM transitions) > COUNT(*) THEN 'unresolved_transitions'
+          ELSE 'observed_runs_only' END AS migration_coverage_status,
+        'native_ucpu_same_machine_nonoverlapping_runs;_cluster_id_for_cross_cluster;_medium_in_big_group;_not_affinity_or_cache_miss_proof' AS migration_evidence
       FROM migrations
-      WHERE prev_cpu IS NOT NULL AND cpu != prev_cpu
     save_as: migrations
 
 output:

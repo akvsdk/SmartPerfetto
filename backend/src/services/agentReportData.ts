@@ -136,6 +136,7 @@ interface ReportResultLike {
   outputOrigin?: AgentDrivenReportData['result']['outputOrigin'];
   runtimeAppendix?: AgentDrivenReportData['result']['runtimeAppendix'];
   reportAssessment?: AgentDrivenReportData['result']['reportAssessment'];
+  investigationAssessment?: AgentDrivenReportData['result']['investigationAssessment'];
   deliveryAssurance?: AgentDrivenReportData['result']['deliveryAssurance'];
   conclusionContract?: unknown;
   sourceUseDecision?: SourceUseDecisionV1;

@@ -78,6 +78,17 @@ steps:
       layer: overview
       title: "选区 Running 线程四象限"
       columns:
+        - {name: window_id, label: "window_id", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: utid, label: "utid", type: number, hidden: true}
+        - {name: role, label: "role", type: string, hidden: true}
+        - {name: state_covered_ns, label: "state_covered_ns", type: duration, unit: ns, hidden: true}
+        - {name: total_observed_threads, label: "total_observed_threads", type: number, hidden: true}
+        - {name: sampling_evidence, label: "sampling_evidence", type: string, hidden: true}
+        - {name: unknown_running_ms, label: "unknown_running_ms", type: number, hidden: true}
+        - {name: other_state_ms, label: "other_state_ms", type: number, hidden: true}
         - name: thread_name
           label: "线程"
           type: string
@@ -133,80 +144,61 @@ steps:
         - name: cross_cluster_migrations
           label: "跨簇迁移"
           type: number
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
+      - fragments/system_sched_spans.sql
     sql: |
-      WITH
-      target_threads AS (
-        SELECT
-          t.utid,
-          t.tid,
-          COALESCE(t.name, '<unknown>') AS thread_name,
-          p.upid,
-          p.pid,
-          COALESCE(p.name, '<unknown>') AS process_name
-        FROM thread t
-        LEFT JOIN process p ON t.upid = p.upid
-        WHERE ('${package|}' = '' OR COALESCE(p.name, '') GLOB '${package|}*')
-          AND ('${thread_name|}' = '' OR COALESCE(t.name, '') GLOB '*${thread_name|}*')
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package|}'='' OR p.name='${package|}' OR p.name GLOB '${package|}:*') AND ('${thread_name|}'='' OR COALESCE(t.name,'') GLOB '*${thread_name|}*')
       ),
       states AS (
-        SELECT
-          tt.utid,
-          tt.tid,
-          tt.thread_name,
-          tt.process_name,
-          ts.ts,
-          ts.state,
-          ts.cpu,
-          COALESCE(ct.core_type, 'unknown') AS core_type,
-          MIN(ts.ts + ts.dur, ${end_ts}) - MAX(ts.ts, ${start_ts}) AS clipped_dur
-        FROM thread_state ts
-        JOIN target_threads tt ON ts.utid = tt.utid
-        LEFT JOIN _cpu_topology ct ON ts.cpu = ct.cpu_id
-        WHERE ts.ts < ${end_ts}
-          AND ts.ts + ts.dur > ${start_ts}
-          AND ts.dur > 0
+       SELECT ss.*,t.tid,t.name AS thread_name,p.name AS process_name,COALESCE(ct.core_type,'unknown') AS core_type
+       FROM system_thread_state_spans ss JOIN thread t ON t.utid=ss.utid JOIN process p ON p.upid=ss.upid
+       LEFT JOIN system_cpu_topology ct ON ct.ucpu=ss.ucpu
       ),
-      running_events AS (
-        SELECT
-          utid,
-          ts,
-          cpu,
-          core_type,
-          LAG(cpu) OVER (PARTITION BY utid ORDER BY ts) AS prev_cpu,
-          LAG(core_type) OVER (PARTITION BY utid ORDER BY ts) AS prev_core_type
-        FROM states
-        WHERE state = 'Running' AND clipped_dur > 0
+      runs AS (
+       SELECT *,LAG(ucpu) OVER(PARTITION BY window_id,utid ORDER BY raw_start_ts,thread_state_id) AS prev_ucpu,
+         LAG(core_type) OVER(PARTITION BY window_id,utid ORDER BY raw_start_ts,thread_state_id) AS prev_core_type
+       FROM states WHERE state='Running'
       ),
       migrations AS (
-        SELECT
-          utid,
-          SUM(CASE WHEN prev_cpu IS NOT NULL AND cpu != prev_cpu THEN 1 ELSE 0 END) AS migrations,
-          SUM(CASE WHEN prev_cpu IS NOT NULL AND cpu != prev_cpu AND core_type != prev_core_type THEN 1 ELSE 0 END) AS cross_cluster_migrations
-        FROM running_events
-        GROUP BY utid
+       SELECT window_id,utid,SUM(CASE WHEN prev_ucpu IS NOT NULL AND prev_ucpu!=ucpu THEN 1 ELSE 0 END) AS migrations,
+         SUM(CASE WHEN prev_ucpu IS NOT NULL AND prev_ucpu!=ucpu AND core_type!='unknown' AND prev_core_type!='unknown'
+           AND core_type!=prev_core_type THEN 1 ELSE 0 END) AS cross_cluster_migrations
+       FROM runs GROUP BY window_id,utid
+      ),
+      summary AS (
+       SELECT s.window_id,s.window_start_ts,s.window_end_ts,s.upid,s.utid,s.tid,s.thread_name,s.process_name,s.role,
+        SUM(s.dur_ns) AS state_covered_ns,
+        SUM(CASE WHEN s.state='Running' THEN s.dur_ns ELSE 0 END)/1e6 AS total_cpu_ms,
+        SUM(CASE WHEN s.state='Running' AND s.core_type IN ('prime','big','medium') THEN s.dur_ns ELSE 0 END)/1e6 AS q1_perf_running_ms,
+        SUM(CASE WHEN s.state='Running' AND s.core_type='little' THEN s.dur_ns ELSE 0 END)/1e6 AS q2_little_running_ms,
+        SUM(CASE WHEN s.state='Running' AND s.core_type='unknown' THEN s.dur_ns ELSE 0 END)/1e6 AS unknown_running_ms,
+        SUM(CASE WHEN s.state IN ('R','R+') THEN s.dur_ns ELSE 0 END)/1e6 AS q3_runnable_ms,
+        SUM(CASE WHEN s.state IN ('D','DK') THEN s.dur_ns ELSE 0 END)/1e6 AS q4a_io_blocked_ms,
+        SUM(CASE WHEN s.state IN ('S','I') THEN s.dur_ns ELSE 0 END)/1e6 AS q4b_sleeping_ms,
+        SUM(CASE WHEN s.state NOT IN ('Running','R','R+','D','DK','S','I') THEN s.dur_ns ELSE 0 END)/1e6 AS other_state_ms,
+        SUM(CASE WHEN s.state='Running' AND s.core_type IN ('prime','big','medium') THEN s.dur_ns ELSE 0 END)*100.0/
+          NULLIF(SUM(CASE WHEN s.state='Running' THEN s.dur_ns ELSE 0 END),0) AS perf_core_pct,
+        GROUP_CONCAT(DISTINCT CASE WHEN s.state='Running' THEN s.cpu END) AS running_cpus,
+        GROUP_CONCAT(DISTINCT CASE WHEN s.state='Running' THEN s.core_type END) AS running_core_types,
+        COALESCE(m.migrations,0) AS migrations,COALESCE(m.cross_cluster_migrations,0) AS cross_cluster_migrations
+       FROM states s LEFT JOIN migrations m ON m.window_id=s.window_id AND m.utid=s.utid
+       GROUP BY s.window_id,s.utid
       )
-      SELECT
-        s.thread_name,
-        s.process_name,
-        s.tid,
-        ROUND(SUM(CASE WHEN s.state = 'Running' THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS total_cpu_ms,
-        ROUND(SUM(CASE WHEN s.state = 'Running' AND s.core_type IN ('prime', 'big', 'medium') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q1_perf_running_ms,
-        ROUND(SUM(CASE WHEN s.state = 'Running' AND s.core_type = 'little' THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q2_little_running_ms,
-        ROUND(SUM(CASE WHEN s.state IN ('R', 'R+') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q3_runnable_ms,
-        ROUND(SUM(CASE WHEN s.state IN ('D', 'DK') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q4a_io_blocked_ms,
-        ROUND(SUM(CASE WHEN s.state IN ('S', 'I') THEN s.clipped_dur ELSE 0 END) / 1e6, 2) AS q4b_sleeping_ms,
-        ROUND(100.0 * SUM(CASE WHEN s.state = 'Running' AND s.core_type IN ('prime', 'big', 'medium') THEN s.clipped_dur ELSE 0 END)
-          / NULLIF(SUM(CASE WHEN s.state = 'Running' THEN s.clipped_dur ELSE 0 END), 0), 1) AS perf_core_pct,
-        GROUP_CONCAT(DISTINCT CASE WHEN s.state = 'Running' THEN s.cpu END) AS running_cpus,
-        GROUP_CONCAT(DISTINCT CASE WHEN s.state = 'Running' THEN s.core_type END) AS running_core_types,
-        COALESCE(m.migrations, 0) AS migrations,
-        COALESCE(m.cross_cluster_migrations, 0) AS cross_cluster_migrations
-      FROM states s
-      LEFT JOIN migrations m ON s.utid = m.utid
-      WHERE s.clipped_dur > 0
-      GROUP BY s.utid
-      HAVING total_cpu_ms > 0
-      ORDER BY total_cpu_ms DESC
+      SELECT *,COUNT(*) OVER(PARTITION BY window_id) AS total_observed_threads,
+        'full_aggregate_before_display_limit' AS sampling_evidence
+      FROM summary
+      ORDER BY CASE WHEN role='main' THEN 0 ELSE 1 END,MAX(q3_runnable_ms,q4a_io_blocked_ms,total_cpu_ms) DESC
       LIMIT ${top_k|20}
     save_as: running_thread_quadrants
 
@@ -219,6 +211,10 @@ steps:
       layer: list
       title: "选区 Running 进程排名"
       columns:
+        - {name: upid, label: "upid", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: runnable_ms, label: "runnable_ms", type: number, hidden: true}
         - name: process_name
           label: "进程"
           type: string
@@ -233,24 +229,27 @@ steps:
         - name: thread_count
           label: "线程数"
           type: number
+    process_scope:
+      role: target
+      binding: effective_target_processes
+    sql_fragments:
+      - fragments/effective_target_processes.sql
+      - fragments/system_thread_state_spans.sql
     sql: |
-      SELECT
-        COALESCE(p.name, '<unknown>') AS process_name,
-        p.pid,
-        ROUND(SUM(MIN(ts.ts + ts.dur, ${end_ts}) - MAX(ts.ts, ${start_ts})) / 1e6, 2) AS running_ms,
-        COUNT(DISTINCT ts.utid) AS thread_count
-      FROM thread_state ts
-      JOIN thread t ON ts.utid = t.utid
-      LEFT JOIN process p ON t.upid = p.upid
-      WHERE ts.ts < ${end_ts}
-        AND ts.ts + ts.dur > ${start_ts}
-        AND ts.dur > 0
-        AND ts.state = 'Running'
-        AND ('${package|}' = '' OR COALESCE(p.name, '') GLOB '${package|}*')
-        AND ('${thread_name|}' = '' OR COALESCE(t.name, '') GLOB '*${thread_name|}*')
-      GROUP BY p.upid
-      ORDER BY running_ms DESC
-      LIMIT ${top_k|20}
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts),
+      system_target_threads AS (
+        SELECT w.window_id,p.upid,t.utid,CASE WHEN t.tid=p.pid THEN 'main' ELSE 'target' END AS role
+        FROM system_windows w CROSS JOIN effective_target_processes p JOIN thread t ON t.upid=p.upid
+        WHERE (${__process_scope.upid} IS NOT NULL OR '${package|}'='' OR p.name='${package|}' OR p.name GLOB '${package|}:*') AND ('${thread_name|}'='' OR COALESCE(t.name,'') GLOB '*${thread_name|}*')
+      )
+      SELECT s.upid,p.name AS process_name,p.pid,s.window_start_ts,s.window_end_ts,
+       SUM(CASE WHEN s.state='Running' THEN s.dur_ns ELSE 0 END)/1e6 AS running_ms,
+       SUM(CASE WHEN s.state IN ('R','R+') THEN s.dur_ns ELSE 0 END)/1e6 AS runnable_ms,
+       COUNT(DISTINCT s.utid) AS thread_count
+      FROM system_thread_state_spans s JOIN process p ON p.upid=s.upid
+      GROUP BY s.window_id,s.upid ORDER BY running_ms DESC LIMIT ${top_k|20}
     save_as: running_process_ranking
 
   - id: cpu_freq_by_core
@@ -262,6 +261,11 @@ steps:
       layer: list
       title: "选区各核平均频率"
       columns:
+        - {name: window_id, label: "window_id", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: ucpu, label: "ucpu", type: number, hidden: true}
+        - {name: topology_source, label: "topology_source", type: string, hidden: true}
         - name: cpu
           label: "CPU"
           type: number
@@ -282,61 +286,21 @@ steps:
           type: duration
           format: duration_ms
           unit: ms
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/system_sched_spans.sql
+      - fragments/system_cpu_frequency_spans.sql
     sql: |
-      WITH
-      cpu_tracks AS (
-        SELECT id, cpu
-        FROM cpu_counter_track
-        WHERE name = 'cpufreq' AND cpu IS NOT NULL
-      ),
-      freq_points AS (
-        SELECT
-          t.cpu,
-          ${start_ts} AS ts,
-          (
-            SELECT c2.value
-            FROM counter c2
-            WHERE c2.track_id = t.id AND c2.ts <= ${start_ts}
-            ORDER BY c2.ts DESC
-            LIMIT 1
-          ) AS freq_khz,
-          0 AS source_order
-        FROM cpu_tracks t
-        UNION ALL
-        SELECT t.cpu, c.ts, c.value AS freq_khz, 1 AS source_order
-        FROM counter c
-        JOIN cpu_tracks t ON c.track_id = t.id
-        WHERE c.ts >= ${start_ts} AND c.ts < ${end_ts}
-      ),
-      freq_spans AS (
-        SELECT
-          cpu,
-          freq_khz,
-          ts,
-          LEAD(ts, 1, ${end_ts}) OVER (PARTITION BY cpu ORDER BY ts, source_order) AS next_ts
-        FROM freq_points
-        WHERE freq_khz IS NOT NULL AND freq_khz > 0
-      ),
-      clipped AS (
-        SELECT
-          cpu,
-          freq_khz,
-          MIN(next_ts, ${end_ts}) - MAX(ts, ${start_ts}) AS dur_ns
-        FROM freq_spans
-        WHERE ts < ${end_ts} AND next_ts > ${start_ts}
-      )
-      SELECT
-        c.cpu,
-        COALESCE(ct.core_type, 'unknown') AS core_type,
-        ROUND(SUM(c.freq_khz * c.dur_ns) / NULLIF(SUM(c.dur_ns), 0) / 1000, 0) AS avg_freq_mhz,
-        ROUND(MIN(c.freq_khz) / 1000, 0) AS min_freq_mhz,
-        ROUND(MAX(c.freq_khz) / 1000, 0) AS max_freq_mhz,
-        ROUND(SUM(c.dur_ns) / 1e6, 2) AS covered_ms
-      FROM clipped c
-      LEFT JOIN _cpu_topology ct ON c.cpu = ct.cpu_id
-      WHERE c.dur_ns > 0
-      GROUP BY c.cpu
-      ORDER BY c.cpu
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts)
+      SELECT f.window_id,f.window_start_ts,f.window_end_ts,f.ucpu,f.cpu,ct.core_type,ct.topology_source,
+       SUM(f.freq_khz*1.0*f.dur_ns)/SUM(f.dur_ns)/1000.0 AS avg_freq_mhz,
+       MIN(f.freq_khz)/1000.0 AS min_freq_mhz,MAX(f.freq_khz)/1000.0 AS max_freq_mhz,
+       SUM(f.dur_ns)/1e6 AS covered_ms
+      FROM system_cpu_frequency_spans f LEFT JOIN system_cpu_topology ct ON ct.ucpu=f.ucpu
+      GROUP BY f.window_id,f.ucpu ORDER BY f.ucpu
     save_as: cpu_freq_by_core
 
   - id: cpu_freq_distribution
@@ -348,6 +312,10 @@ steps:
       layer: deep
       title: "选区各核频率分布"
       columns:
+        - {name: window_id, label: "window_id", type: number, hidden: true}
+        - {name: window_start_ts, label: "window_start_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: window_end_ts, label: "window_end_ts", type: timestamp, unit: ns, hidden: true}
+        - {name: ucpu, label: "ucpu", type: number, hidden: true}
         - name: cpu
           label: "CPU"
           type: number
@@ -366,61 +334,21 @@ steps:
           label: "区间占比"
           type: percentage
           format: percentage
+    process_scope:
+      role: global_context
+    sql_fragments:
+      - fragments/system_sched_spans.sql
+      - fragments/system_cpu_frequency_spans.sql
     sql: |
-      WITH
-      cpu_tracks AS (
-        SELECT id, cpu
-        FROM cpu_counter_track
-        WHERE name = 'cpufreq' AND cpu IS NOT NULL
-      ),
-      freq_points AS (
-        SELECT
-          t.cpu,
-          ${start_ts} AS ts,
-          (
-            SELECT c2.value
-            FROM counter c2
-            WHERE c2.track_id = t.id AND c2.ts <= ${start_ts}
-            ORDER BY c2.ts DESC
-            LIMIT 1
-          ) AS freq_khz,
-          0 AS source_order
-        FROM cpu_tracks t
-        UNION ALL
-        SELECT t.cpu, c.ts, c.value AS freq_khz, 1 AS source_order
-        FROM counter c
-        JOIN cpu_tracks t ON c.track_id = t.id
-        WHERE c.ts >= ${start_ts} AND c.ts < ${end_ts}
-      ),
-      freq_spans AS (
-        SELECT
-          cpu,
-          freq_khz,
-          ts,
-          LEAD(ts, 1, ${end_ts}) OVER (PARTITION BY cpu ORDER BY ts, source_order) AS next_ts
-        FROM freq_points
-        WHERE freq_khz IS NOT NULL AND freq_khz > 0
-      ),
-      clipped AS (
-        SELECT
-          cpu,
-          CAST(ROUND(freq_khz / (${freq_bucket_mhz|100} * 1000.0)) * ${freq_bucket_mhz|100} AS INTEGER) AS freq_mhz_bucket,
-          MIN(next_ts, ${end_ts}) - MAX(ts, ${start_ts}) AS dur_ns
-        FROM freq_spans
-        WHERE ts < ${end_ts} AND next_ts > ${start_ts}
-      )
-      SELECT
-        c.cpu,
-        COALESCE(ct.core_type, 'unknown') AS core_type,
-        c.freq_mhz_bucket,
-        ROUND(SUM(c.dur_ns) / 1e6, 2) AS duration_ms,
-        ROUND(100.0 * SUM(c.dur_ns) / NULLIF(${end_ts} - ${start_ts}, 0), 1) AS pct_of_range
-      FROM clipped c
-      LEFT JOIN _cpu_topology ct ON c.cpu = ct.cpu_id
-      WHERE c.dur_ns > 0
-      GROUP BY c.cpu, c.freq_mhz_bucket
-      ORDER BY c.cpu, duration_ms DESC
-      LIMIT 100
+      WITH system_windows AS (SELECT 0 AS window_id,
+        COALESCE(${start_ts},(SELECT start_ts FROM trace_bounds)) AS window_start_ts,
+        COALESCE(${end_ts},(SELECT end_ts FROM trace_bounds)) AS window_end_ts)
+      SELECT f.window_id,f.window_start_ts,f.window_end_ts,f.ucpu,f.cpu,ct.core_type,
+       CAST(ROUND(f.freq_khz/(${freq_bucket_mhz|100}*1000.0))*${freq_bucket_mhz|100} AS INTEGER) AS freq_mhz_bucket,
+       SUM(f.dur_ns)/1e6 AS duration_ms,
+       100.0*SUM(f.dur_ns)/(f.window_end_ts-f.window_start_ts) AS pct_of_range
+      FROM system_cpu_frequency_spans f LEFT JOIN system_cpu_topology ct ON ct.ucpu=f.ucpu
+      GROUP BY f.window_id,f.ucpu,freq_mhz_bucket ORDER BY f.ucpu,duration_ms DESC
     save_as: cpu_freq_distribution
 
 output:

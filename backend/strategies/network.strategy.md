@@ -3,6 +3,18 @@
 
 ---
 scene: network
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: network_critical_path
+      domain: critical_path
+      description: "Bind the request or packet and application-processing window. Investigate network/callback task scheduling when application latency is involved; packet-only questions do not require unrelated CPU tables."
+    - id: network_dependencies
+      domain: dependency_chain
+      description: "Separate packet timing, retransmission, request queueing and app callback service. Packet-only data does not establish DNS/TLS or remote-server duration; disclose missing protocol endpoints."
 classification_description: "Network traffic, packet activity, connectivity and communication performance."
 priority: 6
 effort: medium

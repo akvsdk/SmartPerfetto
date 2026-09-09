@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "coverageBoundary": "Only executed scenarios provide Provider acceptance. Constructed scenarios exercise synthetic named events and selected-window system evidence, not real-device domain mechanisms or causal proof. all/all-deepseek is OpenAI/Pi/OpenCode only; Claude/Qoder require independent runs. Existing semantic/finalizer/runtime tests cover restored results, fact/ack and existing_only boundaries.",
+  "scenarios": [
+    {
+      "id": "startup-real",
+      "evidenceTier": "real",
+      "trace": "../Trace/real/android-startup-heavy/trace.pftrace",
+      "query": "本轮只调查一次冷启动窗口内主线程的 Running、R/R+ 和等待状态分布，报告该次启动耗时，用同一启动窗口的线程状态证据解释时间花在哪里。不要扩展成完整报告或其他启动事件；其他系统维度仅交代是否适用于本问题。",
+      "expectation": "startup-real.expectation.json"
+    },
+    {
+      "id": "scrolling-real",
+      "evidenceTier": "real",
+      "trace": "../Trace/real/android-scroll-customer/trace.pftrace",
+      "query": "本轮只研究这个滑动 Trace 的全局 CPU 供给背景：以 trace_bounds 的完整窗口分析每个 CPU 忙碌时间，并给出按 upid 和 frame id 去重的总帧数。区分系统背景与掉帧原因，不扩展为整场景报告。",
+      "expectation": "scrolling-real.expectation.json"
+    },
+    {
+      "id": "scheduler-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/system-scheduling-evidence/trace.pftrace",
+      "query": "针对选中的合成调度区间，只分析目标线程在该精确区间内的 Running/R/R+ 等状态分布及调度等待边界，并报告选区持续时间。不要泛化成整场景报告，其他系统维度只说明适用性。",
+      "expectation": "scheduler-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "main",
+        "eventName": "SmartPerfetto::CASE::system-scheduling-evidence"
+      }
+    },
+    {
+      "id": "input-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/input-interaction-latency/trace.pftrace",
+      "query": "针对选中的合成 performClick，只调查该精确选区内的系统 CPU 忙碌背景并报告选区持续时间。区分 CPU 供给背景与真实触摸响应原因，不要声称已证明端到端输入延迟。",
+      "expectation": "input-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "main",
+        "eventName": "performClick"
+      }
+    },
+    {
+      "id": "anr-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/binder-io-blocking/trace.pftrace",
+      "query": "这个构造 Trace 含合成 ANR 事件。本轮只调查选中标记精确窗口内的系统 CPU 忙碌背景并报告标记持续时间；不得把这个局部窗口说成整个 ANR timeout，也不要把忙碌度解释成 ANR 根因。",
+      "expectation": "anr-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "main",
+        "eventName": "SmartPerfetto::CASE::binder-io-blocking"
+      }
+    },
+    {
+      "id": "game-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/rendering-jank/trace.pftrace",
+      "query": "这是构造的 game 数据。本轮只调查选中的 GameThread / PlayerLoop 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "game-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "GameThread",
+        "eventName": "PlayerLoop"
+      }
+    },
+    {
+      "id": "media-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/media-network-camera/trace.pftrace",
+      "query": "这是构造的 media 数据。本轮只调查选中的 RenderThread / Camera3-Device::processCaptureRequest 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "media-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "RenderThread",
+        "eventName": "Camera3-Device::processCaptureRequest"
+      }
+    },
+    {
+      "id": "io-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/binder-io-blocking/trace.pftrace",
+      "query": "这是构造的 io 数据。本轮只调查选中的 RenderThread / FileIO 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "io-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "RenderThread",
+        "eventName": "FileIO"
+      }
+    },
+    {
+      "id": "memory-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/memory-gc-pressure/trace.pftrace",
+      "query": "这是构造的 memory 数据。本轮只调查选中的 RenderThread / GC Young Concurrent 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "memory-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "RenderThread",
+        "eventName": "GC Young Concurrent"
+      }
+    },
+    {
+      "id": "power-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/power-thermal/trace.pftrace",
+      "query": "这是构造的 power 数据。本轮只调查选中的 RenderThread / device_suspend 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "power-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "RenderThread",
+        "eventName": "device_suspend"
+      }
+    },
+    {
+      "id": "linux-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/linux-system-state/trace.pftrace",
+      "query": "这是构造的 linux 数据。本轮只调查选中的 main / journald 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "linux-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "main",
+        "eventName": "journald"
+      }
+    },
+    {
+      "id": "network-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/media-network-camera/trace.pftrace",
+      "query": "这是构造的 network 数据。本轮只调查选中的 RenderThread / NetworkRequest 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "network-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "RenderThread",
+        "eventName": "NetworkRequest"
+      }
+    },
+    {
+      "id": "pipeline-constructed",
+      "evidenceTier": "constructed",
+      "trace": "../Trace/.generated/constructed/rendering-jank/trace.pftrace",
+      "query": "这是构造的 pipeline 数据。本轮只调查选中的 RenderThread / DrawFrame 精确窗口内的系统 CPU 忙碌背景，并报告选区持续时间。保留实际线程身份，不把它替换成进程主线程。事件名称不能证明真实领域机制；缺少设备/GPU/IO/能量或因果证据时明确无法判定，不扩展成完整场景报告。",
+      "expectation": "pipeline-constructed.expectation.json",
+      "selectSlice": {
+        "processName": "com.smartperfetto.fixture",
+        "threadName": "RenderThread",
+        "eventName": "DrawFrame"
+      }
+    },
+    {
+      "id": "startup-pair-real",
+      "evidenceTier": "real",
+      "trace": "../Trace/real/android-startup-heavy/trace.pftrace",
+      "referenceTrace": "../Trace/real/android-startup-light/trace.pftrace",
+      "query": "对比左右两个 Trace 各自一次冷启动主线程的 Running/R/R+ 和等待状态分布。分别报告启动耗时，以各自启动窗口取证，保留两侧进程实例与窗口，不把一侧数据复制到另一侧。这里只调查这些局部调度维度，不要求完整场景报告；差值和并发负载本身不证明根因。",
+      "expectation": "startup-pair-real.expectation.json"
+    }
+  ]
+}

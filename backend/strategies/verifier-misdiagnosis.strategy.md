@@ -3,6 +3,9 @@
 
 ---
 scene: verifier_misdiagnosis
+investigation_contract:
+  schema_version: 1
+  not_applicable_reason: "Shared interpretation constraints apply to existing claims; this is not an independently classified investigation scene."
 strategy_kind: contract_only
 priority: 99
 effort: low

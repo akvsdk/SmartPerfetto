@@ -23,6 +23,8 @@ export type QueryComplexity = 'quick' | 'full';
 
 /** Input signals for the complexity classifier. */
 export interface ComplexityClassifierInput {
+  /** Bounded, authorized typed history. Defined (even empty) disables legacy facts. */
+  historyContext?: string;
   query: string;
   /** Legacy scene hint; semantic turn intent uses the registered scene catalog. */
   sceneType: SceneType;

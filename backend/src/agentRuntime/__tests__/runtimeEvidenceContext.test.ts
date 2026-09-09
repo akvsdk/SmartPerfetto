@@ -19,6 +19,7 @@ import type {TraceProcessorService} from '../../services/traceProcessorService';
 import {buildTraceProcessorQueryProvenance} from '../../services/traceProcessorConnectionModel';
 import {createRuntimeEvidenceContext, resolveRuntimeEvidenceStore,
   type RuntimeEvidenceContext, type RuntimeEvidenceScopeInput} from '../runtimeEvidenceContext';
+import {createAnalysisHistoryReader, toAnalysisHistoryTurn} from '../analysisHistory';
 
 const contexts: RuntimeEvidenceContext[] = [];
 const roots: string[] = [];
@@ -26,6 +27,28 @@ const baseOptions: AnalysisOptions = {tenantId: 'evidence-tenant', workspaceId: 
   userId: 'evidence-user', referenceTraceId: 'reference-trace'};
 const scope = (options = baseOptions): RuntimeEvidenceScopeInput => ({logicalSessionId: 'conversation', traceId: 'trace', options});
 const readOptions = {ownerKey: 'product-finalization', allowedTraces: [{traceId: 'trace', traceSide: 'current' as const}]};
+
+it('exposes bound historical text in existing_only mode without reacquiring or granting proof', async () => {
+  let active = true;
+  const query = jest.fn(async () => ({columns: [], rows: [], durationMs: 0}));
+  const entry = toAnalysisHistoryTurn({id: 'history-run', turnIndex: 0, traceId: 'trace', timestamp: 1,
+    query: 'why', result: {message: '有限结论', partial: true, completion: {status: 'incomplete', reason: 'turn_limit'},
+      conclusionContract: {uncertainties: ['缺少 GPU'], nextSteps: ['检查 fence']}}});
+  const mcp = createClaudeMcpServer({traceId: 'trace', sessionId: 'session', userQuery: 'Continue',
+    traceProcessorService: {query} as unknown as TraceProcessorService, skillExecutor: new SkillExecutor({query}),
+    allowNewEvidence: false, lightweight: true, conversationTraceAttached: true, androidInternalsPackStore: null,
+    analysisHistoryReader: createAnalysisHistoryReader({getTurns: () => [entry], assertActive: () => {if (!active) throw new Error('revoked');}})});
+  const tool = mcp.toolDefinitions.find(candidate => candidate.name === 'read_session_history')!;
+  expect(tool).toBeDefined();
+  expect(tool.evidenceEffect).toBe('read_existing');
+  const response = await tool.shared.handler({turnId: entry.id}, {});
+  expect(response.structuredContent).toMatchObject({success: true, provenance: 'historical_context', partial: true});
+  expect(JSON.parse(String(response.structuredContent?.text))).toEqual(entry);
+  expect(query).not.toHaveBeenCalled();
+  active = false;
+  expect((await tool.shared.handler({turnId: entry.id}, {})).structuredContent)
+    .toMatchObject({success: false, unsupportedReason: 'analysis_history_unavailable'});
+});
 
 function contextFor(options = baseOptions) {
   const context = createRuntimeEvidenceContext(scope(options));
@@ -143,6 +166,8 @@ describe('product-owned live evidence continuity', () => {
         display: {title: 'late', format: 'table'} as any,
       }),
       updateQueryReview: () => run.store.updateQueryReview(id, undefined),
+      observeInvestigationTool: () => run.store.observeInvestigationTool({phase: 'started',
+        toolCallId: 'late', toolName: 'test', params: {}, extra: {}}),
       get: () => run.store.get(id), generateSummary: () => run.store.generateSummary(id),
       generateCompactSummary: () => run.store.generateCompactSummary(id),
       fetch: () => run.store.fetch(id, 'full'), size: () => run.store.size,

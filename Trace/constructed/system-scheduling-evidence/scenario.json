@@ -1,0 +1,257 @@
+{
+  "schema_version": 1,
+  "clock": {
+    "anchor": "trace-middle",
+    "duration_ns": "60000000"
+  },
+  "actors": {
+    "processes": [
+      {
+        "id": "app",
+        "name": "com.smartperfetto.fixture"
+      },
+      {
+        "id": "peer",
+        "name": "com.smartperfetto.systempeer"
+      }
+    ],
+    "threads": [
+      {
+        "id": "main",
+        "process": "app",
+        "name": "main",
+        "is_main": true
+      },
+      {
+        "id": "waiting",
+        "process": "app",
+        "name": "PureWaiting"
+      },
+      {
+        "id": "unfinished",
+        "process": "app",
+        "name": "UnfinishedTask"
+      },
+      {
+        "id": "peer",
+        "process": "peer",
+        "name": "SystemCompetitor",
+        "is_main": true
+      }
+    ]
+  },
+  "signals": [
+    {
+      "type": "atrace-slice",
+      "at_ns": "5000000",
+      "duration_ns": "33000000",
+      "process": "app",
+      "thread": "main",
+      "cpu": 0,
+      "name": "SmartPerfetto::CASE::system-scheduling-evidence"
+    },
+    {
+      "type": "cpu-idle",
+      "at_ns": "1000000",
+      "cpu": 2,
+      "cpu_id": 2,
+      "state": 1
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "2000000",
+      "cpu": 0,
+      "prev_thread": null,
+      "next_thread": "main",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 120
+    },
+    {
+      "type": "cpu-idle",
+      "at_ns": "3000000",
+      "cpu": 2,
+      "cpu_id": 2,
+      "state": 4294967295
+    },
+    {
+      "type": "cpu-frequency",
+      "at_ns": "4000000",
+      "cpu": 0,
+      "cpu_id": 0,
+      "value": 1000000
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "6000000",
+      "cpu": 0,
+      "prev_thread": "main",
+      "next_thread": "peer",
+      "prev_state_raw": "256",
+      "prev_priority": 120,
+      "next_priority": 90
+    },
+    {
+      "type": "cpu-frequency",
+      "at_ns": "8000000",
+      "cpu": 0,
+      "cpu_id": 0,
+      "value": 2000000
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "10000000",
+      "cpu": 0,
+      "prev_thread": "peer",
+      "next_thread": "main",
+      "prev_state_raw": "1",
+      "prev_priority": 90,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "14000000",
+      "cpu": 0,
+      "prev_thread": "main",
+      "next_thread": null,
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "16000000",
+      "cpu": 0,
+      "prev_thread": null,
+      "next_thread": "peer",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 90
+    },
+    {
+      "type": "sched-waking",
+      "at_ns": "18000000",
+      "cpu": 0,
+      "thread": "waiting",
+      "waker_thread": "peer",
+      "target_cpu": 1,
+      "sched_priority": 110
+    },
+    {
+      "type": "cpu-frequency",
+      "at_ns": "18000000",
+      "cpu": 0,
+      "cpu_id": 0,
+      "value": 1500000
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "20000000",
+      "cpu": 0,
+      "prev_thread": "peer",
+      "next_thread": null,
+      "prev_state_raw": "1",
+      "prev_priority": 90,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "23000000",
+      "cpu": 1,
+      "prev_thread": null,
+      "next_thread": "main",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 110
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "27000000",
+      "cpu": 1,
+      "prev_thread": "main",
+      "next_thread": null,
+      "prev_state_raw": "2",
+      "prev_priority": 110,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "30000000",
+      "cpu": 0,
+      "prev_thread": null,
+      "next_thread": "peer",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 90
+    },
+    {
+      "type": "sched-waking",
+      "at_ns": "32000000",
+      "cpu": 0,
+      "thread": "main",
+      "waker_thread": "peer",
+      "target_cpu": 1,
+      "sched_priority": 110
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "34000000",
+      "cpu": 0,
+      "prev_thread": "peer",
+      "next_thread": null,
+      "prev_state_raw": "1",
+      "prev_priority": 90,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "36000000",
+      "cpu": 1,
+      "prev_thread": null,
+      "next_thread": "main",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 110
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "40000000",
+      "cpu": 1,
+      "prev_thread": "main",
+      "next_thread": null,
+      "prev_state_raw": "1",
+      "prev_priority": 110,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "42000000",
+      "cpu": 2,
+      "prev_thread": null,
+      "next_thread": "unfinished",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "45000000",
+      "cpu": 1,
+      "prev_thread": null,
+      "next_thread": "main",
+      "prev_state_raw": "0",
+      "prev_priority": 120,
+      "next_priority": 120
+    },
+    {
+      "type": "sched-switch",
+      "at_ns": "52000000",
+      "cpu": 1,
+      "prev_thread": "main",
+      "next_thread": null,
+      "prev_state_raw": "1",
+      "prev_priority": 120,
+      "next_priority": 120
+    }
+  ]
+}

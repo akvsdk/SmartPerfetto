@@ -49,6 +49,8 @@ import {
   getSessionBackgroundKnowledgeReferences,
 } from './androidInternalsPack/sessionBackgroundKnowledgeRegistry';
 import {sanitizeStoredTraceSummaryAttribution} from './traceSummaryAttribution';
+import {AnalysisHistoryStore} from './analysisHistoryStore';
+import {toAnalysisHistoryTurn} from '../agentRuntime/analysisHistory';
 
 const MAX_SQL_RESULTS_PER_MESSAGE = 5;
 const MAX_SQL_RESULT_ENTRY_BYTES = 100 * 1024;
@@ -263,6 +265,23 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
       ? projectOwnerAnalysisResult(sessionId, result as AnalysisResult, outputLanguage)
       : copyAnalysisResultForSnapshot(result as AnalysisResult)
     : undefined;
+
+  // History is a finalized product record. Failed durable writes must be visible
+  // to the caller, not hidden by the best-effort legacy snapshot fallback below.
+  const runId = finalResult?.completion?.runId ?? session.activeRun?.runId ?? session.lastRun?.runId;
+  if (finalResult && runId && session.tenantId && session.workspaceId && session.userId) {
+    const context = sessionContextManager.get(sessionId, traceId);
+    const turns = context?.getAllTurns() ?? [];
+    const latest = turns[turns.length - 1];
+    new AnalysisHistoryStore().append({tenantId: session.tenantId, workspaceId: session.workspaceId,
+      userId: session.userId, sessionId, traceId, runId}, toAnalysisHistoryTurn({
+      id: runId, turnIndex: Math.max(0, (session.runSequence ?? (latest ? latest.turnIndex + 1 : 1)) - 1),
+      timestamp: session.lastRun?.completedAt ?? Date.now(), query: privateKnowledge ? privateAnalysisQueryMessage(outputLanguage) : query,
+      traceId, result: finalResult,
+      analysisContextFingerprint: session.analysisContextFingerprint,
+      sourceDerived: privateKnowledge || session.sourceActivation === 'bounded_explicit' || session.sourceActivation === 'deep_supplement',
+    }));
+  }
 
   try {
     const sessionContext = sessionContextManager.get(sessionId, traceId);

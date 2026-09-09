@@ -30,6 +30,7 @@ import {
 } from '../io/sessionStore';
 import { upsertSession } from '../io/indexJson';
 import { appendTranscriptTurn } from '../io/transcriptWriter';
+import {toAnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
 import {localize, parseOutputLanguage, type OutputLanguage} from '../../agentv3/outputLanguage';
 import {
   projectOwnerAnalysisError,
@@ -142,6 +143,16 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
     timestamp: config.lastTurnAt,
     question: durableQuery,
     conclusionMd: conclusion,
+    history: toAnalysisHistoryTurn({
+      id: result.result.completion?.runId ?? `${sessionId}:turn:${turn}`,
+      turnIndex: turn - 1,
+      query: durableQuery,
+      traceId: result.traceId,
+      timestamp: config.lastTurnAt,
+      result: result.result,
+      sourceDerived: result.privateKnowledge === true,
+      analysisContextFingerprint: result.analysisContextFingerprint,
+    }),
     confidence: result.result.confidence,
     rounds: result.result.rounds,
     durationMs: result.result.totalDurationMs,
@@ -152,6 +163,10 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
   upsertSession(paths, indexEntry);
 
   renderer.printConclusion(conclusion, {
+    investigationAssurance: {
+      investigation: result.result.deliveryAssurance?.investigation ?? 'not_checked',
+      investigationEvidence: result.result.deliveryAssurance?.investigationEvidence ?? 'not_checked',
+    },
     confidence: result.result.confidence,
     rounds: result.result.rounds,
     durationMs: result.result.totalDurationMs,
@@ -170,6 +185,8 @@ export function commitTurnOutputs(input: CommitTurnInput): void {
     sessionDir: sp.dir,
     sessionId,
     success: result.result.success,
+    hasConclusion: Boolean(conclusion.trim()),
+    ...(result.result.terminationMessage ? { terminationMessage: result.result.terminationMessage } : {}),
     ...(result.result.partial ? { partial: true } : {}),
     ...(result.result.terminationReason ? { terminationReason: result.result.terminationReason } : {}),
   });
@@ -223,6 +240,9 @@ function writeAnalysisQualitySidecars(
   writeJsonFile(sp, `${turnPrefix}.claim-verification.json`, result.result.claimVerificationResult || null);
   writeJsonFile(sp, sp.identityResolutions, result.result.identityResolutions || []);
   writeJsonFile(sp, `${turnPrefix}.identity-resolutions.json`, result.result.identityResolutions || []);
+  // Preserve bound investigation details independently of the readable conclusion.
+  writeJsonFile(sp, `${turnPrefix}.investigation-assessment.json`, result.result.investigationAssessment || null);
+  writeJsonFile(sp, `${turnPrefix}.delivery-assurance.json`, result.result.deliveryAssurance || null);
   writeJsonFile(sp, path.join(sp.dir, 'analysis-receipt.json'), result.result.analysisReceipt || null);
   writeJsonFile(sp, `${turnPrefix}.analysis-receipt.json`, result.result.analysisReceipt || null);
   writeJsonFile(sp, path.join(sp.dir, 'ui-action-proposals.json'), result.result.uiActionProposals || []);

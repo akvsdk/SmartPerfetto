@@ -3,6 +3,18 @@
 
 ---
 scene: touch_tracking
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: touch_tracking_critical_path
+      domain: critical_path
+      description: "Correlate continuous input samples with corresponding app updates and presentation windows. Select input/Main/render/SF critical tasks across that sequence; summarize tracking delay distributions with actual coverage."
+    - id: touch_tracking_dependencies
+      domain: dependency_chain
+      description: "Distinguish input sampling, queueing, task service and presentation lag. Matching FPS alone does not prove good tracking or locate its cause."
 classification_description: "Continuous input-to-display tracking during a gesture, including how closely visual motion follows touch input."
 priority: 3
 effort: medium

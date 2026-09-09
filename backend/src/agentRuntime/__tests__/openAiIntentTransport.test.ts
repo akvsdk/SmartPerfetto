@@ -44,6 +44,57 @@ describe('OpenAI native intent transport', () => {
   beforeEach(() => {jest.useFakeTimers({now: 1000});});
   afterEach(() => {jest.useRealTimers();});
 
+  it.each(['responses', 'chat_completions'] as const)('disables official DeepSeek thinking only for explicit %s classification', async protocol => {
+    for (const purpose of [undefined, 'classification'] as const) {
+      const {input, fetchImpl} = fixture(protocol);
+      input.config.baseURL = 'https://api.deepseek.com/v1';
+      input.config.lightModel = 'deepseek-v4-flash';
+      input.purpose = purpose;
+      const deadline = input.deadlineMs;
+      expect(await runOpenAiIntentTransport(input)).toMatchObject({status: 'ok'});
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [url, request] = fetchImpl.mock.calls[0];
+      expect(String(url)).toBe(`https://api.deepseek.com/v1/${protocol === 'responses' ? 'responses' : 'chat/completions'}`);
+      const body = JSON.parse(request!.body as string);
+      expect(body.model).toBe('deepseek-v4-flash');
+      expect(body[protocol === 'responses' ? 'max_output_tokens' : 'max_tokens']).toBe(2048);
+      expect(input.deadlineMs).toBe(deadline);
+      if (purpose === 'classification') expect(body[protocol === 'responses' ? 'reasoning' : 'thinking'])
+        .toEqual(protocol === 'responses' ? {effort: 'none'} : {type: 'disabled'});
+      else {expect(body).not.toHaveProperty('thinking'); expect(body).not.toHaveProperty('reasoning');}
+      expect(body).not.toHaveProperty(protocol === 'responses' ? 'thinking' : 'reasoning');
+    }
+  });
+
+  it.each(['https://api.deepseek.com:8443/v1', 'http://api.deepseek.com/v1',
+    'https://api.deepseek.com.evil.test/v1', 'https://gateway.example/api.deepseek.com/v1'])(
+    'does not change reasoning behavior for classification through %s', baseURL => {
+      return Promise.all((['responses', 'chat_completions'] as const).map(async protocol => {
+        const {input, fetchImpl} = fixture(protocol);
+        input.config.baseURL = baseURL; input.config.lightModel = 'deepseek-v4-flash'; input.purpose = 'classification';
+        expect(await runOpenAiIntentTransport(input)).toMatchObject({status: 'ok'});
+        const body = JSON.parse(fetchImpl.mock.calls[0][1]!.body as string);
+        expect(body).not.toHaveProperty('thinking'); expect(body).not.toHaveProperty('reasoning');
+      }));
+    },
+  );
+
+  it.each(['semantic', 'analysis', '', null, 1])('rejects unknown explicit purpose %s without dispatch', purpose => {
+    const {input, fetchImpl} = fixture('chat_completions');
+    (input as {purpose?: unknown}).purpose = purpose;
+    return expect(runOpenAiIntentTransport(input)).resolves.toEqual({status: 'unavailable', reason: 'invalid_configuration'})
+      .then(() => expect(fetchImpl).not.toHaveBeenCalled());
+  });
+
+  it('keeps a truncated official classification unavailable without increasing the cap or retrying', async () => {
+    const {input, chatChoice, fetchImpl} = fixture('chat_completions');
+    input.config.baseURL = 'https://api.deepseek.com/v1'; input.config.lightModel = 'deepseek-v4-flash'; input.purpose = 'classification';
+    chatChoice.finish_reason = 'length';
+    expect(await runOpenAiIntentTransport(input)).toEqual({status: 'unavailable', reason: 'incomplete_output'});
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetchImpl.mock.calls[0][1]!.body as string)).toMatchObject({thinking: {type: 'disabled'}, max_tokens: 2048});
+  });
+
   it.each(['responses', 'chat_completions'] as const)('pins endpoint/auth/model for one %s request without history or retries', async protocol => {
     const {input, fetchImpl} = fixture(protocol);
     await expect(runOpenAiIntentTransport(input)).resolves.toEqual({

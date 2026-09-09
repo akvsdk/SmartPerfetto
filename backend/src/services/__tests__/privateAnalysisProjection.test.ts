@@ -23,6 +23,7 @@ import {
 } from '../security/privateAnalysisProjection';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import type {DeterministicNativeRowIdentity} from '../../types/claimVerification';
+import {projectPrivateAnalysisDelivery} from '../security/analysisDeliveryProjection';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import {clearCodeAwareOutputGuards, registerCodeAwareCanary, registerOnDemandSourceLookupForEcho, registerPrivateAnalysisQueryForEcho} from '../security/codeAwareOutputRegistry';
 
@@ -854,5 +855,130 @@ describe('owner source analysis delivery', () => {
       uncertaintyFlags: [], claudeHypotheses: [], runSequence: 1, conversationOrdinal: 0})!;
     expect(projectOwnerSessionStateSnapshot(snapshot).finalResult?.conclusion).toContain(source);
     clearCodeAwareOutputGuards(result.sessionId);
+  });
+});
+
+
+describe('investigation assessment result surfaces', () => {
+  function withInvestigation(): AnalysisResult {
+    const result = deliveredResult();
+    result.investigationAssessment = {schemaVersion: 1, status: 'checked',
+      binding: {...result.reportAssessment!.binding, ledgerFingerprint: analysisDeliveryFingerprint('ledger')},
+      evidenceRecords: [{recordId: 'capture-1', captureId: 'capture-1', rowIndex: 0,
+        evidenceRefId: 'ev-system', artifactId: 'artifact-system', sourceToolCallId: 'tool-system',
+        skillId: 'thread_system_summary_in_range', stepId: 'summary',
+        definitionFingerprint: analysisDeliveryFingerprint('definition'), selectedSqlHash: analysisDeliveryFingerprint('sql'),
+        traceId: 'trace-system', traceSide: 'current', originRunId: 'run-1', origin: 'current_run',
+        domain: 'thread_state', metricId: 'system.thread.state.duration', status: 'observed',
+        window: {start: '9007199254740993', end: '9007199254741093'}, upid: 4, utid: 8,
+        cpu: 2, ucpu: 10, machineId: null, windowId: 'window-system', role: null, aggregation: 'thread_window',
+        value: 0, unit: 'ns', coverage: '100', denominator: '100'}],
+      requirements: [{requirementId: 'scheduler', domain: 'scheduling', applicability: 'applicable',
+        coverage: 'covered', acquisition: 'observed', evidenceStatus: 'observed', scopeMatch: 'matched',
+        contentLocations: [{start: 0, end: 20}], evidenceRecordIds: ['capture-1']}]};
+    result.investigationAssessment.binding.evidenceRecordsFingerprint = analysisDeliveryFingerprint(result.investigationAssessment.evidenceRecords);
+    result.deliveryAssurance = {...result.deliveryAssurance!, investigation: 'passed', investigationEvidence: 'passed'};
+    return result;
+  }
+
+  it('keeps exact assessment through safe owner projection and snapshot serialization', () => {
+    const result = withInvestigation();
+    for (const copied of [projectOwnerAnalysisResult(result.sessionId, result, 'en'), copyAnalysisResultForSnapshot(result)]) {
+      expect(copied.investigationAssessment).toEqual(result.investigationAssessment);
+      expect(copied.deliveryAssurance?.investigation).toBe('passed');
+      expect(copied.deliveryAssurance?.investigationEvidence).toBe('passed');
+      expect(copied.completion).toEqual(result.completion);
+    }
+  });
+
+  it.each(['identityChanged', 'evidenceChanged', 'sourceChanged', 'claimsChanged'] as const)(
+    'invalidates investigation evidence when %s without changing native completion', field => {
+      const result = withInvestigation();
+      const copy = projectPrivateAnalysisDelivery(result, {conclusion: result.conclusion,
+        conclusionContract: result.conclusionContract, [field]: true}, text => text, {privateMetadata: false});
+      expect(copy.investigationAssessment?.requirements[0].evidenceRecordIds).toEqual([]);
+      expect(copy.investigationAssessment?.binding.ledgerFingerprint).toBe('');
+      expect(copy.deliveryAssurance?.investigation).toBe('not_checked');
+      expect(copy.deliveryAssurance?.investigationEvidence).toBe('not_checked');
+      expect(copy.completion).toEqual(result.completion);
+    });
+
+  it('projects original scalar values without converting null, zero, false or exact ns strings', () => {
+    const result = withInvestigation();
+    const original = result.investigationAssessment!.evidenceRecords![0];
+    result.investigationAssessment!.evidenceRecords = [null, false, 0, '0'].map((value, index) =>
+      ({...original, recordId: `record-${index}`, value}));
+    result.investigationAssessment!.binding.evidenceRecordsFingerprint = analysisDeliveryFingerprint(result.investigationAssessment!.evidenceRecords);
+    const copy = copyAnalysisResultForSnapshot(result);
+    expect(copy.investigationAssessment?.evidenceRecords?.map(row => row.value)).toEqual([null, false, 0, '0']);
+    expect(copy.investigationAssessment?.evidenceRecords?.[0].window.start).toBe('9007199254740993');
+    expect(copy.investigationAssessment).toEqual(result.investigationAssessment);
+  });
+
+  it.each(['missing_hash', 'changed_value'] as const)('does not retain PASS for %s records', mutation => {
+    const result = withInvestigation();
+    if (mutation === 'missing_hash') delete result.investigationAssessment!.binding.evidenceRecordsFingerprint;
+    else result.investigationAssessment!.evidenceRecords = [{...result.investigationAssessment!.evidenceRecords![0], value: 700}];
+    const copy = copyAnalysisResultForSnapshot(result);
+    expect(copy.investigationAssessment?.binding.evidenceRecordsFingerprint).toBe('');
+    expect(copy.deliveryAssurance?.investigationEvidence).toBe('not_checked');
+    expect(copy.investigationAssessment?.requirements[0].evidenceRecordIds).toEqual([]);
+  });
+
+  it('redacts evidence row values, omits private keys, and invalidates altered evidence', () => {
+    const result = withInvestigation();
+    const canary = 'PRIVATE_INVESTIGATION_VALUE';
+    result.investigationAssessment!.evidenceRecords = [{...result.investigationAssessment!.evidenceRecords![0],
+      value: canary, ownerKey: canary} as never];
+    registerCodeAwareCanary(result.sessionId, canary);
+    try {
+      const copy = projectOwnerAnalysisResult(result.sessionId, result, 'en');
+      expect(JSON.stringify(copy)).not.toContain(canary);
+      expect(JSON.stringify(copy)).not.toContain('ownerKey');
+      expect(copy.investigationAssessment?.evidenceRecords?.[0].status).toBe('unknown');
+      expect(copy.investigationAssessment?.requirements[0].evidenceRecordIds).toEqual([]);
+      expect(copy.deliveryAssurance?.investigationEvidence).toBe('not_checked');
+    } finally {clearCodeAwareOutputGuards(result.sessionId);}
+  });
+
+  it('drops malformed nested evidence and invalidates its assessment instead of copying arbitrary values', () => {
+    const result = withInvestigation();
+    result.investigationAssessment!.evidenceRecords = [{...result.investigationAssessment!.evidenceRecords![0],
+      value: {private: 'nested'}} as never];
+    const copy = copyAnalysisResultForSnapshot(result);
+    expect(copy.investigationAssessment?.evidenceRecords).toEqual([]);
+    expect(copy.deliveryAssurance?.investigationEvidence).toBe('not_checked');
+  });
+
+  it('preserves a fact-turn exemption without manufacturing an assessment', () => {
+    const result = deliveredResult();
+    result.deliveryAssurance = {...result.deliveryAssurance!, investigation: 'not_applicable', investigationEvidence: 'not_applicable'};
+    const copy = copyAnalysisResultForSnapshot(result);
+    expect(copy.investigationAssessment).toBeUndefined();
+    expect(copy.deliveryAssurance).toMatchObject({investigation: 'not_applicable', investigationEvidence: 'not_applicable'});
+  });
+
+  it('does not manufacture new investigation assurance in legacy snapshots', () => {
+    const result = deliveredResult();
+    const copy = copyAnalysisResultForSnapshot(result);
+    expect(copy.investigationAssessment).toBeUndefined();
+    expect(copy.deliveryAssurance?.investigation).toBeUndefined();
+  });
+
+  it('redacts protected record identifiers and invalidates all positive bindings', () => {
+    const result = withInvestigation();
+    const canary = 'PRIVATE_INVESTIGATION_RECORD';
+    result.investigationAssessment!.requirements[0].evidenceRecordIds = [canary];
+    registerCodeAwareCanary(result.sessionId, canary);
+    try {
+      const copy = projectOwnerAnalysisResult(result.sessionId, result, 'en');
+      expect(JSON.stringify(copy)).not.toContain(canary);
+      expect(copy.investigationAssessment?.status).toBe('coverage_incomplete');
+      expect(copy.investigationAssessment?.requirements[0]).toMatchObject({coverage: 'unknown',
+        acquisition: 'unknown', contentLocations: [], evidenceRecordIds: []});
+      expect(copy.investigationAssessment?.binding.ledgerFingerprint).toBe('');
+      expect(copy.deliveryAssurance).toMatchObject({investigation: 'not_checked', investigationEvidence: 'not_checked'});
+      expect(copy.completion).toEqual(result.completion);
+    } finally { clearCodeAwareOutputGuards(result.sessionId); }
   });
 });

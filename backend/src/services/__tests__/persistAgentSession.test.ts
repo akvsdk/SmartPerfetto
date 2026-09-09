@@ -16,8 +16,29 @@ import {SOURCE_USE_DECISION_SCHEMA_VERSION} from '../codebase/sourceUseDecision'
 import {clearCodeAwareOutputGuards, registerCodeAwareCanary, registerOnDemandSourceLookupForEcho} from '../security/codeAwareOutputRegistry';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
+import {AnalysisHistoryStore} from '../analysisHistoryStore';
 
 describe('persistAgentTurn', () => {
+  it('archives current finalized typed missing work and propagates archive failure', () => {
+    const append = jest.spyOn(AnalysisHistoryStore.prototype, 'append').mockImplementation(() => {});
+    jest.spyOn(SessionPersistenceService, 'getInstance').mockReturnValue({} as any);
+    const sessionId = 'archive-current';
+    const result: AnalysisResult = {sessionId, success: false, findings: [], hypotheses: [],
+      conclusion: 'Evidence is limited.', confidence: 0.3, rounds: 2, totalDurationMs: 1, partial: true,
+      completion: {schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'incomplete', reason: 'turn_limit',
+        runId: 'run-current', attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: 'fingerprint'},
+      conclusionContract: {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [], clusters: [], evidenceChain: [],
+        uncertainties: ['No GPU rows'], nextSteps: ['Inspect the fence']}};
+    const input = {sessionId, traceId: 'trace', query: 'why', result,
+      session: {sessionId, tenantId: 't', workspaceId: 'w', userId: 'u', traceId: 'trace', runSequence: 4, analysisContextFingerprint: 'source-A',
+        orchestrator: {}, dataEnvelopes: []} as any};
+    persistAgentTurn(input);
+    expect(append).toHaveBeenCalledWith(expect.objectContaining({userId: 'u', runId: 'run-current'}),
+      expect.objectContaining({id: 'run-current', turnIndex: 3, partial: true, terminationReason: 'turn_limit', analysisContextFingerprint: 'source-A',
+        uncertainties: ['No GPU rows'], nextSteps: ['Inspect the fence']}));
+    append.mockImplementation(() => {throw new Error('archive unavailable');});
+    expect(() => persistAgentTurn(input)).toThrow('archive unavailable');
+  });
   it('attaches only the complete current result and matching quality fields to the snapshot', () => {
     const save = jest.fn(() => true);
     const takeSnapshot = jest.fn((_sessionId: string, _traceId: string, fields: Record<string, unknown>) => ({

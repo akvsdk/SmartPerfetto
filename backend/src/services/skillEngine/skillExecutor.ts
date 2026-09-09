@@ -39,6 +39,7 @@ import { validateSkillInputs } from './skillValidator';
 import { EXACT_UPID_TOKEN, getExactProcessScopeSupport, sqlScopeDeclarationError, selectProcessScopeSql, type ScopedSqlSource } from './processScopeSql';
 import { assertEffectiveProcessScope, type EffectiveProcessScope } from '../processIdentity/effectiveProcessScope';
 import { sqlScopeEvidence, resultScopeProvenance, resultScopeLimitations } from './scopeEvidence';
+import {attachInvestigationEvidence, investigationCaptureFields, validateInvestigationEvidenceDeclarations} from '../evidence/investigationEvidenceLedger';
 import {attachEvidenceTable, captureEvidenceTable, capturedEvidenceTable, evidenceTableFor, evidenceCaptureHash,
   type CapturedFieldSemantics} from '../evidence/evidenceCapture';
 import { scopeMetadata, mergeScopeProvenance, identityForScopeEvidence, scopeProvenanceForFields, type EvidenceScopeMetadata, type EvidenceScopeProvenanceV1 } from '../../types/identityContract';
@@ -1234,6 +1235,7 @@ export class SkillExecutor {
    * 注册 skill
    */
   registerSkill(skill: SkillDefinition): void {
+    validateInvestigationEvidenceDeclarations(skill);
     this.skillRegistry.set(skill.name, skill);
   }
 
@@ -3030,7 +3032,16 @@ export class SkillExecutor {
         display: skill.output?.display ? processDisplayConfig(skill.output.display, context) : undefined,
         sql, ...sqlScopeEvidence(source, context, 'root', this.rowsToObjects(result.columns, result.rows)),
       };
-      attachEvidenceTable(stepResult, captureEvidenceTable(result, evidenceFields));
+      const definitionFingerprint = skill.investigation_evidence ? fingerprintSkillDefinition(skill, this.fragmentRegistry) : undefined;
+      const selectedSqlHash = evidenceCaptureHash(sql);
+      const witness = captureEvidenceTable(result, {...evidenceFields, ...(definitionFingerprint
+        ? investigationCaptureFields(skill.investigation_evidence,
+          {kind: 'skill_literal', skillId: skill.name, stepId: 'root', definitionFingerprint, selectedSqlHash}) : {})});
+      if (skill.investigation_evidence && definitionFingerprint) attachInvestigationEvidence(witness, {
+        declaration: skill.investigation_evidence, skillId: skill.name, stepId: 'root', traceId: context.traceId,
+        definitionFingerprint, selectedSqlHash,
+      });
+      attachEvidenceTable(stepResult, witness);
       return stepResult;
 
     } catch (error: any) {
@@ -3234,7 +3245,17 @@ export class SkillExecutor {
         ),
         executionTimeMs: Date.now() - startTime,
       };
-      attachEvidenceTable(stepResult, captureEvidenceTable(result, evidenceFields));
+      const parentSkill = parentSkillId ? this.skillRegistry.get(parentSkillId) : undefined;
+      const definitionFingerprint = parentSkill && step.investigation_evidence ? fingerprintSkillDefinition(parentSkill, this.fragmentRegistry) : undefined;
+      const selectedSqlHash = evidenceCaptureHash(sql);
+      const witness = captureEvidenceTable(result, {...evidenceFields, ...(parentSkill && definitionFingerprint
+        ? investigationCaptureFields(step.investigation_evidence,
+          {kind: 'skill_literal', skillId: parentSkill.name, stepId: step.id, definitionFingerprint, selectedSqlHash}) : {})});
+      if (parentSkill && definitionFingerprint && step.investigation_evidence) attachInvestigationEvidence(witness, {
+        declaration: step.investigation_evidence, skillId: parentSkill.name, stepId: step.id, traceId: context.traceId,
+        definitionFingerprint, selectedSqlHash,
+      });
+      attachEvidenceTable(stepResult, witness);
       return stepResult;
 
     } catch (error: any) {

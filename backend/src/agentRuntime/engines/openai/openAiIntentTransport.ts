@@ -5,7 +5,9 @@
 import type {OpenAIAgentConfig} from './openAiConfig';
 import {
   buildOpenAIChatCompletionsTokenLimit,
+  buildOpenAITextRequestPurposeOptions,
   readOpenAIChatCompletionsOutput,
+  type OpenAITextRequestPurpose,
 } from '../../../services/providerManager/openAiChatCompletionsCompat';
 import {
   intentTransportTextResult,
@@ -18,6 +20,7 @@ export interface OpenAiIntentTransportInput extends IntentTransportInput {
   config: Pick<OpenAIAgentConfig, 'baseURL' | 'apiKey' | 'lightModel' | 'protocol'>;
   maxOutputTokens?: number;
   fetchImpl?: typeof fetch;
+  purpose?: OpenAITextRequestPurpose;
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -90,6 +93,7 @@ export function runOpenAiIntentTransport(input: OpenAiIntentTransportInput) {
   return runIntentTransport(input, async scope => {
     const {config} = input;
     if (!config.baseURL || !config.lightModel?.trim()
+      || (input.purpose !== undefined && input.purpose !== 'classification')
       || (input.maxOutputTokens !== undefined
         && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens <= 0))
       || (config.protocol !== 'chat_completions' && config.protocol !== 'responses')) {
@@ -97,16 +101,19 @@ export function runOpenAiIntentTransport(input: OpenAiIntentTransportInput) {
     }
     const endpoint = config.protocol === 'responses' ? 'responses' : 'chat/completions';
     const url = new URL(endpoint, config.baseURL.replace(/\/?$/, '/'));
+    const purposeOptions = buildOpenAITextRequestPurposeOptions({requestUrl: url, protocol: config.protocol, purpose: input.purpose});
     const body = config.protocol === 'responses' ? {
       model: config.lightModel,
       instructions: input.systemPrompt,
       input: [{role: 'user', content: input.prompt}],
       tools: [], store: false,
+      ...purposeOptions,
       ...(input.maxOutputTokens !== undefined ? {max_output_tokens: input.maxOutputTokens} : {}),
     } : {
       model: config.lightModel,
       messages: [{role: 'system', content: input.systemPrompt}, {role: 'user', content: input.prompt}],
       temperature: 0,
+      ...purposeOptions,
       ...(input.maxOutputTokens !== undefined
         ? buildOpenAIChatCompletionsTokenLimit(config.lightModel, input.maxOutputTokens) : {}),
     };

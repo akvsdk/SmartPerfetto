@@ -306,6 +306,9 @@ export function formatToolCallNarration(
   const args = options.privateContext ? {} : asRecord(rawArgs);
 
   switch (toolName) {
+    case 'read_session_history':
+      return localize(language, '回查本次会话的历史结论与未完成项',
+        'Review earlier conclusions and open questions in this conversation');
     case 'submit_plan': {
       const objective = readString(args.objective);
       const phases = parseArray(args.phases);
@@ -796,6 +799,18 @@ export function formatToolResultNarration(input: ToolResultNarrationInput): stri
   const toolName = shortToolName(readString(input.toolName) || 'unknown');
   const args = asRecord(input.args);
   const body = readToolResultBody(input.result);
+
+  if (toolName === 'read_session_history' && !toolResultIsFailure(input)) {
+    if (body.kind === 'turn' && body.partial === true) {
+      return localize(language, '这轮历史结果尚未完整完成，已保留其限制供继续核查',
+        'This earlier result was incomplete; its limitations remain available for follow-up');
+    }
+    if (body.kind === 'index' && Array.isArray(body.entries) && body.entries.length === 0) {
+      return localize(language, '本次会话没有可读取的已保存历史',
+        'No saved history is available for this conversation');
+    }
+    return '';
+  }
 
   if (input.privateContext) return privateToolOutcome(input, toolName, body, language);
 

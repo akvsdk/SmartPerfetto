@@ -4,8 +4,28 @@
 
 import { describe, expect, it } from '@jest/globals';
 import { buildComplexityClassifierInput } from '../queryComplexityContext';
+import {toAnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
+import {buildAnalysisTurnIntentPrompt} from '../queryComplexityPrompt';
 
 describe('buildComplexityClassifierInput', () => {
+  it('only uses bounded scoped typed history and carries unfinished state into the actual intent prompt', () => {
+    const history = [toAnalysisHistoryTurn({id: 'run-1', turnIndex: 0, timestamp: 1, traceId: 'trace', query: 'prior',
+      result: {message: 'Partial answer', completion: {status: 'incomplete', reason: 'turn_limit'},
+        conclusionContract: {uncertainties: ['GPU unavailable'], nextSteps: ['Inspect fence']}}})];
+    const input = buildComplexityClassifierInput({query: 'continue', sceneType: 'general', hasReferenceTrace: false,
+      history, previousTurns: [{query: 'PRIVATE_OLD_QUERY', findings: [{title: 'PRIVATE_OLD_FINDING'} as any]}]});
+    expect(input.historyContext).toContain('turn_limit');
+    expect(input.historyContext).toContain('GPU unavailable');
+    expect(input.previousFindings).toEqual([]);
+    const prompt = buildAnalysisTurnIntentPrompt({context: {...input, previousQueries: ['PRIVATE_OLD_QUERY'],
+      previousFindingDetails: [{turnIndex: 0, title: 'PRIVATE_OLD_FINDING'}]},
+      strategyRegistry: {getAllStrategies: () => []} as any, template: '{{requestContext}}', decisionSchema: {}});
+    expect(prompt).toContain('turn_limit');
+    expect(prompt).not.toContain('PRIVATE_OLD');
+    expect(Buffer.byteLength(input.historyContext!)).toBeLessThanOrEqual(6000);
+    expect(buildComplexityClassifierInput({query: 'new', sceneType: 'general', hasReferenceTrace: false, history: [],
+      previousTurns: [{query: 'PRIVATE_OLD'}]})).toMatchObject({historyContext: '', previousQueries: [], previousFindings: []});
+  });
   it('bounds prior full/finding signals to the recent turn window', () => {
     const input = buildComplexityClassifierInput({
       query: 'trace 时长多少',

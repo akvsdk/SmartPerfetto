@@ -5,6 +5,9 @@ This file is part of SmartPerfetto. See LICENSE for details.
 -->
 ---
 scene: smart
+investigation_contract:
+  schema_version: 1
+  not_applicable_reason: "Aggregate bound child-scene investigation states; this contract does not define a new trace investigation."
 strategy_kind: contract_only
 priority: 5
 effort: high

@@ -130,6 +130,10 @@
         "process_name": "com.smartperfetto.fixture"
       },
       "required_steps": [
+        "system_context_window",
+        "system_cpu_context",
+        "system_task_summary",
+        "system_task_handoffs",
         "init_cpu_topology",
         "event_info",
         "input_dispatch_breakdown",
@@ -138,6 +142,7 @@
         "quadrant_analysis"
       ],
       "required_sql_steps": [
+        "system_context_window",
         "event_info",
         "input_dispatch_breakdown",
         "input_pipeline_lifecycle",

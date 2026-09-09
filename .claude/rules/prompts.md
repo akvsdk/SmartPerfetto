@@ -44,6 +44,13 @@ YAML Skills
 Strategies shape agent behavior. Skills collect deterministic evidence. Keep
 that boundary intact.
 
+`lookup_strategy_detail` returns the complete detail from the run's pinned
+strategy registry. Do not truncate its body or substitute a catalog preview;
+the final sections carry interpretation limits and system-analysis guidance.
+Keep discovery metadata and general runtime budgets separate from this read.
+Scene `investigation_requirements` preserve relevant evidence depth for both
+answers and reports; presentation freedom does not waive that coverage.
+
 The five native runtimes share external typed-intent and conclusion-declaration
 templates. Scene choices come from the pinned strategy registry, and the finite
 proof catalog comes from `SUPPORTED_DETERMINISTIC_CLAIM_RULES`. Valid JSON only

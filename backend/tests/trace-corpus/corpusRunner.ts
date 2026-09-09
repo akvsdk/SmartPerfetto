@@ -507,6 +507,16 @@ export async function runCorpusRegression(
   } = {},
 ): Promise<CorpusRunResult> {
   const corpus = loadCorpus(repoRoot);
+  if (options.caseIds) {
+    const knownCaseIds = new Set(corpus.cases.map(entry => entry.id));
+    const unknownCaseIds = options.caseIds.filter(id => !knownCaseIds.has(id));
+    if (unknownCaseIds.length > 0) {
+      throw new Error(`Unknown requested corpus case(s): ${unknownCaseIds.join(', ')}`);
+    }
+    if (options.caseIds.length === 0) {
+      throw new Error('Explicit corpus case selection must not be empty');
+    }
+  }
   const selectedCases = corpus.cases.filter((entry) =>
     !options.caseIds || options.caseIds.includes(entry.id),
   );

@@ -7,6 +7,10 @@ import {randomUUID} from 'node:crypto';
 import {tmpdir} from 'node:os';
 import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
 import {resolveRuntimeTurnPolicy, type RuntimeTurnPolicy} from '../../runtimeTurnPolicy';
+import {createRuntimeTurnCloseoutTape, resolveRuntimeTurnBudget} from '../../runtimeTurnCloseout';
+import {createRuntimeAnalysisHistoryReader, renderAnalysisHistoryContext} from '../../analysisHistory';
+import {resolveKnowledgeScope} from '../../../services/scopedKnowledgeStore';
+import type {RuntimeToolObserver} from '../../runtimeToolObserver';
 import {runClaudeIntentTransport} from './claudeIntentTransport';
 import {attachFinalizationContext, type RuntimeFinalizationContextInput} from '../../analysisFinalizationContext';
 import {analysisDeliveryFingerprint, type AnalysisCandidateIdentity, type AnalysisCompletion, type AnalysisOutputOrigin, type AnalysisDeliveryContext} from '../../../types/analysisDelivery';
@@ -39,7 +43,6 @@ import type { ArchitectureInfo } from '../../../agent/detectors/types';
 import { createClaudeMcpServer, loadLearnedSqlFixPairs, MCP_NAME_PREFIX } from '../../../agentv3/claudeMcpServer';
 import {
   buildSystemPromptParts,
-  buildSelectionContextSection,
 } from '../../../agentv3/claudeSystemPrompt';
 import {
   createSseBridge,
@@ -77,6 +80,8 @@ import { getExtendedKnowledgeBase } from '../../../services/sqlKnowledgeBase';
 import {
   analysisContextMemoryPartitionKey,
   analysisContextUsesPrivateKnowledge,
+  assertCurrentAnalysisContextAuthorization,
+  buildAnalysisContextAuthorizationFingerprint,
 } from '../../../services/resolvedAnalysisContext';
 import type { AnalysisNote, AnalysisPlanV3, ClaudeAnalysisContext, FailedApproach, Hypothesis, UncertaintyFlag } from '../../../agentv3/types';
 import { ArtifactStore } from '../../../agentv3/artifactStore';
@@ -156,7 +161,6 @@ import { localize, type OutputLanguage } from '../../../agentv3/outputLanguage';
 import { planPhaseUpdatedContent } from '../../../agentv3/planPhaseEvents';
 import { isPolicyRefusalResult } from '../../../agentv3/toolNarration';
 import {
-  deleteClaudeSessionMapRuntimeSnapshot,
   deleteClaudeSessionMapRuntimeSnapshots,
   loadClaudeSessionMapFromRuntimeSnapshots,
   saveClaudeSessionMapToRuntimeSnapshots,
@@ -174,7 +178,6 @@ import {
   buildQuickConversationContext,
   buildRuntimeSessionMapKey,
   captureSkillDisplayEntities,
-  collectRecentFindings,
   createRuntimeSkillNotesBudget,
   getLruCacheEntry,
   isFreshRuntimeEntry,
@@ -720,59 +723,6 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     this.persistSessionMapEntry(sessionId, traceId, sessionMapKey, entry, options);
   }
 
-  private forgetSdkSessionMapping(
-    sessionId: string,
-    sessionMapKey: string,
-    reason: string,
-    options: AnalysisOptions = {},
-  ): void {
-    const removed = this.sessionMap.delete(sessionMapKey);
-    if (legacySessionMapWritesEnabled()) {
-      savePersistedSessionMapSync(this.sessionMap);
-    }
-
-    if (enterpriseSessionMapDbWritesEnabled()) {
-      try {
-        deleteClaudeSessionMapRuntimeSnapshot(sessionId, sessionMapKey, providerScopeFromAnalysisOptions(options));
-      } catch (err) {
-        console.warn('[ClaudeRuntime] Failed to delete stale SDK session map from runtime_snapshots:', diagnosticLogIdentity((err as Error).message));
-      }
-    }
-
-    console.warn(
-      `[ClaudeRuntime] Discarded stale SDK session mapping for ${sessionMapKey}` +
-      `${removed ? '' : ' (not present in memory)'}: ${reason}`,
-    );
-  }
-
-  private async retryWithoutSdkResume(params: {
-    query: string;
-    sessionId: string;
-    traceId: string;
-    options: AnalysisOptions;
-    sessionMapKey: string;
-    errorMessage: string;
-    mode: 'full' | 'fast';
-    outputLanguage: import('../../../agentv3/outputLanguage').OutputLanguage;
-  }): Promise<void> {
-    this.forgetSdkSessionMapping(params.sessionId, params.sessionMapKey, params.errorMessage, params.options);
-    this.emitUpdate({
-      type: 'degraded',
-      content: {
-        module: 'claudeRuntime',
-        fallback: 'fresh_sdk_session_after_missing_conversation',
-        error: 'missing_sdk_conversation',
-        mode: params.mode,
-        message: localize(
-          params.outputLanguage,
-          'Claude 远端对话已不可用，已清理旧会话并使用本地持久化上下文重新发起分析...',
-          'Claude remote conversation is no longer available. Retrying with persisted local context in a fresh SDK session...',
-        ),
-      },
-      timestamp: Date.now(),
-    });
-  }
-
   private removeSessionMapEntries(sessionId: string): void {
     const referencePrefix = `${sessionId}:ref:`;
     for (const key of [...this.sessionMap.keys()]) {
@@ -827,7 +777,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     // 1200s compare that dispatched 45 turns reported `rounds: 0`.
     let observedTurns = 0;
     let mainAttemptWorkObserved = false;
-    const observedRunTurns = () => rounds || Math.max(observedTurns, mainAttemptWorkObserved ? 1 : 0);
+    const observedRunTurns = () => Math.max(rounds, observedTurns, mainAttemptWorkObserved ? 1 : 0);
     let outputLanguage = options.outputLanguage ?? this.config.outputLanguage;
     let sourceUse: ReturnType<typeof createClaudeMcpServer>['sourceUse'] | undefined;
     let resolvedQuickBudget: ReturnType<typeof resolveQuickTurnBudget> | undefined;
@@ -902,6 +852,18 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       executionLease.throwIfAborted();
       const sessionContext = sessionContextManager.getOrCreate(sessionId, traceId);
       const previousTurns = sessionContext.getAllTurns?.() || [];
+      const authorizationScope = resolveKnowledgeScope(options);
+      const authorizationFingerprint = options.analysisContextFingerprint ??
+        buildAnalysisContextAuthorizationFingerprint(options, authorizationScope);
+      const assertAuthorized = () => {
+        executionLease.throwIfAborted();
+        assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+      };
+      const analysisHistoryReader = createRuntimeAnalysisHistoryReader({
+        options, sessionId, traceId,
+        getTurns: () => sessionContext.getAnalysisHistory(),
+        assertActive: assertAuthorized,
+      });
       const providerScope = providerScopeFromAnalysisOptions(options);
       const configured = resolveRuntimeConfig(this.config, options.providerId, providerScope);
       const resolvedConfig = options.outputLanguage ? {...configured, outputLanguage: options.outputLanguage} : configured;
@@ -910,7 +872,8 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       const intentResolver = createAnalysisTurnIntentResolver({
         context: buildComplexityClassifierInput({
           query, sceneType: 'general', selectionContext: options.selectionContext,
-          hasReferenceTrace: !!options.referenceTraceId, previousTurns,
+          hasReferenceTrace: !!options.referenceTraceId, previousTurns: [],
+          history: analysisHistoryReader.getTurns(),
           requestedMode: options.analysisMode ?? 'auto',
         }),
         signal: executionLease.signal,
@@ -940,11 +903,15 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         targetEnvKeys: ['AGENT_QUICK_TARGET_TURNS', 'CLAUDE_QUICK_TARGET_TURNS'],
         hardCapEnvKeys: ['AGENT_QUICK_MAX_TURNS', 'CLAUDE_QUICK_MAX_TURNS'], enforcement: 'turn_cap',
       }) : undefined;
+      const turnBudget = resolveRuntimeTurnBudget(runtimeConfig.maxTurns);
+      const closeoutTape = createRuntimeTurnCloseoutTape();
+      const acquisition = {open: true};
       const sceneType = turnIntent.sceneId;
       runSnapshots.capture(sessionId, sceneType, intentResolver.strategyRegistry);
       const analysisRunSpec = createAnalysisRunSpec({
         query, sessionId, traceId, options, runtimeSelection: this.runtimeSelection,
-        sceneType, outputLanguage, previousTurns, resolvedMode: turnPolicy.budgetMode,
+        sceneType, outputLanguage, previousTurns: [], history: analysisHistoryReader.getTurns(),
+        resolvedMode: turnPolicy.budgetMode,
         resolvedModel: runtimeConfig.model, turnIntent,
         budget: {
           model: runtimeConfig.model, lightModel: runtimeConfig.lightModel,
@@ -1012,6 +979,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         executionLease,
         runtimePerformance,
         turnIntent, turnPolicy, strategyRegistry: intentResolver.strategyRegistry, runActivity,
+        toolObserver: closeoutTape.observe, analysisHistoryReader, acquisition,
       });
       sourceUse = ctx.sourceUse;
       executionLease.throwIfAborted();
@@ -1075,15 +1043,10 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         timestamp: Date.now(),
       });
 
-      // Reuse composite key from prepareAnalysisContext for comparison mode session identity isolation
+      // Each logical turn receives only product-owned, bounded history.
       const privateAnalysisContext = analysisContextUsesPrivateKnowledge(options);
-      let existingSessionMapEntry = privateAnalysisContext
-        ? undefined
-        : this.sessionMap.get(ctx.sessionMapKey);
-      let existingSdkSessionId = isFreshFullSdkSessionEntry(existingSessionMapEntry)
-        ? existingSessionMapEntry.sdkSessionId : undefined;
-      let missingSdkConversationError: string | undefined;
       let finalResult: string | undefined;
+      let mainCostUsd: number | undefined;
       let terminationReason: AnalysisResult['terminationReason'];
       let terminationMessage: string | undefined;
       let sdkStreamErrorMessage: string | undefined;
@@ -1093,47 +1056,24 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       const failedApproaches: FailedApproach[] = [];
       let sdkCompactDetected = false;
       const sdkRuntimeReceiptState: SdkQueryRuntimeReceiptState = {sdkStartRecorded: false};
-      for (;;) {
+      {
         executionLease.throwIfAborted();
-        missingSdkConversationError = undefined;
         sdkStreamErrorMessage = undefined;
         finalResult = undefined;
         terminationReason = undefined;
         terminationMessage = undefined;
         timedOut = false;
         timeoutState.kind = 'request';
-        if (existingSessionMapEntry && existingSdkSessionId && enterpriseSessionMapDbWritesEnabled()) {
-          this.persistSessionMapEntry(sessionId, traceId, ctx.sessionMapKey, existingSessionMapEntry, options);
-        }
-
-        // When resuming an SDK session, systemPrompt is ignored by the SDK (mutually exclusive).
-        // Prepend selectionContext directly into the prompt so the AI sees it in the conversation.
         let effectivePrompt = query;
-        if (!existingSdkSessionId) {
-          const localConversationContext = buildQuickConversationContext(
-            ctx.previousTurns,
-            outputLanguage,
-          );
-          if (localConversationContext) {
-            effectivePrompt = `${localConversationContext}\n\n${effectivePrompt}`;
-          }
-        }
-        if (existingSdkSessionId && options.selectionContext) {
-          const selSection = buildSelectionContextSection(options.selectionContext);
-          if (selSection) {
-            effectivePrompt = `${selSection}\n\n${query}`;
-          }
-        }
-        // Resume ignores systemPrompt. Install the current pinned instructions in
-        // the new turn as well; MCP independently enforces evidence access.
-        if (existingSdkSessionId) effectivePrompt = `${ctx.systemPrompt}\n\n${effectivePrompt}`;
+        const historyContext = renderAnalysisHistoryContext(analysisHistoryReader.getTurns(), {outputLanguage});
+        if (historyContext) effectivePrompt = `${historyContext}\n\n${effectivePrompt}`;
         // Prepend pre-queried trace data so the AI has all context without spending turns on SQL
         if (ctx.analysisRunSpec?.traceContext.promptSection) {
           const traceSection = ctx.analysisRunSpec.traceContext.promptSection;
           effectivePrompt = `${traceSection}\n\n${effectivePrompt}`;
         }
 
-        executionLease.throwIfAborted();
+        assertAuthorized();
         if (Date.now() >= requestDeadline) {
           acceptedTerminal = {status: 'incomplete', reason: 'timeout'};
           throw new Error('Claude request budget expired before SDK dispatch');
@@ -1142,7 +1082,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
             prompt: effectivePrompt,
             options: {
               model: runtimeConfig.model,
-              maxTurns: runtimeConfig.maxTurns,
+              maxTurns: turnBudget.acquisitionTurns,
               systemPrompt: ctx.sdkSystemPrompt,
               mcpServers: { smartperfetto: ctx.mcpServer },
               includePartialMessages: true,
@@ -1159,7 +1099,6 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
                 );
               },
               ...(runtimeConfig.maxBudgetUsd ? { maxBudgetUsd: runtimeConfig.maxBudgetUsd } : {}),
-              ...(existingSdkSessionId ? { resume: existingSdkSessionId } : {}),
               ...(ctx.agents ? { agents: ctx.agents } : {}),
             },
         }, {
@@ -1170,13 +1109,14 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           recordSdkStartPhase: true,
           runtimeReceiptState: sdkRuntimeReceiptState,
           onAttempt: () => {
-            executionLease.throwIfAborted();
+            assertAuthorized();
             flushPendingAnswer();
             attemptStreamOffset = getAccumulatedAnswer().length;
             acceptedRawBody = undefined;
             acceptedAttemptId = `${runId}:main:${++attemptNumber}`;
             acceptedTerminal = {status: 'unknown'};
             acceptedOrigin = 'assistant_stream';
+            acquisition.open = true;
             mainAttemptWorkObserved = false;
             sdkSessionId = undefined;
           },
@@ -1315,20 +1255,6 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           }
 
           const sdkResultError = getSdkResultErrorMessage(msg);
-          if (sdkResultError && existingSdkSessionId && !mainAttemptWorkObserved && isMissingSdkConversationError(sdkResultError)) {
-            if (msg.type === 'result') {
-              finalizeTurnMetrics();
-              currentTurnMetrics = null;
-              metricsCollector.recordSdkUsage({
-                usage: (msg as any).usage,
-                modelUsage: (msg as any).modelUsage,
-                total_cost_usd: (msg as any).total_cost_usd,
-              });
-              recordAuthoritativeEvaluationUsage((msg as any).usage);
-            }
-            missingSdkConversationError = sdkResultError;
-            continue;
-          }
           if (sdkResultError && !isSdkMaxTurnsSubtype((msg as any).subtype)) {
             sdkStreamErrorMessage = sdkResultError;
           }
@@ -1617,12 +1543,22 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           }
 
           if (msg.type === 'result') {
+            acquisition.open = false;
             // Finalize last turn metrics before stream ends
             finalizeTurnMetrics();
             currentTurnMetrics = null;
 
-            rounds = (msg as any).num_turns || rounds;
             const resultSubtype = (msg as any).subtype;
+            const reportedCost = (msg as any).total_cost_usd;
+            if (typeof reportedCost === 'number' && Number.isFinite(reportedCost) && reportedCost >= 0) {
+              mainCostUsd = reportedCost;
+            }
+            const reportedTurns = (msg as any).num_turns;
+            if (typeof reportedTurns === 'number' && Number.isSafeInteger(reportedTurns) && reportedTurns >= 0) {
+              rounds = reportedTurns;
+            } else if (isSdkMaxTurnsSubtype(resultSubtype)) {
+              rounds = turnBudget.acquisitionTurns;
+            }
             acceptedTerminal = claudeTerminalState(msg);
             if (resultSubtype === 'success' && typeof (msg as any).result === 'string') {
               finalResult = (msg as any).result;
@@ -1721,8 +1657,6 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
             },
             timestamp: Date.now(),
           });
-        } else if (existingSdkSessionId && !mainAttemptWorkObserved && isMissingSdkConversationError((err as Error).message || '')) {
-          missingSdkConversationError = (err as Error).message || 'No conversation found with SDK session';
         } else {
           throw err;
         }
@@ -1758,33 +1692,62 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         }, timestamp: Date.now()});
       }
 
-      if (!timedOut && missingSdkConversationError && existingSdkSessionId) {
-        await this.retryWithoutSdkResume({
-          query,
-          sessionId,
-          traceId,
-          options,
-          sessionMapKey: ctx.sessionMapKey,
-          errorMessage: missingSdkConversationError,
-          mode: 'full',
-          outputLanguage,
-        });
-        existingSessionMapEntry = privateAnalysisContext
-          ? undefined
-          : this.sessionMap.get(ctx.sessionMapKey);
-        existingSdkSessionId = undefined;
-        sdkSessionId = undefined;
-        continue;
-      }
       if (sdkStreamErrorMessage && !timedOut) {
         throw new Error(sdkStreamErrorMessage);
       }
-      break;
       }
 
+      acquisition.open = false;
       executionLease.throwIfAborted();
       flushPendingAnswer();
       conclusionText = chooseClaudeConclusionText({finalResult, accumulatedAnswer: getAttemptAnswer()});
+      const remainingBudgetUsd = runtimeConfig.maxBudgetUsd === undefined ? undefined
+        : mainCostUsd === undefined ? 0 : runtimeConfig.maxBudgetUsd - mainCostUsd;
+      if (acceptedTerminal.reason === 'turn_limit' && turnBudget.deliveryTurns > 0 &&
+          (remainingBudgetUsd === undefined || remainingBudgetUsd > 0) &&
+          observedRunTurns() < turnBudget.totalTurns && Date.now() < requestDeadline) {
+        const prompt = closeoutTape.buildPrompt({query, outputLanguage,
+          priorConclusion: sanitizeOwnerCodeAwareStructuredTextWithReceipt(sessionId, conclusionText).text});
+        if (prompt) {
+          // This is the reserved delivery attempt, including failed dispatches.
+          rounds = observedRunTurns() + 1;
+          let directory: string | undefined;
+          try {
+            directory = await fs.promises.mkdtemp(path.join(tmpdir(), 'smartperfetto-claude-closeout-'));
+            assertAuthorized();
+            const summary = await runClaudeIntentTransport({
+              prompt, systemPrompt: ctx.systemPrompt, signal: executionLease.signal,
+              deadlineMs: requestDeadline, outputByteLimit: 128 * 1024,
+              config: {lightModel: runtimeConfig.model, cwd: directory},
+              sdkEnv: finalizationEnv, sdkBinaryOptions: finalizationBinaryOptions,
+              loadSdk: async () => ({query: input => {
+                assertAuthorized();
+                return sdkQuery({...input, options: {
+                  ...input.options, ...(remainingBudgetUsd === undefined ? {} : {maxBudgetUsd: remainingBudgetUsd}),
+                }});
+              }}),
+            });
+            assertAuthorized();
+            if (summary.status === 'ok' && summary.text.trim()) {
+              conclusionText = summary.text.trim();
+              acceptedAttemptId = `${runId}:turn-closeout:1`;
+              acceptedOrigin = 'sdk_final';
+              // Acquiring evidence stopped at the cap even when delivery succeeds.
+              acceptedTerminal = {status: 'incomplete', reason: 'turn_limit',
+                ...(summary.finishReason ? {sdkFinishReason: summary.finishReason} : {})};
+            }
+          } catch {
+            executionLease.throwIfAborted();
+            // Failed delivery retains the original answer and the cap receipt.
+          } finally {
+            if (directory) await fs.promises.rm(directory, {recursive: true, force: true}).catch(() => undefined);
+          }
+        }
+      }
+      if (acceptedTerminal.reason === 'turn_limit') {
+        terminationMessage = buildMaxTurnsTerminationMessage({mode: turnPolicy.budgetMode === 'quick' ? 'fast' : 'full',
+          turns: observedRunTurns(), maxTurns: runtimeConfig.maxTurns, outputLanguage});
+      }
       if (!hasAcceptedSdkFinal() && acceptedTerminal.status === 'completed') {
         acceptedTerminal = {status: 'unknown'};
       }
@@ -1957,6 +1920,10 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           confidence: finalAnalysisResult.confidence,
           message: finalAnalysisResult.conclusion,
           partial: finalAnalysisResult.partial,
+          completion: finalAnalysisResult.completion,
+          conclusionContract: finalAnalysisResult.conclusionContract,
+          sourceDerived: privateAnalysisContext || undefined,
+          analysisContextFingerprint: options.analysisContextFingerprint,
           terminationReason: finalAnalysisResult.terminationReason,
           terminationMessage: finalAnalysisResult.terminationMessage,
         },
@@ -2301,14 +2268,6 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
   }
 
   /**
-   * Collect the most recent findings from previous turns for system prompt injection.
-   * Caps at 5 findings to prevent unbounded prompt growth.
-   */
-  private collectPreviousFindings(sessionContext: any, maxTurns?: number): Finding[] {
-    return collectRecentFindings(sessionContext, { maxTurns, maxFindings: 5 });
-  }
-
-  /**
    * Build a compact entity context string for the system prompt.
    * Gives Claude awareness of known frames/sessions for drill-down resolution.
    */
@@ -2340,6 +2299,9 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       analysisRunSpec?: AnalysisRunSpec;
       executionLease?: RuntimeExecutionLease;
       runtimePerformance?: RuntimePerformanceRun;
+      toolObserver?: RuntimeToolObserver;
+      analysisHistoryReader?: ReturnType<typeof createRuntimeAnalysisHistoryReader>;
+      acquisition?: {open: boolean};
     },
   ) {
     const {turnIntent, turnPolicy, strategyRegistry} = precomputed;
@@ -2589,27 +2551,8 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     // Composite key for comparison mode session identity isolation
     const sessionMapKey = precomputed?.analysisRunSpec?.identity.sessionMapKey
       ?? this.buildSessionMapKey(sessionId, referenceTraceId);
-    const sessionMapEntry = this.sessionMap.get(sessionMapKey);
-    const existingSdkSession = analysisContextUsesPrivateKnowledge(options)
-      ? undefined
-      : isFreshFullSdkSessionEntry(sessionMapEntry)
-      ? sessionMapEntry.sdkSessionId
-      : undefined;
-    // P0-3: SDK sessions on Anthropic's side expire after ~4 hours.
-    // If the local sessionMap entry is stale, treat it as expired and inject full manual context.
-    // Without this check, `hasActiveResume` stays true for stale entries, causing the system
-    // to skip both SDK context (expired) AND manual context injection → silent context loss.
-    const hasActiveResume = !!existingSdkSession;
-    const previousFindings = hasActiveResume
-      ? [] // SDK already has these in conversation history
-      : this.collectPreviousFindings(sessionContext);
-    const conversationSummary = previousTurns.length > 0 && !hasActiveResume
-      ? sessionContext.generatePromptContext(2000)
-      : undefined;
-
     // Phase 4: Entity store + entity context for drill-down
     const entityStore = sessionContext.getEntityStore();
-    const entityContext = this.buildEntityContext(entityStore);
 
     // Phase 5: Scene classification + effort resolution (reuse precomputed if available)
     const sceneType = turnIntent.sceneId;
@@ -2659,7 +2602,6 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       analysisPlan.history.push(analysisPlan.current);
       if (analysisPlan.history.length > 3) analysisPlan.history.shift();
     }
-    const previousPlan = analysisPlan.current ?? undefined;
     analysisPlan.current = null;
     resetPrePlanToolCallsForNewRun(analysisPlan);
 
@@ -2705,6 +2647,10 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
     );
     const notesBudget = createRuntimeSkillNotesBudget(turnPolicy.onDemandContext);
     const { server: mcpServer, allowedTools, toolDefinitions, sourceUse } = createClaudeMcpServer({
+      toolObserver: precomputed.toolObserver,
+      analysisHistoryReader: precomputed.analysisHistoryReader,
+      canInvokeTool: () => precomputed.acquisition?.open !== false &&
+        precomputed.runActivity?.active !== false && !executionLease?.signal.aborted,
       conversationTraceAttached: options.assistantSurface === 'conversation'
         ? options.conversationTraceAttached === true
         : undefined,
@@ -2785,19 +2731,13 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       packageName: effectivePackageName,
       focusApps: focusResult.apps.length > 0 ? focusResult.apps : undefined,
       focusMethod: focusResult.method,
-      previousFindings,
-      conversationSummary,
       knowledgeBaseContext,
-      entityContext,
       sceneType,
-      analysisNotes: notes.length > 0 ? notes : undefined,
       availableAgents: agents ? Object.keys(agents) : undefined,
       sqlErrorFixPairs: sqlErrorFixPairs.length > 0 ? sqlErrorFixPairs : undefined,
       patternContext,
       negativePatternContext,
       caseBackgroundContext,
-      previousPlan,
-      planHistory: analysisPlan.history.length > 0 ? analysisPlan.history : undefined,
       selectionContext: options.selectionContext,
       comparison: comparisonContext,
       traceCompleteness,

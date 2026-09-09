@@ -17,6 +17,7 @@ const {
 } = require('../lib/generator.cjs');
 const {resolveCaseTrace} = require('../lib/catalog.cjs');
 const {buildCatalogCases} = require('../lib/builder.cjs');
+const {loadTraceType} = require('../lib/perfetto-proto.cjs');
 
 const repoRoot = path.resolve(__dirname, '../../..');
 const traceProcessor = resolveTraceProcessor(repoRoot);
@@ -124,7 +125,127 @@ test('encodes deterministic isolated overlay packets with lossless timestamps', 
   assert.equal(first.identities.threads.main, 700003);
   assert.equal(first.provenance.anchor_ns, '9007199254740993000');
   assert.equal(first.provenance.sequence_id, 987654);
+  // Recorded before explicit scheduler signals: absent optional signals must
+  // retain the existing protobuf representation, including default priority.
+  assert.equal(first.provenance.overlay_sha256, 'aa2ca6c6becfb039254e41df7876e98e165db455a1b8a618e7d81349b3e6f7fd');
   assert.ok(first.buffer.length > 0);
+});
+
+test('preserves native handoffs, wakeups, priority changes and clipped system evidence', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'trace-system-scheduling-'));
+  t.after(() => fs.rmSync(tempDir, {recursive: true, force: true}));
+  const caseDir = path.join(repoRoot, 'Trace/constructed/system-scheduling-evidence');
+  const expected = JSON.parse(fs.readFileSync(path.join(caseDir, 'analysis/expected.json'), 'utf8')).native_oracle;
+  const outputPath = path.join(tempDir, 'trace.pftrace');
+  const build = buildConstructedTrace(repoRoot, {
+    caseId: 'system-scheduling-evidence',
+    basePath: resolveCaseTrace(repoRoot, 'android-scroll-customer'),
+    scenarioPath: path.join(caseDir, 'scenario.json'),
+    overlayPath: path.join(tempDir, 'overlay.pftrace'),
+    outputPath,
+  });
+  const anchor = BigInt(build.provenance.anchor_ns);
+  const start = anchor + BigInt(expected.clipped_window_relative_ns[0]);
+  const end = anchor + BigInt(expected.clipped_window_relative_ns[1]);
+  const targetTid = build.overlay.identities.threads.main;
+  const peerTid = build.overlay.identities.threads.peer;
+  const cpu = build.provenance.cpu_map;
+
+  const states = queryTrace(outputPath, `
+    SELECT state, SUM(MIN(ts + dur, ${end}) - MAX(ts, ${start})) AS duration_ns
+    FROM thread_state JOIN thread USING (utid)
+    WHERE tid = ${targetTid} AND dur > 0 AND ts < ${end} AND ts + dur > ${start}
+    GROUP BY state ORDER BY state`);
+  for (const [state, duration] of Object.entries(expected.state_duration_ns)) {
+    assert.ok(states.includes(`"${state}",${duration}`), states);
+  }
+  // Exact raw boundary and ucpu identity, independent of the shared production SQL.
+  const handoff = queryTrace(outputPath, `
+    SELECT a.end_state, a.priority, b.priority, b.ts - a.ts - a.dur AS gap_ns,
+           b.ts - ${anchor} AS relative_ts, tb.tid
+    FROM sched a JOIN thread ta ON ta.utid = a.utid
+    JOIN sched b ON b.ucpu = a.ucpu AND b.ts = a.ts + a.dur
+    JOIN thread tb ON tb.utid = b.utid
+    WHERE ta.tid = ${targetTid} AND a.end_state = 'R+'`);
+  assert.ok(handoff.includes(`"R+",120,${expected.preempted_next_priority},0,${expected.preempted_handoff_relative_ns},${peerTid}`), handoff);
+  const priorities = queryTrace(outputPath, `
+    SELECT DISTINCT priority FROM sched JOIN thread USING (utid)
+    WHERE tid = ${targetTid} ORDER BY priority`);
+  assert.equal(priorities.trim(), '"priority"\n' + expected.observed_target_priorities.join('\n'));
+
+  const negativeEvidence = queryTrace(outputPath, `
+    SELECT
+      (SELECT COUNT(*) FROM sched JOIN thread USING (utid)
+       WHERE tid = ${targetTid} AND end_state = 'R') AS ordinary_r,
+      (SELECT COUNT(*) FROM sched JOIN thread USING (utid)
+       WHERE tid = ${build.overlay.identities.threads.waiting}) AS waiting_runs,
+      (SELECT COUNT(*) FROM thread_state JOIN thread USING (utid)
+       WHERE tid = ${build.overlay.identities.threads.waiting} AND state = 'R') AS waiting_states,
+      (SELECT COUNT(*) FROM sched JOIN thread USING (utid)
+       WHERE tid = ${build.overlay.identities.threads.unfinished} AND dur = -1) AS unfinished,
+      (SELECT COUNT(*) FROM thread_state s JOIN thread t ON t.utid = s.utid
+       JOIN thread w ON w.utid = s.waker_utid
+       WHERE t.tid = ${targetTid} AND w.tid = ${peerTid} AND s.state = 'R') AS wakeups,
+      COALESCE((SELECT value FROM stats WHERE name = 'mismatched_sched_switch_tids'), 0) AS mismatches`);
+  assert.match(negativeEvidence, /\n1,0,1,1,1,0\s*$/);
+
+  const frequency = queryTrace(outputPath, `
+    WITH spans AS (
+      SELECT c.ts, LEAD(c.ts, 1, trace_end()) OVER (PARTITION BY track_id ORDER BY c.ts) AS end_ts,
+             c.value, t.cpu
+      FROM counter c JOIN cpu_counter_track t ON t.id = c.track_id WHERE t.name = 'cpufreq'
+    ), running AS (
+      SELECT MAX(ts, ${start}) AS ts, MIN(ts + dur, ${end}) AS end_ts, cpu
+      FROM sched JOIN thread USING (utid)
+      WHERE tid = ${targetTid} AND dur > 0 AND ts < ${end} AND ts + dur > ${start}
+    ), overlaps AS (
+      SELECT MIN(r.end_ts, f.end_ts) - MAX(r.ts, f.ts) AS dur, value
+      FROM running r JOIN spans f ON r.cpu = f.cpu AND r.ts < f.end_ts AND r.end_ts > f.ts
+    )
+    SELECT SUM(dur), (SELECT SUM(end_ts - ts) FROM running) - SUM(dur),
+           SUM(dur * value) / SUM(dur) / 1000 AS weighted_mhz FROM overlaps`);
+  assert.ok(frequency.includes(`\n${expected.clipped_frequency_covered_running_ns},${expected.clipped_frequency_unknown_running_ns},${expected.clipped_frequency_weighted_mhz}`), frequency);
+  const cpuEvidence = queryTrace(outputPath, `
+    SELECT
+      (SELECT COUNT(*) FROM counter c JOIN cpu_counter_track t ON t.id = c.track_id
+       WHERE t.name = 'cpufreq' AND t.cpu = ${cpu[0]} AND c.ts >= ${anchor}) AS frequency_samples,
+      (SELECT COUNT(*) FROM cpu_counter_track WHERE name = 'cpufreq' AND cpu = ${cpu[1]}) AS missing_frequency,
+      (SELECT COUNT(*) FROM counter c JOIN cpu_counter_track t ON t.id = c.track_id
+       WHERE t.name = 'cpuidle' AND t.cpu = ${cpu[2]} AND c.ts >= ${anchor}) AS idle_samples,
+      (SELECT COUNT(*) FROM cpu WHERE cpu IN (${cpu[0]}, ${cpu[1]}, ${cpu[2]}) AND capacity IS NOT NULL) AS known_capacity`);
+  assert.match(cpuEvidence, /\n3,0,2,0\s*$/);
+
+  // Decode the original protobuf too: waking target_cpu must follow the same
+  // isolation map as the ftrace bundle and frequency/idle payload cpu_id.
+  const trace = loadTraceType(repoRoot).decode(build.overlay.buffer);
+  const waking = trace.packet.flatMap((p) => p.ftraceEvents?.event ?? []).filter((e) => e.schedWaking);
+  assert.equal(waking.length, 2);
+  assert.ok(waking.every((e) => e.schedWaking.targetCpu === cpu[1]));
+});
+
+test('rejects malformed explicit sched signals without reusing Android log priority', () => {
+  const scenario = fixtureScenario();
+  const signal = {type: 'sched-switch', at_ns: '1', cpu: 0, prev_thread: null,
+    next_thread: 'main', prev_state_raw: '0', prev_priority: 120, next_priority: 90};
+  const options = {anchorNs: '1', sequenceId: 1};
+  for (const [field, value, error] of [
+    ['next_priority', 'WARN', /kernel sched priority/],
+    ['next_priority', 140, /kernel sched priority/],
+    ['prev_state_raw', 'R+', /decimal string/],
+    ['prev_state_raw', '9223372036854775808', /signed 64-bit/],
+    ['next_thread', 'missing', /unknown thread/],
+  ]) {
+    scenario.signals = [{...signal, [field]: value}];
+    assert.throws(() => encodeScenarioOverlay(repoRoot, scenario, options), error);
+  }
+  scenario.signals = [{...signal, next_thread: null}];
+  assert.throws(() => encodeScenarioOverlay(repoRoot, scenario, options), /change the running thread/);
+  scenario.signals = [{type: 'sched-waking', at_ns: '1', cpu: 0, thread: 'main',
+    waker_thread: null, target_cpu: -1, sched_priority: 120}];
+  assert.throws(() => encodeScenarioOverlay(repoRoot, scenario, options), /non-negative integer/);
+  scenario.signals[0].thread = null;
+  scenario.signals[0].target_cpu = 0;
+  assert.throws(() => encodeScenarioOverlay(repoRoot, scenario, options), /cannot wake the idle thread/);
 });
 
 test('materializes a parseable trace with slice, counter, and sched evidence', () => {

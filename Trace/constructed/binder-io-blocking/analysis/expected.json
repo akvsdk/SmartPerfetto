@@ -129,6 +129,10 @@
         "anr_type": ""
       },
       "required_steps": [
+        "system_context_window",
+        "system_cpu_context",
+        "system_task_summary",
+        "system_task_handoffs",
         "init_cpu_topology",
         "anr_info",
         "main_thread_quadrant",
@@ -151,6 +155,7 @@
         "anr_logcat_context"
       ],
       "required_sql_steps": [
+        "system_context_window",
         "anr_info",
         "main_thread_quadrant",
         "render_thread_analysis",

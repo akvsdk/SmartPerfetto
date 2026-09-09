@@ -780,10 +780,19 @@ describe('scrolling_analysis skill schema', () => {
           (2, 'Running', 100, 0, 0),
           (3, 'Running', 100, 0, 0),
           (4, 'Running', 100, 0, 0);
+        ALTER TABLE thread ADD COLUMN is_idle INTEGER DEFAULT 0;
+        CREATE TABLE cpu(id INTEGER,cpu INTEGER,machine_id INTEGER,cluster_id INTEGER,capacity INTEGER);
+        INSERT INTO cpu VALUES(0,0,0,0,1024),(1,1,0,1,300);
+        CREATE TABLE trace_bounds(start_ts INTEGER,end_ts INTEGER);
+        INSERT INTO trace_bounds VALUES(0,100);
+        CREATE TABLE sched_slice(id INTEGER,utid INTEGER,cpu INTEGER,ucpu INTEGER,ts INTEGER,dur INTEGER,end_state TEXT,priority INTEGER);
+        INSERT INTO sched_slice SELECT rowid,utid,cpu,cpu,ts,dur,'S',120 FROM thread_state;
       `);
 
       const run = (packageName: string) => db.prepare(`
-        WITH ${cte
+        WITH system_windows(window_id,window_start_ts,window_end_ts) AS (VALUES(0,0,100)),
+        ${fs.readFileSync(path.join(process.cwd(), 'skills/fragments/system_sched_spans.sql'), 'utf8')},
+        ${cte
           .split('${package}').join(packageName)
           .split('${start_ts}').join('NULL')
           .split('${end_ts}').join('NULL')}
@@ -1396,6 +1405,16 @@ describe('scrolling_analysis skill schema', () => {
         INSERT INTO cpu_counter_track VALUES (1, 'cpufreq', 0);
         INSERT INTO _cpu_topology VALUES (0, 'big');
         INSERT INTO counter VALUES (1, 1100000, 2000000);
+        CREATE TABLE cpu(id INTEGER,cpu INTEGER,machine_id INTEGER,cluster_id INTEGER,capacity INTEGER);
+        INSERT INTO cpu VALUES (0,0,0,0,1024),(1,1,0,1,300);
+        CREATE TABLE trace_bounds(start_ts INTEGER,end_ts INTEGER);
+        INSERT INTO trace_bounds VALUES (0,2000000);
+        CREATE TABLE cpu_frequency_counters(cpu INTEGER,ts INTEGER,dur INTEGER,freq INTEGER);
+        INSERT INTO cpu_frequency_counters VALUES (0,1100000,900000,2000000);
+        ALTER TABLE cpu_frequency_counters ADD COLUMN id INTEGER;
+        ALTER TABLE cpu_frequency_counters ADD COLUMN track_id INTEGER;
+        ALTER TABLE cpu_frequency_counters ADD COLUMN ucpu INTEGER;
+        UPDATE cpu_frequency_counters SET id=rowid,track_id=cpu,ucpu=cpu;
         INSERT INTO thread_track VALUES (10, 99);
         INSERT INTO slice VALUES (10, 1100000, 600000, 'fsync');
       `);
@@ -1412,6 +1431,11 @@ describe('scrolling_analysis skill schema', () => {
             ('surface:Layer A:7', 'main', 99),
             ('surface:Layer B:7', 'main', 99)
         ),
+        system_windows AS (
+          SELECT frame_key AS window_id,frame_start AS window_start_ts,frame_end AS window_end_ts FROM jank_frame_list
+        ),
+        ${fs.readFileSync(path.join(process.cwd(), 'skills/fragments/system_sched_spans.sql'), 'utf8')},
+        ${fs.readFileSync(path.join(process.cwd(), 'skills/fragments/system_cpu_frequency_spans.sql'), 'utf8')},
         ${frequencyCte},
         ${fileIoCte}
         SELECT
@@ -1882,10 +1906,30 @@ describe('single-frame exact UPID SQL semantics', () => {
         (800,18,43,'young',10000000,80000000);
       CREATE TABLE _cpu_topology(cpu_id INTEGER,core_type TEXT);
       INSERT INTO _cpu_topology VALUES (0,'big'),(1,'little');
+      CREATE TABLE trace_bounds(start_ts INTEGER,end_ts INTEGER);
+      INSERT INTO trace_bounds VALUES (0,100000000);
+      CREATE TABLE cpu(id INTEGER,cpu INTEGER,machine_id INTEGER,cluster_id INTEGER,capacity INTEGER);
+      INSERT INTO cpu VALUES (0,0,0,0,1024),(1,1,0,1,300);
+      CREATE TABLE cpu_frequency_counters(cpu INTEGER,ts INTEGER,dur INTEGER,freq INTEGER);
+      INSERT INTO cpu_frequency_counters VALUES (0,0,50000000,1000000),(0,50000000,50000000,2000000),
+        (1,0,50000000,500000),(1,50000000,50000000,600000);
+      ALTER TABLE cpu_frequency_counters ADD COLUMN id INTEGER;
+      ALTER TABLE cpu_frequency_counters ADD COLUMN track_id INTEGER;
+      ALTER TABLE cpu_frequency_counters ADD COLUMN ucpu INTEGER;
+      UPDATE cpu_frequency_counters SET id=rowid,track_id=cpu,ucpu=cpu;
       CREATE TABLE thread_state(utid INTEGER,ts INTEGER,dur INTEGER,state TEXT,cpu INTEGER,io_wait INTEGER,blocked_function TEXT);
       INSERT INTO thread_state VALUES (1,0,10000000,'Running',0,0,NULL),(11,0,40000000,'Running',0,0,NULL),
         (90,0,60000000,'Running',1,0,NULL),(1,20000000,2000000,'D',NULL,1,'filemap_fault'),
         (11,20000000,8000000,'D',NULL,1,'filemap_fault'),(5,20000000,9000000,'D',NULL,1,'filemap_fault');
+      ALTER TABLE thread_state ADD COLUMN ucpu INTEGER;
+      UPDATE thread_state SET ucpu=cpu;
+      ALTER TABLE thread_state ADD COLUMN id INTEGER;
+      ALTER TABLE thread_state ADD COLUMN irq_context INTEGER;
+      ALTER TABLE thread_state ADD COLUMN waker_utid INTEGER;
+      UPDATE thread_state SET id=rowid;
+      ALTER TABLE thread ADD COLUMN is_idle INTEGER DEFAULT 0;
+      CREATE TABLE sched_slice(id INTEGER,utid INTEGER,cpu INTEGER,ucpu INTEGER,ts INTEGER,dur INTEGER,end_state TEXT,priority INTEGER);
+      INSERT INTO sched_slice SELECT rowid,utid,cpu,ucpu,ts,dur,'S',120 FROM thread_state WHERE state='Running';
       CREATE TABLE counter(track_id INTEGER,ts INTEGER,value REAL);
       INSERT INTO counter VALUES (100,0,0),(100,16666667,1),(100,33333334,0),
         (200,0,1000000),(200,50000000,2000000),(201,0,500000),(201,50000000,600000);
@@ -1965,15 +2009,17 @@ describe('single-frame exact UPID SQL semantics', () => {
     try {
       const frequencies = db.prepare(sqlFor('cpu_freq_analysis', 42)).all();
       expect(frequencies).toEqual([
-        {core_type: 'little', avg_freq_mhz: 550, max_freq_mhz: 600, min_freq_mhz: 500},
-        {core_type: 'big', avg_freq_mhz: 1500, max_freq_mhz: 2000, min_freq_mhz: 1000},
+        expect.objectContaining({core_type: 'little', avg_freq_mhz: 550, max_freq_mhz: 600, min_freq_mhz: 500}),
+        expect.objectContaining({core_type: 'big', avg_freq_mhz: 1500, max_freq_mhz: 2000, min_freq_mhz: 1000}),
       ]);
       expect(db.prepare(sqlFor('cpu_freq_analysis', 43)).all()).toEqual(frequencies);
       const timeline = db.prepare(sqlFor('cpu_freq_timeline', 42)).all();
       expect(timeline).toHaveLength(4);
       expect(db.prepare(sqlFor('cpu_freq_timeline', 43)).all()).toEqual(timeline);
       const cluster = rootCtes('cluster_core_counts', 'gc_frame_overlap', 42);
-      expect(db.prepare(`WITH ${cluster} SELECT * FROM cluster_load`).get()).toEqual({big_load_pct: 50, little_load_pct: 60});
+      const systemSched = fs.readFileSync(path.join(process.cwd(), 'skills/fragments/system_sched_spans.sql'), 'utf8');
+      expect(db.prepare(`WITH system_windows(window_id,window_start_ts,window_end_ts) AS (VALUES('frame',0,100000000)),
+        ${systemSched}, ${cluster} SELECT * FROM cluster_load`).get()).toEqual({big_load_pct: 50, little_load_pct: 60});
       const root = db.prepare(sqlFor('root_cause_summary', 42)).get() as Record<string, unknown>;
       expect(root).toMatchObject({slice_name: 'target_main', slice_dur: 20, frame_budget_ms: 16.67,
         frame_dur_ms: 100, main_io_block_ms: 2, reason_code: 'binder_sync_blocking'});

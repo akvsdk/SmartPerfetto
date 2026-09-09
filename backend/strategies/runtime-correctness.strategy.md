@@ -3,6 +3,18 @@
 
 ---
 scene: runtime_correctness
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: runtime_correctness_critical_path
+      domain: critical_path
+      description: "Bind the actual app crash, ANR, LMK or memory-growth event and affected tasks/windows. Relate failure-path task states and system pressure when relevant; exception names alone do not imply a scheduling cause."
+    - id: runtime_correctness_dependencies
+      domain: dependency_chain
+      description: "Separate crash, resource exhaustion and timeout evidence from performance symptoms. Missing failure or exit evidence limits diagnosis; this scene is not a request to repair the analyzer backend runtime."
 classification_description: "Application runtime failures and correctness, including crashes, process termination and failures involving memory or blocking."
 priority: 5
 effort: medium

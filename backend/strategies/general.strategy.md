@@ -3,12 +3,21 @@
 
 ---
 scene: general
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: system_execution, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: general_critical_path
+      domain: critical_path
+      description: "Bind the objects, process instances and windows in the current question before selecting critical tasks. Apply relevant shared system evidence to actual performance attribution even when no specialized scene matches."
+    - id: general_dependencies
+      domain: dependency_chain
+      description: "Use domain-specific dependency evidence only where it explains the selected performance goal. Preserve unresolved scope and missing data instead of turning an ambiguous query into an automatic broad investigation."
 classification_description: "A specific question, trace fact, acknowledgement or analysis request without a more relevant specialized scene."
 priority: 99
 effort: high
-investigation_requirements:
-  - 'When the question concerns animation or main-thread jank, inspect same-scope continuous main-thread tasks and scheduling states, including work outside doFrame; FrameTimeline is an outcome reference. Reuse existing evidence, or use main_thread_frame_work/equivalent SQL only when new evidence is allowed. Keep other questions within their requested scope.'
-  - 'For those investigations, retain task slice/state IDs, exact times and source uncertainty. Running is CPU execution; R/R+ waits for CPU scheduling, not a lock/Binder. S does not prove an idle queue; unqualified D does not prove IO. Task-before-doFrame execution order alone does not prove delayed callbacks or missed frames; keep interference a hypothesis until causal evidence supports it. Do not assume a refresh rate or use an unrelated global VSYNC as the target budget. Names and nested slices are instrumentation clues, not verified callers, implementation or thread safety. Confirm dependencies before recommending independent worker execution, and keep UI inflation/binding on the main thread.'
 required_capabilities:
   - cpu_scheduling
 optional_capabilities: []

@@ -158,18 +158,24 @@ export class McpToolRegistry {
   private readonly toolConcurrencyCoordinator: RuntimeToolConcurrencyCoordinator;
   private readonly runManifestAttributionSink?: RunManifestAttributionSink;
   private readonly toolObserver?: RuntimeToolObserver;
+  private readonly acquisitionObserver?: RuntimeToolObserver;
   private readonly requestScope?: ToolRequestScope;
+  private readonly canInvokeTool?: () => boolean;
 
   constructor(options: {
     toolConcurrencyCoordinator?: RuntimeToolConcurrencyCoordinator;
     runManifestAttributionSink?: RunManifestAttributionSink;
     toolObserver?: RuntimeToolObserver;
+    acquisitionObserver?: RuntimeToolObserver;
     requestScope?: ToolRequestScope;
+    canInvokeTool?: () => boolean;
   } = {}) {
     this.toolConcurrencyCoordinator = options.toolConcurrencyCoordinator
       ?? createRuntimeToolConcurrencyCoordinator();
     this.runManifestAttributionSink = options.runManifestAttributionSink;
     this.toolObserver = options.toolObserver;
+    this.acquisitionObserver = options.acquisitionObserver;
+    this.canInvokeTool = options.canInvokeTool;
     this.requestScope = options.requestScope && Object.freeze({
       ...options.requestScope,
       ...(options.requestScope.capabilities
@@ -196,7 +202,7 @@ export class McpToolRegistry {
         }}
       : base;
     const access = Object.freeze({exposure: shared.exposure, evidenceEffect: shared.evidenceEffect});
-    const guarded = withRuntimeToolGuard(
+    const scopeGuarded = withRuntimeToolGuard(
       compactSharedToolSpec(shared),
       () => isToolAllowedForScope(access, this.requestScope),
       async () => createRuntimeToolResult({
@@ -205,8 +211,17 @@ export class McpToolRegistry {
         unsupportedReason: 'tool_not_allowed_for_request',
       }, {isError: true}),
     );
+    const guarded = withRuntimeToolGuard(scopeGuarded, () => {
+      try { return this.canInvokeTool?.() !== false; } catch { return false; }
+    }, async () => createRuntimeToolResult({success: false,
+      action_required: 'deliver_existing_conclusion', unsupportedReason: 'acquisition_closed'}, {isError: true}));
+    const acquisitionObserver = shared.evidenceEffect === 'acquire' ? this.acquisitionObserver : undefined;
+    const observer: RuntimeToolObserver | undefined = acquisitionObserver ? async event => {
+      try { await acquisitionObserver(event); } catch { /* Retained captures remain independently checked. */ }
+      if (this.toolObserver) await this.toolObserver(event);
+    } : this.toolObserver;
     const runtimeShared = withRuntimeToolConcurrency(
-      withRuntimeToolObserver(guarded, this.toolObserver),
+      withRuntimeToolObserver(guarded, observer),
       this.toolConcurrencyCoordinator,
       {runManifestAttributionSink: this.runManifestAttributionSink},
     );

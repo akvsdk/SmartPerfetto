@@ -40,6 +40,7 @@ import {
 import type {AdaptiveRoutingReceiptV1} from '../types/adaptiveRouting';
 import {parseAdaptiveRoutingReceipt} from './adaptiveEvidenceRouter';
 import type {AnalysisTurnIntent} from './analysisTurnIntent';
+import type {AnalysisHistoryTurn} from './analysisHistory';
 
 export interface RuntimeBudgetInputs {
   model?: string;
@@ -120,6 +121,7 @@ export interface CreateAnalysisRunSpecInput {
   sceneType: SceneType;
   outputLanguage: OutputLanguage;
   previousTurns?: ConversationTurn[];
+  history?: readonly AnalysisHistoryTurn[];
   resolvedMode?: QueryComplexity;
   /** Complete provider configuration selected for this run, independent of budget. */
   resolvedModel?: string;
@@ -179,6 +181,7 @@ export function createAnalysisRunSpec(input: CreateAnalysisRunSpecInput): Analys
     selectionContext: options.selectionContext,
     hasReferenceTrace: !!options.referenceTraceId,
     previousTurns: input.previousTurns ?? [],
+    history: input.history,
     requestedMode: options.analysisMode ?? 'auto',
   });
   const traceContextPrompt = formatTraceContext(options.traceContext, input.outputLanguage);

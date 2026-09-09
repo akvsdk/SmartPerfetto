@@ -7,7 +7,7 @@ import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import type {ConclusionBindingEligibility, ConclusionContract} from '../agent/core/conclusionContract';
 import {isIssuedFinalizationContext, type RuntimeFinalizationContext} from '../agentRuntime/analysisFinalizationContext';
 import type {ComparisonReportSection} from '../agentv3/sessionStateSnapshot';
-import {getFinalReportContract} from '../agentv3/strategyLoader';
+import {getFinalReportContract, loadPromptTemplate} from '../agentv3/strategyLoader';
 import type {DataEnvelope} from '../types/dataContract';
 import {analysisDeliveryFingerprint, reportRequirementsFingerprint, sameAnalysisCandidate,
   type AnalysisCandidateIdentity, type AnalysisCaseRetrievalState, type AnalysisDeliveryContext,
@@ -19,13 +19,18 @@ import {prepareAnalysisRelations} from './evidence/analysisRelationPreparation';
 import {prepareClaimEvidence, preparedClaimEvidenceSnapshot, preparedIdentityResolutions} from './evidence/claimEvidencePreparation';
 import {runClaimVerification, collectMatchedTraceEvidenceRefIdsByClaimId,
   collectVerifiedTraceOccurrenceRefIdsByClaimId} from './verifier/claimVerificationRunner';
-import {assessFinalSemantics, type FinalSemanticAssessment, type FinalSemanticSnapshot} from './finalSemanticAssessment';
+import {assessFinalSemantics, FINAL_SEMANTIC_INPUT_BYTE_LIMIT, type FinalSemanticAssessment, type FinalSemanticSnapshot} from './finalSemanticAssessment';
 import {applyFinalResultQualityGate, type FinalResultComparisonIdentity, type FinalResultQualityIssue} from './finalResultQualityGate';
 import {projectCodeAwareStructuredText, withOwnerCodeAwareProjection} from './security/codeAwareOutputRegistry';
 import {projectConclusionSemanticInput} from './security/conclusionProtocolProjection';
 import {applySourceLocationProofs} from './codebase/sourceLocationProof';
 import {isUnusedSourceDecision, type SourceExecutionScopeV1, type SourceUseDecisionV1} from './codebase/sourceUseDecision';
 import {projectOwnerClaimVerification, projectOwnerClaimSupport} from './security/privateAnalysisProjection';
+import {resolveAnalysisInvestigationRequirements} from '../agentRuntime/analysisInvestigationRequirements';
+import {assessInvestigationAcquisition} from './finalInvestigationContractGate';
+import type {ResolvedAnalysisInvestigationRequirements} from '../types/analysisInvestigation';
+import type {FinalInvestigationAssessment} from '../types/analysisInvestigationAssessment';
+import {compactInvestigationEvidence} from './evidence/investigationEvidenceLedger';
 
 export interface AnalysisFinalizationOwner {
   runId: string;
@@ -199,6 +204,31 @@ function semanticReportAssessment(input: {
 }
 
 /** The only asynchronous final-verification boundary; all acquisition belongs to the run. */
+function semanticInvestigationAssessment(input: {
+  candidate: AnalysisCandidateIdentity; result: AnalysisResult; context: RuntimeFinalizationContext;
+  evidenceFingerprint: string; requirements: ResolvedAnalysisInvestigationRequirements; semantic: FinalSemanticAssessment;
+}): FinalInvestigationAssessment {
+  const {candidate, result, context, requirements, semantic} = input;
+  const bound = sameAnalysisCandidate(semantic.binding?.canonicalCandidate, candidate, result.conclusion);
+  const investigation = semantic.investigation;
+  return {schemaVersion: 1, binding: {...candidate,
+    conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
+    evidenceFingerprint: input.evidenceFingerprint, requirementsFingerprint: analysisDeliveryFingerprint(requirements),
+    registryFingerprint: context.strategyRegistry.registryFingerprint,
+    intentFingerprint: analysisDeliveryFingerprint(context.turnIntent),
+    ledgerFingerprint: analysisDeliveryFingerprint(context.investigationEvidence ?? null),
+    evidenceRecordsFingerprint: analysisDeliveryFingerprint(context.investigationEvidence?.records ?? [])},
+    status: !bound ? 'not_checked' : semantic.status === 'unavailable' || semantic.status === 'not_checked'
+      ? semantic.status : semantic.coverage.body !== 'complete' ? 'coverage_incomplete' : investigation?.status ?? 'not_checked',
+    evidenceRecords: context.investigationEvidence?.records,
+    requirements: bound ? (investigation?.requirements ?? []).map(row => {
+      const definition = requirements.requirements.find(requirement => requirement.id === row.requirementId)!;
+      return {...row, domain: definition.domain,
+        acquisition: assessInvestigationAcquisition(definition, row, context.investigationEvidence)};
+    }) : []};
+}
+
+/** The only asynchronous final-verification boundary; all acquisition belongs to the run. */
 export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput): Promise<FinalizedAnalysisResult> {
   const {context, owner} = input;
   try {
@@ -267,6 +297,8 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
       relationActivationClaimIds: relations.relationActivationClaimIds, preparedEvidence: prepared,
       bindingEligibility: canonical.bindingEligibility, policy: 'record_only'});
     const requirements = context ? pinnedRequirements(context) : undefined;
+    const investigationRequirements = context ? resolveAnalysisInvestigationRequirements({
+      intent: context.turnIntent, strategyRegistry: context.strategyRegistry}) : undefined;
     let semantic: FinalSemanticAssessment | undefined;
     if (context) {
       const diagnostics = canonical.protocolDiagnostics;
@@ -274,11 +306,26 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
         query: providerQuery?.text ?? query,
         body: result.conclusion, conclusionContract: validationContract, evidenceSnapshot, sourceUse,
         capabilitySnapshot: context.capabilityEvidence, reportRequirements: requirements, caseRetrieval,
+        investigationRequirements,
         protocolDiagnostics: diagnostics ? {sidecar: {status: diagnostics.sidecar.status,
           issues: diagnostics.sidecar.issues, bindingEligibility: diagnostics.sidecar.bindingEligibility,
           rawPayload: diagnostics.sidecar.rawPayload},
           conversation: diagnostics.conversation ? {status: diagnostics.conversation.status,
             issues: diagnostics.conversation.issues} : undefined} : undefined};
+      if (context.investigationEvidence) {
+        // Keep the original whole-body/claim request budget. Omitted ledger
+        // cohorts remain visible as investigation gaps, not a second request.
+        try {
+          const remainingBytes = FINAL_SEMANTIC_INPUT_BYTE_LIMIT - 8192 -
+            Buffer.byteLength(JSON.stringify(snapshot), 'utf8') -
+            Buffer.byteLength(loadPromptTemplate('prompt-final-semantic-assessment') ?? '', 'utf8');
+          snapshot.investigationEvidence = compactInvestigationEvidence(context.investigationEvidence,
+            Math.max(0, Math.min(64 * 1024, remainingBytes)));
+        } catch {
+          // The existing semantic boundary owns missing-template/error status.
+          // Optional sizing must never prevent the accepted body from delivery.
+        }
+      }
       // This query was accepted as provider input in the same run. The echo guard
       // still protects it in output and in every other role in this snapshot.
       const projected = withOwnerCodeAwareProjection(() => projectConclusionSemanticInput({sessionId: result.sessionId, snapshot, prepared,
@@ -288,7 +335,7 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
       const safeSnapshot: FinalSemanticSnapshot = projected.changed
         ? {...snapshot, inputCoverage: 'incomplete', query: '', body: result.conclusion,
           conclusionContract: undefined, protocolDiagnostics: undefined, evidenceSnapshot: null,
-          sourceUse: undefined, capabilitySnapshot: undefined, caseRetrieval: undefined}
+          sourceUse: undefined, capabilitySnapshot: undefined, caseRetrieval: undefined, investigationEvidence: undefined}
         : projected.value;
       assertOwner(owner);
       semantic = await assessFinalSemantics({context, canonicalCandidate: candidate, snapshot: safeSnapshot, signal: owner.signal});
@@ -326,6 +373,9 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
         sourceUseFingerprint, sourceScopeFingerprint, conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
         verificationFingerprint: analysisDeliveryFingerprint(result.sourceClaimVerificationResult)} : undefined,
       reportRequirements: requirements, caseRetrieval,
+      investigationRequirements, investigationEvidence: context?.investigationEvidence,
+      investigationAssessment: context && semantic && investigationRequirements ? semanticInvestigationAssessment({
+        candidate, result, context, evidenceFingerprint, requirements: investigationRequirements, semantic}) : undefined,
       reportAssessment: context && semantic ? semanticReportAssessment({candidate, result, context,
         evidenceFingerprint, requirements, caseRetrieval, semantic}) : undefined};
     assertOwner(owner);

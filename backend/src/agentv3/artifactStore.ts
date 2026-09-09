@@ -18,6 +18,8 @@
 
 import type { TraceProcessorQueryProvenance } from '../services/traceProcessorConnectionModel';
 import {randomUUID} from 'crypto';
+import type {RuntimeToolInvocationEvent} from '../agentRuntime/runtimeToolObserver';
+import {captureInvestigationToolObservation, type InvestigationToolObservation} from '../services/evidence/investigationEvidenceLedger';
 import {createDataEnvelope} from '../types/dataContract';
 import {capturedEvidenceTable, freezeEvidenceValue, type EvidenceTableWitness} from '../services/evidence/evidenceCapture';
 import {createEvidenceReadView, type EvidenceReadView, type EvidenceReadViewOptions,
@@ -243,9 +245,13 @@ export interface CompactArtifactSummary extends EvidenceScopeMetadata {
   executionError?: string;
 }
 
+// Origin belongs to the issued execution witness, not the latest artifact registration.
+const captureOriginRuns = new WeakMap<EvidenceTableWitness, string | undefined>();
+
 export class ArtifactStore {
   private artifacts: Map<string, StoredArtifact> = new Map();
   private readonly executionCaptures = new Map<string, EvidenceReadRecord>();
+  private readonly investigationToolObservations = new Map<string, InvestigationToolObservation & {originRunId?: string}>();
   private readonly evidenceStoreId = randomUUID();
   private captureGeneration = 0;
   private counter = 0;
@@ -314,7 +320,7 @@ export class ArtifactStore {
 
   /** Private runtime witness registration; snapshots and display rows cannot recreate it. */
   registerEvidenceCapture(id: string, witness: EvidenceTableWitness,
-    descriptor: {evidenceRefId: string; queryHash?: string; sourceRefs?: readonly string[]}): boolean {
+    descriptor: {evidenceRefId: string; queryHash?: string; sourceRefs?: readonly string[]; originRunId?: string}): boolean {
     const artifact = this.artifacts.get(id);
     const table = capturedEvidenceTable(witness);
     if (!artifact || !table || !descriptor.evidenceRefId.trim()) return false;
@@ -332,23 +338,26 @@ export class ArtifactStore {
       identityRefId: artifact.identityResolution?.identityRefId, identityStatus: artifact.identityResolution?.status,
       identityWarnings: artifact.identityResolution?.warnings,
     });
-    this.captureRecord(id, witness, envelope.meta, envelope.display, descriptor.sourceRefs);
+    this.captureRecord(id, witness, envelope.meta, envelope.display, descriptor.sourceRefs, descriptor.originRunId);
     return true;
   }
 
   registerStandaloneEvidenceCapture(witness: EvidenceTableWitness,
-    descriptor: {meta: DataEnvelopeMeta; display: import('../types/dataContract').DataEnvelope['display']; sourceRefs?: readonly string[]}): boolean {
+    descriptor: {meta: DataEnvelopeMeta; display: import('../types/dataContract').DataEnvelope['display']; sourceRefs?: readonly string[]; originRunId?: string}): boolean {
     if (!capturedEvidenceTable(witness) || !descriptor.meta.evidenceRefId) return false;
-    this.captureRecord(`capture:${randomUUID()}`, witness, descriptor.meta, descriptor.display, descriptor.sourceRefs);
+    this.captureRecord(`capture:${randomUUID()}`, witness, descriptor.meta, descriptor.display, descriptor.sourceRefs, descriptor.originRunId);
     return true;
   }
 
   private captureRecord(key: string, witness: EvidenceTableWitness, meta: DataEnvelopeMeta,
-    display: import('../types/dataContract').DataEnvelope['display'], sourceRefs?: readonly string[]): void {
+    display: import('../types/dataContract').DataEnvelope['display'], sourceRefs?: readonly string[], originRunId?: string): void {
     const table = capturedEvidenceTable(witness)!;
+    if (!captureOriginRuns.has(witness)) captureOriginRuns.set(witness, originRunId);
+    const capturedOriginRunId = captureOriginRuns.get(witness);
     const {queryReview: _reviewOnly, ...capturedMeta} = meta;
     this.executionCaptures.set(key, {witness, record: freezeEvidenceValue(structuredClone({
       captureId: witness.captureId, storeId: this.evidenceStoreId, generation: ++this.captureGeneration,
+      ...(capturedOriginRunId ? {originRunId: capturedOriginRunId} : {}),
       columns: [...table.columns], totalRowCount: table.rows.length, fields: table.fields,
       meta: {...capturedMeta, ...scopeMetadata(meta.scopeProvenance)}, display,
       ...(sourceRefs ? {sourceRefs: [...sourceRefs]} : {}),
@@ -358,7 +367,17 @@ export class ArtifactStore {
 
   createEvidenceReadView(options: EvidenceReadViewOptions): EvidenceReadView {
     const admitted = new Set(this.executionCaptures.values());
-    return createEvidenceReadView(() => [...this.executionCaptures.values()].filter(record => admitted.has(record)), options);
+    const observations = [...this.investigationToolObservations.values()];
+    return createEvidenceReadView(() => [...this.executionCaptures.values()].filter(record => admitted.has(record)), options, () => observations);
+  }
+
+  /** Shared admitted-tool observer; records no payload or model-authored success claims. */
+  observeInvestigationTool(event: RuntimeToolInvocationEvent, originRunId?: string): void {
+    this.investigationToolObservations.set(`${originRunId || ''}:${event.toolCallId}`,
+      {...captureInvestigationToolObservation(event), ...(originRunId ? {originRunId} : {})});
+    while (this.investigationToolObservations.size > 4096) {
+      this.investigationToolObservations.delete(this.investigationToolObservations.keys().next().value!);
+    }
   }
 
   updateQueryReview(id: string, queryReview: QueryReviewV1 | undefined): boolean {
@@ -788,6 +807,7 @@ export class ArtifactStore {
   clear(): void {
     this.artifacts.clear();
     this.executionCaptures.clear();
+    this.investigationToolObservations.clear();
     this.counter = 0;
   }
 }

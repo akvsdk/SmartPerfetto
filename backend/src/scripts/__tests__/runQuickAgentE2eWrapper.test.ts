@@ -30,6 +30,112 @@ const itWithLaunchLightTraceProcessor = fs.existsSync(traceProcessorPath) && fs.
   ? it
   : it.skip;
 
+describe('declarative system-analysis suite', () => {
+  const wrapper = require(path.join(backendRoot, 'scripts/run-deepseek-agent-e2e.cjs'));
+  it('exposes a bounded suite with separate real and constructed scenario labels', () => {
+    expect(wrapper.parseArgs(['--suite', 'system-analysis', '--runtime', 'openai']).suite).toBe('system-analysis');
+    const scenarios = wrapper.systemAnalysisScenarios();
+    expect(scenarios.filter((item: any) => item.evidenceTier === 'real').map((item: any) => item.id))
+      .toEqual(['startup-real', 'scrolling-real', 'startup-pair-real']);
+    expect(scenarios.filter((item: any) => item.evidenceTier === 'constructed').map((item: any) => item.id))
+      .toEqual(['scheduler-constructed', 'input-constructed', 'anr-constructed', 'game-constructed', 'media-constructed',
+        'io-constructed', 'memory-constructed', 'power-constructed', 'linux-constructed', 'network-constructed', 'pipeline-constructed']);
+    for (const scenario of scenarios) {
+      expect(scenario.args).toContain('--require-non-partial');
+      expect(scenario.args).not.toContain('--require-text');
+      expect(scenario.args).not.toContain('--require-tool');
+      const fixture = scenario.args[scenario.args.indexOf('--expectation-json') + 1];
+      expect(fixture.startsWith('@')).toBe(true);
+      const expectation = JSON.parse(fs.readFileSync(fixture.slice(1), 'utf8'));
+      expect(expectation.investigation.requirements[0].records[0].oracleScope.factId).toBe(expectation.facts[0].id);
+      expect(expectation.investigation.requirements[0].records[0].origin).toBe('current_run');
+      if (scenario.evidenceTier === 'constructed') expect(scenario.args).toContain('--select-slice-json');
+    }
+  });
+  it('does not label the three DeepSeek native adapters as five-runtime acceptance', () => {
+    expect(wrapper.resolveRuntimeKinds('all')).toEqual(['openai-agents-sdk', 'pi-agent-core', 'opencode']);
+    expect(wrapper.resolveRuntimeKinds('claude')).toEqual(['claude-agent-sdk']);
+    expect(wrapper.resolveRuntimeKinds('qoder')).toEqual(['qoder-agent-sdk']);
+  });
+  it('selects a single known system scenario without claiming the whole matrix', () => {
+    expect(wrapper.parseArgs(['--suite', 'system-analysis', '--system-scenario', 'scheduler-constructed']).systemScenario)
+      .toBe('scheduler-constructed');
+    expect(() => wrapper.parseArgs(['--suite', 'startup', '--system-scenario', 'startup-real'])).toThrow('system-analysis suite');
+    expect(() => wrapper.parseArgs(['--suite', 'system-analysis', '--system-scenario', 'absent'])).toThrow('existing manifest ID');
+  });
+  it('keeps legacy real output names compatible and isolates every constructed runtime artifact', () => {
+    const runtimes = wrapper.resolveRuntimeKinds('all');
+    expect(wrapper.withRuntimeOutputPath(['--output', 'test-output/e2e-startup-real.json'],
+      'test-output/e2e-startup-real.json', 'pi-agent-core'))
+      .toEqual(['--output', 'test-output/e2e-startup-pi-agent-core-real.json']);
+    for (const scenario of wrapper.systemAnalysisScenarios()) {
+      const outputs = runtimes.map((runtime: string) => {
+        const args = wrapper.withRuntimeOutputPath(scenario.args, scenario.output, runtime);
+        const output = args[args.indexOf('--output') + 1];
+        expect(output).toContain(runtime);
+        expect(scenario.args[scenario.args.indexOf('--output') + 1]).toBe(scenario.output);
+        return output;
+      });
+      expect(new Set(outputs).size).toBe(runtimes.length);
+      for (const suffix of ['.diagnostics.json', '.session-log.jsonl', '.isolated-session-log.jsonl']) {
+        expect(new Set(outputs.map((output: string) => `${output}${suffix}`)).size).toBe(runtimes.length);
+      }
+    }
+    expect(wrapper.withRuntimeOutputPath([], 'test-output/system-analysis/scheduler-constructed.json', 'opencode'))
+      .toEqual(['--output', 'test-output/system-analysis/scheduler-constructed-opencode.json']);
+  });
+
+  it('keeps every coverage-matrix test pointer current and selects real non-main actors from constructed fixtures', () => {
+    const directory = path.join(backendRoot, 'tests/e2e/system-analysis-fixtures');
+    const matrix = JSON.parse(fs.readFileSync(path.join(directory, 'coverage-matrix.json'), 'utf8'));
+    expect(matrix.providerDefinitions.map((item: any) => item.id)).toEqual(wrapper.systemAnalysisScenarios().map((item: any) => item.id));
+    for (const item of matrix.deterministicDefinitions) expect(fs.readFileSync(path.join(backendRoot, item.testFile), 'utf8')).toContain(item.testTitle);
+    const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8'));
+    for (const row of manifest.scenarios.filter((item: any) => item.evidenceTier === 'constructed')) {
+      const caseId = row.trace.split('/').at(-2);
+      const fixture = JSON.parse(fs.readFileSync(path.resolve(backendRoot, '../Trace/constructed', caseId, 'scenario.json'), 'utf8'));
+      const threads = new Map(fixture.actors.threads.map((thread: any) => [thread.id, thread]));
+      const selected = fixture.signals.filter((signal: any) => signal.type === 'atrace-slice' && signal.name === row.selectSlice.eventName &&
+        (threads.get(signal.thread) as any)?.name === row.selectSlice.threadName);
+      expect(selected).toHaveLength(1);
+    }
+    expect(manifest.scenarios.find((item: any) => item.id === 'game-constructed').selectSlice.threadName).toBe('GameThread');
+    expect(manifest.scenarios.find((item: any) => item.id === 'media-constructed').selectSlice.threadName).toBe('RenderThread');
+  });
+
+  it('preserves redacted child logs and releases isolated roots when the verifier fails', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wrapper-failure-'));
+    const output = path.join(directory, 'result.json');
+    const previousExitCode = process.exitCode;
+    let isolatedRoot = '';
+    const spawn = jest.fn((_command: string, _args: string[], options: any) => {
+      isolatedRoot = path.dirname(options.env.SMARTPERFETTO_BACKEND_LOG_DIR);
+      const logs = path.join(options.env.SMARTPERFETTO_BACKEND_LOG_DIR, 'sessions');
+      fs.mkdirSync(logs, {recursive: true});
+      fs.writeFileSync(path.join(logs, 'session_owned_2026.jsonl'), JSON.stringify({level: 'error',
+        error: {message: 'analysis_history_parent_not_authorized'}, apiKey: 'secret-not-for-artifact'}));
+      return {status: 1};
+    });
+    jest.doMock('child_process', () => ({...jest.requireActual('child_process'), spawnSync: spawn}));
+    const logging = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      jest.isolateModules(() => {
+        const isolated = require(path.join(backendRoot, 'scripts/run-deepseek-agent-e2e.cjs'));
+        expect(() => isolated.runSuite('system-analysis', {apiKey: 'fake', credentialKind: 'test'}, 'openai-agents-sdk', false, 10,
+          {label: 'test', output, args: ['--output', output]})).toThrow('exited with status 1');
+      });
+      expect(fs.existsSync(isolatedRoot)).toBe(false);
+      const log = fs.readFileSync(`${output}.isolated-session-log.jsonl`, 'utf8');
+      expect(log).toContain('analysis_history_parent_not_authorized');
+      expect(log).not.toContain('secret-not-for-artifact');
+    } finally {
+      process.exitCode = previousExitCode;
+      jest.dontMock('child_process'); logging.mockRestore();
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
+  });
+});
+
 describe('source binding acceptance', () => {
   it('uses the original source oracle query with an explicit native ID column and no copied fingerprint', () => {
     const query = semanticDeltaQueries().find(item => item.kind === 'quantitative-only')!;

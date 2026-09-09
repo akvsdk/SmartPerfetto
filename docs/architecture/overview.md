@@ -116,15 +116,30 @@ Web UI 的两个 AI 入口共享同一鉴权边界，但不共享 trace 前置�
   native trace processor。`/api/workspaces/:workspaceId/traces/leases/:leaseId/connection`
   只返回粗粒度状态，不返回端口、凭据、文件路径或其他租户信息。
 
-OIDC 模式下，session、trace、lease、connection、run/receipt 和临时连接状态都只存在于
-当前页面内存。可持久化消息先移除运行时绑定和原始私有请求；已授权的分析源码引用可以保留，再写入 tenant/user/workspace
-隔离的命名空间；切换身份或 workspace 不会恢复另一个作用域的历史。logout、401、跨
+OIDC 模式下，物理 session、trace、lease、connection、run/receipt 和临时连接状态只存在于
+当前页面内存。浏览器可保存逻辑 conversationId 定位信息，绑定完整 tenant/user/workspace
+与 backend URL；恢复前必须由后端重新授权，旧本地消息不能直接成为可信历史。
+可持久化消息先移除运行时绑定和原始私有请求；源码历史只有在当前授权与原始上下文指纹
+一致时才可继承。切换身份或 workspace 不会恢复另一个作用域的历史。logout、401、跨
 标签页 authority invalidation、身份/上下文切换和页面卸载都会 abort start/stream，递增
 运行代际并清空页面运行态，迟到结果不得写回新身份。
 
 local/API-key 模式保持既有浏览器请求和 resume 语义：共享 helper 不会无条件添加
 cookie credentials，也不会把非 OIDC 401 当作 OIDC authority 失效。本次架构整合没有
 新增环境变量或配置项；provider、runtime 和 endpoint 仍来自现有配置源。
+
+## 轮次上限与连续追问
+
+五个运行时共享采集预算与收尾状态。总预算大于一轮时，预留最后一轮无工具请求，
+在采集触顶后根据已经返回的事实生成有限结论、不足和下一步；取消、超时、授权失效及
+提供方错误不会触发额外总结。结果仍保留 `incomplete/turn_limit`，不能把交付文本当作
+取证完整。OpenCode 的上限依赖观察后中止，实际超额必须记录且不得再追加总结。
+
+每个用户问题使用新的物理模型上下文。同一逻辑会话经 owner、Trace、provider 和源码
+授权检查后，默认继承有界的近轮结论、缺口与证据定位；更早记录由 `read_session_history`
+分页读取。历史定位不产生本轮核验凭据。逻辑会话描述与完整轮次在同一数据库事务中
+持久化，网页重新打开和后端重启使用同一恢复路径，CLI 复用相同 typed history 合同。
+详见[Agent Runtime 架构](agent-runtime.md)。
 
 ## 主分析数据流
 
@@ -316,3 +331,9 @@ tool registry、`backend/skills/` 文件树和 strategy frontmatter 决定。
 catalog 中的 pipeline 条目定义 trace 检测子路径或 feature。只有 catalog 中
 `classification_role: variant` 且 `primary_eligible: true` 的条目能成为主判定；
 同步、哈希和引用完整性由 `npm run check:rendering-pipelines` 校验。
+
+## 系统调查合同
+
+`investigation-profiles.yaml` 与场景 Strategy 声明调查义务，解析后随 registry fingerprint 固定到本轮。共享 Skill 或受信任的等价 SQL 产生范围绑定的原始证据，运行记录与最终正文解释分别核验。`investigationAssessment` 随结果进入 SSE、报告、快照和比较摘要；`deliveryAssurance.investigation` 与 `investigationEvidence` 独立于 completion、report 和 claims。
+
+只保存声明不会创建采集权威。私有投影或正文、声明、身份、intent、证据改变后，原正向调查核验失效并清除旧引用。历史恢复不会自动取证；旧结果保留未知状态。

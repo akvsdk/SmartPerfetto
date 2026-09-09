@@ -59,7 +59,7 @@
           "type": {
             "enum": [
               "atrace-slice", "atrace-counter", "atrace-async-slice", "atrace-async-track-slice",
-              "sched-running", "process-stats", "battery-counters", "power-rail",
+              "sched-running", "sched-switch", "sched-waking", "process-stats", "battery-counters", "power-rail",
               "gpu-work-period", "gpu-frequency", "gpu-power-state", "cpu-frequency", "cpu-idle",
               "irq-span", "frame-timeline", "lmk-kill", "managed-heap-graph",
               "gpu-compute-kernel", "anr-event", "perf-sample", "android-log"
@@ -69,6 +69,14 @@
           "duration_ns": {"type": "string", "pattern": "^[0-9]+$"},
           "process": {"type": "string"},
           "thread": {"type": "string"},
+          "prev_thread": {"type": ["string", "null"], "description": "Explicit sched-switch source actor; null denotes idle."},
+          "next_thread": {"type": ["string", "null"], "description": "Explicit sched-switch destination actor; null denotes idle."},
+          "waker_thread": {"type": ["string", "null"]},
+          "prev_priority": {"type": "integer", "minimum": -1, "maximum": 139},
+          "next_priority": {"type": "integer", "minimum": -1, "maximum": 139},
+          "sched_priority": {"type": "integer", "minimum": -1, "maximum": 139},
+          "prev_state_raw": {"type": "string", "pattern": "^[0-9]+$", "description": "Raw kernel sched_switch prev_state bitmask. The base trace kernel version controls decoding: modern kernels (4.14+) use 256 for R+; missing kernel metadata defaults to 4.4 and uses 2048. No policy is inferred from this field or priority."},
+          "target_cpu": {"type": "integer", "minimum": 0},
           "target_process": {"type": "string"},
           "name": {"type": "string"},
           "error_id": {"type": "string", "minLength": 1},
@@ -188,6 +196,14 @@
           }
         },
         "allOf": [
+          {
+            "if": {"properties": {"type": {"const": "sched-switch"}}},
+            "then": {"required": ["cpu", "prev_thread", "next_thread", "prev_priority", "next_priority", "prev_state_raw"]}
+          },
+          {
+            "if": {"properties": {"type": {"const": "sched-waking"}}},
+            "then": {"required": ["cpu", "thread", "waker_thread", "target_cpu", "sched_priority"]}
+          },
           {
             "if": {"properties": {"type": {"const": "managed-heap-graph"}}},
             "then": {"required": ["process", "heap_bytes_allocated", "types", "objects", "roots"]}

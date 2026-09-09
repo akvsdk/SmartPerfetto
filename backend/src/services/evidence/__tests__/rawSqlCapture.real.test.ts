@@ -36,6 +36,7 @@ import {canonicalizeAnalysisResult} from '../../canonicalAnalysisResult';
 import {projectPrivateAnalysisResult, copyAnalysisResultForSnapshot} from '../../security/privateAnalysisProjection';
 import {prepareClaimEvidence} from '../claimEvidencePreparation';
 import {getCapturedAnchorFacts} from '../evidenceCapture';
+import {readRawSqlCaptureMetadata} from '../rawSqlNativeProvenance';
 import {runClaimVerification} from '../../verifier/claimVerificationRunner';
 import type {EvidenceReadView} from '../evidenceReadView';
 
@@ -141,6 +142,27 @@ function captureFixture(service: TraceProcessorService, traceId: string, toolNam
 
 const filter = "WHERE name = 'StartupHooks.initializeOnMainThread#before-first-frame-sync-policy' LIMIT 1";
 describe('pinned native raw SQL -> MCP capture -> numeric proof', () => {
+  it('preserves later direct ID and duration proof after actual bounded scalar and IN subqueries', async () => {
+    const {processor, execute} = await fixture('execute_sql');
+    for (const predicate of [`t.id = (SELECT track_id FROM slice ${filter})`,
+      `t.id IN (SELECT track_id FROM slice ${filter})`]) {
+      const nested = await processor.query(`SELECT t.id AS track_id FROM track t WHERE ${predicate}`);
+      expect(nested.error).toBeUndefined();
+      expect(nested.rows).toHaveLength(1);
+      expect(readRawSqlCaptureMetadata(nested)).toBeUndefined();
+      expect(processor.getNativeProvenanceSnapshot().status).toBe('trusted');
+      const direct = await execute(`SELECT id, dur FROM slice ${filter}`, 'dur', 42_000_000);
+      expect(direct.claimVerificationResult.claimResults[0].deterministicProof).toMatchObject({status: 'proved',
+        nativeRows: [{relation: 'slice', idColumn: 'id', traceId: processor.traceId}]});
+      expect(getCapturedAnchorFacts(direct.claimSupport[0].anchors[0])?.fields.dur)
+        .toMatchObject({unit: 'ns', origin: {kind: 'native_producer'}});
+    }
+    await processor.query("SELECT (SELECT run_metric('smartperfetto_nonexistent_subquery_probe.sql'))");
+    expect(processor.getNativeProvenanceSnapshot().status).toBe('tainted');
+    const later = await execute(`SELECT id, dur FROM slice ${filter}`, 'dur', 42_000_000);
+    expect(later.claimVerificationResult.claimResults[0].deterministicProof).toMatchObject({status: 'candidate', reason: 'unit_authority_unknown'});
+  });
+
   it.each(['execute_sql', 'execute_sql_on'] as const)('retains authoritative duration units through %s', async tool => {
     const {execute} = await fixture(tool);
     for (const [projection, column] of [['dur', 'dur'], ['s.dur AS duration_ns', 'duration_ns'], ['s.*', 'dur']]) {

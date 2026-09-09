@@ -188,6 +188,20 @@
       ],
       "split": "train",
       "createdAt": "2026-07-29T00:00:00.000Z"
+    },
+    {
+      "caseId": "synthetic-system-scheduling-evidence-v1",
+      "catalogAlias": "system-scheduling-evidence",
+      "query": "Analyze the exact SmartPerfetto::CASE::system-scheduling-evidence marker interval for com.smartperfetto.fixture/main. Explain the clipped Running, R, R+, and D state distribution, observed preemption handoff and wakeup evidence, and distinguish raw priority from unknown scheduling policy. Preserve missing frequency and topology evidence rather than inferring CPU classes or a causal competitor.",
+      "analysisMode": "full",
+      "expectedScene": "cpu",
+      "goldenPoints": [
+        "Bind the target UPID/UTID and exact marker window; preserve raw boundaries while reporting the independently constructed clipped state totals.",
+        "Distinguish R from R+, require the actual same-UCPU successor for handoff evidence, and do not equate successor duration with target delay.",
+        "Retain pure-waiting tasks and unknown topology, frequency, policy, and blocked-function evidence; raw priorities alone do not prove RT/FIFO/RR."
+      ],
+      "split": "validation",
+      "createdAt": "2026-09-09T00:00:00.000Z"
     }
   ]
 }

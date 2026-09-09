@@ -6,6 +6,21 @@ export type OpenAIChatCompletionsTokenLimit =
   | { max_tokens: number }
   | { max_completion_tokens: number };
 
+export type OpenAITextRequestPurpose = 'classification';
+
+/** Bounded classification does not spend its output cap on provider-default thinking.
+ * Apply only to the actual official origin; gateways own their protocol semantics.
+ * https://api-docs.deepseek.com/guides/thinking_mode/
+ */
+export function buildOpenAITextRequestPurposeOptions(input: {
+  requestUrl: URL;
+  protocol: 'chat_completions' | 'responses';
+  purpose?: OpenAITextRequestPurpose;
+}): {thinking?: {type: 'disabled'}; reasoning?: {effort: 'none'}} {
+  if (input.purpose !== 'classification' || input.requestUrl.origin !== 'https://api.deepseek.com') return {};
+  return input.protocol === 'responses' ? {reasoning: {effort: 'none'}} : {thinking: {type: 'disabled'}};
+}
+
 const MAX_COMPLETION_TOKENS_MODEL_PATTERNS = [
   /^gpt-5\.6(?:$|-)/,
 ];

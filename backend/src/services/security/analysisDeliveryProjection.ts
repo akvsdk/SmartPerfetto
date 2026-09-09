@@ -3,6 +3,7 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
+import type {InvestigationEvidenceRecord} from '../evidence/investigationEvidenceLedger';
 import {isProductionAgentRuntimeKind} from '../../agentRuntime/runtimeKinds';
 import {
   analysisDeliveryFingerprint,
@@ -18,7 +19,7 @@ import {
 
 export type AnalysisDeliveryFields = Pick<AnalysisResult,
   'turnIntent' | 'completion' | 'outputOrigin' | 'runtimeAppendix' |
-  'reportAssessment' | 'deliveryAssurance'>;
+  'reportAssessment' | 'investigationAssessment' | 'deliveryAssurance'>;
 
 /** Preserve surviving field order because existing bindings hash the serialized contract. */
 export function preserveProjectedFieldOrder<T>(original: unknown, projection: T, depth = 0): T {
@@ -53,6 +54,49 @@ function opaqueId(value: unknown): string {
 
 function fingerprint(value: unknown): string {
   return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : '';
+}
+
+function exactNonnegativeInteger(value: unknown): value is number | string {
+  return typeof value === 'number' ? Number.isSafeInteger(value) && value >= 0
+    : typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value) && value.length <= 20;
+}
+
+/** An explicit public row projection; no witness, owner key or nested producer data escapes. */
+function copyInvestigationEvidenceRecords(values: readonly unknown[], projectText: (text: string) => string): InvestigationEvidenceRecord[] {
+  return preserveProjectedFieldOrder(values, values.flatMap(raw => {
+    if (!record(raw) || !record(raw.window) || !exactNonnegativeInteger(raw.window.start) ||
+        !exactNonnegativeInteger(raw.window.end) || BigInt(raw.window.end) <= BigInt(raw.window.start) ||
+        typeof raw.rowIndex !== 'number' || !Number.isSafeInteger(raw.rowIndex) || raw.rowIndex < 0 ||
+        !member(raw.traceSide, ['current', 'reference']) ||
+        !(raw.value === null || typeof raw.value === 'string' || typeof raw.value === 'boolean' ||
+          (typeof raw.value === 'number' && Number.isFinite(raw.value)))) return [];
+    const id = (value: unknown) => opaqueId(typeof value === 'string' ? projectText(value) : value);
+    const optionalId = (key: 'evidenceRefId' | 'artifactId' | 'sourceToolCallId' | 'originRunId') =>
+      raw[key] === undefined ? {} : {[key]: id(raw[key])};
+    const nullableIdentity = (key: 'cpu' | 'ucpu' | 'machineId') => raw[key] === null
+      ? {[key]: null} : typeof raw[key] === 'number' && exactNonnegativeInteger(raw[key]) ? {[key]: raw[key]} : {};
+    return [{recordId: id(raw.recordId), captureId: id(raw.captureId), rowIndex: raw.rowIndex,
+      ...optionalId('evidenceRefId'), ...optionalId('artifactId'), ...optionalId('sourceToolCallId'), ...optionalId('originRunId'),
+      skillId: id(raw.skillId), stepId: id(raw.stepId),
+      definitionFingerprint: fingerprint(raw.definitionFingerprint), selectedSqlHash: fingerprint(raw.selectedSqlHash),
+      traceId: id(raw.traceId), traceSide: raw.traceSide,
+      origin: member(raw.origin, ['current_run', 'reused', 'unknown']) ? raw.origin : 'unknown',
+      domain: id(raw.domain), metricId: id(raw.metricId),
+      status: member(raw.status, ['observed', 'partial', 'unavailable', 'unknown']) ? raw.status : 'unknown',
+      window: {start: raw.window.start, end: raw.window.end},
+      ...(typeof raw.upid === 'number' && exactNonnegativeInteger(raw.upid) ? {upid: raw.upid} : {}),
+      ...(typeof raw.utid === 'number' && exactNonnegativeInteger(raw.utid) ? {utid: raw.utid} : {}),
+      ...nullableIdentity('cpu'), ...nullableIdentity('ucpu'), ...nullableIdentity('machineId'),
+      ...(raw.windowId === null || (typeof raw.windowId === 'number' && exactNonnegativeInteger(raw.windowId))
+        ? {windowId: raw.windowId} : typeof raw.windowId === 'string' ? {windowId: projectText(raw.windowId)} : {}),
+      ...(raw.role === null ? {role: null} : typeof raw.role === 'string' ? {role: projectText(raw.role)} : {}),
+      ...(typeof raw.aggregation === 'string' ? {aggregation: projectText(raw.aggregation)} : {}),
+      value: typeof raw.value === 'string' ? projectText(raw.value) : raw.value,
+      ...(typeof raw.unit === 'string' ? {unit: projectText(raw.unit)} : {}),
+      ...(exactNonnegativeInteger(raw.coverage) ? {coverage: raw.coverage} : {}),
+      ...(exactNonnegativeInteger(raw.denominator) ? {denominator: raw.denominator} : {}),
+    }];
+  }));
 }
 
 function candidate(value: AnalysisCandidateIdentity): AnalysisCandidateIdentity {
@@ -163,6 +207,46 @@ export function copyAnalysisDeliveryFields(input: AnalysisDeliveryFields): Analy
       completion: copyAssuranceStatus(assurance.completion), claims: copyAssuranceStatus(assurance.claims),
       source: copyAssuranceStatus(assurance.source), identity: copyAssuranceStatus(assurance.identity),
       report: copyAssuranceStatus(assurance.report),
+      ...(assurance.investigation !== undefined ? {investigation: copyAssuranceStatus(assurance.investigation)} : {}),
+      ...(assurance.investigationEvidence !== undefined ? {investigationEvidence: copyAssuranceStatus(assurance.investigationEvidence)} : {}),
+    };
+  }
+  const investigation = input.investigationAssessment;
+  if (investigation?.schemaVersion === 1 && investigation.binding && Array.isArray(investigation.requirements) &&
+      member(investigation.status, ['not_checked', 'unavailable', 'coverage_incomplete', 'checked'])) {
+    const binding = investigation.binding;
+    output.investigationAssessment = {
+      schemaVersion: 1, status: investigation.status,
+      ...(Array.isArray(investigation.evidenceRecords)
+        ? {evidenceRecords: copyInvestigationEvidenceRecords(investigation.evidenceRecords, text => text)} : {}),
+      binding: {...candidate(binding),
+        conclusionContractFingerprint: fingerprint(binding.conclusionContractFingerprint),
+        evidenceFingerprint: fingerprint(binding.evidenceFingerprint),
+        requirementsFingerprint: fingerprint(binding.requirementsFingerprint),
+        registryFingerprint: opaqueId(binding.registryFingerprint),
+        intentFingerprint: fingerprint(binding.intentFingerprint),
+        ledgerFingerprint: fingerprint(binding.ledgerFingerprint),
+        ...(binding.evidenceRecordsFingerprint !== undefined
+          ? {evidenceRecordsFingerprint: fingerprint(binding.evidenceRecordsFingerprint)} : {}),
+        ...(binding.caseRetrievalFingerprint !== undefined
+          ? {caseRetrievalFingerprint: fingerprint(binding.caseRetrievalFingerprint)} : {})},
+      requirements: investigation.requirements.map((raw: unknown) => {
+        const requirement = record(raw) ? raw : {};
+        const acquisitionStatuses = ['observed', 'insufficient', 'not_checked', 'failed', 'not_applicable', 'unknown'] as const;
+        return {
+          requirementId: opaqueId(requirement.requirementId), domain: opaqueId(requirement.domain),
+          applicability: member(requirement.applicability, ['applicable', 'not_applicable', 'unknown'])
+            ? requirement.applicability : 'unknown',
+          coverage: member(requirement.coverage, ['covered', 'missing', 'unknown']) ? requirement.coverage : 'unknown',
+          scopeMatch: member(requirement.scopeMatch, ['matched', 'mismatched', 'unknown']) ? requirement.scopeMatch : 'unknown',
+          acquisition: member(requirement.acquisition, acquisitionStatuses) ? requirement.acquisition : 'unknown',
+          evidenceStatus: member(requirement.evidenceStatus, acquisitionStatuses) ? requirement.evidenceStatus : 'unknown',
+          contentLocations: Array.isArray(requirement.contentLocations)
+            ? requirement.contentLocations.filter(contentLocation).map(({start, end}) => ({start, end})) : [],
+          evidenceRecordIds: Array.isArray(requirement.evidenceRecordIds)
+            ? requirement.evidenceRecordIds.map(opaqueId).filter(Boolean) : [],
+        };
+      }),
     };
   }
   return preserveProjectedFieldOrder(input, output);
@@ -179,7 +263,7 @@ export function analysisProjectionChanged(before: unknown, after: unknown): bool
 export function projectPrivateAnalysisDelivery(
   input: AnalysisDeliveryFields & {conclusion?: string; conclusionContract?: unknown},
   projection: {conclusion: string; conclusionContract?: unknown; claimsChanged?: boolean;
-    sourceChanged?: boolean; identityChanged?: boolean},
+    sourceChanged?: boolean; identityChanged?: boolean; evidenceChanged?: boolean},
   projectText: (text: string) => string,
   options: {privateMetadata?: boolean} = {},
 ): AnalysisDeliveryFields {
@@ -207,6 +291,15 @@ export function projectPrivateAnalysisDelivery(
         ...(!boundCandidate(appendix.sourceCandidate, projection.conclusion) || bodyChanged
           ? {conclusionFingerprint: ''} : {})}};
   }
+  if (output.investigationAssessment) {
+    output.investigationAssessment = {...output.investigationAssessment,
+      ...(output.investigationAssessment.evidenceRecords ? {evidenceRecords:
+        copyInvestigationEvidenceRecords(output.investigationAssessment.evidenceRecords, projectText)} : {}),
+      requirements: output.investigationAssessment.requirements.map(requirement => ({...requirement,
+        requirementId: opaqueId(projectText(requirement.requirementId)),
+        domain: opaqueId(projectText(requirement.domain)),
+        evidenceRecordIds: requirement.evidenceRecordIds.map(id => opaqueId(projectText(id))).filter(Boolean)}))};
+  }
   const assessment = output.reportAssessment;
   const reportInvalid = analysisProjectionChanged(input.reportAssessment, assessment) || Boolean(assessment && (claimsChanged || intentChanged || projection.sourceChanged ||
     !boundCandidate(assessment.binding, projection.conclusion) ||
@@ -225,6 +318,31 @@ export function projectPrivateAnalysisDelivery(
         coverage: requirement.coverage === 'covered' ? 'unknown' : requirement.coverage,
       }))};
   }
+  const investigation = output.investigationAssessment;
+  const investigationContextChanged = claimsChanged || intentChanged || projection.sourceChanged ||
+    projection.identityChanged || projection.evidenceChanged;
+  const investigationInvalid = analysisProjectionChanged(input.investigationAssessment, investigation) ||
+    Boolean(investigation && (investigationContextChanged || !boundCandidate(investigation.binding, projection.conclusion) ||
+      investigation.binding.conclusionContractFingerprint !== analysisDeliveryFingerprint(projection.conclusionContract) ||
+      investigation.binding.intentFingerprint !== analysisDeliveryFingerprint(output.turnIntent) ||
+      (investigation.evidenceRecords !== undefined && investigation.binding.evidenceRecordsFingerprint !==
+        analysisDeliveryFingerprint(investigation.evidenceRecords)) ||
+      Object.values(investigation.binding).some(value => value === '') ||
+      investigation.requirements.some(requirement => requirement.contentLocations.some(location => location.end > projection.conclusion.length))));
+  if (investigation && investigationInvalid) {
+    output.investigationAssessment = {...investigation,
+      status: investigation.status === 'checked' ? 'coverage_incomplete' : investigation.status,
+      ...(investigation.evidenceRecords ? {evidenceRecords: investigation.evidenceRecords.map(row => ({...row,
+        status: 'unknown' as const, origin: 'unknown' as const}))} : {}),
+      binding: {...investigation.binding, conclusionFingerprint: '', conclusionContractFingerprint: '',
+        evidenceFingerprint: '', intentFingerprint: '', ledgerFingerprint: '',
+        ...(investigation.evidenceRecords !== undefined || investigation.binding.evidenceRecordsFingerprint !== undefined
+          ? {evidenceRecordsFingerprint: ''} : {})},
+      requirements: investigation.requirements.map(requirement => ({...requirement,
+        applicability: requirement.applicability === 'not_applicable' ? 'unknown' : requirement.applicability,
+        coverage: requirement.coverage === 'covered' ? 'unknown' : requirement.coverage,
+        acquisition: 'unknown', evidenceStatus: 'unknown', scopeMatch: 'unknown', contentLocations: [], evidenceRecordIds: []}))};
+  }
   if (output.deliveryAssurance) {
     const assurance = output.deliveryAssurance;
     output.deliveryAssurance = {...assurance,
@@ -233,7 +351,13 @@ export function projectPrivateAnalysisDelivery(
       claims: claimsChanged ? downgrade(assurance.claims) : assurance.claims,
       source: claimsChanged || projection.sourceChanged ? downgrade(assurance.source) : assurance.source,
       identity: projection.identityChanged ? downgrade(assurance.identity) : assurance.identity,
-      report: reportInvalid || claimsChanged || intentChanged ? downgrade(assurance.report) : assurance.report};
+      report: reportInvalid || claimsChanged || intentChanged ? downgrade(assurance.report) : assurance.report,
+      ...(assurance.investigation !== undefined ? {investigation: investigationInvalid || investigationContextChanged ||
+        (!investigation && assurance.investigation !== 'not_applicable')
+        ? downgrade(assurance.investigation) : assurance.investigation} : {}),
+      ...(assurance.investigationEvidence !== undefined ? {investigationEvidence: investigationInvalid || investigationContextChanged ||
+        (!investigation && assurance.investigationEvidence !== 'not_applicable')
+        ? downgrade(assurance.investigationEvidence) : assurance.investigationEvidence} : {})};
   }
   return output;
 }

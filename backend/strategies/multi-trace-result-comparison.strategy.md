@@ -3,6 +3,18 @@
 
 ---
 scene: multi_trace_result_comparison
+investigation_contract:
+  schema_version: 1
+  profiles:
+    - {id: result_comparison, version: 1}
+    - {id: causal_reasoning, version: 1}
+  requirements:
+    - id: multi_trace_result_comparison_critical_path
+      domain: critical_path
+      description: "Retain each saved snapshot identity, original scene, scope and evidence pin. Compare stored app and system findings in their original windows; missing investigation coverage remains unknown."
+    - id: multi_trace_result_comparison_dependencies
+      domain: dependency_chain
+      description: "Explain compatible deltas, alternatives and incomparable dimensions using saved artifacts. Do not query original traces, reinterpret missing values as zero, or generalize one side coverage to the pair."
 classification_description: "Comparing previously saved analysis results or snapshots, including scope and metric differences between results."
 priority: 0
 effort: medium

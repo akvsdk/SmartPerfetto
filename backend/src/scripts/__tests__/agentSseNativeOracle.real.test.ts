@@ -64,6 +64,33 @@ function expectReleased(group: AnalysisRunTraceProcessorLeases) {
 }
 
 describe('real native oracle lease lifecycle', () => {
+  it('queries two actual native processors under one pair lease without crossing side pins', async () => {
+    await withLoadedTrace(async (service, traceId) => {
+      const referenceTraceId = await service.loadTraceFromFilePath(path.resolve(process.cwd(), '../Trace/real/android-startup-light/trace.pftrace'));
+      const sql = 'SELECT id AS row_id, dur FROM slice WHERE dur >= 0 ORDER BY id LIMIT 1';
+      const expected = parseAgentSseExpectation({schemaVersion: 1, intent: {taskKind: 'comparison'}, facts:
+        ['current', 'reference'].map(traceSide => ({id: `${traceSide}_duration`, kind: 'numeric', columns: ['dur'], unit: 'ns',
+          verification: 'proved', oracle: {sql, column: 'dur', unit: 'ns', traceSide,
+            anchorMatch: {nativeRow: {relation: 'slice', idColumn: 'id', oracleColumn: 'row_id'}}}}))});
+      let owned: AnalysisRunTraceProcessorLeases | undefined;
+      const prepare = jest.fn(async (input: Parameters<typeof prepareAnalysisRunTraceProcessorLeases>[0]) => {
+        owned = await prepareAnalysisRunTraceProcessorLeases(input); return owned;
+      });
+      const query = jest.spyOn(service, 'query');
+      const result = await collectAgentSseOracleEvidence({service, traceId, referenceTraceId, expectation: expected, scope,
+        deadlineMs: Date.now() + 90_000}, {prepareLeases: prepare});
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(owned!.entries.map(entry => entry.side)).toEqual(['current', 'reference']);
+      expect(result.schemas.current_duration.traceId).toBe(traceId);
+      expect(result.schemas.reference_duration.traceId).toBe(referenceTraceId);
+      expect(query.mock.calls.filter(call => call[1] === sql).map(call => call[0])).toEqual([traceId, referenceTraceId]);
+      expect(result.rows.current_duration).toHaveLength(1);
+      expect(result.rows.reference_duration).toHaveLength(1);
+      for (const entry of owned!.entries) expect(getTraceProcessorLeaseStore().getLeaseById(scope, entry.lease.id))
+        .toMatchObject({state: 'released', holderCount: 0});
+    });
+  });
+
   it('loads a tainted shared instance, uses one real isolated group for the original JOIN, and releases it', async () => {
     await withLoadedTrace(async (service, traceId) => {
       const shared = service.getRunningNativeProcessorObservation(traceId)!;

@@ -4,9 +4,33 @@
 
 import {
   buildOpenAIChatCompletionsTokenLimit,
+  buildOpenAITextRequestPurposeOptions,
   isOpenAIChatCompletionsOutputTruncated,
   readOpenAIChatCompletionsOutput,
 } from '../openAiChatCompletionsCompat';
+
+describe('official DeepSeek classification protocol options', () => {
+  it.each(['https://api.deepseek.com/v1/chat/completions', 'https://API.DEEPSEEK.COM:443/responses'])(
+    'uses only the parsed official origin for %s', url => {
+      const requestUrl = new URL(url);
+      expect(buildOpenAITextRequestPurposeOptions({requestUrl, protocol: 'chat_completions', purpose: 'classification'}))
+        .toEqual({thinking: {type: 'disabled'}});
+      expect(buildOpenAITextRequestPurposeOptions({requestUrl, protocol: 'responses', purpose: 'classification'}))
+        .toEqual({reasoning: {effort: 'none'}});
+      expect(buildOpenAITextRequestPurposeOptions({requestUrl, protocol: 'chat_completions'})).toEqual({});
+      expect(buildOpenAITextRequestPurposeOptions({requestUrl, protocol: 'responses'})).toEqual({});
+    },
+  );
+  it.each(['http://api.deepseek.com/chat/completions', 'https://api.deepseek.com:8443/chat/completions',
+    'https://api.deepseek.com.evil.test/chat/completions', 'https://evil.test/api.deepseek.com/chat/completions',
+    'https://gateway.example/v1/chat/completions', 'https://api.deepseek.com@evil.test/chat/completions'])(
+    'leaves other endpoints unchanged: %s', url => {
+      for (const protocol of ['chat_completions', 'responses'] as const) expect(buildOpenAITextRequestPurposeOptions({
+        requestUrl: new URL(url), protocol, purpose: 'classification',
+      })).toEqual({});
+    },
+  );
+});
 
 describe('OpenAI Chat Completions token-limit compatibility', () => {
   it.each([

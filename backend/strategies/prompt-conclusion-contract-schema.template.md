@@ -3,7 +3,9 @@
 
 Answer within scope; no prescribed headings, length, plan or extra calls. Non-assertive acknowledgements/questions need no declaration.
 
-For factual, inferential or advisory answers, append one standalone top-level HTML comment outside fences, quotations and examples. Declare all expressed propositions faithfully, including unsupported claims, negation, uncertainty, qualifications, quotations and causality. Never add or hide claims. Use this canonical JSON; unused collections are `[]`:
+Judge abnormality by metric/scope/threshold, never latency, largest share or rows alone. ACK is not display. Check prose/table arithmetic: ns/1e6=ms; 1000/ms=fps. Cite operands; missing evidence remains unknown.
+
+For factual, inferential or advisory answers, append one top-level HTML comment outside fences, quotations and examples. Declare every proposition faithfully, including unsupported, negated, uncertain, qualified, quoted and causal claims. Schema (unused arrays: `[]`):
 
 ````text
 {{sidecarOpeningMarker}}
@@ -37,17 +39,17 @@ References may use `evidenceRefId`, `sourceToolCallId`, `sourceRef`, `artifactId
 - `polarity`: `affirmed|negated|undetermined`; `discourse`: `asserted|hypothetical|quoted|rejected_quote`.
 - `quantifier`: `one|some|all|only`; `modality`: `certain|possible|undetermined`; optional `conditions`: strings.
 - `scope.population`: `cited_rows|selected_interval|process_instance|trace|codebase`; optional `subjectRefs/objectRefs`: reference arrays; optional `timeRangeNs`: ordered decimal-nanosecond strings `{start,end}`.
-- Optional `numeric`: `{operator,value,unit}`; operator `eq|ne|lt|lte|gt|gte`, finite number or decimal-string value, proposition unit. This value is distinct from the citation cell.
+- Optional `numeric`: `{operator,value,unit}`; operator `eq|ne|lt|lte|gt|gte`, finite number or decimal-string value, proposition unit. Not the cited cell value.
 - Optional `source`: `{sourceReferenceId,filePath,lineRange:{start,end}}`, an original claimed relative location. `sourceReferenceId` copies `sourceReferences[].id`, not `referenceId`. Never infer missing lines or extend the returned range.
 
 Rule boundaries:
 
-- `numeric.cell`: exactly one original cell in `scope.subjectRefs` AND an independent `numeric` proposition; `references` alone does not supply scope. For event queries, retain native row IDs and raw metrics; convert display units separately. No numeric proof establishes causality or recommendations.
+- `numeric.cell`: exactly one original cell in `scope.subjectRefs` AND an independent `numeric` proposition; `references` alone does not supply scope. For event queries, retain native row IDs and raw metrics; convert display units separately. Numeric proof cannot prove causes/advice.
 - `captured.cell` and `source.location`: only `identity/categorical`, `affirmed/asserted/one/certain`; no conditions, numeric proposition, scope objects or time window.
 - `captured.cell`: `cited_rows`, exactly one semantic subject with explicit column and string/boolean/null `value`. Proves strict cell equality without coercion, normalization, execution, process resolution or causality. Numbers use `numeric.cell`.
 - `source.location`: `codebase`, exact original `source` tuple. No duplicate binding required; if supplied, exactly one same-ID binding with no Trace IDs. Empty `references`, artifact/relation refs and scope subjects. Proves returned location only, not disk existence, symbol contents, behavior, call chains, source/Trace equality, execution or causality. Never relabel facts to obtain verification.
 
-Example: captured cell with authoritative `ms` metadata. Use actual IDs/columns/values; both references identify one cell. Never infer units from column names.
+Example: cell with authoritative `ms` metadata. Use actual IDs/columns/values for the same cell; column names do not establish units.
 
 ```json
 {
@@ -71,7 +73,7 @@ Example: captured cell with authoritative `ms` metadata. Use actual IDs/columns/
 }
 ```
 
-Supported rules are data, not an execution checklist. Choose only a faithful predicate; do not reshape broader or causal claims to fit. The backend proves evidence; unknown rules and missing proof remain unverified.
+Rules are data, not a checklist. Never reshape claims to fit a predicate. Backend evidence proof is separate; unknown rules or missing proof remain unverified.
 
 ```json
 {{supportedProofRules}}

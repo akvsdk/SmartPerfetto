@@ -5,6 +5,7 @@
 
 import 'dotenv/config';
 import { installEpipeGuard } from '../utils/epipeGuard';
+import {backendLogPath} from '../runtimePaths';
 installEpipeGuard();
 
 import cors from 'cors';
@@ -43,6 +44,7 @@ import type {ClaimSupportV1, EvidenceAnchorV1} from '../types/evidenceContract';
 import type {AnalysisDeliveryAssurance, AnalysisCompletion} from '../types/analysisDelivery';
 import {analysisDeliveryFingerprint} from '../types/analysisDelivery';
 import type {AnalysisTurnIntent} from '../agentRuntime/analysisTurnIntent';
+import type {FinalInvestigationAssessment, InvestigationRequirementAssessment} from '../types/analysisInvestigationAssessment';
 import {sanitizeCandidateProtocolDiagnostic, type CandidateProtocolDiagnostic} from '../services/canonicalAnalysisResult';
 import {WorkingTraceProcessor} from '../services/workingTraceProcessor';
 import {analyzeRawSqlDirectProjection} from '../services/evidence/rawSqlDirectProjection';
@@ -268,7 +270,7 @@ export interface AgentSseExpectedFact {
   value?: FactScalar;
   unit?: string;
   /** Suite-owned read-only query. Results never enter the model context. */
-  oracle?: {sql: string; column: string; unit?: string;
+  oracle?: {sql: string; column: string; unit?: string; traceSide?: 'current' | 'reference';
     anchorMatch?: {startTs?: string; upid?: string;
       nativeRow?: {relation: string; idColumn: string; oracleColumn: string}}};
 }
@@ -277,8 +279,33 @@ export interface AgentSseExpectation {
   schemaVersion: 1;
   intent: Partial<Pick<AnalysisTurnIntent, 'sceneId' | 'taskKind' | 'scope' | 'deliverable' | 'evidenceAccess'>>;
   facts: AgentSseExpectedFact[];
+  investigation?: AgentSseInvestigationExpectation;
   /** Explicitly unmeasured facets, such as source recommendation wording. */
   uncoveredFacets?: string[];
+}
+
+export interface AgentSseInvestigationExpectation {
+  contentAssurance: NonNullable<AnalysisDeliveryAssurance['investigation']>;
+  evidenceAssurance: NonNullable<AnalysisDeliveryAssurance['investigationEvidence']>;
+  assessmentStatus: FinalInvestigationAssessment['status'];
+  requirements: Array<{
+    id: string;
+    domain: string;
+    applicability: InvestigationRequirementAssessment['applicability'];
+    coverage: InvestigationRequirementAssessment['coverage'];
+    acquisition: InvestigationRequirementAssessment['acquisition'];
+    scopeMatch: InvestigationRequirementAssessment['scopeMatch'];
+    records?: Array<{
+      metricId: string;
+      traceSide: 'current' | 'reference';
+      origin?: 'current_run' | 'reused' | 'unknown';
+      upid?: number;
+      utid?: number;
+      window?: {start: string; end: string};
+      /** Resolve window/identity from an independently collected fact oracle row. */
+      oracleScope?: {factId: string; startColumn: string; endColumn: string; upidColumn?: string; utidColumn?: string};
+    }>;
+  }>;
 }
 
 export interface TerminalAnalysisEvidence {
@@ -290,6 +317,7 @@ export interface TerminalAnalysisEvidence {
   conclusionContract?: ConclusionContract;
   claimVerificationResult?: ClaimVerificationResult;
   claimSupport?: ClaimSupportV1[];
+  investigationAssessment?: FinalInvestigationAssessment;
 }
 
 export type AgentSseOracleRows = Record<string, Array<Record<string, unknown>>>;
@@ -364,6 +392,7 @@ export async function prepareAgentSseNativeOracle(input: {
 export async function collectAgentSseOracleEvidence(input: {
   expectation: AgentSseExpectation;
   traceId: string;
+  referenceTraceId?: string;
   service: TraceProcessorService;
   scope: EnterpriseRepositoryScope;
   deadlineMs: number;
@@ -371,20 +400,45 @@ export async function collectAgentSseOracleEvidence(input: {
 }, dependencies: Parameters<typeof prepareAgentSseNativeOracle>[1] & {
   prepareLeases?: typeof prepareAnalysisRunTraceProcessorLeases;
 } = {}): Promise<{rows: AgentSseOracleRows; schemas: AgentSseOracleNativeSchemas}> {
+  const needsReference = input.expectation.facts.some(fact => fact.oracle?.traceSide === 'reference');
+  if (needsReference && (!input.referenceTraceId || input.referenceTraceId === input.traceId)) {
+    throw new Error('Task reference trace oracle unavailable');
+  }
+  const sides: Array<['current' | 'reference', string]> = [['current', input.traceId]];
+  if (needsReference) sides.push(['reference', input.referenceTraceId!]);
   if (!input.expectation.facts.some(fact => fact.oracle?.anchorMatch?.nativeRow)) {
-    return {rows: await collectAgentSseOracleRows(input.expectation, sql => input.service.query(input.traceId, sql)), schemas: {}};
+    const registrations = new Map(sides.map(([, id]) => [id, input.service.getTrace(id)]));
+    const assertPair = () => {
+      input.signal?.throwIfAborted();
+      if (!needsReference) return;
+      if (Date.now() >= input.deadlineMs || sides.some(([, id]) => !registrations.get(id) ||
+        input.service.getTrace(id) !== registrations.get(id) || registrations.get(id)?.status !== 'ready' || registrations.get(id)?.id !== id)) {
+        throw new Error('Task reference trace oracle registration changed');
+      }
+    };
+    assertPair();
+    const rows = await collectAgentSseOracleRows(input.expectation, async (sql, side) => {
+      assertPair();
+      const result = await input.service.query(side === 'reference' ? input.referenceTraceId! : input.traceId, sql);
+      assertPair();
+      return result;
+    });
+    return {rows, schemas: {}};
   }
   if (!Number.isFinite(input.deadlineMs)) throw new Error('Task native row oracle deadline invalid');
   const controller = new AbortController();
   const signal = input.signal ? AbortSignal.any([input.signal, controller.signal]) : controller.signal;
-  const registered = input.service.getTrace(input.traceId);
+  const registered = new Map(sides.map(([side, id]) => [side, input.service.getTrace(id)]));
   const assertOwner = () => {
     if (!signal.aborted && Date.now() >= input.deadlineMs) {
       controller.abort(new DOMException('Task native row oracle deadline exceeded', 'TimeoutError'));
     }
     signal.throwIfAborted();
-    if (!registered || input.service.getTrace(input.traceId) !== registered || registered.id !== input.traceId || registered.status !== 'ready') {
-      throw new Error('Task native row oracle registration changed');
+    for (const [side, id] of sides) {
+      const registration = registered.get(side);
+      if (!registration || input.service.getTrace(id) !== registration || registration.id !== id || registration.status !== 'ready') {
+        throw new Error('Task native row oracle registration changed');
+      }
     }
   };
   assertOwner();
@@ -406,6 +460,7 @@ export async function collectAgentSseOracleEvidence(input: {
     assertOwner();
     const preparation = (dependencies.prepareLeases ?? prepareAnalysisRunTraceProcessorLeases)({
       service: input.service, scope: input.scope, currentTraceId: input.traceId,
+      ...(needsReference ? {referenceTraceId: input.referenceTraceId} : {}),
       runId: `verification-oracle-${randomUUID()}`, sessionId: `verification-oracle-${randomUUID()}`,
       signal, assertCurrent: assertOwner,
       onInvalidated: error => controller.abort(error),
@@ -415,20 +470,29 @@ export async function collectAgentSseOracleEvidence(input: {
     group = await Promise.race([preparation, aborted]);
     const ownedGroup = group;
     const result = await Promise.race([ownedGroup.run(async () => {
-      const entries = ownedGroup.entries.filter(entry => entry.side === 'current' && entry.context.traceId === input.traceId);
-      if (entries.length !== 1 || ownedGroup.entries.length !== 1) throw new Error('Task native row oracle lease unavailable');
-      const entry = entries[0];
-      const pin = await prepareAgentSseNativeOracle({expectation: input.expectation, traceId: input.traceId,
-        service: input.service, signal, lease: entry, assertCurrent: () => {assertOwner(); ownedGroup.assertCurrent();}}, dependencies);
-      const rows = await collectAgentSseOracleRows(input.expectation, async sql => {
-        await pin.assertCurrent();
-        const result = await input.service.query(input.traceId, sql, {signal,
-          leaseId: entry.lease.id, leaseMode: entry.lease.mode, leaseScope: entry.context.leaseScope});
-        await pin.assertCurrent();
-        return result;
-      });
-      await pin.assertCurrent();
-      return {rows, schemas: pin.schemas};
+      if (ownedGroup.entries.length !== sides.length) throw new Error('Task native row oracle lease unavailable');
+      const rows: AgentSseOracleRows = Object.create(null);
+      const schemas: AgentSseOracleNativeSchemas = Object.create(null);
+      const pins: Array<Awaited<ReturnType<typeof prepareAgentSseNativeOracle>>> = [];
+      for (const [side, targetTraceId] of sides) {
+        const entries = ownedGroup.entries.filter(entry => entry.side === side && entry.context.traceId === targetTraceId);
+        if (entries.length !== 1) throw new Error('Task native row oracle lease unavailable');
+        const entry = entries[0];
+        const expectation = {...input.expectation, facts: input.expectation.facts.filter(fact => (fact.oracle?.traceSide ?? 'current') === side)};
+        const pin = await prepareAgentSseNativeOracle({expectation, traceId: targetTraceId,
+          service: input.service, signal, lease: entry, assertCurrent: () => {assertOwner(); ownedGroup.assertCurrent();}}, dependencies);
+        pins.push(pin);
+        Object.assign(rows, await collectAgentSseOracleRows(expectation, async sql => {
+          for (const active of pins) await active.assertCurrent();
+          const result = await input.service.query(targetTraceId, sql, {signal,
+            leaseId: entry.lease.id, leaseMode: entry.lease.mode, leaseScope: entry.context.leaseScope});
+          for (const active of pins) await active.assertCurrent();
+          return result;
+        }));
+        Object.assign(schemas, pin.schemas);
+      }
+      for (const pin of pins) await pin.assertCurrent();
+      return {rows, schemas};
     }), aborted]);
     assertOwner();
     return result;
@@ -459,8 +523,8 @@ function nativeOracleAnchorMatches(input: {
   return row.anchorId === anchor.anchorId && row.evidenceRefId === anchor.evidenceRefId &&
     proof.deterministicProof.anchorIds.includes(row.anchorId) && proof.deterministicProof.evidenceRefIds.includes(row.evidenceRefId) &&
     typeof row.captureId === 'string' && row.captureId.length > 0 && row.captureId === anchor.context.captureId &&
-    row.traceId === input.traceId && row.traceId === anchor.context.traceId && row.traceSide === 'current' &&
-    anchor.context.traceSide === 'current' && row.relation === schema.relation && row.idColumn === schema.idColumn &&
+    row.traceId === input.traceId && row.traceId === anchor.context.traceId && row.traceSide === (input.fact.oracle?.traceSide ?? 'current') &&
+    anchor.context.traceSide === row.traceSide && row.relation === schema.relation && row.idColumn === schema.idColumn &&
     row.schemaFingerprint === schema.schemaFingerprint && /^[a-f0-9]{64}$/.test(row.schemaFingerprint) &&
     Number.isSafeInteger(row.id) && row.id >= 0 && row.id === input.oracleRow[tuple.oracleColumn];
 }
@@ -599,7 +663,7 @@ export function parseAgentSseExpectation(value: unknown): AgentSseExpectation {
   const strings = (v: unknown): v is string[] => Array.isArray(v) && v.length > 0 && v.every(s => typeof s === 'string' && s.trim());
   const scalar = (v: unknown) => typeof v === 'string' || typeof v === 'boolean' || typeof v === 'number' && Number.isFinite(v);
   const fail = (): never => {throw new Error('Invalid --expectation-json: expected agent SSE expectation schemaVersion 1');};
-  if (!object(value) || !keys(value, ['schemaVersion', 'intent', 'facts', 'uncoveredFacets']) || value.schemaVersion !== 1 ||
+  if (!object(value) || !keys(value, ['schemaVersion', 'intent', 'facts', 'investigation', 'uncoveredFacets']) || value.schemaVersion !== 1 ||
       !object(value.intent) || !keys(value.intent, ['sceneId', 'taskKind', 'scope', 'deliverable', 'evidenceAccess']) ||
       !Object.keys(value.intent).length || !Array.isArray(value.facts) || !value.facts.length ||
       (value.uncoveredFacets !== undefined && !strings(value.uncoveredFacets))) return fail();
@@ -620,8 +684,9 @@ export function parseAgentSseExpectation(value: unknown): AgentSseExpectation {
     ids.add(fact.id);
     if (fact.oracle !== undefined) {
       const oracle = fact.oracle;
-      if (!object(oracle) || !keys(oracle, ['sql', 'column', 'unit', 'anchorMatch']) ||
+      if (!object(oracle) || !keys(oracle, ['sql', 'column', 'unit', 'traceSide', 'anchorMatch']) ||
           typeof oracle.sql !== 'string' || !oracle.sql.trim() || typeof oracle.column !== 'string' || !oracle.column.trim() ||
+          (oracle.traceSide !== undefined && !['current', 'reference'].includes(String(oracle.traceSide))) ||
           (oracle.unit !== undefined && (typeof oracle.unit !== 'string' || !oracle.unit.trim())) ||
           (oracle.anchorMatch !== undefined && (!object(oracle.anchorMatch) || !keys(oracle.anchorMatch, ['startTs', 'upid', 'nativeRow']) ||
             [oracle.anchorMatch.startTs, oracle.anchorMatch.upid].some(v => v !== undefined && (typeof v !== 'string' || !v.trim()))))) return fail();
@@ -633,6 +698,42 @@ export function parseAgentSseExpectation(value: unknown): AgentSseExpectation {
       const query = oracle.sql.replace(/^(?:\s*INCLUDE\s+PERFETTO\s+MODULE\s+[\w.]+\s*;)*/i, '').replace(/;\s*$/, '');
       if (!/^\s*(SELECT|WITH)\b/i.test(query) || query.includes(';') ||
           /\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|REPLACE)\b/i.test(oracle.sql)) return fail();
+    }
+  }
+  if (value.investigation !== undefined) {
+    const investigation = value.investigation;
+    const assurance = ['not_applicable', 'not_checked', 'unavailable', 'coverage_incomplete', 'passed', 'failed'];
+    if (!object(investigation) || !keys(investigation, ['contentAssurance', 'evidenceAssurance', 'assessmentStatus', 'requirements']) ||
+      !assurance.includes(String(investigation.contentAssurance)) || !assurance.includes(String(investigation.evidenceAssurance)) ||
+      !['not_checked', 'unavailable', 'coverage_incomplete', 'checked'].includes(String(investigation.assessmentStatus)) ||
+      !Array.isArray(investigation.requirements) || !investigation.requirements.length) return fail();
+    const requirementIds = new Set<string>();
+    const ns = (v: unknown): v is string => typeof v === 'string' && /^(0|[1-9][0-9]*)$/.test(v) && v.length <= 20;
+    for (const row of investigation.requirements) {
+      if (!object(row) || !keys(row, ['id', 'domain', 'applicability', 'coverage', 'acquisition', 'scopeMatch', 'records']) ||
+        typeof row.id !== 'string' || !row.id.trim() || requirementIds.has(row.id) || typeof row.domain !== 'string' || !row.domain.trim() ||
+        !['applicable', 'not_applicable', 'unknown'].includes(String(row.applicability)) ||
+        !['covered', 'missing', 'unknown'].includes(String(row.coverage)) ||
+        !['observed', 'insufficient', 'not_checked', 'failed', 'not_applicable', 'unknown'].includes(String(row.acquisition)) ||
+        !['matched', 'mismatched', 'unknown'].includes(String(row.scopeMatch)) ||
+        (row.records !== undefined && (!Array.isArray(row.records) || !row.records.length))) return fail();
+      requirementIds.add(row.id);
+      for (const record of (row.records ?? []) as unknown[]) {
+        if (!object(record) || !keys(record, ['metricId', 'traceSide', 'origin', 'upid', 'utid', 'window', 'oracleScope']) ||
+          typeof record.metricId !== 'string' || !record.metricId.trim() || !['current', 'reference'].includes(String(record.traceSide)) ||
+          (record.origin !== undefined && !['current_run', 'reused', 'unknown'].includes(String(record.origin))) ||
+          [record.upid, record.utid].some(id => id !== undefined && (!Number.isSafeInteger(id) || (id as number) < 0))) return fail();
+        if (record.window !== undefined && (!object(record.window) || !keys(record.window, ['start', 'end']) ||
+          !ns(record.window.start) || !ns(record.window.end) || BigInt(record.window.end) <= BigInt(record.window.start))) return fail();
+        if (record.oracleScope !== undefined) {
+          const scope = record.oracleScope;
+          if (!object(scope) || !keys(scope, ['factId', 'startColumn', 'endColumn', 'upidColumn', 'utidColumn']) ||
+            !['factId', 'startColumn', 'endColumn'].every(key => typeof scope[key] === 'string' && (scope[key] as string).trim()) ||
+            [scope.upidColumn, scope.utidColumn].some(column => column !== undefined && (typeof column !== 'string' || !column.trim())) ||
+            !value.facts.some(fact => object(fact) && fact.id === scope.factId && object(fact.oracle) &&
+              (fact.oracle.traceSide ?? 'current') === record.traceSide)) return fail();
+        }
+      }
     }
   }
   return structuredClone(value) as unknown as AgentSseExpectation;
@@ -655,10 +756,87 @@ function factValueEquals(actual: unknown, actualUnit: string | undefined, expect
     left * timeScale[actualUnit] === right * timeScale[expectedUnit]);
 }
 
+/** Assert server-issued investigation projection bindings; prose and tool counts are not proof. */
+export function evaluateAgentSseInvestigationExpectation(input: {
+  terminal?: TerminalAnalysisEvidence;
+  expectation: AgentSseInvestigationExpectation;
+  traceId: string;
+  referenceTraceId?: string;
+  oracleRows?: AgentSseOracleRows;
+}): Record<string, boolean> {
+  const {terminal, expectation, traceId, referenceTraceId} = input;
+  const assessment = terminal?.investigationAssessment;
+  const binding = assessment?.binding;
+  const completion = terminal?.completion;
+  const body = terminal?.conclusion ?? '';
+  const records = assessment?.evidenceRecords ?? [];
+  const nonempty = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+  const ns = (value: unknown): bigint | undefined => {
+    const text = String(value);
+    return /^(0|[1-9][0-9]*)$/.test(text) && text.length <= 20 &&
+      (typeof value !== 'number' || Number.isSafeInteger(value)) ? BigInt(text) : undefined;
+  };
+  const checks: Record<string, boolean> = {
+    'investigation:contentAssurance': terminal?.deliveryAssurance?.investigation === expectation.contentAssurance,
+    'investigation:evidenceAssurance': terminal?.deliveryAssurance?.investigationEvidence === expectation.evidenceAssurance,
+    'investigation:assessmentStatus': assessment?.schemaVersion === 1 && assessment.status === expectation.assessmentStatus,
+    'investigation:candidateBinding': Boolean(binding && completion && nonempty(binding.candidateRef) && nonempty(binding.runId) &&
+      nonempty(binding.attemptId) && nonempty(binding.registryFingerprint) && binding.candidateRef === completion.candidateRef &&
+      binding.runId === completion.runId && binding.attemptId === completion.attemptId &&
+      binding.conclusionFingerprint === analysisDeliveryFingerprint(body) &&
+      binding.conclusionContractFingerprint === analysisDeliveryFingerprint(terminal?.conclusionContract) &&
+      binding.registryFingerprint === terminal?.turnIntent?.registryFingerprint &&
+      binding.intentFingerprint === analysisDeliveryFingerprint(terminal?.turnIntent) &&
+      nonempty(binding.requirementsFingerprint) && nonempty(binding.evidenceFingerprint) && nonempty(binding.ledgerFingerprint)),
+    'investigation:uniqueRequirements': Boolean(assessment && new Set(assessment.requirements.map(row => row.requirementId)).size === assessment.requirements.length),
+    'investigation:uniqueRecords': new Set(records.map(record => record.recordId)).size === records.length,
+    'investigation:recordsBinding': !expectation.requirements.some(row => row.records?.length) ||
+      Boolean(binding?.evidenceRecordsFingerprint && binding.evidenceRecordsFingerprint === analysisDeliveryFingerprint(records)),
+  };
+  for (const expected of expectation.requirements) {
+    const rows = assessment?.requirements.filter(row => row.requirementId === expected.id) ?? [];
+    const row = rows.length === 1 ? rows[0] : undefined;
+    checks[`investigation:requirement:${expected.id}`] = Boolean(row && row.domain === expected.domain &&
+      row.applicability === expected.applicability && row.coverage === expected.coverage &&
+      row.acquisition === expected.acquisition && row.evidenceStatus === expected.acquisition && row.scopeMatch === expected.scopeMatch &&
+      (row.coverage !== 'covered' || (row.contentLocations.length > 0 && row.contentLocations.every(location =>
+        Number.isSafeInteger(location.start) && Number.isSafeInteger(location.end) && location.start >= 0 &&
+        location.end > location.start && location.end <= body.length))) &&
+      new Set(row.evidenceRecordIds).size === row.evidenceRecordIds.length);
+    for (const [index, desired] of (expected.records ?? []).entries()) {
+      checks[`investigation:record:${expected.id}:${index}`] = Boolean(row?.evidenceRecordIds.some(recordId => {
+        const candidates = records.filter(record => record.recordId === recordId);
+        const record = candidates.length === 1 ? candidates[0] : undefined;
+        if (!record || record.domain !== expected.domain || record.metricId !== desired.metricId ||
+          record.traceSide !== desired.traceSide || record.traceId !== (desired.traceSide === 'current' ? traceId : referenceTraceId) ||
+          !nonempty(record.traceId) || !nonempty(record.captureId) || !nonempty(record.recordId) || !record.window ||
+          !Number.isSafeInteger(record.rowIndex) || record.rowIndex < 0 ||
+          !record.recordId.startsWith(`${record.captureId}:${record.rowIndex}:`) ||
+          !nonempty(record.definitionFingerprint) || !nonempty(record.selectedSqlHash) || !nonempty(record.skillId) || !nonempty(record.stepId) ||
+          (desired.origin !== undefined && record.origin !== desired.origin) ||
+          (record.origin === 'current_run' && record.originRunId !== completion?.runId) ||
+          (desired.upid !== undefined && record.upid !== desired.upid) || (desired.utid !== undefined && record.utid !== desired.utid) ||
+          (expected.acquisition === 'observed' && record.status !== 'observed')) return false;
+        const start = ns(record.window.start), end = ns(record.window.end);
+        if (start === undefined || end === undefined || end <= start) return false;
+        if (desired.window && (start !== ns(desired.window.start) || end !== ns(desired.window.end))) return false;
+        const scope = desired.oracleScope;
+        if (!scope) return true;
+        return (input.oracleRows?.[scope.factId] ?? []).some(oracle =>
+          start === ns(oracle[scope.startColumn]) && end === ns(oracle[scope.endColumn]) &&
+          (!scope.upidColumn || record.upid === oracle[scope.upidColumn]) &&
+          (!scope.utidColumn || record.utid === oracle[scope.utidColumn]));
+      }));
+    }
+  }
+  return checks;
+}
+
 /** Transport projections do not reissue capture witnesses. v2 proves the retained raw cells. */
 export function evaluateAgentSseExpectation(input: {
   terminal?: TerminalAnalysisEvidence; expectation: AgentSseExpectation; traceId: string; oracleRows?: AgentSseOracleRows;
   oracleNativeSchemas?: AgentSseOracleNativeSchemas;
+  referenceTraceId?: string;
 }): {checks: Record<string, boolean>; facts: Record<string, AgentSseFactVerification>; uncoveredFacets: string[]} {
   const {terminal, expectation, traceId} = input;
   const claims = terminal?.conclusionContract?.claims ?? [];
@@ -683,8 +861,13 @@ export function evaluateAgentSseExpectation(input: {
         (result.status === 'verified' || result.status === 'inference')).length === 1),
   };
   for (const [key, value] of Object.entries(expectation.intent)) checks[`intent:${key}`] = terminal?.turnIntent?.[key as keyof AnalysisTurnIntent] === value;
+  if (expectation.investigation) Object.assign(checks, evaluateAgentSseInvestigationExpectation({
+    ...input, expectation: expectation.investigation,
+  }));
   const facts: Record<string, AgentSseFactVerification> = Object.create(null);
   for (const fact of expectation.facts) {
+    const traceSide = fact.oracle?.traceSide ?? 'current';
+    const factTraceId = traceSide === 'reference' ? input.referenceTraceId : traceId;
     const matchedAnchorIds = new Set<string>();
     const matchedClaims = claims.filter(claim => {
       const semantics = claim.semantics;
@@ -698,7 +881,7 @@ export function evaluateAgentSseExpectation(input: {
           proof.deterministicProof.kind !== 'numeric_cell' ||
           proof.propositionCoverage?.status !== 'complete' || proof.propositionCoverage.uncovered.length > 0)) return false;
       return support[0].anchors.some(anchor => {
-        if (anchor.missing || anchor.context.traceId !== traceId || anchor.context.traceSide !== 'current') return false;
+        if (anchor.missing || !factTraceId || anchor.context.traceId !== factTraceId || anchor.context.traceSide !== traceSide) return false;
         if (fact.verification === 'proved' && (!proof?.deterministicProof?.anchorIds.includes(anchor.anchorId) ||
             !proof.deterministicProof.evidenceRefIds.includes(anchor.evidenceRefId))) return false;
         return anchor.cells?.some(cell => {
@@ -722,7 +905,7 @@ export function evaluateAgentSseExpectation(input: {
             const unit = fact.oracle?.unit ?? fact.unit;
             if (fact.value !== undefined && !factValueEquals(expected, unit, fact.value, fact.unit)) return false;
             const nativeMatch = nativeOracleAnchorMatches({fact, proof, anchor, oracleRow: row,
-              schema: input.oracleNativeSchemas?.[fact.id], traceId});
+              schema: input.oracleNativeSchemas?.[fact.id], traceId: factTraceId});
             if (nativeMatch === false) return false;
             const match = fact.oracle?.anchorMatch;
             if (nativeMatch === true) {
@@ -753,15 +936,17 @@ export function evaluateAgentSseExpectation(input: {
     ...expectation.facts.filter(fact => fact.verification === 'reference_only').map(fact => `${fact.id}: proposition proof unavailable`)]};
 }
 
-export async function collectAgentSseOracleRows(expectation: AgentSseExpectation, query: (sql: string) => Promise<{
+export async function collectAgentSseOracleRows(expectation: AgentSseExpectation, query: (sql: string, traceSide: 'current' | 'reference') => Promise<{
   columns: string[]; rows: unknown[][]; error?: string;
 }>): Promise<AgentSseOracleRows> {
   const out: AgentSseOracleRows = Object.create(null);
   const queried = new Map<string, Awaited<ReturnType<typeof query>>>();
   for (const fact of expectation.facts) {
     if (!fact.oracle) continue;
-    let result = queried.get(fact.oracle.sql);
-    if (!result) {result = await query(fact.oracle.sql); queried.set(fact.oracle.sql, result);}
+    const traceSide = fact.oracle.traceSide ?? 'current';
+    const queryKey = `${traceSide}:${fact.oracle.sql}`;
+    let result = queried.get(queryKey);
+    if (!result) {result = await query(fact.oracle.sql, traceSide); queried.set(queryKey, result);}
     if (result.error || !result.columns.includes(fact.oracle.column) || !result.rows.length || result.rows.length > 100_000) {
       throw new Error(`Task fact oracle unavailable: ${fact.id}`);
     }
@@ -2169,6 +2354,10 @@ export function writeVerificationDiagnostics(outputPath: string, snapshot: Verif
   }
 }
 
+export class VerificationLifecycleError extends Error {
+  constructor(readonly code: string) {super('The analysis lifecycle failed');}
+}
+
 /** Only verifier-issued phase/status fields enter failure artifacts, never error or provider text. */
 export async function recordVerificationFailureAndCancel(input: {
   baseUrl: string;
@@ -2189,8 +2378,10 @@ export async function recordVerificationFailureAndCancel(input: {
     timeoutMs: input.timeoutMs,
     sessionId: input.sessionId || undefined,
     runId: input.runId || undefined,
-    errorCode: input.error instanceof VerificationSseTimeoutError ? 'SSE_TIMEOUT'
+    errorCode: input.error instanceof VerificationLifecycleError ? input.error.code
+      : input.error instanceof VerificationSseTimeoutError ? 'SSE_TIMEOUT'
       : input.error instanceof VerificationSliceSelectionError ? input.error.code : 'VERIFICATION_FAILED',
+    ...preserveVerificationSessionLog(input.outputPath, input.sessionId ?? ''),
     ...(input.selectionResolution ? {selectionResolution: input.selectionResolution} : {}),
     cancellation: input.sessionId && input.runId ? 'pending' : 'not_owned',
     passed: false,
@@ -2468,6 +2659,7 @@ export async function collectSseSummary(
                 conclusionContract: payload.conclusionContract as TerminalAnalysisEvidence['conclusionContract'],
                 claimVerificationResult: payload.claimVerificationResult as TerminalAnalysisEvidence['claimVerificationResult'],
                 claimSupport: payload.claimSupport as TerminalAnalysisEvidence['claimSupport'],
+                investigationAssessment: payload.investigationAssessment as TerminalAnalysisEvidence['investigationAssessment'],
               };
             }
             if (typeof payload?.conclusion === 'string') {
@@ -2596,6 +2788,10 @@ export async function collectSseSummary(
           }
 
           if (event === 'error') {
+            const lifecycleCode = payload?.code ?? payload?.errorCode;
+            if (typeof lifecycleCode === 'string' && /^[A-Za-z][A-Za-z0-9_]{3,100}$/.test(lifecycleCode)) {
+              throw new VerificationLifecycleError(lifecycleCode);
+            }
             if (typeof payload?.message === 'string') {
               summary.errorEvents.push(payload.message);
             } else {
@@ -2805,8 +3001,8 @@ async function postJsonResponse(
   return {ok: response.ok, status: response.status, payload};
 }
 
-function findSessionLogFile(sessionId: string): string | null {
-  const logDir = path.resolve(process.cwd(), 'logs/sessions');
+export function findSessionLogFile(sessionId: string): string | null {
+  const logDir = backendLogPath('sessions');
   if (!fs.existsSync(logDir)) {
     return null;
   }
@@ -2821,6 +3017,39 @@ function findSessionLogFile(sessionId: string): string | null {
   }
 
   return path.join(logDir, files[files.length - 1]);
+}
+
+/** Preserve this task's session evidence before isolated runtime cleanup, without credentials. */
+export function preserveVerificationSessionLog(outputPath: string, sessionId: string): {
+  sessionLogFile?: string; lifecycleErrorCode?: string;
+} {
+  if (!sessionId) return {};
+  const source = findSessionLogFile(sessionId);
+  if (!source) return {};
+  const secrets = Object.entries(process.env).filter(([key, value]) =>
+    /key|token|password|secret|credential/i.test(key) && value && value.length >= 8).map(([, value]) => value!);
+  const redact = (value: unknown): unknown => {
+    if (typeof value === 'string') return secrets.reduce((text, secret) => text.split(secret).join('[REDACTED]'), value)
+      .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [REDACTED]');
+    if (Array.isArray(value)) return value.map(redact);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key,
+      /authorization|api[-_]?key|password|secret|credential|cookie|accessToken|refreshToken/i.test(key) ? '[REDACTED]' : redact(nested)]));
+  };
+  let lifecycleErrorCode: string | undefined;
+  const entries = fs.readFileSync(source, 'utf8').split('\n').filter(Boolean).map(line => {
+    let entry: Record<string, unknown>;
+    try {entry = JSON.parse(line);} catch {return JSON.stringify({unparsedLineHash: createHash('sha256').update(line).digest('hex')});}
+    const error = asRecord(entry.error);
+    if (entry.level === 'error' && typeof error?.message === 'string' && /^[a-z][a-z0-9_]{3,100}$/.test(error.message)) {
+      lifecycleErrorCode = error.message;
+    }
+    return JSON.stringify(redact(entry));
+  });
+  const sessionLogFile = `${outputPath}.session-log.jsonl`;
+  fs.mkdirSync(path.dirname(sessionLogFile), {recursive: true});
+  fs.writeFileSync(sessionLogFile, `${entries.join('\n')}\n`);
+  return {sessionLogFile, ...(lifecycleErrorCode ? {lifecycleErrorCode} : {})};
 }
 
 async function main(): Promise<void> {
@@ -2881,7 +3110,7 @@ async function main(): Promise<void> {
     }
     phase = 'trace_oracle';
     const oracleEvidence = options.expectation ? await collectAgentSseOracleEvidence({
-      expectation: options.expectation, traceId, service: traceProcessorService, deadlineMs: startedAt + options.timeoutMs,
+      expectation: options.expectation, traceId, referenceTraceId, service: traceProcessorService, deadlineMs: startedAt + options.timeoutMs,
       scope: {tenantId: DEFAULT_TENANT_ID, workspaceId: DEFAULT_WORKSPACE_ID, userId: DEFAULT_DEV_USER_ID},
     }) : undefined;
     const oracleRows = oracleEvidence?.rows;
@@ -2959,7 +3188,7 @@ async function main(): Promise<void> {
     }, {runId: ownedRunId});
     phase = 'analysis_verification';
     const taskVerification = options.expectation ? evaluateAgentSseExpectation({
-      terminal: sse.terminalAnalysis, expectation: options.expectation, traceId, oracleRows,
+      terminal: sse.terminalAnalysis, expectation: options.expectation, traceId, referenceTraceId, oracleRows,
       oracleNativeSchemas: oracleEvidence?.schemas,
     }) : undefined;
     const auditedLookupCounts = successfulCodeLookupToolCounts(
@@ -3197,7 +3426,7 @@ async function main(): Promise<void> {
         summary: followUpSse,
       };
     }
-    const sessionLogFile = findSessionLogFile(sessionId);
+    const preservedSessionLog = preserveVerificationSessionLog(outputPath, sessionId);
 
     const output = {
       timestamp: new Date().toISOString(),
@@ -3227,7 +3456,7 @@ async function main(): Promise<void> {
       summary: sse,
       externalIssue: externalIssueVerification?.summary,
       followUp: followUpOutput,
-      sessionLogFile,
+      ...preservedSessionLog,
     };
 
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
@@ -3247,6 +3476,7 @@ async function main(): Promise<void> {
     throw new Error(`Verification failed during ${phase}: ${failure.errorCode}; failure artifact recorded`);
   } finally {
     persistDiagnostics();
+    try {preserveVerificationSessionLog(outputPath, sessionId);} catch { /* Preserve the primary outcome if diagnostic copying fails. */ }
     if (sessionId !== '' && !options.keepSession) {
       try {
         await fetch(`${baseUrl}/api/agent/v1/${sessionId}`, { method: 'DELETE' });

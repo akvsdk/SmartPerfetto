@@ -37,10 +37,9 @@ import type {CodeAwareMode} from '../../services/codebase/codeAwareFeature';
 import type {CliAnalysisMode, TraceCaptureResult} from '../types';
 import {localize, parseOutputLanguage} from '../../agentv3/outputLanguage';
 import {privateAnalysisQueryMessage} from '../../services/security/privateAnalysisProjection';
+import {toAnalysisHistoryTurn, type AnalysisHistoryTurn} from '../../agentRuntime/analysisHistory';
+import {parseAnalysisHistoryTurn} from '../../services/analysisHistoryStore';
 
-const RESUME_CONTEXT_MAX_CHARS = 4000;
-const RESUME_TURN_MAX_CHARS = 1200;
-const RESUME_MAX_TURNS = 3;
 const CLI_LEVEL3_LINEAGE_REASON = 'cli-level3-degraded' as const;
 
 export interface TurnRunnerContext {
@@ -225,9 +224,9 @@ function escapeHtml(value: string): string {
  * Continue an existing session — reloads the trace (with the original id
  * when possible), runs turn N+1, and commits outputs to the same folder.
  *
- * Three-level degradation (plan §G.3): Level 1/2 keep sessionId+sdkSessionId
- * intact; Level 3 falls back to a fresh load with the prior conclusion
- * injected as preamble but keeps the CLI-visible session id stable.
+ * Reuse the logical backend session when the trace can be restored. A fresh
+ * trace load starts a new backend lineage while keeping the CLI session stable.
+ * Both paths supply typed history separately from the current user question.
  */
 export async function continueSession(
   ctx: TurnRunnerContext,
@@ -252,7 +251,6 @@ export async function continueSession(
   const reloaded = await ctx.service.reloadTraceById(existingConfig.traceId);
 
   let effectiveTraceId: string;
-  let effectiveQuery: string;
   let requestedSessionId: string | undefined;
   let degraded = false;
   let degradedPreviousBackendSessionId: string | undefined;
@@ -260,13 +258,11 @@ export async function continueSession(
 
   if (reloaded) {
     effectiveTraceId = existingConfig.traceId;
-    effectiveQuery = buildResumeContextQuery(sp, input.query);
     requestedSessionId = previousBackendSessionId;
     logText(ctx, `Trace reloaded (traceId=${effectiveTraceId.slice(0, 8)}…)`);
   } else {
-    logText(ctx, '(trace evicted from cache — loading fresh and replaying conclusion as preamble)');
+    logText(ctx, '(trace evicted from cache — loading fresh with prior conversation history)');
     effectiveTraceId = await ctx.service.loadTrace(existingConfig.tracePath);
-    effectiveQuery = buildResumeContextQuery(sp, input.query);
     requestedSessionId = undefined;
     degraded = true;
     degradedPreviousBackendSessionId = previousBackendSessionId;
@@ -292,7 +288,9 @@ export async function continueSession(
   const runInput: Parameters<CliAnalyzeService['runTurn']>[0] = {
     traceId: effectiveTraceId,
     referenceTraceId: effectiveReferenceTraceId,
-    query: effectiveQuery,
+    query: input.query,
+    history: readCliAnalysisHistory(sp, existingConfig.traceId,
+      Boolean(existingConfig.codebaseIds?.length || existingConfig.knowledgeSourceIds?.length)),
     sessionId: requestedSessionId,
     codeAwareMode: existingConfig.codeAwareMode,
     codebaseIds: existingConfig.codebaseIds,
@@ -455,45 +453,24 @@ function createCliLevel3Lineage(previousBackendSessionId: string): CliSessionLin
   };
 }
 
-export function buildResumeContextQuery(sp: SessionPaths, userQuery: string): string {
-  const transcriptTurns = readTranscriptTurns(sp.transcript).slice(-RESUME_MAX_TURNS);
-  let context = '';
-
-  if (transcriptTurns.length > 0) {
-    context = transcriptTurns
-      .map((turn) => {
-        const answer = turn.conclusionMd?.trim()
-          ? truncateAtBoundary(turn.conclusionMd.trim(), RESUME_TURN_MAX_CHARS)
-          : '(empty)';
-        return [
-          `Turn ${turn.turn}`,
-          `Question: ${turn.question}`,
-          `Conclusion: ${answer}`,
-        ].join('\n');
-      })
-      .join('\n\n---\n\n');
-  } else {
-    context = readConclusionContext(sp.conclusion);
-  }
-
-  if (!context.trim()) return userQuery;
-
-  const trimmed = context.length > RESUME_CONTEXT_MAX_CHARS
-    ? `${truncateAtBoundary(context, RESUME_CONTEXT_MAX_CHARS)}…（已截断）`
-    : context;
+/** Old transcripts stay readable but cannot acquire a completed or verified status from prose. */
+export function readCliAnalysisHistory(sp: SessionPaths, traceId: string,
+  legacySourceDerived = false): AnalysisHistoryTurn[] {
   const sessionId = path.basename(sp.dir);
-
-  return [
-    '（continuing prior SmartPerfetto CLI session; previous context below）',
-    `Session id: ${sessionId}`,
-    `Session dir: ${sp.dir}`,
-    `Report path: ${sp.report}`,
-    '---',
-    trimmed,
-    '---',
-    'Use the previous context when it is sufficient; only query the trace again if the new question needs new evidence.',
-    `用户新问题: ${userQuery}`,
-  ].join('\n');
+  const turns = readTranscriptTurns(sp.transcript);
+  const history = turns.flatMap(turn => {
+    const stored = parseAnalysisHistoryTurn(turn.history);
+    if (stored) return [stored];
+    if (typeof turn.question !== 'string' || !Number.isSafeInteger(turn.turn) || turn.turn < 1) return [];
+    return [toAnalysisHistoryTurn({id: `${sessionId}:turn:${turn.turn}`, turnIndex: turn.turn - 1,
+      query: turn.question, traceId, timestamp: Number.isFinite(turn.timestamp) ? turn.timestamp : 0,
+      result: {message: typeof turn.conclusionMd === 'string' ? turn.conclusionMd : ''},
+      sourceDerived: legacySourceDerived})];
+  });
+  if (history.length) return history;
+  const answer = readConclusionContext(sp.conclusion);
+  return answer.trim() ? [toAnalysisHistoryTurn({id: `${sessionId}:legacy`, turnIndex: 0,
+    query: '', traceId, timestamp: 0, result: {message: answer}, sourceDerived: legacySourceDerived})] : [];
 }
 
 function readConclusionContext(conclusionFile: string): string {
