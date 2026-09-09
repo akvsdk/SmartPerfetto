@@ -38,12 +38,59 @@ For beginners, the UI path is the least ambiguous:
 
 1. Start SmartPerfetto; portable packages use the actual `Open:` URL printed by the launcher, while Docker defaults to `http://localhost:10000`.
 2. Open **AI Assistant Settings → Providers → Add Provider**.
-3. Choose the provider type, paste the **Provider API Key**, then check the preset Base URLs and SDK Runtime.
+3. Choose a provider and paste the **API Key**. The name, official connection URLs, and models are prefilled. Save directly, or choose a model suggestion or enter a model ID.
 4. Click **Create Provider**. This only saves the profile.
 5. Back in the provider list, click the plug icon to test the connection, then click the provider row or choose it in the provider switcher to activate it.
 6. Verify with authenticated `/api/runtime-health`. `aiEngine.credentialSource=provider-manager` means the UI provider is active; `env-or-default` means SmartPerfetto is using env or local Claude Code fallback. Public `/health` is liveness-only.
 
 An active Provider Manager profile overrides `.env`. To make `.env` changes take effect again, choose `System Default` in the provider switcher or deactivate the active provider.
+
+### Built-in model options
+
+Model inputs in **Providers** use the backend catalog as suggestions. Clear the
+field to search and choose an option, or enter a newly released model ID directly
+without switching to Custom Provider. Reopening a saved profile preserves its ID.
+Light and sub-agent models also accept direct input. IDs keep their case; only
+leading and trailing whitespace is trimmed. The provider determines availability.
+
+The common form shows the provider, API key, and primary model. **Advanced settings**
+contains the display name, light and sub-agent models, runtime, connection overrides,
+and tuning. It starts collapsed; toggling it does not clear saved values. Custom,
+Bedrock, and Vertex connections still expose the fields needed to configure them.
+
+New profiles use template defaults, favoring current general-purpose, lightweight,
+or automatic-routing options. Primary and light models can be the same; Custom
+profiles use the primary model when no light model is specified. Reopen settings
+after updating the backend to load new options and new-profile defaults. Editing
+or cloning a profile does not replace its saved values with template defaults or
+change session pins. Save your selection and test the connection. Suggestions
+come from public catalogs; access depends on your account, plan, and region. Experimental and
+Preview labels identify experimental or preview releases.
+
+Model IDs differ across endpoints. Kimi Platform uses `kimi-k3`, while Kimi Code
+uses `k3` / `k3-256k`. International Qwen Coding Plan has its own allowlist and
+does not inherit the general API's Qwen 3.8 models. See the official
+[Kimi Code model configuration](https://www.kimi.com/code/docs/en/kimi-code/models.html)
+and [international Qwen Coding Plan](https://www.alibabacloud.com/help/en/model-studio/coding-plan).
+
+Legacy options may remain for existing profiles even after provider retirement.
+For example, Kimi Platform's `kimi-k2.5` has retired; select a newer model manually
+using the [Kimi model catalog](https://platform.kimi.ai/docs/models). Plan catalogs
+can also change, so check current plan support when a connection fails.
+
+New Huawei MaaS profiles use `https://api.modelarts-maas.com/openai/v1` for the
+OpenAI runtime. If a saved profile still uses the old `/v1` URL, edit its Base URL
+in Providers manually; that legacy endpoint does not receive new models. The
+Claude runtime's `/anthropic` URL is unchanged. See the official
+[Huawei OpenAI-compatible API](https://support.huaweicloud.com/model-call-maas/model-call-021.html).
+
+Maintainers update the shared catalog in
+`backend/src/services/providerManager/templates.ts`, checking each template's
+endpoint, region, and plan against official API IDs and keeping source links by
+the corresponding entries. Options cover text analysis and tool calling; image
+generation, speech, and embedding APIs are separate products. Default changes
+apply only to new profiles; run template and Provider API tests. Catalog
+verification does not establish a successful real-provider Agent run.
 
 The preset Base URLs come from public provider information and public documentation. They are not guaranteed to be correct for every account, plan, region, or future provider change. If connection, streaming, or tool/function calling fails, first verify the Base URL, model ID, and protocol in your provider console.
 

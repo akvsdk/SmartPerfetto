@@ -14,6 +14,26 @@ function availableModelIds(template: ProviderTemplate): Set<string> {
 }
 
 describe('Provider Manager templates', () => {
+  it('uses the Huawei OpenAI-compatible endpoint for its current models', () => {
+    expect(templateFor('huawei').defaultConnection).toMatchObject({
+      claudeBaseUrl: 'https://api.modelarts-maas.com/anthropic',
+      openaiBaseUrl: 'https://api.modelarts-maas.com/openai/v1',
+      openaiProtocol: 'chat_completions',
+    });
+  });
+
+  it('provides unambiguous, non-empty model options for each provider', () => {
+    for (const template of officialTemplates) {
+      const ids = template.availableModels.map(model => model.id);
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const model of template.availableModels) {
+        expect(model.id).toBe(model.id.trim());
+        expect(model.id.length).toBeGreaterThan(0);
+        expect(model.name.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+
   it('keeps every non-empty default model selectable', () => {
     for (const template of officialTemplates) {
       if (template.availableModels.length === 0) continue;
@@ -37,8 +57,8 @@ describe('Provider Manager templates', () => {
 
     const openai = templateFor('openai');
     expect(openai.defaultModels).toEqual({
-      primary: 'gpt-5.4-mini',
-      light: 'gpt-5.4-mini',
+      primary: 'gpt-5.6-terra',
+      light: 'gpt-5.6-luna',
     });
     expect(availableModelIds(openai).has('gpt-5.5')).toBe(true);
 

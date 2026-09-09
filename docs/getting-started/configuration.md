@@ -35,12 +35,49 @@ Self-Evolution 工作流。`Connection` 页里的高级 backend auth token 是�
 
 1. 启动 SmartPerfetto；免安装包使用启动器打印的实际 `Open:` 地址，Docker 默认打开 `http://localhost:10000`。
 2. 打开 **AI Assistant Settings → Providers → Add Provider**。
-3. 选择 provider 类型，填写 **Provider API Key**，核对预置 Base URL 和 SDK Runtime。
+3. 选择 provider，填写 **API Key**。名称、官方连接地址和模型已预填，通常可以直接保存；需要换模型时，可从建议中选择或直接输入模型 ID。
 4. 点击 **Create Provider**。这一步只是保存 profile。
 5. 回到 provider 列表，先点插头图标测试连接，再点击 provider 行或在输入框旁的 provider switcher 里选择它来激活。
 6. 用带鉴权的 `/api/runtime-health` 验证。`aiEngine.credentialSource=provider-manager` 表示 UI provider 已经生效；`env-or-default` 表示仍在使用 env 或本机 Claude Code fallback。公开 `/health` 只用于存活检查。
 
 active Provider Manager profile 会覆盖 `.env`。如果希望 `.env` 修改重新生效，在 provider switcher 里选择 `System Default`，或在设置里停用 active provider。
+
+### 内置模型选项
+
+在 **Providers** 中创建或编辑配置时，模型输入框会读取当前后端目录作为建议。可清空后
+搜索并选择，也可直接填写尚未收录的新模型 ID；不需要改成 Custom Provider。保存后
+再次编辑会显示原有 ID，轻量模型和子 Agent 模型也支持直接输入。模型 ID 大小写保持
+不变，仅移除首尾空格；是否实际可用由供应商验证。
+
+常用表单只显示供应商、密钥和主模型。**高级设置**中可修改显示名称、轻量模型、子 Agent
+模型、运行时、连接覆盖项及调优参数，默认折叠；展开或收起不会清除已保存值。
+Custom、Bedrock、Vertex 等需要额外配置的入口仍显示其必要字段。
+
+新建配置自动使用模板默认值，优先选择供应商当前提供的通用、轻量或自动路由型号。
+主模型与轻量模型可以相同；Custom 未填写轻量模型时使用主模型。更新后端后重新打开
+设置即可获取新选项和新建默认值；编辑或克隆已有配置不会被新模板覆盖，会话绑定也
+不会改变。选择新模型后保存配置，再测试连接。建议项来自公开目录，实际权限
+仍由账号、套餐和地区决定；标记为 Experimental 或 Preview 的型号属于实验或预览版本。
+
+不同入口的模型 ID 不能互换。例如 Kimi 平台使用 `kimi-k3`，Kimi Code 使用 `k3` /
+`k3-256k`；国际 Qwen Coding Plan 只提供其套餐清单内的型号，不能直接使用通用 API 的
+Qwen 3.8 系列。参考 [Kimi Code 模型配置](https://www.kimi.com/code/docs/en/kimi-code/models.html)
+和 [国际 Qwen Coding Plan](https://www.alibabacloud.com/help/en/model-studio/coding-plan)。
+
+旧选项可能为兼容已有配置而保留，不代表供应商仍在服务。例如 Kimi 平台的
+`kimi-k2.5` 已退役，需手动切换到新模型，详见 [Kimi 模型目录](https://platform.kimi.ai/docs/models)。
+套餐目录也可能调整；连接失败时核对当前套餐，而不是仅根据模型名称判断支持情况。
+
+华为 MaaS 使用 OpenAI runtime 时，新建配置预设
+`https://api.modelarts-maas.com/openai/v1`。已有配置若仍使用旧 `/v1`，需在 Providers
+中手动修改 Base URL；旧接口不再扩展新模型。Claude runtime 的 `/anthropic` 地址保持
+不变。地址和支持模型见 [华为 OpenAI 兼容接口](https://support.huaweicloud.com/model-call-maas/model-call-021.html)。
+
+维护者只在 `backend/src/services/providerManager/templates.ts` 的统一目录补充模型，
+按每个模板的 endpoint、地区和套餐核对官方 API ID，并在对应条目旁保留来源链接。
+这里只列适用于文本分析和工具调用的型号；图像生成、语音、Embedding 等专用接口不属于
+分析模型选项。默认值调整只影响新建配置，通过模板和 Provider API 测试验证；新增选项
+不等于完成了真实供应商的完整 Agent 调用验收。
 
 预置的 Base URL 来自 provider 公开信息和公开文档，不保证对所有账号、套餐、地区长期正确。很多 provider 的入口会按地区、申请国家、套餐或专属控制台域名变化，例如新加坡区、国内区、国际区可能不同。如果连接、流式输出或 tool/function calling 出错，先到 provider 控制台核对 Base URL、模型 ID 和协议类型；确认是公开 preset 错误后，建议提交 issue 或 PR 修正。
 
