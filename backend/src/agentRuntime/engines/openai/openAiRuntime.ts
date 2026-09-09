@@ -20,11 +20,15 @@ import type {AnalysisOptions, AnalysisResult, AnalysisTerminationReason, IOrches
 import type {ArchitectureInfo} from '../../../agent/detectors/types';
 import {createClaudeMcpServer, loadLearnedSqlFixPairs} from '../../../agentv3/claudeMcpServer';
 import {buildSystemPrompt} from '../../../agentv3/claudeSystemPrompt';
+import {loadPromptTemplate, renderTemplate} from '../../../agentv3/strategyLoader';
+import {inspectCandidateProtocol, buildCandidateProtocolDiagnostic, sanitizeCandidateProtocolDiagnostic,
+  type CandidateProtocolDiagnostic} from '../../../services/canonicalAnalysisResult';
 import {extractFindingsFromText} from '../../../agentv3/claudeFindingExtractor';
 import {detectFocusApps, focusAppTimeRangeFromSelection, type FocusAppDetectionResult} from '../../../agentv3/focusAppDetector';
 import {type SceneType} from '../../../agentv3/sceneClassifier';
 import {getExtendedKnowledgeBase} from '../../../services/sqlKnowledgeBase';
-import {analysisContextMemoryPartitionKey, analysisContextUsesPrivateKnowledge} from '../../../services/resolvedAnalysisContext';
+import {analysisContextMemoryPartitionKey, analysisContextUsesPrivateKnowledge, assertCurrentAnalysisContextAuthorization, buildAnalysisContextAuthorizationFingerprint} from '../../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../../services/scopedKnowledgeStore';
 import type {AnalysisNote, AnalysisPlanV3, ClaudeAnalysisContext, Hypothesis, TracePairContext, TraceCompleteness, UncertaintyFlag} from '../../../agentv3/types';
 import {recordPlanOrPrePlanToolCall, resetPrePlanToolCallsForNewRun, readToolResultFacts} from '../../../agentv3/planToolCallRecorder';
 import {buildComplexityClassifierInput} from '../../../agentv3/queryComplexityContext';
@@ -34,9 +38,9 @@ import {createOpenAISnapshotEngineState, getOpenAISnapshotEngineState, projectSe
 import {extractTraceFeatures, extractKeyInsights, saveAnalysisPattern, saveQuickPathPattern} from '../../../agentv3/analysisPatternMemory';
 import {probeTraceCompleteness} from '../../../agentv3/traceCompletenessProber';
 import {localize, type OutputLanguage} from '../../../agentv3/outputLanguage';
-import {createCodeAwareStreamingTextProjection, sanitizeCodeAwareStructuredTextWithReceipt, type CodeAwareStreamingTextProjection} from '../../../services/security/codeAwareOutputRegistry';
+import {createCodeAwareStreamingTextProjection, type CodeAwareStreamingTextProjection} from '../../../services/security/codeAwareOutputRegistry';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
-import {formatToolCallNarration, formatToolResultNarration, toolResultIsFailure} from '../../../agentv3/toolNarration';
+import {formatToolCallNarration, formatToolResultNarration, issuePrivateToolResultNarrationReceipt, toolResultIsFailure} from '../../../agentv3/toolNarration';
 import {estimateAnalysisConfidence} from '../../../agentv3/analysisTermination';
 import {ReasoningThoughtBuffer} from '../../reasoningThoughtBuffer';
 import {planPhaseUpdatedContent} from '../../../agentv3/planPhaseEvents';
@@ -63,7 +67,7 @@ import {TransformStream} from 'node:stream/web';
 import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
 import {resolveRuntimeTurnPolicy, type RuntimeTurnPolicy} from '../../runtimeTurnPolicy';
 import {runOpenAiIntentTransport} from './openAiIntentTransport';
-import {attachFinalizationContext, FINALIZATION_MAX_OUTPUT_TOKENS} from '../../analysisFinalizationContext';
+import {attachFinalizationContext} from '../../analysisFinalizationContext';
 import {buildRuntimeTracePairIdentityContext} from '../../runtimePromptContext';
 import type {ReadonlyStrategyRegistrySnapshot} from '../../../services/selfEvolution/effectiveRuntimeRegistryContext';
 import {analysisDeliveryFingerprint, type AnalysisCandidateIdentity, type AnalysisCompletion, type AnalysisDeliveryContext, type AnalysisOutputOrigin} from '../../../types/analysisDelivery';
@@ -192,7 +196,6 @@ function finalizeOpenAiCandidate(input: {
   attemptId: string;
   finish: Pick<AnalysisCompletion, 'status' | 'reason' | 'sdkFinishReason'>;
   outputOrigin: AnalysisOutputOrigin;
-  projection?: CodeAwareStreamingTextProjection;
   sourceUse?: ReturnType<typeof createClaudeMcpServer>['sourceUse'];
 }) {
   const {result, runId, attemptId} = input;
@@ -212,11 +215,8 @@ function finalizeOpenAiCandidate(input: {
   }
   const nativeContext: AnalysisDeliveryContext = {entry: 'runtime_draft', acceptedCandidate,
     completion: result.completion, outputOrigin: input.outputOrigin, turnIntent: result.turnIntent};
-  const priorProjection = input.projection?.projectCompleteWithReceipt(result.conclusion)
-    ?? sanitizeCodeAwareStructuredTextWithReceipt(result.sessionId, result.conclusion);
-  result.conclusion = priorProjection.text;
   const finalized = finalizeSourceAwareAnalysisResultWithProjection(result, input.sourceUse, {
-    priorProjection, context: nativeContext,
+    context: nativeContext,
   });
   if (finalized.result.quickRun) {
     finalized.result.quickRun.stopReason = quickStopReasonFromTermination({
@@ -480,7 +480,7 @@ function buildOpenAIModelSettings(
   model: string,
   allowRemotePersistence: boolean,
 ) {
-  const chatCompletionsTokenLimit = config.protocol === 'chat_completions'
+  const chatCompletionsTokenLimit = config.protocol === 'chat_completions' && config.maxOutputTokens !== undefined
     ? buildOpenAIChatCompletionsTokenLimit(model, config.maxOutputTokens)
     : undefined;
   const usesMaxCompletionTokens = chatCompletionsTokenLimit
@@ -489,10 +489,44 @@ function buildOpenAIModelSettings(
   return {
     ...(usesMaxCompletionTokens
       ? { providerData: chatCompletionsTokenLimit }
-      : { maxTokens: config.maxOutputTokens }),
+      : config.maxOutputTokens !== undefined ? { maxTokens: config.maxOutputTokens } : {}),
     parallelToolCalls: false,
     store: allowRemotePersistence,
   };
+}
+
+/** Keep the complete current-run transcript or decline recovery; never trim evidence. */
+function buildOpenAiOutputLimitRecoveryInput(
+  history: AgentInputItem[],
+  maxHistoryBytes: number,
+  observedToolCalls: number,
+  turnIntent: AnalysisTurnIntent,
+  language: OutputLanguage,
+  recoveryReason: 'output_limit' | 'empty_body' | 'invalid_protocol',
+  candidateDiagnostic: CandidateProtocolDiagnostic,
+): AgentInputItem[] | undefined {
+  if (!Array.isArray(history) || !history.some(item => 'role' in item && item.role === 'user')) return undefined;
+  const pendingCalls = new Set<string>();
+  let completedCalls = 0;
+  for (const item of history) {
+    if (item.type === 'function_call') pendingCalls.add(item.callId);
+    if (item.type === 'function_call_result') {
+      if (!pendingCalls.delete(item.callId)) return undefined;
+      completedCalls++;
+    }
+  }
+  if (pendingCalls.size || completedCalls < observedToolCalls) return undefined;
+  let template: string | undefined;
+  try { template = loadPromptTemplate(`prompt-openai-final-report-continuation-${language === 'en' ? 'en' : 'zh'}`); }
+  catch { return undefined; }
+  if (!template?.trim()) return undefined;
+  const prompt = renderTemplate(template.replace(/<!--[\s\S]*?-->/g, '').trim(), {
+    turn_intent: JSON.stringify(turnIntent),
+    completion_reason: recoveryReason,
+    candidate_protocol_diagnostic: JSON.stringify(sanitizeCandidateProtocolDiagnostic(candidateDiagnostic) ?? null),
+  });
+  const input: AgentInputItem[] = [...history, {role: 'user', content: prompt}];
+  return serializedByteLength(input) <= maxHistoryBytes ? input : undefined;
 }
 
 async function commitAfterProviderClose<T>(
@@ -669,7 +703,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
         signal: analysisAbortScope.signal,
         deadlineMs: Date.now() + config.classifierTimeoutMs,
         dispatch: input => runOpenAiIntentTransport({...input, config,
-          maxOutputTokens: Math.min(config.maxOutputTokens, 2048)}),
+          maxOutputTokens: Math.min(config.maxOutputTokens ?? 2048, 2048)}),
       });
       const resolvedTurnIntent = await intentResolver.resolve();
       turnIntent = resolvedTurnIntent;
@@ -684,7 +718,8 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
       const selectedModel = quickMode && turnIntent.status === 'resolved' ? config.lightModel : config.model;
       const maxTurns = quickMode ? config.quickMaxTurns : config.maxTurns;
       const finalizationConfig = Object.freeze({baseURL: config.baseURL, apiKey: config.apiKey,
-        protocol: config.protocol, lightModel: config.model});
+        protocol: config.protocol, lightModel: config.model,
+        ...(config.maxOutputTokens !== undefined ? {maxOutputTokens: config.maxOutputTokens} : {})});
       const currentTraceId = traceId && (options.assistantSurface !== 'conversation' || options.conversationTraceAttached === true)
         ? traceId : undefined;
       const referenceTraceId = currentTraceId ? options.referenceTraceId : undefined;
@@ -713,6 +748,9 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
       });
       sourceUse = context.sourceUse;
       analysisAbortScope.throwIfAborted();
+      const authorizationScope = resolveKnowledgeScope(options);
+      const authorizationFingerprint = options.analysisContextFingerprint ??
+        buildAnalysisContextAuthorizationFingerprint(options, authorizationScope);
       const promptPrefix = analysisRunSpec.traceContext.promptSection;
       const effectivePrompt = promptPrefix ? `${promptPrefix}\n\n${query}` : query;
       let runInput = resolveOpenAIRunInput({
@@ -757,15 +795,24 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
       let outputOrigin: AnalysisOutputOrigin = 'assistant_stream';
       let finish: Pick<AnalysisCompletion, 'status' | 'reason' | 'sdkFinishReason'> = {status: 'unknown'};
       let attemptId = '';
-      let finalAnswerProjection: CodeAwareStreamingTextProjection | undefined;
       let terminationMessage: string | undefined;
       let finalHistory: AgentInputItem[] | undefined;
       let finalLastResponseId: string | undefined;
       let finalRunState: string | undefined;
       let observedToolCalls = 0;
+      let recoveryCandidate: {
+        conclusion: string; attemptId: string; outputOrigin: AnalysisOutputOrigin;
+        finish: typeof finish; hadDeclarations: boolean; terminationMessage: string | undefined;
+      } | undefined;
+      const restoreRecoveryCandidate = () => {
+        if (!recoveryCandidate) return;
+        ({conclusion, attemptId, outputOrigin, finish, terminationMessage} = recoveryCandidate);
+      };
       for (;;) {
         analysisAbortScope.throwIfAborted();
+        const recoveringOutputLimit = Boolean(recoveryCandidate);
         attemptId = randomUUID();
+        chatTerminal = {};
         const linked = analysisAbortScope.createLinkedController();
         const controller = linked.controller;
         let active = true;
@@ -777,12 +824,12 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
         if (analysisAbortScope.signal.aborted) onCancellation();
         void cancellation.catch(() => undefined);
         let runAnswer = '';
+        let attemptModelTurns = 0;
         let lastResponse: unknown;
         let streamCompleted = false;
         const answerStreamFilter = createOpenAiReasoningFilterState();
         const answerTextProjection = analysisContextUsesPrivateKnowledge(options)
           ? createCodeAwareStreamingTextProjection(sessionId, `openai-answer-${attemptId}`) : undefined;
-        finalAnswerProjection = answerTextProjection;
         const toolInputsByTaskId = new Map<string, {toolName: string; args: Record<string, unknown>}>();
         const processedToolResultIds = new Set<string>();
         const reasoningThoughts = new ReasoningThoughtBuffer();
@@ -798,9 +845,13 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
         const providerPhase = runtimePerformance.startPhase('provider');
         try {
           if (Date.now() >= deadlineAt) {timedOut = true; throw new Error('OpenAI request deadline elapsed');}
+          if (recoveringOutputLimit) {
+            executionLease.throwIfAborted();
+            assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+          }
           commitEvaluationSdkHandoffIfActive();
           const stream = await Promise.race([
-            runner.run(agent, runInput.input, {stream: true, maxTurns: Math.max(1, maxTurns - rounds),
+            runner.run(agent, runInput.input, {stream: true, maxTurns: recoveringOutputLimit ? 1 : Math.max(1, maxTurns - rounds),
               context: {signal: controller.signal}, signal: controller.signal,
               ...(runInput.previousResponseId ? {previousResponseId: runInput.previousResponseId} : {})}),
             requestTimeout.promise, providerIdleTimeout.promise, cancellation,
@@ -812,6 +863,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
               if (event.type === 'raw_model_stream_event') {
                 const data = event.data as any;
                 if (data?.type === 'response_started') {
+                  attemptModelTurns++;
                   runAnswer = '';
                   lastResponse = undefined;
                   Object.assign(answerStreamFilter, createOpenAiReasoningFilterState());
@@ -819,6 +871,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
               }
               runAnswer += this.handleStreamEvent(event, config.outputLanguage, {
                 sessionId, quickMode, answerStreamFilter, answerTextProjection, runtimePerformance,
+                suppressAnswerTokens: recoveringOutputLimit,
                 toolInputsByTaskId, processedToolResultIds, reasoningThoughts,
                 tracePairContext: options.tracePairContext, onToolCalled: () => {observedToolCalls++;},
               });
@@ -831,8 +884,9 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
           await Promise.race([consume(), requestTimeout.promise, providerIdleTimeout.promise, cancellation]);
           analysisAbortScope.throwIfAborted();
           const projectedTail = answerTextProjection?.flush();
-          if (projectedTail) this.emitUpdate({type: 'answer_token', content: {token: projectedTail}, timestamp: Date.now()});
-          rounds += stream.currentTurn || (runAnswer ? 1 : 0);
+          if (projectedTail && !recoveringOutputLimit) this.emitUpdate({type: 'answer_token', content: {token: projectedTail}, timestamp: Date.now()});
+          // SDK currentTurn can be zero-based; every native response consumes a turn.
+          rounds += Math.max(attemptModelTurns, stream.currentTurn || 0, runAnswer ? 1 : 0);
           const finalOutput = streamCompleted ? stream.finalOutput : undefined;
           conclusion = typeof finalOutput === 'string' ? finalOutput : finalOutput !== undefined
             ? JSON.stringify(finalOutput) : runAnswer;
@@ -845,6 +899,28 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
             finalRunState = this.safeSerializeRunState(stream.state);
           }
           providerPhase.end('ok');
+          const nativeProtocol = inspectCandidateProtocol(conclusion);
+          const candidateProtocolDiagnostic = buildCandidateProtocolDiagnostic(nativeProtocol, 'native', recoveringOutputLimit ? 2 : 1);
+          this.emitUpdate({type: 'progress', content: {phase: 'candidate_protocol',
+            candidateProtocolDiagnostic}, timestamp: Date.now()});
+          const protocolInvalid = nativeProtocol.status === 'invalid';
+          const bodyEmpty = !nativeProtocol.canonicalBody.trim();
+          if (recoveringOutputLimit && (finish.status !== 'completed' || bodyEmpty || protocolInvalid ||
+              recoveryCandidate?.hadDeclarations && nativeProtocol.status === 'absent')) {
+            restoreRecoveryCandidate();
+          } else if (!recoveringOutputLimit && (finish.status === 'incomplete' && finish.reason === 'output_limit' ||
+              finish.status === 'completed' && (bodyEmpty || protocolInvalid)) &&
+              streamCompleted && rounds < maxTurns && Date.now() < deadlineAt && !runInput.previousResponseId) {
+            const recoveryReason = finish.reason === 'output_limit' ? 'output_limit' : protocolInvalid ? 'invalid_protocol' : 'empty_body';
+            const recoveryInput = buildOpenAiOutputLimitRecoveryInput(stream.history, config.maxHistoryBytes, observedToolCalls, turnIntent, config.outputLanguage, recoveryReason, candidateProtocolDiagnostic);
+            if (recoveryInput) {
+              recoveryCandidate = {conclusion, attemptId, outputOrigin, finish, terminationMessage,
+                hadDeclarations: nativeProtocol.status !== 'absent'};
+              agent = agent.clone({tools: [], modelSettings: {...agent.modelSettings, toolChoice: 'none'}});
+              runInput = {...runInput, input: recoveryInput, previousResponseId: undefined};
+              continue;
+            }
+          }
           break;
         } catch (error) {
           providerPhase.end(runtimeOutcomeFromError(error, executionLease.signal));
@@ -865,8 +941,9 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
           finish = timedOut ? {status: 'incomplete', reason: 'timeout'}
             : error instanceof MaxTurnsExceededError ? {status: 'incomplete', reason: 'turn_limit'}
             : {status: 'failed', reason: 'provider_error'};
-          rounds = Math.max(rounds, error instanceof MaxTurnsExceededError ? maxTurns : observedToolCalls + (runAnswer ? 1 : 0));
+          rounds = Math.max(rounds + attemptModelTurns, error instanceof MaxTurnsExceededError ? maxTurns : observedToolCalls + (runAnswer ? 1 : 0));
           runtimePerformanceOutcome = timedOut ? 'cancelled' : 'error';
+          if (recoveringOutputLimit) restoreRecoveryCandidate();
           break;
         } finally {
           active = false;
@@ -897,10 +974,13 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
           contextInjected: {conversationTurns: countCompletedQuickConversationTurns(previousTurns)},
         }) : undefined,
       };
-      const {result, deliveryContext, conclusionProjection} = finalizeOpenAiCandidate({
+      const {result, deliveryContext, conclusionProjection, protocolProjection} = finalizeOpenAiCandidate({
         result: nativeResult, runId, attemptId, finish, outputOrigin,
-        projection: finalAnswerProjection, sourceUse,
+        sourceUse,
       });
+      this.emitUpdate({type: 'progress', content: {phase: 'candidate_protocol',
+        candidateProtocolDiagnostic: buildCandidateProtocolDiagnostic(inspectCandidateProtocol(result.conclusion), 'runtime_projected',
+          recoveryCandidate && attemptId !== recoveryCandidate.attemptId ? 2 : 1, conclusionProjection.disposition)}, timestamp: Date.now()});
       const verificationPhase = runtimePerformance.startPhase('verification');
       await verifyConclusion(result.findings, result.conclusion, {
         emitUpdate: update => this.emitUpdate(update), enableLLM: false,
@@ -933,15 +1013,17 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
           runId, sessionId, deadlineMs: deadlineAt, turnIntent: resolvedTurnIntent,
           providerQuery: {text: analysisRunSpec.query.text, analysisContextFingerprint: options.analysisContextFingerprint},
           strategyRegistry: intentResolver.strategyRegistry,
-          traceIdentity: {currentTraceId, referenceTraceId}, deliveryContext,
+          traceIdentity: {currentTraceId, referenceTraceId}, deliveryContext, protocolProjection,
           sourceUse: sourceUse?.getSourceUseDecision(),
+          sourceScope: sourceUse?.getSourceExecutionScope?.(),
           evidenceReadView: this.artifactStores.get(sessionId)?.createEvidenceReadView({
             allowedTraces, ownerKey: evidenceOwnerKey,
           }),
           // No SDK/session state survives this closure. The shared context supplies
           // the finalization caller's signal and clamps the original absolute deadline.
           dispatchText: input => runOpenAiIntentTransport({...input, config: finalizationConfig,
-            maxOutputTokens: FINALIZATION_MAX_OUTPUT_TOKENS}),
+            ...(finalizationConfig.maxOutputTokens !== undefined
+              ? {maxOutputTokens: finalizationConfig.maxOutputTokens} : {})}),
         });
         return result;
       });
@@ -1418,6 +1500,8 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
       onSuppressedAnswerDelta?: (delta: string) => void;
       /** Holds pre-plan model text so it can be shown as reasoning, not dropped. */
       reasoningThoughts?: ReasoningThoughtBuffer;
+      /** A replacement candidate is delivered atomically by the final conclusion event. */
+      suppressAnswerTokens?: boolean;
     },
   ): string {
     const now = Date.now();
@@ -1427,7 +1511,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
         const delta = filterOpenAiVisibleAnswerDelta(data.delta, streamContext.answerStreamFilter);
         if (!delta) return '';
         const projected = streamContext.answerTextProjection?.write(delta) ?? delta;
-        if (projected) {
+        if (projected && !streamContext.suppressAnswerTokens) {
           streamContext.runtimePerformance?.recordFirstOutput();
           this.emitUpdate({type: 'answer_token', content: {token: projected}, timestamp: now});
         }
@@ -1493,6 +1577,9 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
       // tool's payload with a rejection envelope that has no success field.
       const resultIsFailure = toolResultIsFailure({toolName, result: rawOutput});
       const projectedOutput = projectToolResultForExternalSurface(toolName, rawOutput);
+      const privateToolResultReceipt = issuePrivateToolResultNarrationReceipt({
+        toolName, result: projectedOutput, isError: resultIsFailure,
+      });
       const resultText = summarizeToolOutput(projectedOutput);
       // Narrate from the projected object while it is still intact; resultText
       // is byte-truncated and can end mid-JSON.
@@ -1531,6 +1618,7 @@ export class OpenAIRuntime extends EventEmitter implements IOrchestrator {
           toolName,
           result: resultText,
           resultNarration,
+          ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
           isError: resultIsFailure,
         },
         timestamp: now,

@@ -35,9 +35,24 @@ export interface ClaimReferenceVerificationResult {
 
 export type DeterministicClaimProofKind =
   | 'numeric_cell'
+  | 'captured_cell'
+  | 'source_location'
   | 'interval_overlap'
   | 'comparison_delta'
   | 'none';
+
+/** Original native row used by a finite proof; no occurrence or causal assertion is implied. */
+export interface DeterministicNativeRowIdentity {
+  anchorId: string;
+  evidenceRefId: string;
+  captureId: string;
+  traceId: string;
+  traceSide: 'current' | 'reference';
+  relation: string;
+  idColumn: string;
+  id: number;
+  schemaFingerprint: string;
+}
 
 export interface DeterministicClaimProof {
   kind: DeterministicClaimProofKind;
@@ -46,6 +61,7 @@ export interface DeterministicClaimProof {
   reason: string;
   anchorIds: string[];
   evidenceRefIds: string[];
+  nativeRows?: DeterministicNativeRowIdentity[];
 }
 
 export interface ClaimPropositionCoverage {

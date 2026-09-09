@@ -9,6 +9,8 @@ import {localize} from '../../agentv3/outputLanguage';
 import {sanitizeCodeAwareText} from './codeAwareOutputRegistry';
 import {projectPrivateDataEnvelope} from './privateAnalysisProjection';
 import {validateDataEnvelope} from '../../types/dataContract';
+import {formatToolCallNarration, formatToolResultNarration, readPrivateToolResultNarrationReceipt} from '../../agentv3/toolNarration';
+import {sanitizeCandidateProtocolDiagnostic} from '../canonicalAnalysisResult';
 
 type PrivateEventPolicy =
   | 'deterministic'
@@ -111,25 +113,69 @@ function privateDegradedIssueType(
     : undefined;
 }
 
-function privateProgress(
+function privateDegradation(
   language: OutputLanguage,
   sourceType: StreamingUpdate['type'],
   sourceContent?: StreamingUpdate['content'],
-): StreamingUpdate['content'] {
+): StreamingUpdate['content'] | undefined {
   const degradedFallback = privateDegradedFallback(sourceType, sourceContent);
   const degradedIssueType = privateDegradedIssueType(sourceType, sourceContent);
+  if (!degradedFallback && !degradedIssueType) return undefined;
   return {
     phase: sourceType,
     message: localize(
       language,
-      '正在基于已授权的源码与知识源分析；中间模型内容已按隐私策略隐藏。',
-      'Analyzing authorized source and knowledge context; intermediate model content is hidden by the privacy policy.',
+      '部分分析检查未通过，详细状态将在最终结果中保留。',
+      'Some analysis checks did not pass; their status will be retained in the final result.',
     ),
     privateModelTextSuppressed: true,
     sourceEventType: sourceType,
     ...(degradedFallback ? {degradedFallback} : {}),
     ...(degradedIssueType ? {degradedIssueType} : {}),
   };
+}
+
+function privateExecutionUpdate(update: StreamingUpdate, language: OutputLanguage): StreamingUpdate | null {
+  const content = update.content && typeof update.content === 'object' && !Array.isArray(update.content)
+    ? update.content as Record<string, unknown> : {};
+  if (update.type === 'progress' && content.phase === 'candidate_protocol') {
+    const diagnostic = sanitizeCandidateProtocolDiagnostic(content.candidateProtocolDiagnostic);
+    return diagnostic ? {...update, content: {
+      phase: 'candidate_protocol', candidateProtocolDiagnostic: diagnostic,
+    }} : null;
+  }
+  const toolName = typeof content.toolName === 'string' ? content.toolName : '';
+  const callNarration = formatToolCallNarration(toolName, undefined, language, {privateContext: true});
+  const safeToolName = callNarration ? toolName.trim().replace(/^mcp__smartperfetto__|^smartperfetto__/, '') : undefined;
+  if (update.type === 'tool_call' || update.type === 'agent_task_dispatched') {
+    return callNarration ? {...update, type: 'tool_call', content: {toolName: safeToolName, message: callNarration}} : null;
+  }
+  if (update.type === 'agent_response') {
+    // Reconstruct from outcome fields; never trust an incoming narration string,
+    // private-safe flag, model prose, or a truncated payload as a finding.
+    const receipt = readPrivateToolResultNarrationReceipt(content.privateToolResultReceipt, toolName, language);
+    const resultNarration = receipt?.message ?? formatToolResultNarration({
+      toolName, result: content.result, isError: content.isError === true,
+      language, privateContext: true,
+    });
+    return resultNarration
+      ? {...update, content: {...(safeToolName ? {toolName: safeToolName} : {}), resultNarration,
+          isError: receipt?.isError ?? content.isError === true}}
+      : null;
+  }
+  if (update.type === 'plan_phase_updated' && content.origin === 'auto') {
+    const messages: Record<string, [string, string]> = {
+      in_progress: ['开始验证下一个分析阶段', 'Start verifying the next analysis phase'],
+      completed: ['当前分析阶段已完成', 'The current analysis phase is complete'],
+      pending: ['当前分析阶段仍需补充证据', 'The current analysis phase needs more evidence'],
+      skipped: ['已跳过当前分析阶段', 'The current analysis phase was skipped'],
+    };
+    const status = typeof content.status === 'string' ? content.status : '';
+    const message = Object.prototype.hasOwnProperty.call(messages, status) ? messages[status] : undefined;
+    return message ? {...update, type: 'progress', content: {message: localize(language, ...message)}} : null;
+  }
+  const degraded = privateDegradation(language, update.type, update.content);
+  return degraded ? {...update, type: 'progress', content: degraded} : null;
 }
 
 /**
@@ -142,7 +188,7 @@ export function projectCodeAwareStreamingUpdate(
   update: StreamingUpdate,
   sourceAware: boolean,
   language: OutputLanguage,
-): StreamingUpdate {
+): StreamingUpdate | null {
   if (!sourceAware) return update;
 
   const policy = PRIVATE_EVENT_POLICIES[update.type] ?? 'suppress';
@@ -156,7 +202,7 @@ export function projectCodeAwareStreamingUpdate(
         content: Array.isArray(update.content) ? projected : projected[0],
       };
     }
-    return {...update, type: 'progress', content: privateProgress(language, update.type)};
+    return null;
   }
   if (policy === 'answer') {
     return {
@@ -165,11 +211,7 @@ export function projectCodeAwareStreamingUpdate(
     };
   }
   if (policy === 'suppress') {
-    return {
-      ...update,
-      type: 'progress',
-      content: privateProgress(language, update.type, update.content),
-    };
+    return privateExecutionUpdate(update, language);
   }
   if (policy === 'error') {
     return {
@@ -234,5 +276,5 @@ export function projectCodeAwareStreamingUpdate(
       },
     };
   }
-  return {...update, type: 'progress', content: privateProgress(language, update.type)};
+  return null;
 }

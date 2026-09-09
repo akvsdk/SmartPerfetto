@@ -5,10 +5,17 @@
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import {renderConclusionContractSidecar, type ConclusionContract} from '../../agent/core/conclusionContract';
 import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisDeliveryContext} from '../../types/analysisDelivery';
-import {canonicalizeAnalysisResult, isIssuedCanonicalAnalysisProjection} from '../canonicalAnalysisResult';
+import {canonicalizeAnalysisResult, isIssuedCanonicalAnalysisProjection, inspectCandidateProtocol,
+  buildCandidateProtocolDiagnostic, sanitizeCandidateProtocolDiagnostic} from '../canonicalAnalysisResult';
 import {assessFinalResultQualityAssessment} from '../finalResultQualityGate';
 import {runClaimVerification} from '../verifier/claimVerificationRunner';
 import {createDataEnvelope} from '../../types/dataContract';
+import {finalizeSourceAwareAnalysisResultWithProjection} from '../codebase/sourceClaimVerifier';
+import {claimConclusionProtocolProjection, readConclusionProtocolProjection, releaseConclusionProtocolProjection,
+  projectConclusionSemanticInput} from '../security/conclusionProtocolProjection';
+import {registerOnDemandSourceLookupForEcho, registerCodeAwareCanary, registerPrivateAnalysisQueryForEcho,
+  revokeCodeAwareOutputGuards, clearCodeAwareOutputGuards} from '../security/codeAwareOutputRegistry';
+import {prepareClaimEvidence, preparedClaimEvidenceSnapshot} from '../evidence/claimEvidencePreparation';
 
 function declaration(value = 999): ConclusionContract {
   return {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer', conclusions: [], clusters: [],
@@ -35,7 +42,207 @@ function contextFor(source: AnalysisResult, status: AnalysisCompletion['status']
 
 const control = '<!-- smartperfetto:conversation-control {"kind":"needs_user_input","question":"Which trace?"} -->';
 
+async function proseFixture(attach = true) {
+  const marker = 'source_native_prose_marker_unique';
+  const prose = (field: string) => `${field}: ${marker}`;
+  const contract: ConclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+    conclusions: [{rank: 1, statement: prose('statement'), trigger: prose('trigger'), supply: prose('supply'), amplification: prose('amplification')}],
+    clusters: [{cluster: prose('cluster'), description: prose('description')}],
+    evidenceChain: [{conclusionId: 'C1', text: prose('evidence')}], uncertainties: [prose('uncertainty')], nextSteps: [prose('next')],
+    claims: [{id: 'c1', conclusionId: 'C1', kind: 'inference', text: prose('claim'), references: [],
+      semantics: {schemaVersion: 'claim_semantics@1', predicate: 'source.prose', polarity: 'affirmed', discourse: 'asserted',
+        quantifier: 'one', modality: 'possible', conditions: [prose('condition')], scope: {population: 'codebase'}}}]};
+  const source = result(`Visible ${marker}.\n${renderConclusionContractSidecar(contract)}`);
+  registerOnDemandSourceLookupForEcho(source.sessionId, [{referenceId: 'prose-read', codebaseId: 'cb-prose',
+    filePath: 'src/Prose.kt', lineRange: {start: 1, end: 1}, text: `val marker = "${marker}"`}]);
+  const projected = finalizeSourceAwareAnalysisResultWithProjection(source, undefined, {context: contextFor(source)});
+  const token = projected.protocolProjection!;
+  if (attach) claimConclusionProtocolProjection(token);
+  if (!projected.deliveryContext || projected.deliveryContext.entry === 'historical_restore') throw new Error('Unexpected fixture entry');
+  const native = readConclusionProtocolProjection(token, {result: source,
+    candidate: projected.deliveryContext.acceptedCandidate, runId: 'run-a'});
+  const canonical = canonicalizeAnalysisResult(source, {context: projected.deliveryContext, nativeDeclaration: native});
+  const prepared = await prepareClaimEvidence({conclusionContract: canonical.validationContract, bindingEligibility: canonical.bindingEligibility});
+  const input = {sessionId: source.sessionId, nativeDeclaration: native, canonicalProjection: canonical.projection,
+    canonicalCandidate: canonical.projection.candidate!, runId: 'run-a', prepared,
+    snapshot: {inputCoverage: 'complete' as const, declarationBindingEligibility: canonical.bindingEligibility,
+      query: 'Review these declarations', body: canonical.result.conclusion,
+      conclusionContract: structuredClone(canonical.validationContract), evidenceSnapshot: preparedClaimEvidenceSnapshot(prepared)}};
+  return {input, marker, source, canonical, token,
+    cleanup: () => {releaseConclusionProtocolProjection(token); clearCodeAwareOutputGuards(source.sessionId);}};
+}
+
+describe('exact native prose semantic input receipt', () => {
+  it('restores only original declaration fields while keeping the actual display body and receipt private', async () => {
+    const target = await proseFixture();
+    try {
+      const projected = projectConclusionSemanticInput(target.input);
+      expect(projected.changed).toBe(false);
+      const {parseIssues: _issues, ...expected} = target.input.snapshot.conclusionContract!;
+      expect(projected.value.conclusionContract).toEqual(expected);
+      expect(projected.value.body).toBe(target.canonical.result.conclusion);
+      expect(projected.value.body).not.toContain(target.marker);
+      expect(JSON.stringify(target.canonical.projection)).not.toContain(target.marker);
+      expect(JSON.stringify(target.canonical.result)).not.toContain(target.marker);
+    } finally {target.cleanup();}
+  });
+
+  it.each(['copy', 'absent', 'session', 'run', 'attempt', 'candidate', 'body', 'native', 'released', 'unattached', 'historical'] as const)(
+    'grants no prose role after a changed %s identity', async kind => {
+      const target = await proseFixture(kind !== 'unattached');
+      try {
+        const input = {...target.input, snapshot: structuredClone(target.input.snapshot)};
+        if (kind === 'copy') input.canonicalProjection = {...input.canonicalProjection};
+        if (kind === 'absent') delete (input as Partial<typeof input>).canonicalProjection;
+        if (kind === 'session') input.sessionId = 'other-session';
+        if (kind === 'run') input.runId = 'other-run';
+        if (kind === 'attempt') input.canonicalCandidate = {...input.canonicalCandidate, attemptId: 'other-attempt'};
+        if (kind === 'candidate') input.canonicalCandidate = {...input.canonicalCandidate, candidateRef: 'other-candidate'};
+        if (kind === 'body') {input.snapshot.body += ' changed'; input.canonicalCandidate = {...input.canonicalCandidate,
+          conclusionFingerprint: analysisDeliveryFingerprint(input.snapshot.body)};}
+        if (kind === 'native') input.nativeDeclaration = {...input.nativeDeclaration};
+        if (kind === 'released') releaseConclusionProtocolProjection(target.token);
+        if (kind === 'historical') input.canonicalProjection = canonicalizeAnalysisResult(target.source,
+          {context: {entry: 'historical_restore'}}).projection;
+        if (kind === 'session') registerOnDemandSourceLookupForEcho(input.sessionId, [{referenceId: 'other-read',
+          codebaseId: 'other', filePath: 'Other.kt', text: target.marker}]);
+        const projected = projectConclusionSemanticInput(input);
+        expect(projected.changed).toBe(true);
+        expect(JSON.stringify(projected.value.conclusionContract)).not.toContain(target.marker);
+      } finally {clearCodeAwareOutputGuards('other-session'); target.cleanup();}
+    });
+
+  it.each(['text', 'claim_id', 'kind', 'presence', 'rank', 'cluster', 'conclusion_id', 'moved', 'substring'] as const)(
+    'does not restore original prose under changed %s fields', async kind => {
+      const target = await proseFixture();
+      try {
+        const contract = target.input.snapshot.conclusionContract!;
+        const claim = contract.claims![0];
+        if (kind === 'text') claim.text += ' added';
+        if (kind === 'claim_id') claim.id = 'other-claim';
+        if (kind === 'kind') claim.kind = 'identity';
+        if (kind === 'presence') delete claim.conclusionId;
+        if (kind === 'rank') contract.conclusions[0].rank = 2;
+        if (kind === 'cluster') contract.clusters[0].cluster += ' changed';
+        if (kind === 'conclusion_id') contract.evidenceChain[0].conclusionId = 'C2';
+        if (kind === 'moved') [contract.uncertainties[0], contract.nextSteps[0]] = [contract.nextSteps[0], contract.uncertainties[0]];
+        if (kind === 'substring') claim.text = target.marker;
+        expect(projectConclusionSemanticInput(target.input).changed).toBe(true);
+      } finally {target.cleanup();}
+    });
+
+  it.each(['canary', 'private_query', 'revoked', 'claim_key', 'parent_key', 'statement_key'] as const)(
+    'keeps %s stronger than exact native prose permissions', async kind => {
+      const target = await proseFixture();
+      try {
+        if (kind === 'canary') registerCodeAwareCanary(target.input.sessionId, target.marker);
+        if (kind === 'private_query') registerPrivateAnalysisQueryForEcho(target.input.sessionId, target.marker);
+        if (kind === 'revoked') revokeCodeAwareOutputGuards(target.input.sessionId);
+        if (kind === 'claim_key') registerCodeAwareCanary(target.input.sessionId, 'text');
+        if (kind === 'parent_key') registerCodeAwareCanary(target.input.sessionId, 'claims');
+        if (kind === 'statement_key') registerCodeAwareCanary(target.input.sessionId, 'statement');
+        const projected = projectConclusionSemanticInput(target.input);
+        expect(projected.changed).toBe(true);
+        if (kind === 'claim_key') expect(projected.value.conclusionContract?.claims?.[0]).not.toHaveProperty('text');
+        else if (kind === 'parent_key') expect(projected.value.conclusionContract).not.toHaveProperty('claims');
+        else if (kind === 'statement_key') expect(projected.value.conclusionContract?.conclusions?.[0]).not.toHaveProperty('statement');
+        else expect(JSON.stringify(projected.value)).not.toContain(target.marker);
+      } finally {target.cleanup();}
+    });
+});
+
 describe('canonical analysis result projection', () => {
+  it('uses the same protocol inspection for native diagnostics and canonical narrative', () => {
+    const raw = `Visible body\n${renderConclusionContractSidecar(declaration())}`;
+    const inspected = inspectCandidateProtocol(raw);
+    expect(inspected.canonicalBody).toBe(canonicalizeAnalysisResult(result(raw)).result.conclusion);
+    expect(buildCandidateProtocolDiagnostic(inspected, 'native', 1)).toMatchObject({
+      status: 'valid', sidecarStatus: 'valid', typedJsonStatus: 'not_checked', canonicalChars: 12,
+      projectionKind: 'protocol_projection', issueCodes: [], issueCount: 0,
+    });
+    const onlySidecar = inspectCandidateProtocol(renderConclusionContractSidecar(declaration()));
+    expect(buildCandidateProtocolDiagnostic(onlySidecar, 'native', 1)).toMatchObject({status: 'valid', canonicalChars: 0});
+  });
+
+  it('distinguishes valid native declarations from a later malformed projected declaration without disclosing text', () => {
+    const raw = `Body PRIVATE_DIAGNOSTIC_CANARY\n${renderConclusionContractSidecar(declaration())}`;
+    const changed = raw.replace('"focused_answer"', '"PRIVATE_DIAGNOSTIC_CANARY"');
+    const native = buildCandidateProtocolDiagnostic(inspectCandidateProtocol(raw), 'native', 1);
+    const projected = buildCandidateProtocolDiagnostic(inspectCandidateProtocol(changed), 'runtime_projected', 1, 'redacted');
+    expect(native.status).toBe('valid');
+    expect(projected).toMatchObject({status: 'invalid', projectionKind: 'redacted', issueCodes: ['invalid_contract']});
+    expect(sanitizeCandidateProtocolDiagnostic(projected)).toEqual(projected);
+    expect(JSON.stringify([native, projected])).not.toContain('PRIVATE_DIAGNOSTIC_CANARY');
+    expect(projected).toMatchObject({claimCount: 1, semanticClaimCount: 0, sourceBindingCount: 0, status: 'invalid'});
+  });
+
+  it('records declared claim/semantic/binding counts without treating them as valid evidence', () => {
+    const original = {...declaration(), claims: [
+      {id: 'one', text: 'A hypothetical statement.', kind: 'inference', references: [], semantics: {
+        schemaVersion: 'claim_semantics@1', predicate: 'example.hypothesis', polarity: 'affirmed',
+        discourse: 'hypothetical', quantifier: 'one', modality: 'possible', scope: {population: 'codebase'},
+      }},
+      {id: 'two', text: 'An unchecked statement.', kind: 'inference', references: []},
+    ], sourceClaimBindings: [{invalid: 'PRIVATE_DIAGNOSTIC_CANARY'}, {alsoInvalid: true}]};
+    const inspect = (payload: unknown) => inspectCandidateProtocol(
+      `Body\n<!-- smartperfetto:conclusion-contract@1\n\`\`\`json\n${JSON.stringify(payload)}\n\`\`\`\n-->`);
+    const native = buildCandidateProtocolDiagnostic(inspect(original), 'native', 1);
+    expect(native).toMatchObject({claimCount: 2, semanticClaimCount: 1, sourceBindingCount: 2});
+    expect(sanitizeCandidateProtocolDiagnostic(native)).toEqual(native);
+    const projected = buildCandidateProtocolDiagnostic(inspect({...original, sourceClaimBindings: []}), 'runtime_projected', 1);
+    expect(projected).toMatchObject({claimCount: 2, semanticClaimCount: 1, sourceBindingCount: 0});
+    expect(JSON.stringify([native, projected])).not.toContain('PRIVATE_DIAGNOSTIC_CANARY');
+    const old = buildCandidateProtocolDiagnostic(inspectCandidateProtocol('Body'), 'native', 1);
+    expect(old).not.toHaveProperty('claimCount');
+    expect(sanitizeCandidateProtocolDiagnostic(old)).toEqual(old);
+  });
+
+  it('projects only fixed root structure facts and raw declaration entry counts for an invalid shell', () => {
+    const raw = renderConclusionContractSidecar({...declaration(), mode: 'PRIVATE_STRUCTURE_CANARY'} as any);
+    const diagnostic = buildCandidateProtocolDiagnostic(inspectCandidateProtocol(raw), 'native', 1);
+    expect(diagnostic).toMatchObject({status: 'invalid', issueCount: 1, claimCount: 1, semanticClaimCount: 0,
+      sourceBindingCount: 0, details: [{field: '$.mode', expected: 'conclusion_mode', actual: 'string', reason: 'invalid_enum'}]});
+    expect(sanitizeCandidateProtocolDiagnostic(diagnostic)).toEqual(diagnostic);
+    expect(JSON.stringify(diagnostic)).not.toContain('PRIVATE_STRUCTURE_CANARY');
+  });
+
+  it('rejects duplicate, excessive, unknown or impossible structure detail combinations while accepting old diagnostics', () => {
+    const diagnostic = buildCandidateProtocolDiagnostic(inspectCandidateProtocol(
+      renderConclusionContractSidecar({...declaration(), mode: 'bad'} as any)), 'native', 1);
+    const detail = {field: '$.mode', expected: 'conclusion_mode', actual: 'string', reason: 'invalid_enum'};
+    for (const details of [[detail, detail], Array(25).fill(detail), [null],
+      [{...detail, field: '/private/source'}], [{...detail, actual: 'PRIVATE_STRUCTURE_CANARY'}],
+      [{...detail, expected: 'string'}], [{...detail, reason: 'wrong_type'}],
+      [{...detail, field: '$.conclusions[].rank', expected: 'finite_number'}],
+      [{...detail, field: '$', expected: 'object', actual: 'missing', reason: 'missing_required'}],
+      [{...detail, raw: 'PRIVATE_STRUCTURE_CANARY'}]]) {
+      expect(sanitizeCandidateProtocolDiagnostic({...diagnostic, details})).toBeUndefined();
+    }
+    const uniqueDetails = ['$', '$.conclusions[]', '$.clusters[]', '$.evidenceChain[]'].flatMap(field =>
+      ['null', 'array', 'string', 'number', 'boolean', 'undefined', 'other', 'nonfinite_number'].map(actual =>
+        ({field, expected: 'object', actual, reason: 'wrong_type'})));
+    expect(sanitizeCandidateProtocolDiagnostic({...diagnostic, details: uniqueDetails.slice(0, 24)})).toBeDefined();
+    expect(sanitizeCandidateProtocolDiagnostic({...diagnostic, details: uniqueDetails.slice(0, 25)})).toBeUndefined();
+    expect(sanitizeCandidateProtocolDiagnostic({...diagnostic, issueCodes: ['invalid_reference'], details: [detail]})).toBeUndefined();
+    const {details: _details, ...old} = diagnostic;
+    expect(sanitizeCandidateProtocolDiagnostic(old)).toEqual(old);
+  });
+
+  it.each(['Ordinary answer', JSON.stringify(declaration())])('keeps ordinary or legacy declarations absent rather than invalid: %s', raw => {
+    expect(inspectCandidateProtocol(raw).status).toBe('absent');
+  });
+
+  it.each([
+    {raw: 'PRIVATE_DIAGNOSTIC_CANARY'}, {path: '/private/source'}, {claimId: 'private-claim'},
+    {issueCodes: ['private_failure'], issueCount: 1}, {rawChars: -1}, {canonicalChars: Infinity},
+    {issueCount: Number.MAX_SAFE_INTEGER + 1}, {candidateIndex: 3}, {stage: 'model_claim'},
+    {claimCount: 1}, {claimCount: 1, semanticClaimCount: 2, sourceBindingCount: 0},
+    {claimCount: 1, semanticClaimCount: 1, sourceBindingCount: -1},
+  ])('rejects unsafe or malformed diagnostic metadata %j', extra => {
+    const diagnostic = buildCandidateProtocolDiagnostic(inspectCandidateProtocol('Body'), 'native', 1);
+    expect(sanitizeCandidateProtocolDiagnostic({...diagnostic, ...extra})).toBeUndefined();
+  });
+
   it.each(['sidecar_first', 'control_first'] as const)('preserves exact narrative for %s', order => {
     const sidecar = renderConclusionContractSidecar(declaration());
     const blocks = order === 'sidecar_first' ? `${sidecar}\r\n${control}` : `${control}\r\n${sidecar}`;

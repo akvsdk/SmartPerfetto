@@ -6,23 +6,20 @@ import {randomUUID} from 'node:crypto';
 import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import {deriveConclusionContract} from '../agent/core/conclusionGenerator';
 import {parseConclusionContractSidecar, parseTypedConclusionContractJson, parseDeclaredConclusionClaims,
-  parseDeclaredRelationProposals, type ConclusionContract, type ConclusionBindingEligibility,
-  type ConclusionContractDeclarationParseResult, type ConclusionContractSidecarParseResult} from '../agent/core/conclusionContract';
+  parseDeclaredRelationProposals, declaredFields, declaredContractForResult, type ConclusionContract, type ConclusionBindingEligibility,
+  type ConclusionContractDeclarationParseResult, type ConclusionContractSidecarParseResult,
+  MAX_CONCLUSION_STRUCTURE_DETAILS, isConclusionContractStructureDetail,
+  type ConclusionContractStructureDetail, type ConclusionContractParseIssue} from '../agent/core/conclusionContract';
 import {parseConversationResponseWithProjection, type ConversationEvidenceRef,
   type ConversationResponseProjection, type ConversationRuntimeOutcome} from '../assistant/contracts/conversationContract';
-import {analysisDeliveryFingerprint, sameAnalysisCandidate, type AnalysisCandidateIdentity,
+import {analysisDeliveryFingerprint, sameAnalysisCandidate,
   type AnalysisDeliveryContext} from '../types/analysisDelivery';
 import {sanitizeSourceUseDecision, sanitizeSourceReferences, sanitizeSourceClaimBindings} from './codebase/sourceUseDecision';
 import type {CaseKnowledgeReportRecommendation, CaseKnowledgeRecommendation} from '../types/caseKnowledge';
-
-/** Internal receipt. Neither this object nor the source hash belongs in result JSON. */
-export interface CanonicalAnalysisProjection {
-  readonly disposition: 'preserved' | 'protocol_projection';
-  readonly inputFingerprint: string;
-  readonly outputFingerprint: string;
-  readonly sourceCandidate?: Readonly<AnalysisCandidateIdentity>;
-  readonly candidate?: Readonly<AnalysisCandidateIdentity>;
-}
+import {isIssuedNativeConclusionDeclaration, projectConclusionContractForDisplay,
+  type NativeConclusionDeclaration} from './security/conclusionProtocolProjection';
+import {issueCanonicalAnalysisProjection, type CanonicalAnalysisProjection} from './canonicalAnalysisProjection';
+export {isIssuedCanonicalAnalysisProjection, type CanonicalAnalysisProjection} from './canonicalAnalysisProjection';
 
 export interface CanonicalAnalysisResult {
   result: AnalysisResult;
@@ -41,127 +38,6 @@ export interface CanonicalAnalysisResult {
   };
 }
 
-const issuedProjections = new WeakSet<object>();
-
-export function isIssuedCanonicalAnalysisProjection(value: unknown): value is CanonicalAnalysisProjection {
-  return typeof value === 'object' && value !== null && issuedProjections.has(value);
-}
-
-function issueProjection(input: CanonicalAnalysisProjection): CanonicalAnalysisProjection {
-  const projection = Object.freeze({...input,
-    ...(input.sourceCandidate ? {sourceCandidate: Object.freeze({...input.sourceCandidate})} : {}),
-    ...(input.candidate ? {candidate: Object.freeze({...input.candidate})} : {}),
-  });
-  issuedProjections.add(projection);
-  return projection;
-}
-
-function declaredFields<T extends object, K extends keyof T>(value: T, keys: readonly K[]): Pick<T, K> {
-  if (!value || typeof value !== 'object') return {} as Pick<T, K>;
-  return Object.fromEntries(keys.flatMap(key => {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor && 'value' in descriptor ? [[key, descriptor.value]] : [];
-  })) as Pick<T, K>;
-}
-
-function strings(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-
-function stringFields<T extends object, K extends keyof T>(value: T, keys: readonly K[]): Partial<Pick<T, K>> {
-  return Object.fromEntries(Object.entries(declaredFields(value, keys)).filter(([, item]) => typeof item === 'string')) as Partial<Pick<T, K>>;
-}
-
-function numberFields<T extends object, K extends keyof T>(value: T, keys: readonly K[]): Partial<Pick<T, K>> {
-  return Object.fromEntries(Object.entries(declaredFields(value, keys)).filter(([, item]) => typeof item === 'number' && Number.isFinite(item))) as Partial<Pick<T, K>>;
-}
-
-function caseRecommendationsForResult(value: ConclusionContract['caseRecommendations']): CaseKnowledgeReportRecommendation[] {
-  const recommendations = (items: unknown): CaseKnowledgeRecommendation[] => Array.isArray(items) ? items.flatMap(item => {
-    if (!item || typeof item !== 'object') return [];
-    const fields = declaredFields(item as CaseKnowledgeRecommendation, ['id', 'priority', 'action', 'applies_when', 'risks']);
-    return typeof fields.id === 'string' && typeof fields.action === 'string' && typeof fields.applies_when === 'string' &&
-      typeof fields.risks === 'string' && ['P0', 'P1', 'P2', 'P3'].includes(fields.priority) ? [fields] : [];
-  }) : [];
-  return Array.isArray(value) ? value.flatMap(item => {
-    if (!item || typeof item.caseId !== 'string' || typeof item.title !== 'string' ||
-      !['strong', 'partial', 'background'].includes(item.matchStrength)) return [];
-    const learned = item.learnedProvenance;
-    return [{caseId: item.caseId, title: item.title, matchStrength: item.matchStrength,
-      ...stringFields(item, ['scene', 'primaryRootCause', 'evidenceGap']),
-      ...(item.evidenceRefs ? {evidenceRefs: strings(item.evidenceRefs)} : {}),
-      ...(item.matchedSignatures ? {matchedSignatures: strings(item.matchedSignatures)} : {}),
-      ...(item.missingRequiredSignatures ? {missingRequiredSignatures: strings(item.missingRequiredSignatures)} : {}),
-      recommendations: {app: recommendations(item.recommendations?.app), oem: recommendations(item.recommendations?.oem)},
-      ...(learned && typeof learned.candidateId === 'string' && typeof learned.supported === 'boolean' &&
-        Number.isFinite(learned.supportingEvidence) && Number.isFinite(learned.contradictingEvidence) ? {learnedProvenance: {
-          candidateId: learned.candidateId, supportingEvidence: learned.supportingEvidence,
-          contradictingEvidence: learned.contradictingEvidence, supported: learned.supported,
-        }} : {}),
-    }];
-  }) : [];
-}
-
-/** Raw malformed declarations remain private; typed declarations retain parser eligibility. */
-function declaredContractForResult(contract: ConclusionContract | undefined): ConclusionContract | undefined {
-  if (!contract) return undefined;
-  const typed = declaredFields(contract, ['schemaVersion', 'mode', 'conclusions', 'clusters', 'evidenceChain',
-    'claims', 'relationProposals', 'bindingEligibility', 'sourceUseDecision', 'sourceReferences',
-    'sourceClaimBindings', 'caseRecommendations', 'uncertainties', 'nextSteps', 'metadata']);
-  if (Array.isArray(typed.conclusions)) typed.conclusions = typed.conclusions.flatMap(item =>
-    item && typeof item.statement === 'string' && Number.isFinite(item.rank) ? [{rank: item.rank, statement: item.statement,
-      ...numberFields(item, ['confidencePercent']), ...stringFields(item, ['trigger', 'supply', 'amplification'])}] : []);
-  if (Array.isArray(typed.clusters)) typed.clusters = typed.clusters.flatMap(item =>
-    item && typeof item.cluster === 'string' ? [{cluster: item.cluster, ...stringFields(item, ['description']),
-      ...numberFields(item, ['frames', 'percentage', 'omittedFrameRefs']),
-      ...(item.frameRefs ? {frameRefs: strings(item.frameRefs)} : {})}] : []);
-  if (Array.isArray(typed.evidenceChain)) typed.evidenceChain = typed.evidenceChain.flatMap(item =>
-    item && typeof item.conclusionId === 'string' && typeof item.text === 'string'
-      ? [{conclusionId: item.conclusionId, text: item.text}] : []);
-  if (typed.claims) {
-    const declarations = typed.claims.map(claim => declaredFields(claim,
-      ['id', 'conclusionId', 'text', 'kind', 'references', 'artifactRefs', 'relationRefs', 'supportLevel', 'semantics']));
-    typed.claims = parseDeclaredConclusionClaims(declarations).claims.map(claim => {
-      const {rawReferences: _references, rawSemantics: _semantics, semanticsParseIssues: _issues, ...projected} = claim;
-      if (projected.artifactRefs) projected.artifactRefs = projected.artifactRefs.map(reference => ({
-        ...reference, ...(reference.rowSelector ? {rowSelector: Object.fromEntries(Object.entries(reference.rowSelector)
-          .filter(([, item]) => typeof item === 'string' || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)))} : {}),
-      }));
-      return projected;
-    });
-  }
-  if (typed.relationProposals) typed.relationProposals = parseDeclaredRelationProposals(typed.relationProposals).relationProposals;
-  if (typed.sourceUseDecision) typed.sourceUseDecision = sanitizeSourceUseDecision(typed.sourceUseDecision);
-  if (typed.sourceReferences) typed.sourceReferences = sanitizeSourceReferences(typed.sourceReferences);
-  if (typed.sourceClaimBindings) typed.sourceClaimBindings = sanitizeSourceClaimBindings(typed.sourceClaimBindings);
-  if (typed.caseRecommendations) typed.caseRecommendations = caseRecommendationsForResult(typed.caseRecommendations);
-  if (typed.uncertainties) typed.uncertainties = strings(typed.uncertainties);
-  if (typed.nextSteps) typed.nextSteps = strings(typed.nextSteps);
-  if (typed.metadata) {
-    const metadata = typed.metadata;
-    const clusterPolicy = metadata.clusterPolicy;
-    typed.metadata = {
-      ...(typeof metadata.confidencePercent === 'number' ? {confidencePercent: metadata.confidencePercent} : {}),
-      ...(typeof metadata.rounds === 'number' ? {rounds: metadata.rounds} : {}),
-      ...(typeof metadata.sceneId === 'string' ? {sceneId: metadata.sceneId} : {}),
-      ...(typeof metadata.derivedFromNarrativeEvidenceMatch === 'boolean'
-        ? {derivedFromNarrativeEvidenceMatch: metadata.derivedFromNarrativeEvidenceMatch} : {}),
-      ...(typeof metadata.replacedUnresolvableProviderClaims === 'boolean'
-        ? {replacedUnresolvableProviderClaims: metadata.replacedUnresolvableProviderClaims} : {}),
-      ...(metadata.claimDerivation === 'explicit_model_contract' || metadata.claimDerivation === 'narrative_evidence_match'
-        ? {claimDerivation: metadata.claimDerivation} : {}),
-      ...(metadata.claimVerificationScope === 'explicit_claims' || metadata.claimVerificationScope === 'sampled_narrative_evidence'
-        ? {claimVerificationScope: metadata.claimVerificationScope} : {}),
-      ...(clusterPolicy && ['required', 'optional', 'none'].includes(clusterPolicy.outputMode) &&
-        ['none', 'top', 'full'].includes(clusterPolicy.frameListMode) ? {clusterPolicy: {
-          outputMode: clusterPolicy.outputMode, frameListMode: clusterPolicy.frameListMode,
-          ...(typeof clusterPolicy.maxFramesPerCluster === 'number' ? {maxFramesPerCluster: clusterPolicy.maxFramesPerCluster} : {}),
-        }} : {}),
-    };
-  }
-  return typed;
-}
-
 function removeMachineSegments(raw: string, segments: Array<{start: number; end: number}>): string {
   const merged: Array<{start: number; end: number}> = [];
   for (const segment of [...segments].sort((left, right) => left.start - right.start)) {
@@ -175,13 +51,125 @@ function removeMachineSegments(raw: string, segments: Array<{start: number; end:
   return narrative;
 }
 
+/** Private inspection: callers must publish only the bounded diagnostic projection below. */
+export function inspectCandidateProtocol(raw: string, conversationInput?: {
+  fallbackQuestion: string; evidence?: ConversationEvidenceRef[];
+}) {
+  const sidecar = parseConclusionContractSidecar(raw);
+  const conversation = conversationInput ? parseConversationResponseWithProjection(
+    raw, conversationInput.fallbackQuestion, conversationInput.evidence,
+  ) : undefined;
+  const canonicalBody = removeMachineSegments(raw, [...sidecar.machineSegments, ...(conversation?.machineSegments ?? [])]);
+  const typedJson = sidecar.status === 'absent' ? parseTypedConclusionContractJson(canonicalBody) : undefined;
+  const status = sidecar.status === 'invalid' || typedJson?.status === 'invalid' ? 'invalid'
+    : sidecar.status === 'valid' || typedJson?.status === 'valid' ? 'valid' : 'absent';
+  return {rawChars: raw.length, canonicalBody, sidecar, typedJson, conversation, status} as const;
+}
+
+export interface CandidateProtocolDiagnostic {
+  schemaVersion: 'candidate_protocol_diagnostic@1';
+  stage: 'native' | 'runtime_projected';
+  candidateIndex: 1 | 2;
+  status: 'absent' | 'valid' | 'invalid';
+  sidecarStatus: 'absent' | 'valid' | 'invalid';
+  typedJsonStatus: 'not_checked' | 'absent' | 'valid' | 'invalid';
+  issueCodes: ConclusionContractParseIssue['code'][];
+  /** Schema-owned fields/types only, never arbitrary parser paths or model values. */
+  details?: ConclusionContractStructureDetail[];
+  issueCount: number;
+  rawChars: number;
+  /** UTF-16 characters after trimming canonical narrative whitespace. */
+  canonicalChars: number;
+  projectionKind: 'preserved' | 'protocol_projection' | 'redacted' | 'replaced';
+  /** Declaration entries, never evidence of validity or verification. Absent in older artifacts. */
+  claimCount?: number;
+  semanticClaimCount?: number;
+  sourceBindingCount?: number;
+}
+
+const CANDIDATE_PROTOCOL_ISSUE_CODES: readonly ConclusionContractParseIssue['code'][] = [
+  'invalid_framing', 'duplicate_marker', 'invalid_json', 'invalid_contract', 'invalid_claim',
+  'invalid_reference', 'invalid_semantics', 'duplicate_claim_id', 'invalid_relation_proposal',
+  'duplicate_proposal_id', 'untrusted_parser_metadata',
+];
+const CANDIDATE_PROTOCOL_DIAGNOSTIC_KEYS = [
+  'schemaVersion', 'stage', 'candidateIndex', 'status', 'sidecarStatus', 'typedJsonStatus',
+  'issueCodes', 'issueCount', 'rawChars', 'canonicalChars', 'projectionKind',
+  'claimCount', 'semanticClaimCount', 'sourceBindingCount', 'details',
+] as const;
+
+/** Diagnostics carry only fixed schema locations, never source paths, model text or admission authority. */
+export function sanitizeCandidateProtocolDiagnostic(value: unknown): CandidateProtocolDiagnostic | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      Object.keys(value).some(key => !(CANDIDATE_PROTOCOL_DIAGNOSTIC_KEYS as readonly string[]).includes(key))) return undefined;
+  const data = declaredFields(value as CandidateProtocolDiagnostic, CANDIDATE_PROTOCOL_DIAGNOSTIC_KEYS);
+  const statuses = ['absent', 'valid', 'invalid'];
+  if (data.schemaVersion !== 'candidate_protocol_diagnostic@1' ||
+      !['native', 'runtime_projected'].includes(data.stage) || ![1, 2].includes(data.candidateIndex) ||
+      !statuses.includes(data.status) || !statuses.includes(data.sidecarStatus) ||
+      !['not_checked', ...statuses].includes(data.typedJsonStatus) ||
+      !['preserved', 'protocol_projection', 'redacted', 'replaced'].includes(data.projectionKind) ||
+      ![data.issueCount, data.rawChars, data.canonicalChars].every(count => Number.isSafeInteger(count) && count >= 0) ||
+      !Array.isArray(data.issueCodes) || data.issueCodes.length > CANDIDATE_PROTOCOL_ISSUE_CODES.length ||
+      data.issueCodes.some(code => !CANDIDATE_PROTOCOL_ISSUE_CODES.includes(code)) ||
+      new Set(data.issueCodes).size !== data.issueCodes.length || data.issueCount < data.issueCodes.length) return undefined;
+  const counts = [data.claimCount, data.semanticClaimCount, data.sourceBindingCount];
+  if (counts.some(count => count !== undefined) &&
+      (!counts.every(count => Number.isSafeInteger(count) && count! >= 0) || data.semanticClaimCount! > data.claimCount!)) return undefined;
+  if (data.details !== undefined && (!Array.isArray(data.details) || data.details.length === 0 ||
+    data.details.length > MAX_CONCLUSION_STRUCTURE_DETAILS || data.status !== 'invalid' ||
+    !data.issueCodes.includes('invalid_contract') || !data.details.every(isConclusionContractStructureDetail) ||
+    new Set(data.details.map(detail => `${detail.field}:${detail.actual}`)).size !== data.details.length)) return undefined;
+  return {...data, issueCodes: [...data.issueCodes],
+    ...(data.details ? {details: data.details.map(detail => ({...detail}))} : {})};
+}
+
+export function buildCandidateProtocolDiagnostic(
+  inspected: ReturnType<typeof inspectCandidateProtocol>,
+  stage: CandidateProtocolDiagnostic['stage'],
+  candidateIndex: CandidateProtocolDiagnostic['candidateIndex'],
+  privacyProjection?: 'preserved' | 'redacted' | 'replaced',
+): CandidateProtocolDiagnostic {
+  const issues = [...inspected.sidecar.issues, ...(inspected.typedJson?.issues ?? [])];
+  const parsed = inspected.sidecar.status !== 'absent' ? inspected.sidecar : inspected.typedJson;
+  const payload = parsed?.rawPayload as {claims?: unknown; sourceClaimBindings?: unknown} | undefined;
+  const claims = Array.isArray(payload?.claims) ? payload.claims : parsed?.contract?.claims ?? [];
+  const sourceBindings = Array.isArray(payload?.sourceClaimBindings) ? payload.sourceClaimBindings
+    : parsed?.contract?.sourceClaimBindings ?? [];
+  const details: ConclusionContractStructureDetail[] = [];
+  const seenDetails = new Set<string>();
+  for (const issue of issues) {
+    if (issue.code !== 'invalid_contract') continue;
+    for (const detail of issue.details ?? []) {
+      if (!isConclusionContractStructureDetail(detail)) continue;
+      const key = `${detail.field}:${detail.actual}`;
+      if (seenDetails.has(key) || details.length >= MAX_CONCLUSION_STRUCTURE_DETAILS) continue;
+      seenDetails.add(key);
+      details.push({...detail});
+    }
+  }
+  return {
+    schemaVersion: 'candidate_protocol_diagnostic@1', stage, candidateIndex, status: inspected.status,
+    sidecarStatus: inspected.sidecar.status, typedJsonStatus: inspected.typedJson?.status ?? 'not_checked',
+    issueCodes: [...new Set(issues.map(issue => issue.code))], issueCount: issues.length,
+    ...(details.length ? {details} : {}),
+    rawChars: inspected.rawChars, canonicalChars: inspected.canonicalBody.trim().length,
+    ...(parsed?.contract || payload && typeof payload === 'object' && !Array.isArray(payload) ? {claimCount: claims.length,
+      semanticClaimCount: claims.filter(claim => claim && typeof claim === 'object' &&
+        Object.prototype.hasOwnProperty.call(claim, 'semantics')).length,
+      sourceBindingCount: sourceBindings.length} : {}),
+    projectionKind: privacyProjection && privacyProjection !== 'preserved' ? privacyProjection
+      : inspected.rawChars !== inspected.canonicalBody.length ? 'protocol_projection' : 'preserved',
+  };
+}
+
 /**
  * Select canonical declarations and remove only protocol spans identified by the
  * actual parsers. No caller-supplied renderer or text replacement can mint proof.
  */
 export function canonicalizeAnalysisResult(
   source: AnalysisResult,
-  options: {context?: AnalysisDeliveryContext; conversation?: {
+  options: {context?: AnalysisDeliveryContext; nativeDeclaration?: NativeConclusionDeclaration; conversation?: {
     fallbackQuestion: string; evidence?: ConversationEvidenceRef[];
   }} = {},
 ): CanonicalAnalysisResult {
@@ -189,27 +177,29 @@ export function canonicalizeAnalysisResult(
   if (options.context?.entry === 'historical_restore') {
     return {result: source, validationContract: source.conclusionContract,
       bindingEligibility: source.conclusionContract?.bindingEligibility ?? 'legacy_unchecked',
-      deliveryContext: options.context, projection: issueProjection({
+      deliveryContext: options.context, projection: issueCanonicalAnalysisProjection({
       disposition: 'preserved', inputFingerprint: analysisDeliveryFingerprint(raw), outputFingerprint: analysisDeliveryFingerprint(raw),
     })};
   }
   // Sidecar presence is decided from the original body, before any display projection.
-  const sidecar = parseConclusionContractSidecar(raw);
-  const conversation = options.conversation ? parseConversationResponseWithProjection(
-    raw, options.conversation.fallbackQuestion, options.conversation.evidence,
-  ) : undefined;
-  const narrative = removeMachineSegments(raw, [...sidecar.machineSegments, ...(conversation?.machineSegments ?? [])]);
-  const typedJson = sidecar.status === 'absent' ? parseTypedConclusionContractJson(narrative) : undefined;
+  if (options.nativeDeclaration && !isIssuedNativeConclusionDeclaration(options.nativeDeclaration)) {
+    throw new Error('unissued_native_conclusion_declaration');
+  }
+  const display = inspectCandidateProtocol(raw, options.conversation);
+  const {sidecar, conversation, typedJson} = options.nativeDeclaration
+    ? inspectCandidateProtocol(options.nativeDeclaration.raw, options.conversation) : display;
+  const narrative = display.canonicalBody;
   const intent = options.context?.turnIntent;
   const validationContract = sidecar.status !== 'absent'
     ? sidecar.contract
-    : typedJson && typedJson.status !== 'absent' ? typedJson.contract : source.conclusionContract ?? deriveConclusionContract(narrative, {
+    : typedJson && typedJson.status !== 'absent' ? typedJson.contract : options.nativeDeclaration?.contract ?? source.conclusionContract ?? deriveConclusionContract(narrative, {
       mode: intent?.status === 'resolved' && intent.deliverable === 'answer' ? 'focused_answer' : 'initial_report',
       ...(intent?.status === 'resolved' ? {sceneId: intent.sceneId} : {}),
     }) ?? undefined;
   const bindingEligibility: ConclusionBindingEligibility = sidecar.status === 'invalid' || typedJson?.status === 'invalid' ||
     conversation?.status === 'invalid' ? 'ineligible' : validationContract?.bindingEligibility ?? 'legacy_unchecked';
-  const conclusionContract = declaredContractForResult(validationContract);
+  const conclusionContract = options.nativeDeclaration
+    ? projectConclusionContractForDisplay(source.sessionId, validationContract) : declaredContractForResult(validationContract);
   if (conclusionContract && bindingEligibility === 'ineligible') conclusionContract.bindingEligibility = 'ineligible';
   const bodyChanged = narrative !== raw;
   const contractChanged = sidecar.status !== 'absent' || (typedJson !== undefined && typedJson.status !== 'absent') ||
@@ -223,11 +213,13 @@ export function canonicalizeAnalysisResult(
     ? bodyChanged ? {...sourceCandidate, candidateRef: `canonical-${randomUUID()}`,
       conclusionFingerprint: analysisDeliveryFingerprint(narrative)} : sourceCandidate
     : undefined;
-  const projection = issueProjection({
+  const projection = issueCanonicalAnalysisProjection({
     disposition: bodyChanged ? 'protocol_projection' : 'preserved',
     inputFingerprint: analysisDeliveryFingerprint(raw), outputFingerprint: analysisDeliveryFingerprint(narrative),
     ...(sourceMatches ? {sourceCandidate} : {}), ...(candidate ? {candidate} : {}),
-  });
+  }, options.nativeDeclaration && bindingEligibility === 'eligible' && sourceMatches && candidate && validationContract
+    ? {sessionId: source.sessionId, nativeDeclaration: options.nativeDeclaration, canonicalBody: narrative,
+      contract: validationContract} : undefined);
   if (deliveryContext) {
     const nativeCompletion = deliveryContext.completion;
     const completionCurrent = nativeCompletion?.schemaVersion === 1 &&

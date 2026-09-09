@@ -21,6 +21,8 @@ describe('source use decision contract', () => {
     'native/CMakeLists.cmake',
     'queries/startup.sql',
     'docs/README.md',
+    '源码/启动流程.kt',
+    'feature modules/Main Screen.kt',
   ])('accepts a canonical policy or legacy-contract source path: %s', filePath => {
     expect(normalizeSourceReferencePath(`./${filePath}`)).toBe(filePath);
   });
@@ -34,6 +36,8 @@ describe('source use decision contract', () => {
     'src/Secret.kt\u0000.txt',
     'https://example.test/Secret.kt',
     'src/not-source.txt',
+    'C:relative/Secret.kt',
+    'src/hidden\u202efile.kt',
   ])('rejects unsafe or unsupported source paths: %s', filePath => {
     expect(normalizeSourceReferencePath(filePath)).toBeUndefined();
   });

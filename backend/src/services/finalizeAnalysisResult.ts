@@ -5,7 +5,7 @@
 import {randomUUID} from 'node:crypto';
 import type {AnalysisResult} from '../agent/core/orchestratorTypes';
 import type {ConclusionBindingEligibility, ConclusionContract} from '../agent/core/conclusionContract';
-import type {RuntimeFinalizationContext} from '../agentRuntime/analysisFinalizationContext';
+import {isIssuedFinalizationContext, type RuntimeFinalizationContext} from '../agentRuntime/analysisFinalizationContext';
 import type {ComparisonReportSection} from '../agentv3/sessionStateSnapshot';
 import {getFinalReportContract} from '../agentv3/strategyLoader';
 import type {DataEnvelope} from '../types/dataContract';
@@ -22,6 +22,10 @@ import {runClaimVerification, collectMatchedTraceEvidenceRefIdsByClaimId,
 import {assessFinalSemantics, type FinalSemanticAssessment, type FinalSemanticSnapshot} from './finalSemanticAssessment';
 import {applyFinalResultQualityGate, type FinalResultComparisonIdentity, type FinalResultQualityIssue} from './finalResultQualityGate';
 import {projectCodeAwareStructuredText} from './security/codeAwareOutputRegistry';
+import {projectConclusionSemanticInput} from './security/conclusionProtocolProjection';
+import {applySourceLocationProofs} from './codebase/sourceLocationProof';
+import {isUnusedSourceDecision, type SourceExecutionScopeV1, type SourceUseDecisionV1} from './codebase/sourceUseDecision';
+import {projectPrivateClaimVerification, projectPrivateClaimSupport} from './security/privateAnalysisProjection';
 
 export interface AnalysisFinalizationOwner {
   runId: string;
@@ -53,6 +57,39 @@ export interface FinalizedAnalysisResult {
 }
 
 const consumedContexts = new WeakSet<RuntimeFinalizationContext>();
+
+/** Inspect the original declaration, including malformed fields a typed parser may omit. */
+function hasNoSourceDeclarations(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const declaration = raw as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(declaration, 'sourceUseDecision')) return false;
+  for (const key of ['sourceReferences', 'sourceClaimBindings']) {
+    if (Object.prototype.hasOwnProperty.call(declaration, key) &&
+      (!Array.isArray(declaration[key]) || declaration[key].length !== 0)) return false;
+  }
+  if (declaration.claims === undefined) return true;
+  if (!Array.isArray(declaration.claims)) return false;
+  return declaration.claims.every(claim => {
+    const semantics = claim?.semantics;
+    return !semantics || !Object.prototype.hasOwnProperty.call(semantics, 'source') &&
+      !(typeof semantics.predicate === 'string' && semantics.predicate.startsWith('source.')) &&
+      semantics.scope?.population !== 'codebase';
+  });
+}
+
+function sourceScopeHasNoAccess(scope: Readonly<SourceExecutionScopeV1> | undefined,
+  sourceUse: SourceUseDecisionV1 | undefined): boolean {
+  if (!scope || !['off', 'metadata_only', 'provider_send'].includes(scope.codeAwareMode) ||
+    typeof scope.analysisContextFingerprint !== 'string' || !scope.analysisContextFingerprint.trim() || !Array.isArray(scope.selectedCodebaseIds) ||
+    scope.selectedCodebaseIds.some(id => typeof id !== 'string' || !id.trim()) ||
+    new Set(scope.selectedCodebaseIds).size !== scope.selectedCodebaseIds.length ||
+    scope.hasCodebaseAccess !== (scope.codeAwareMode !== 'off' && scope.selectedCodebaseIds.length > 0)) return false;
+  if (!scope.hasCodebaseAccess) return sourceUse === undefined;
+  return Boolean(sourceUse && isUnusedSourceDecision(sourceUse) && sourceUse.codeAwareMode === scope.codeAwareMode &&
+    Array.isArray(sourceUse.selectedCodebaseIds) &&
+    sourceUse.selectedCodebaseIds.length === scope.selectedCodebaseIds.length &&
+    scope.selectedCodebaseIds.every(id => sourceUse.selectedCodebaseIds.includes(id)));
+}
 
 function frozenSnapshot<T>(input: T): T {
   const snapshot = structuredClone(input);
@@ -136,7 +173,8 @@ function joinClaimVerification(input: {
   return {schemaVersion: 'claim_verifier@2', policy: 'record_only', status, passed,
     checkedClaimCount: claimResults.filter(claim => claim.status !== 'not_checked').length,
     unsupportedClaimCount, claimResults, issues,
-    ...(!passed && !failed ? {notCheckedReason: semantic?.reason ?? 'complete_proposition_review_unavailable'} : {})};
+    ...(semantic?.reason ? {notCheckedReason: semantic.reason}
+      : !passed && !failed ? {notCheckedReason: 'complete_proposition_review_unavailable'} : {})};
 }
 
 function semanticReportAssessment(input: {
@@ -190,7 +228,8 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
         referenceTraceId: expectedPair.referenceTraceId} : suppliedIdentity;
     const caseRetrieval = frozenSnapshot(input.caseRetrieval ?? (context?.deliveryContext.entry !== 'historical_restore'
       ? context?.deliveryContext.caseRetrieval : undefined));
-    const canonical = canonicalizeAnalysisResult(original, {context: context?.deliveryContext, conversation});
+    const nativeDeclaration = context?.getNativeDeclaration(original, owner.signal);
+    const canonical = canonicalizeAnalysisResult(original, {context: context?.deliveryContext, nativeDeclaration, conversation});
     if (!isIssuedCanonicalAnalysisProjection(canonical.projection)) throw new Error('unissued_canonical_projection');
     const result = canonical.result;
     const candidate = canonical.projection.candidate ?? {runId: owner.runId,
@@ -202,6 +241,14 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
         turnIntent: context?.turnIntent};
     }
     const sourceUse = context?.sourceUse;
+    const sourceScope = context?.sourceScope;
+    const rawDeclaration = canonical.protocolDiagnostics?.sidecar.rawPayload ??
+      canonical.protocolDiagnostics?.typedJson?.rawPayload ?? nativeDeclaration?.contract ?? original.conclusionContract;
+    const sourceNotApplicable = Boolean(context && isIssuedFinalizationContext(context) &&
+      canonical.bindingEligibility === 'eligible' && sourceScopeHasNoAccess(sourceScope, sourceUse) &&
+      (owner.analysisContextFingerprint === undefined || sourceScope?.analysisContextFingerprint === owner.analysisContextFingerprint) &&
+      (providerQuery?.analysisContextFingerprint === undefined || sourceScope?.analysisContextFingerprint === providerQuery.analysisContextFingerprint) &&
+      hasNoSourceDeclarations(rawDeclaration));
     const sourceReader = sourceUse ? {getSourceUseDecision: () => sourceUse} : undefined;
     attachSourceUseToAnalysisResult(result, sourceReader);
     const dataEnvelopes = frozenSnapshot(input.dataEnvelopes ?? []) as DataEnvelope[];
@@ -234,9 +281,10 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
             issues: diagnostics.conversation.issues} : undefined} : undefined};
       // This query was accepted as provider input in the same run. The echo guard
       // still protects it in output and in every other role in this snapshot.
-      const projected = projectCodeAwareStructuredText(result.sessionId,
-        providerQuery ? {...snapshot, query: ''} : snapshot);
-      if (providerQuery && projected.value) projected.value.query = providerQuery.text;
+      const projected = projectConclusionSemanticInput({sessionId: result.sessionId, snapshot, prepared,
+        providerQuery: providerQuery?.text, nativeDeclaration,
+        ...(isIssuedFinalizationContext(context) ? {canonicalProjection: canonical.projection,
+          canonicalCandidate: candidate, runId: context.runId} : {})});
       const safeSnapshot: FinalSemanticSnapshot = projected.changed
         ? {...snapshot, inputCoverage: 'incomplete', query: '', body: result.conclusion,
           conclusionContract: undefined, protocolDiagnostics: undefined, evidenceSnapshot: null,
@@ -246,7 +294,9 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
       semantic = await assessFinalSemantics({context, canonicalCandidate: candidate, snapshot: safeSnapshot, signal: owner.signal});
       assertOwner(owner);
     }
-    result.claimVerificationResult = joinClaimVerification({contract: validationContract, draft: draft.claimVerificationResult,
+    const finiteProofs = applySourceLocationProofs({contract: validationContract, sourceUse,
+      draft: draft.claimVerificationResult});
+    result.claimVerificationResult = joinClaimVerification({contract: validationContract, draft: finiteProofs,
       semantic, candidate, body: result.conclusion, bindingEligibility: canonical.bindingEligibility});
     const statusByClaim = new Map(result.claimVerificationResult.claimResults.map(claim => [claim.claimId, claim.status]));
     result.claimSupport = draft.claimSupport.map(support => {
@@ -259,13 +309,21 @@ export async function finalizeAnalysisResult(input: FinalizeAnalysisResultInput)
       actualSourceUseDecision: sourceUse, semanticsPolicy: 'declared',
       matchedTraceEvidenceRefIdsByClaimId: collectMatchedTraceEvidenceRefIdsByClaimId(result.claimVerificationResult),
       verifiedTraceOccurrenceRefIdsByClaimId: collectVerifiedTraceOccurrenceRefIdsByClaimId(result.claimVerificationResult)});
+    if (nativeDeclaration) {
+      // The verdict is computed from original values. Only its public projection enters delivery artifacts.
+      result.claimVerificationResult = projectPrivateClaimVerification(result.sessionId, result.claimVerificationResult)!;
+      result.claimSupport = projectPrivateClaimSupport(result.sessionId, result.claimSupport);
+    }
     const claimsFingerprint = analysisDeliveryFingerprint(result.conclusionContract?.claims ?? []);
     const sourceUseFingerprint = analysisDeliveryFingerprint(result.sourceUseDecision);
-    delivery = {...delivery, evidenceFingerprint, sourceUseFingerprint,
+    const sourceScopeFingerprint = sourceScope ? analysisDeliveryFingerprint(sourceScope) : undefined;
+    delivery = {...delivery, evidenceFingerprint, sourceUseFingerprint, sourceScopeFingerprint,
+      sourceApplicability: sourceNotApplicable && semantic?.coverage.body === 'complete' &&
+        semantic.coverage.claims === 'complete' && semantic.omissions.length === 0 ? 'not_applicable' : undefined,
       claimVerificationBinding: {candidate, claimsFingerprint, evidenceFingerprint,
         verificationFingerprint: analysisDeliveryFingerprint(result.claimVerificationResult)},
       sourceVerificationBinding: result.sourceClaimVerificationResult ? {candidate, claimsFingerprint, evidenceFingerprint,
-        sourceUseFingerprint, conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
+        sourceUseFingerprint, sourceScopeFingerprint, conclusionContractFingerprint: analysisDeliveryFingerprint(result.conclusionContract),
         verificationFingerprint: analysisDeliveryFingerprint(result.sourceClaimVerificationResult)} : undefined,
       reportRequirements: requirements, caseRetrieval,
       reportAssessment: context && semantic ? semanticReportAssessment({candidate, result, context,

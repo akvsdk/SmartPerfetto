@@ -121,7 +121,8 @@ async function finalizeCurrentSurfaceFixture(draft: AnalysisResult, envelope: Da
 }
 
 describe('source provenance output surface matrix', () => {
-  it('keeps one canonical current-run decision and binding across SSE, report, CLI, snapshot, and API readback', async () => {
+  it.each(['src/main/Foo.kt', 'src/功能目录/My Feature/Foo.kt'])(
+    'keeps current-run source %s across SSE, report, CLI, snapshot, and API readback', async filePath => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-source-surfaces-'));
     const dbPath = path.join(tempRoot, 'enterprise.db');
     const cliHome = path.join(tempRoot, 'cli-home');
@@ -129,7 +130,7 @@ describe('source provenance output surface matrix', () => {
     const reference = sanitizeSourceReference({
       referenceId: 'lookup-surface-1',
       codebaseId: 'safe-app',
-      filePath: 'src/main/Foo.kt',
+      filePath,
       lineRange: {start: 10, end: 12},
       symbol: 'Foo.run',
       lookupKind: 'body',
@@ -285,6 +286,8 @@ describe('source provenance output surface matrix', () => {
       });
       expect(reportData.result.claimVerificationResult).toEqual(result.claimVerificationResult);
       const html = new HTMLReportGenerator().generateAgentDrivenHTML(reportData);
+      expect(html).toContain(filePath);
+      expect(sseContract.sourceUseDecision.references[0]).toMatchObject({filePath, lineRange: {start: 10, end: 12}});
       persistReport(reportId, {
         html,
         generatedAt: 1,

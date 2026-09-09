@@ -115,11 +115,11 @@ share a trace prerequisite:
   ordinary multi-turn conversation without a loaded trace and becomes
   trace-aware only after the user attaches one.
 - Authorized source and source actually used by the current run are separate
-  states. Ordinary conversation runs keep source dormant and publish the
-  primary answer first. Only explicit source intent or a narrow Trace-backed
-  code anchor enters the bounded source phase. Automatic source supplements use
-  an independent SSE lifecycle, stay out of later dormant prompt history, and
-  cannot change the primary run status on failure.
+  states. Explicit selection exposes shared source tools to the primary run;
+  the model decides whether the question and trace anchors warrant lookup.
+  Registration and selection do not require indexing. Actual calls update the
+  run ledger continuously. Model-visible references must pass capacity admission
+  and remain bindable in the same run; a model declaration cannot establish use.
 - With a loaded trace, `AIPanel`, the sidebar, and the floating window share the
   page- and trace-scoped `AnalysisBackendConnection`. A completed background
   upload creates only a connection candidate; AI analysis can use the backend
@@ -147,6 +147,10 @@ variables or configuration keys; providers, runtimes, and endpoints continue
 to come from the existing configuration sources.
 
 ## Main Analysis Data Flow
+
+Jank investigation starts with continuous execution on the target process's main thread. `main_thread_frame_work` and the top-level work tables in `scrolling_analysis` share SQL fragments for observed doFrame phases, tasks and thread states, retaining source locators. FrameTimeline adds outcome evidence. Nested hotspots, ambiguous track attribution, unannotated execution and missing scheduling data remain distinct; missing data never means idle. Top-level work tables feed display, synthesis and artifacts so selecting a nested Skill's first payload cannot discard the task evidence.
+
+Strategy frontmatter `investigation_requirements` is separate from report formatting. The shared typed-intent prompt builder reads these evidence obligations from the run's pinned strategy snapshot for investigation answers and reports. Bounded questions apply only relevant obligations; facts and acknowledgements gain no investigation recipe, and `existing_only` gains no retrieval authority. Older snapshots may omit the optional field; declared requirements participate in the fingerprint.
 
 In OIDC mode, the static entry point gates startup through `/api/auth/session`
 and does not load the Perfetto bundle until the session is ready. After the

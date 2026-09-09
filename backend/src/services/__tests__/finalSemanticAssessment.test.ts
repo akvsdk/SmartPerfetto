@@ -393,6 +393,145 @@ describe('final semantic response protocol', () => {
   });
 });
 
+describe('final semantic v2 exact quotation locations', () => {
+  function quoteFixture(options: Parameters<typeof fixture>[0] = {}) {
+    const run = fixture(options);
+    const quote = {text: run.input.snapshot.body};
+    const reply: any = {...run.reply, schemaVersion: 'final_semantic_response@2',
+      claims: run.reply.claims.map(claim => ({...claim, contentLocations: [quote]})),
+      requirements: run.reply.requirements.map(requirement => ({...requirement, contentLocations: [quote]}))};
+    run.dispatch.mockImplementation(async () => ({status: 'ok', text: JSON.stringify(reply)}));
+    return {...run, reply};
+  }
+
+  it('requests v2 in the real template and retains only offsets with the existing one-review cache', async () => {
+    const run = quoteFixture({body: '😀 本次区间持续 9 ms。'});
+    run.reply.claims[0].contentLocations = [{text: '本次区间持续 9 ms'}];
+    const pending = assessFinalSemantics(run.input);
+    expect(assessFinalSemantics(run.input)).toBe(pending);
+    const assessment = await pending;
+    expect(assessment).toMatchObject({schemaVersion: 'final_semantic_assessment@1', status: 'checked',
+      consistency: 'consistent', claims: [{contentLocations: [{start: 3, end: 14}]}]});
+    expect(assessment.claims[0].contentLocations[0]).toEqual({start: 3, end: 14});
+    expect(run.dispatch).toHaveBeenCalledTimes(1);
+    expect(run.reads).not.toHaveBeenCalled();
+    const prompt = run.dispatch.mock.calls[0][0].prompt;
+    expect(prompt).toContain('"schemaVersion": "final_semantic_response@2"');
+    expect(prompt).toContain('including overlapping matches');
+    expect(prompt).toContain('does not establish factual');
+    expect(prompt).toContain(`"bodyUtf16Length":${run.input.snapshot.body.length}`);
+  });
+
+  it.each([1, 2])('selects exact repeated text occurrence %s in the whole original body', async occurrence => {
+    const run = quoteFixture({body: '值为 9 ms；值为 9 ms。'});
+    run.reply.claims[0].contentLocations = [{text: '值为 9 ms', occurrence}];
+    const start = occurrence === 1 ? 0 : 8;
+    expect(await assessFinalSemantics(run.input)).toMatchObject({status: 'checked',
+      claims: [{contentLocations: [{start, end: start + 7}]}]});
+  });
+
+  it('counts overlapping occurrences rather than advancing by the quotation length', async () => {
+    const run = quoteFixture({body: 'banana'});
+    run.reply.claims[0].contentLocations = [{text: 'ana', occurrence: 2}];
+    expect(await assessFinalSemantics(run.input)).toMatchObject({status: 'checked',
+      claims: [{contentLocations: [{start: 3, end: 6}]}]});
+  });
+
+  it.each([undefined, 0, -1, 1.5, 3, Number.MAX_SAFE_INTEGER + 1, '2', null, true])(
+    'rejects ambiguous or invalid repeated-text occurrence %s', async occurrence => {
+      const run = quoteFixture({body: 'banana'});
+      run.reply.claims[0].contentLocations = [{text: 'ana', ...(occurrence === undefined ? {} : {occurrence})}];
+      expect(await assessFinalSemantics(run.input)).toMatchObject({reason: 'invalid_response', claims: []});
+    });
+
+  it.each([
+    {body: '  开始\r\n😀  e\u0301结束  ', text: '\r\n😀  e\u0301', start: 4, end: 12},
+    {body: 'café e\u0301', text: 'e\u0301', start: 5, end: 7},
+    {body: ' 9 ms ', text: ' 9 ms ', start: 0, end: 6},
+  ])('preserves exact CRLF, spaces and combining characters in $text', async ({body, text, start, end}) => {
+    const run = quoteFixture({body});
+    run.reply.claims[0].contentLocations = [{text}];
+    expect(await assessFinalSemantics(run.input)).toMatchObject({status: 'checked',
+      claims: [{contentLocations: [{start, end}]}]});
+  });
+
+  it.each([
+    {body: 'x\r\n y', text: 'x\n y'},
+    {body: 'x  y', text: 'x y'},
+    {body: 'e\u0301', text: 'é'},
+    {body: '😀', text: '\ud83d'},
+    {body: '😀', text: '\ude00'},
+    {body: 'seen', text: 'missing'},
+    {body: 'x \r\n y', text: ' \r\n '},
+    {body: 'seen', text: ''},
+  ])('rejects nonexact, empty or split-surrogate quotation $text', async ({body, text}) => {
+    const run = quoteFixture({body});
+    run.reply.claims[0].contentLocations = [{text}];
+    expect(await assessFinalSemantics(run.input)).toMatchObject({reason: 'invalid_response'});
+  });
+
+  it.each(['start', 'end', 'both', 'extra', 'duplicate', 'mixed', 'one_bad'] as const)(
+    'rejects the entire v2 response for %s location fields', async invalid => {
+      const run = quoteFixture();
+      const quote = {text: run.input.snapshot.body};
+      if (invalid === 'start') run.reply.claims[0].contentLocations = [{...quote, start: 0}];
+      if (invalid === 'end') run.reply.claims[0].contentLocations = [{...quote, end: quote.text.length}];
+      if (invalid === 'both') run.reply.claims[0].contentLocations = [span(quote.text)];
+      if (invalid === 'extra') run.reply.claims[0].contentLocations = [{...quote, verified: true}];
+      if (invalid === 'duplicate') run.reply.claims[0].contentLocations = [quote, {...quote, occurrence: 1}];
+      if (invalid === 'mixed') run.reply.claims[0].contentLocations = [quote, span(quote.text)];
+      if (invalid === 'one_bad') run.reply.claims[0].contentLocations = [quote, {text: 'not in body'}];
+      expect(await assessFinalSemantics(run.input)).toMatchObject({reason: 'invalid_response', claims: []});
+    });
+
+  it.each(['missing_offsets', 'mixed_quote', 'occurrence'] as const)(
+    'never repairs v1 %s using the v2 quotation protocol', async invalid => {
+      const run = fixture();
+      const quote = {text: run.input.snapshot.body};
+      if (invalid === 'missing_offsets') run.reply.claims[0].contentLocations = [quote as any];
+      if (invalid === 'mixed_quote') run.reply.claims[0].contentLocations.push(quote as any);
+      if (invalid === 'occurrence') Object.assign(run.reply.claims[0].contentLocations[0], {occurrence: 1});
+      expect(await assessFinalSemantics(run.input)).toMatchObject({reason: 'invalid_response'});
+    });
+
+  it.each(['claim', 'issue', 'omission', 'requirement'] as const)(
+    'resolves and validates every location in the %s collection', async collection => {
+      const requirements = [{id: 'observation', label: 'Observation', required: true}];
+      for (const invalid of [false, true]) {
+        const run = quoteFixture({requirements, scope: 'scene_wide'});
+        const locations = [{text: run.input.snapshot.body}, ...(invalid ? [{text: 'not in body'}] : [])];
+        if (collection === 'claim') run.reply.claims[0].contentLocations = locations;
+        if (collection === 'issue') {
+          run.reply.claims[0].consistency = 'inconsistent';
+          run.reply.claims[0].issues = [{code: 'numeric_mismatch', contentLocations: locations}];
+        }
+        if (collection === 'omission') run.reply.omissions = [{code: 'undeclared_claim', contentLocations: locations}];
+        if (collection === 'requirement') run.reply.requirements[0].contentLocations = locations;
+        const assessment = await assessFinalSemantics(run.input);
+        expect(assessment).toMatchObject(invalid ? {reason: 'invalid_response', claims: [], omissions: [], requirements: []}
+          : {status: 'checked', consistency: collection === 'issue' || collection === 'omission' ? 'inconsistent' : 'consistent'});
+        if (!invalid) expect(JSON.stringify(assessment)).not.toContain('"text":');
+      }
+    });
+
+  it.each(['missing_claim', 'duplicate_claim', 'missing_omissions', 'empty_omission', 'missing_requirement',
+    'duplicate_requirement', 'wrong_claim_ref', 'coverage_gap', 'coverage_quote', 'extra_coverage'] as const)(
+    'preserves the existing full-response rejection for %s', async invalid => {
+      const run = quoteFixture({requirements: [{id: 'observation', label: 'Observation', required: true}], scope: 'scene_wide'});
+      if (invalid === 'missing_claim') run.reply.claims = [];
+      if (invalid === 'duplicate_claim') run.reply.claims.push(structuredClone(run.reply.claims[0]));
+      if (invalid === 'missing_omissions') delete run.reply.omissions;
+      if (invalid === 'empty_omission') run.reply.omissions = [{code: 'undeclared_claim', contentLocations: []}];
+      if (invalid === 'missing_requirement') run.reply.requirements = [];
+      if (invalid === 'duplicate_requirement') run.reply.requirements.push(structuredClone(run.reply.requirements[0]));
+      if (invalid === 'wrong_claim_ref') run.reply.requirements[0].claimIds = ['unknown'];
+      if (invalid === 'coverage_gap') run.reply.bodyCoverage.reviewedSpans[0].end -= 1;
+      if (invalid === 'coverage_quote') run.reply.bodyCoverage.reviewedSpans = [{text: run.input.snapshot.body}];
+      if (invalid === 'extra_coverage') run.reply.bodyCoverage.reviewedSpans[0].text = run.input.snapshot.body;
+      expect(await assessFinalSemantics(run.input)).toMatchObject({reason: 'invalid_response'});
+    });
+});
+
 describe('semantic report applicability and coverage', () => {
   const required = {id: 'observation', label: 'Observed data', required: true};
   it('accepts content locations without a prescribed heading', async () => {
@@ -503,35 +642,54 @@ describe('semantic dispatch failure and cancellation', () => {
     expect(run.dispatch.mock.calls[0][0].signal?.aborted).toBe(true);
   });
 
-  it('caps an unresponsive issued transport at 60 seconds without extending the original deadline', async () => {
+  it('accepts a same-request response after 60 seconds when the original run deadline has time remaining', async () => {
     jest.useFakeTimers({now: 1_000});
-    const run = fixture({deadlineMs: 901_000, dispatch: async () => new Promise<IntentTransportResult>(() => undefined)});
+    let resolve!: (response: IntentTransportResult) => void;
+    const run = fixture({deadlineMs: 91_000, dispatch: async () => new Promise<IntentTransportResult>(done => {resolve = done;})});
     const pending = assessFinalSemantics(run.input);
     let settled = false;
     void pending.then(() => {settled = true;});
-    await jest.advanceTimersByTimeAsync(59_999);
+    await jest.advanceTimersByTimeAsync(65_000);
     expect(settled).toBe(false);
-    expect(run.dispatch.mock.calls[0][0].deadlineMs).toBe(61_000);
-    expect(run.input.context.deadlineMs).toBe(901_000);
+    expect(run.dispatch.mock.calls[0][0].deadlineMs).toBe(91_000);
+    expect(assessFinalSemantics(run.input)).toBe(pending);
+    resolve({status: 'ok', text: JSON.stringify(run.reply)});
+    expect(await pending).toMatchObject({status: 'checked', consistency: 'consistent'});
+    expect(run.dispatch).toHaveBeenCalledTimes(1);
+    expect(run.input.context.deadlineMs).toBe(91_000);
+  });
+
+  it('stops an unresponsive issued transport at the original deadline without renewing it on repeated calls', async () => {
+    jest.useFakeTimers({now: 1_000});
+    const run = fixture({deadlineMs: 91_000, dispatch: async () => new Promise<IntentTransportResult>(() => undefined)});
+    const pending = assessFinalSemantics(run.input);
+    let settled = false;
+    void pending.then(() => {settled = true;});
+    await jest.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false);
+    expect(assessFinalSemantics(run.input)).toBe(pending);
+    await jest.advanceTimersByTimeAsync(29_999);
+    expect(settled).toBe(false);
     await jest.advanceTimersByTimeAsync(1);
     expect(await pending).toMatchObject({status: 'unavailable', reason: 'timeout', consistency: 'unknown'});
+    expect(run.dispatch.mock.calls[0][0].deadlineMs).toBe(91_000);
     expect(run.dispatch.mock.calls[0][0].signal?.aborted).toBe(true);
     expect(assessFinalSemantics(run.input)).toBe(pending);
     expect(run.dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it('starts the ceiling at the first assessment call and ignores success after the cached timeout', async () => {
+  it('preserves the original absolute deadline across dispatch delay and ignores success after the cached timeout', async () => {
     jest.useFakeTimers({now: 1_000});
     let resolve!: (response: IntentTransportResult) => void;
-    const run = fixture({deadlineMs: 901_000, dispatch: async () => new Promise<IntentTransportResult>(done => {resolve = done;})});
+    const run = fixture({deadlineMs: 91_000, dispatch: async () => new Promise<IntentTransportResult>(done => {resolve = done;})});
     const pending = assessFinalSemantics(run.input);
-    // Synchronous work before the dispatch microtask consumes the same budget.
+    // Synchronous work before the dispatch microtask consumes the original run budget.
     jest.setSystemTime(31_000);
     expect(assessFinalSemantics(run.input)).toBe(pending);
-    await jest.advanceTimersByTimeAsync(30_000);
+    await jest.advanceTimersByTimeAsync(60_000);
     const timeout = await pending;
     expect(timeout).toMatchObject({status: 'unavailable', reason: 'timeout'});
-    expect(run.dispatch.mock.calls[0][0].deadlineMs).toBe(61_000);
+    expect(run.dispatch.mock.calls[0][0].deadlineMs).toBe(91_000);
     resolve({status: 'ok', text: JSON.stringify(run.reply)});
     await jest.advanceTimersByTimeAsync(0);
     expect(assessFinalSemantics(run.input)).toBe(pending);
@@ -539,7 +697,37 @@ describe('semantic dispatch failure and cancellation', () => {
     expect(run.dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it('lets owner cancellation win before the service ceiling even if the callback never settles', async () => {
+  it('rejects a successful response after a clock jump past the original deadline before its timer runs', async () => {
+    jest.useFakeTimers({now: 1_000});
+    let resolve!: (response: IntentTransportResult) => void;
+    const run = fixture({deadlineMs: 91_000, dispatch: async () => new Promise<IntentTransportResult>(done => {resolve = done;})});
+    const pending = assessFinalSemantics(run.input);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(run.dispatch).toHaveBeenCalledTimes(1);
+    jest.setSystemTime(91_001);
+    resolve({status: 'ok', text: JSON.stringify(run.reply)});
+    expect(await pending).toMatchObject({status: 'unavailable', reason: 'timeout', consistency: 'unknown'});
+    expect(assessFinalSemantics(run.input)).toBe(pending);
+    expect(run.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops a disposed context and never accepts its late response', async () => {
+    jest.useFakeTimers({now: 1_000});
+    let resolve!: (response: IntentTransportResult) => void;
+    const run = fixture({deadlineMs: 91_000, dispatch: async () => new Promise<IntentTransportResult>(done => {resolve = done;})});
+    const pending = assessFinalSemantics(run.input);
+    await jest.advanceTimersByTimeAsync(0);
+    run.input.context.dispose();
+    const disposed = await pending;
+    expect(disposed).toMatchObject({status: 'unavailable', consistency: 'unknown'});
+    expect(run.dispatch.mock.calls[0][0].signal?.aborted).toBe(true);
+    resolve({status: 'ok', text: JSON.stringify(run.reply)});
+    await jest.advanceTimersByTimeAsync(0);
+    expect(await pending).toBe(disposed);
+    expect(run.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets owner cancellation win before the original deadline even if the callback never settles', async () => {
     jest.useFakeTimers({now: 1_000});
     const run = fixture({deadlineMs: 901_000, dispatch: async () => new Promise<IntentTransportResult>(() => undefined)});
     const pending = assessFinalSemantics(run.input);

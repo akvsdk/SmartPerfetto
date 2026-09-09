@@ -7,11 +7,11 @@
     "authoredNarrativeRemainsVerbatim": true
   },
   "inventory": {
-    "skillCount": 235,
+    "skillCount": 236,
     "pipelineDefinitionCount": 31,
     "moduleExpertCount": 18,
-    "stepCount": 1228,
-    "explicitColumnCount": 3540
+    "stepCount": 1238,
+    "explicitColumnCount": 3779
   },
   "skills": {
     "ams_module": {
@@ -12484,7 +12484,7 @@
         "en": "Frame Production Gap"
       },
       "description": {
-        "zh-CN": "检测帧间隙（缺帧）并分析 UI Thread/RenderThread 在 gap 期间的活动状态",
+        "zh-CN": "检测 FrameTimeline 区间间隙与 doFrame/DrawFrame 观测覆盖；不据此推断主线程空闲或 SF 背压",
         "en": "Analyzes Frame Production Gap using trace metrics and supporting evidence."
       },
       "type": "composite",
@@ -12545,6 +12545,24 @@
                 "en": "Drawframe Count"
               }
             },
+            "upid": {
+              "label": {
+                "zh-CN": "进程 UPID",
+                "en": "UPID"
+              }
+            },
+            "layer_name": {
+              "label": {
+                "zh-CN": "LayerName",
+                "en": "Layer"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据边界",
+                "en": "Evidence Scope"
+              }
+            },
             "before_frame_id": {
               "label": {
                 "zh-CN": "前帧 ID",
@@ -12580,20 +12598,20 @@
             },
             "ui_no_frame_count": {
               "label": {
-                "zh-CN": "UI无帧",
+                "zh-CN": "未观测到 doFrame",
                 "en": "UI No Frame Count"
               }
             },
             "rt_no_drawframe_count": {
               "label": {
-                "zh-CN": "RT无DrawFrame",
+                "zh-CN": "未观测到 DrawFrame",
                 "en": "Rt No Drawframe Count"
               }
             },
-            "sf_backpressure_count": {
+            "drawframe_observed_count": {
               "label": {
-                "zh-CN": "SF背压",
-                "en": "Sf Backpressure Count"
+                "zh-CN": "DrawFrame 已观测（不代表背压）",
+                "en": "Drawframe Observed Count"
               }
             },
             "max_gap_ms": {
@@ -20060,6 +20078,809 @@
         }
       }
     },
+    "main_thread_frame_work": {
+      "displayName": {
+        "zh-CN": "主线程连续工作分析",
+        "en": "Main Thread Frame Work"
+      },
+      "description": {
+        "zh-CN": "从整个动画或交互窗口的主线程 slice 与调度状态追查帧内、帧间和边界任务；FrameTimeline 仅供另行核对结果",
+        "en": "Analyzes Main Thread Frame Work using trace metrics and supporting evidence."
+      },
+      "type": "composite",
+      "steps": {
+        "__synthesize_summary__": {
+          "title": {
+            "zh-CN": "洞见摘要",
+            "en": "Insight Summary"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        },
+        "main_thread_work_cadence": {
+          "title": {
+            "zh-CN": "doFrame起点间隔（非deadline或呈现间隔）",
+            "en": "Main Thread Work Cadence"
+          },
+          "columns": {
+            "observed_start_interval_ms": {
+              "label": {
+                "zh-CN": "观测起点间隔",
+                "en": "Observed Start Interval ms"
+              }
+            },
+            "between_execution_ms": {
+              "label": {
+                "zh-CN": "前次结束至本次开始",
+                "en": "Between Execution ms"
+              }
+            },
+            "observation": {
+              "label": {
+                "zh-CN": "观测范围",
+                "en": "Observation"
+              }
+            },
+            "start_ts": {
+              "label": {
+                "zh-CN": "前次起点",
+                "en": "Start Ts"
+              }
+            },
+            "dur": {
+              "label": {
+                "zh-CN": "间隔(ns)",
+                "en": "Dur"
+              }
+            },
+            "previous_slice_id": {
+              "label": {
+                "zh-CN": "前次slice",
+                "en": "Previous Slice Id"
+              }
+            },
+            "slice_id": {
+              "label": {
+                "zh-CN": "本次slice",
+                "en": "Slice Id"
+              }
+            },
+            "eligible_interval_count": {
+              "label": {
+                "zh-CN": "全部观测间隔",
+                "en": "Eligible Interval Count"
+              }
+            },
+            "returned_interval_count": {
+              "label": {
+                "zh-CN": "已返回间隔",
+                "en": "Returned Interval Count"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "next_start_ts": {
+              "label": {
+                "zh-CN": "本次起点",
+                "en": "Next Start Ts"
+              }
+            },
+            "marker_count": {
+              "label": {
+                "zh-CN": "本次同起点标记数",
+                "en": "Marker Count"
+              }
+            },
+            "previous_marker_count": {
+              "label": {
+                "zh-CN": "前次同起点标记数",
+                "en": "Previous Marker Count"
+              }
+            },
+            "is_incomplete": {
+              "label": {
+                "zh-CN": "本次标记未结束",
+                "en": "Is Incomplete"
+              }
+            },
+            "previous_is_incomplete": {
+              "label": {
+                "zh-CN": "前次标记未结束",
+                "en": "Previous Is Incomplete"
+              }
+            },
+            "execution_overlap_ms": {
+              "label": {
+                "zh-CN": "观测执行重叠",
+                "en": "Execution Overlap ms"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据范围",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        },
+        "main_thread_work_sources": {
+          "title": {
+            "zh-CN": "任务来源（每个采样任务前三热点/等待，不可相加）",
+            "en": "Main Thread Work Sources"
+          },
+          "columns": {
+            "source_kind": {
+              "label": {
+                "zh-CN": "证据类型",
+                "en": "Source Kind"
+              }
+            },
+            "root_slice_id": {
+              "label": {
+                "zh-CN": "所属任务slice",
+                "en": "Root Slice Id"
+              }
+            },
+            "source_name": {
+              "label": {
+                "zh-CN": "来源标注",
+                "en": "Source Name"
+              }
+            },
+            "source_slice_id": {
+              "label": {
+                "zh-CN": "来源slice",
+                "en": "Source Slice Id"
+              }
+            },
+            "thread_state_id": {
+              "label": {
+                "zh-CN": "调度state ID",
+                "en": "Thread State Id"
+              }
+            },
+            "state": {
+              "label": {
+                "zh-CN": "原调度状态",
+                "en": "State"
+              }
+            },
+            "blocked_function": {
+              "label": {
+                "zh-CN": "阻塞函数",
+                "en": "Blocked Function"
+              }
+            },
+            "io_wait": {
+              "label": {
+                "zh-CN": "原IO标记",
+                "en": "I/O Wait"
+              }
+            },
+            "start_ts": {
+              "label": {
+                "zh-CN": "观测起点",
+                "en": "Start Ts"
+              }
+            },
+            "end_ts": {
+              "label": {
+                "zh-CN": "观测终点",
+                "en": "End Ts"
+              }
+            },
+            "dur": {
+              "label": {
+                "zh-CN": "观测时长(ns)",
+                "en": "Dur"
+              }
+            },
+            "exclusive_wall_ms": {
+              "label": {
+                "zh-CN": "热点exclusive wall",
+                "en": "Exclusive Wall ms"
+              }
+            },
+            "exclusive_outside_doframe_ms": {
+              "label": {
+                "zh-CN": "热点帧外exclusive wall",
+                "en": "Exclusive Outside Doframe ms"
+              }
+            },
+            "wait_overlap_ms": {
+              "label": {
+                "zh-CN": "等待重叠时长",
+                "en": "Wait Overlap ms"
+              }
+            },
+            "parent_id": {
+              "label": {
+                "zh-CN": "来源父slice",
+                "en": "Parent Id"
+              }
+            },
+            "arg_set_id": {
+              "label": {
+                "zh-CN": "来源参数集",
+                "en": "Arg Set Id"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "track_id": {
+              "label": {
+                "zh-CN": "来源轨道",
+                "en": "Track Id"
+              }
+            },
+            "root_track_id": {
+              "label": {
+                "zh-CN": "任务轨道",
+                "en": "Root Track Id"
+              }
+            },
+            "in_doframe_tree": {
+              "label": {
+                "zh-CN": "属于doFrame调用树",
+                "en": "In Doframe Tree"
+              }
+            },
+            "is_incomplete": {
+              "label": {
+                "zh-CN": "未结束标注",
+                "en": "Is Incomplete"
+              }
+            },
+            "source_rank": {
+              "label": {
+                "zh-CN": "来源排名",
+                "en": "Source Rank"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据范围",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        },
+        "main_thread_work_summary": {
+          "title": {
+            "zh-CN": "主线程连续窗口（wall time与调度状态）",
+            "en": "Main Thread Work Summary"
+          },
+          "columns": {
+            "phase": {
+              "label": {
+                "zh-CN": "区间",
+                "en": "Phase"
+              }
+            },
+            "wall_ms": {
+              "label": {
+                "zh-CN": "区间时长",
+                "en": "Wall ms"
+              }
+            },
+            "annotated_wall_ms": {
+              "label": {
+                "zh-CN": "有slice标注",
+                "en": "Annotated Wall ms"
+              }
+            },
+            "running_ms": {
+              "label": {
+                "zh-CN": "Runningms",
+                "en": "Running"
+              }
+            },
+            "runnable_ms": {
+              "label": {
+                "zh-CN": "Runnablems",
+                "en": "Runnable"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "抢占后Runnable",
+                "en": "Runnable Preempted ms"
+              }
+            },
+            "sleep_ms": {
+              "label": {
+                "zh-CN": "S等待",
+                "en": "Sleep ms"
+              }
+            },
+            "idle_state_ms": {
+              "label": {
+                "zh-CN": "I状态",
+                "en": "Idle State ms"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "D等待",
+                "en": "Uninterruptible ms"
+              }
+            },
+            "uninterruptible_wakekill_ms": {
+              "label": {
+                "zh-CN": "DK等待",
+                "en": "Uninterruptible Wakekill ms"
+              }
+            },
+            "io_wait_ms": {
+              "label": {
+                "zh-CN": "已标记IO等待",
+                "en": "I/O Wait ms"
+              }
+            },
+            "unknown_state_ms": {
+              "label": {
+                "zh-CN": "未知状态",
+                "en": "Unknown State ms"
+              }
+            },
+            "unannotated_running_ms": {
+              "label": {
+                "zh-CN": "无标注Running",
+                "en": "Unannotated Running ms"
+              }
+            },
+            "ambiguous_annotation_wall_ms": {
+              "label": {
+                "zh-CN": "根标注重叠",
+                "en": "Ambiguous Annotation Wall ms"
+              }
+            },
+            "incomplete_slice_count": {
+              "label": {
+                "zh-CN": "未结束slice",
+                "en": "Incomplete Slice Count"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "窗口起点",
+                "en": "Window Start Ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "窗口终点",
+                "en": "Window End Ts"
+              }
+            },
+            "unannotated_wall_ms": {
+              "label": {
+                "zh-CN": "无标注时长",
+                "en": "Unannotated Wall ms"
+              }
+            },
+            "known_state_ms": {
+              "label": {
+                "zh-CN": "已知调度状态",
+                "en": "Known State ms"
+              }
+            },
+            "conflicting_state_ms": {
+              "label": {
+                "zh-CN": "冲突调度状态",
+                "en": "Conflicting State ms"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "其他调度状态",
+                "en": "Other State ms"
+              }
+            },
+            "unknown_io_wait_ms": {
+              "label": {
+                "zh-CN": "D或DK的IO属性未知",
+                "en": "Unknown I/O Wait ms"
+              }
+            },
+            "eligible_task_count": {
+              "label": {
+                "zh-CN": "全部根任务",
+                "en": "Eligible Task Count"
+              }
+            },
+            "observed_doframe_count": {
+              "label": {
+                "zh-CN": "观测doFrame数",
+                "en": "Observed Doframe Count"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据范围",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {
+            "field:annotated_wall_ms": {
+              "zh-CN": "主线程有标注区间(ms)",
+              "en": "Annotated Wall ms"
+            },
+            "field:unannotated_running_ms": {
+              "zh-CN": "主线程无slice标注的Running(ms)",
+              "en": "Unannotated Running ms"
+            },
+            "field:unknown_state_ms": {
+              "zh-CN": "主线程调度状态未知(ms)",
+              "en": "Unknown State ms"
+            }
+          }
+        },
+        "main_thread_work_tasks": {
+          "title": {
+            "zh-CN": "主线程任务（含帧间任务与来源）",
+            "en": "Main Thread Work Tasks"
+          },
+          "columns": {
+            "task_name": {
+              "label": {
+                "zh-CN": "任务标注",
+                "en": "Task Name"
+              }
+            },
+            "phase": {
+              "label": {
+                "zh-CN": "与doFrame的关系",
+                "en": "Phase"
+              }
+            },
+            "outside_doframe_ms": {
+              "label": {
+                "zh-CN": "doFrame外",
+                "en": "Outside Doframe ms"
+              }
+            },
+            "wall_ms": {
+              "label": {
+                "zh-CN": "观测时长",
+                "en": "Wall ms"
+              }
+            },
+            "running_ms": {
+              "label": {
+                "zh-CN": "Runningms",
+                "en": "Running"
+              }
+            },
+            "hotspot_name": {
+              "label": {
+                "zh-CN": "子热点标注",
+                "en": "Hotspot Name"
+              }
+            },
+            "hotspot_exclusive_wall_ms": {
+              "label": {
+                "zh-CN": "子热点exclusive wall",
+                "en": "Hotspot Exclusive Wall ms"
+              }
+            },
+            "start_ts": {
+              "label": {
+                "zh-CN": "起点",
+                "en": "Start Ts"
+              }
+            },
+            "dur": {
+              "label": {
+                "zh-CN": "时长(ns)",
+                "en": "Dur"
+              }
+            },
+            "slice_id": {
+              "label": {
+                "zh-CN": "任务slice",
+                "en": "Slice Id"
+              }
+            },
+            "hotspot_slice_id": {
+              "label": {
+                "zh-CN": "子热点slice",
+                "en": "Hotspot Slice Id"
+              }
+            },
+            "arg_set_id": {
+              "label": {
+                "zh-CN": "参数集",
+                "en": "Arg Set Id"
+              }
+            },
+            "ancestor_path": {
+              "label": {
+                "zh-CN": "标注调用路径",
+                "en": "Ancestor Path"
+              }
+            },
+            "attribution": {
+              "label": {
+                "zh-CN": "归属范围",
+                "en": "Attribution"
+              }
+            },
+            "is_incomplete": {
+              "label": {
+                "zh-CN": "未结束标注",
+                "en": "Is Incomplete"
+              }
+            },
+            "eligible_task_count": {
+              "label": {
+                "zh-CN": "全部根任务",
+                "en": "Eligible Task Count"
+              }
+            },
+            "returned_task_count": {
+              "label": {
+                "zh-CN": "已返回根任务",
+                "en": "Returned Task Count"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "track_id": {
+              "label": {
+                "zh-CN": "轨道",
+                "en": "Track Id"
+              }
+            },
+            "parent_id": {
+              "label": {
+                "zh-CN": "父slice",
+                "en": "Parent Id"
+              }
+            },
+            "end_ts": {
+              "label": {
+                "zh-CN": "终点",
+                "en": "End Ts"
+              }
+            },
+            "raw_ts": {
+              "label": {
+                "zh-CN": "原始起点",
+                "en": "Raw Ts"
+              }
+            },
+            "raw_dur": {
+              "label": {
+                "zh-CN": "原始时长",
+                "en": "Raw Dur"
+              }
+            },
+            "runnable_ms": {
+              "label": {
+                "zh-CN": "Runnablems",
+                "en": "Runnable"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "抢占后Runnable",
+                "en": "Runnable Preempted ms"
+              }
+            },
+            "sleep_ms": {
+              "label": {
+                "zh-CN": "S等待",
+                "en": "Sleep ms"
+              }
+            },
+            "idle_state_ms": {
+              "label": {
+                "zh-CN": "I状态",
+                "en": "Idle State ms"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "D或DK等待",
+                "en": "Uninterruptible ms"
+              }
+            },
+            "io_wait_ms": {
+              "label": {
+                "zh-CN": "已标记IO等待",
+                "en": "I/O Wait ms"
+              }
+            },
+            "unknown_io_wait_ms": {
+              "label": {
+                "zh-CN": "IO属性未知",
+                "en": "Unknown I/O Wait ms"
+              }
+            },
+            "unknown_state_ms": {
+              "label": {
+                "zh-CN": "未知调度状态",
+                "en": "Unknown State ms"
+              }
+            },
+            "inside_doframe_ms": {
+              "label": {
+                "zh-CN": "doFrame内",
+                "en": "Inside Doframe ms"
+              }
+            },
+            "between_doframes_ms": {
+              "label": {
+                "zh-CN": "doFrame之间",
+                "en": "Between Doframes ms"
+              }
+            },
+            "before_first_doframe_ms": {
+              "label": {
+                "zh-CN": "首次doFrame前",
+                "en": "Before First Doframe ms"
+              }
+            },
+            "after_last_doframe_ms": {
+              "label": {
+                "zh-CN": "最后doFrame后",
+                "en": "After Last Doframe ms"
+              }
+            },
+            "no_doframe_ms": {
+              "label": {
+                "zh-CN": "无doFrame观测",
+                "en": "No Doframe ms"
+              }
+            },
+            "ambiguous_annotation_wall_ms": {
+              "label": {
+                "zh-CN": "重叠根标注",
+                "en": "Ambiguous Annotation Wall ms"
+              }
+            },
+            "hotspot_arg_set_id": {
+              "label": {
+                "zh-CN": "热点参数集",
+                "en": "Hotspot Arg Set Id"
+              }
+            },
+            "hotspot_parent_id": {
+              "label": {
+                "zh-CN": "热点父slice",
+                "en": "Hotspot Parent Id"
+              }
+            },
+            "hotspot_exclusive_outside_doframe_ms": {
+              "label": {
+                "zh-CN": "热点帧外exclusive wall",
+                "en": "Hotspot Exclusive Outside Doframe ms"
+              }
+            },
+            "top_wait_state_id": {
+              "label": {
+                "zh-CN": "等待state ID",
+                "en": "Top Wait State Id"
+              }
+            },
+            "top_wait_state": {
+              "label": {
+                "zh-CN": "最长等待原状态",
+                "en": "Top Wait State"
+              }
+            },
+            "top_wait_blocked_function": {
+              "label": {
+                "zh-CN": "最长等待阻塞函数",
+                "en": "Top Wait Blocked Function"
+              }
+            },
+            "top_wait_io_wait": {
+              "label": {
+                "zh-CN": "等待IO标记",
+                "en": "Top Wait I/O Wait"
+              }
+            },
+            "top_wait_start_ts": {
+              "label": {
+                "zh-CN": "等待起点",
+                "en": "Top Wait Start Ts"
+              }
+            },
+            "top_wait_end_ts": {
+              "label": {
+                "zh-CN": "等待终点",
+                "en": "Top Wait End Ts"
+              }
+            },
+            "top_wait_overlap_ms": {
+              "label": {
+                "zh-CN": "等待观测时长",
+                "en": "Top Wait Overlap ms"
+              }
+            },
+            "selection_scope": {
+              "label": {
+                "zh-CN": "采样范围",
+                "en": "Selection Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {
+            "field:task_name": {
+              "zh-CN": "主线程任务",
+              "en": "Task Name"
+            },
+            "field:outside_doframe_ms": {
+              "zh-CN": "doFrame外耗时(ms)",
+              "en": "Outside Doframe ms"
+            },
+            "field:slice_id": {
+              "zh-CN": "定位slice",
+              "en": "Slice Id"
+            },
+            "group:task_name": {
+              "zh-CN": "主线程观测任务",
+              "en": "Task Name"
+            }
+          }
+        },
+        "root": {
+          "title": {
+            "zh-CN": "主线程连续工作分析",
+            "en": "Main Thread Frame Work"
+          },
+          "columns": {},
+          "synthesizeLabels": {}
+        }
+      }
+    },
     "main_thread_handler_callback_slices": {
       "displayName": {
         "zh-CN": "主线程 Handler 回调切片",
@@ -26987,7 +27808,7 @@
         "en": "Scrolling Analysis"
       },
       "description": {
-        "zh-CN": "基于 Perfetto FrameTimeline 与 android.input 的滑动分析，分层展示：概览 → 区间 → 帧详情",
+        "zh-CN": "沿实际主线程连续执行追查动画/滑动任务与等待，再用 FrameTimeline 和 android.input 核对出帧结果",
         "en": "Analyzes Scrolling Analysis using trace metrics and supporting evidence."
       },
       "type": "composite",
@@ -27902,6 +28723,780 @@
             }
           },
           "synthesizeLabels": {}
+        },
+        "main_thread_work_cadence": {
+          "title": {
+            "zh-CN": "doFrame起点间隔（非deadline或呈现间隔）",
+            "en": "Main Thread Work Cadence"
+          },
+          "columns": {
+            "observed_start_interval_ms": {
+              "label": {
+                "zh-CN": "观测起点间隔",
+                "en": "Observed Start Interval ms"
+              }
+            },
+            "between_execution_ms": {
+              "label": {
+                "zh-CN": "前次结束至本次开始",
+                "en": "Between Execution ms"
+              }
+            },
+            "observation": {
+              "label": {
+                "zh-CN": "观测范围",
+                "en": "Observation"
+              }
+            },
+            "start_ts": {
+              "label": {
+                "zh-CN": "前次起点",
+                "en": "Start Ts"
+              }
+            },
+            "dur": {
+              "label": {
+                "zh-CN": "间隔(ns)",
+                "en": "Dur"
+              }
+            },
+            "previous_slice_id": {
+              "label": {
+                "zh-CN": "前次slice",
+                "en": "Previous Slice Id"
+              }
+            },
+            "slice_id": {
+              "label": {
+                "zh-CN": "本次slice",
+                "en": "Slice Id"
+              }
+            },
+            "eligible_interval_count": {
+              "label": {
+                "zh-CN": "全部观测间隔",
+                "en": "Eligible Interval Count"
+              }
+            },
+            "returned_interval_count": {
+              "label": {
+                "zh-CN": "已返回间隔",
+                "en": "Returned Interval Count"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "next_start_ts": {
+              "label": {
+                "zh-CN": "本次起点",
+                "en": "Next Start Ts"
+              }
+            },
+            "marker_count": {
+              "label": {
+                "zh-CN": "本次同起点标记数",
+                "en": "Marker Count"
+              }
+            },
+            "previous_marker_count": {
+              "label": {
+                "zh-CN": "前次同起点标记数",
+                "en": "Previous Marker Count"
+              }
+            },
+            "is_incomplete": {
+              "label": {
+                "zh-CN": "本次标记未结束",
+                "en": "Is Incomplete"
+              }
+            },
+            "previous_is_incomplete": {
+              "label": {
+                "zh-CN": "前次标记未结束",
+                "en": "Previous Is Incomplete"
+              }
+            },
+            "execution_overlap_ms": {
+              "label": {
+                "zh-CN": "观测执行重叠",
+                "en": "Execution Overlap ms"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据范围",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        },
+        "main_thread_work_sources": {
+          "title": {
+            "zh-CN": "任务来源（每个采样任务前三热点/等待，不可相加）",
+            "en": "Main Thread Work Sources"
+          },
+          "columns": {
+            "source_kind": {
+              "label": {
+                "zh-CN": "证据类型",
+                "en": "Source Kind"
+              }
+            },
+            "root_slice_id": {
+              "label": {
+                "zh-CN": "所属任务slice",
+                "en": "Root Slice Id"
+              }
+            },
+            "source_name": {
+              "label": {
+                "zh-CN": "来源标注",
+                "en": "Source Name"
+              }
+            },
+            "source_slice_id": {
+              "label": {
+                "zh-CN": "来源slice",
+                "en": "Source Slice Id"
+              }
+            },
+            "thread_state_id": {
+              "label": {
+                "zh-CN": "调度state ID",
+                "en": "Thread State Id"
+              }
+            },
+            "state": {
+              "label": {
+                "zh-CN": "原调度状态",
+                "en": "State"
+              }
+            },
+            "blocked_function": {
+              "label": {
+                "zh-CN": "阻塞函数",
+                "en": "Blocked Function"
+              }
+            },
+            "io_wait": {
+              "label": {
+                "zh-CN": "原IO标记",
+                "en": "I/O Wait"
+              }
+            },
+            "start_ts": {
+              "label": {
+                "zh-CN": "观测起点",
+                "en": "Start Ts"
+              }
+            },
+            "end_ts": {
+              "label": {
+                "zh-CN": "观测终点",
+                "en": "End Ts"
+              }
+            },
+            "dur": {
+              "label": {
+                "zh-CN": "观测时长(ns)",
+                "en": "Dur"
+              }
+            },
+            "exclusive_wall_ms": {
+              "label": {
+                "zh-CN": "热点exclusive wall",
+                "en": "Exclusive Wall ms"
+              }
+            },
+            "exclusive_outside_doframe_ms": {
+              "label": {
+                "zh-CN": "热点帧外exclusive wall",
+                "en": "Exclusive Outside Doframe ms"
+              }
+            },
+            "wait_overlap_ms": {
+              "label": {
+                "zh-CN": "等待重叠时长",
+                "en": "Wait Overlap ms"
+              }
+            },
+            "parent_id": {
+              "label": {
+                "zh-CN": "来源父slice",
+                "en": "Parent Id"
+              }
+            },
+            "arg_set_id": {
+              "label": {
+                "zh-CN": "来源参数集",
+                "en": "Arg Set Id"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "track_id": {
+              "label": {
+                "zh-CN": "来源轨道",
+                "en": "Track Id"
+              }
+            },
+            "root_track_id": {
+              "label": {
+                "zh-CN": "任务轨道",
+                "en": "Root Track Id"
+              }
+            },
+            "in_doframe_tree": {
+              "label": {
+                "zh-CN": "属于doFrame调用树",
+                "en": "In Doframe Tree"
+              }
+            },
+            "is_incomplete": {
+              "label": {
+                "zh-CN": "未结束标注",
+                "en": "Is Incomplete"
+              }
+            },
+            "source_rank": {
+              "label": {
+                "zh-CN": "来源排名",
+                "en": "Source Rank"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据范围",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {}
+        },
+        "main_thread_work_summary": {
+          "title": {
+            "zh-CN": "主线程连续窗口（wall time与调度状态）",
+            "en": "Main Thread Work Summary"
+          },
+          "columns": {
+            "phase": {
+              "label": {
+                "zh-CN": "区间",
+                "en": "Phase"
+              }
+            },
+            "wall_ms": {
+              "label": {
+                "zh-CN": "区间时长",
+                "en": "Wall ms"
+              }
+            },
+            "annotated_wall_ms": {
+              "label": {
+                "zh-CN": "有slice标注",
+                "en": "Annotated Wall ms"
+              }
+            },
+            "running_ms": {
+              "label": {
+                "zh-CN": "Runningms",
+                "en": "Running"
+              }
+            },
+            "runnable_ms": {
+              "label": {
+                "zh-CN": "Runnablems",
+                "en": "Runnable"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "抢占后Runnable",
+                "en": "Runnable Preempted ms"
+              }
+            },
+            "sleep_ms": {
+              "label": {
+                "zh-CN": "S等待",
+                "en": "Sleep ms"
+              }
+            },
+            "idle_state_ms": {
+              "label": {
+                "zh-CN": "I状态",
+                "en": "Idle State ms"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "D等待",
+                "en": "Uninterruptible ms"
+              }
+            },
+            "uninterruptible_wakekill_ms": {
+              "label": {
+                "zh-CN": "DK等待",
+                "en": "Uninterruptible Wakekill ms"
+              }
+            },
+            "io_wait_ms": {
+              "label": {
+                "zh-CN": "已标记IO等待",
+                "en": "I/O Wait ms"
+              }
+            },
+            "unknown_state_ms": {
+              "label": {
+                "zh-CN": "未知状态",
+                "en": "Unknown State ms"
+              }
+            },
+            "unannotated_running_ms": {
+              "label": {
+                "zh-CN": "无标注Running",
+                "en": "Unannotated Running ms"
+              }
+            },
+            "ambiguous_annotation_wall_ms": {
+              "label": {
+                "zh-CN": "根标注重叠",
+                "en": "Ambiguous Annotation Wall ms"
+              }
+            },
+            "incomplete_slice_count": {
+              "label": {
+                "zh-CN": "未结束slice",
+                "en": "Incomplete Slice Count"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "window_start_ts": {
+              "label": {
+                "zh-CN": "窗口起点",
+                "en": "Window Start Ts"
+              }
+            },
+            "window_end_ts": {
+              "label": {
+                "zh-CN": "窗口终点",
+                "en": "Window End Ts"
+              }
+            },
+            "unannotated_wall_ms": {
+              "label": {
+                "zh-CN": "无标注时长",
+                "en": "Unannotated Wall ms"
+              }
+            },
+            "known_state_ms": {
+              "label": {
+                "zh-CN": "已知调度状态",
+                "en": "Known State ms"
+              }
+            },
+            "conflicting_state_ms": {
+              "label": {
+                "zh-CN": "冲突调度状态",
+                "en": "Conflicting State ms"
+              }
+            },
+            "other_state_ms": {
+              "label": {
+                "zh-CN": "其他调度状态",
+                "en": "Other State ms"
+              }
+            },
+            "unknown_io_wait_ms": {
+              "label": {
+                "zh-CN": "D或DK的IO属性未知",
+                "en": "Unknown I/O Wait ms"
+              }
+            },
+            "eligible_task_count": {
+              "label": {
+                "zh-CN": "全部根任务",
+                "en": "Eligible Task Count"
+              }
+            },
+            "observed_doframe_count": {
+              "label": {
+                "zh-CN": "观测doFrame数",
+                "en": "Observed Doframe Count"
+              }
+            },
+            "evidence_scope": {
+              "label": {
+                "zh-CN": "证据范围",
+                "en": "Evidence Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {
+            "field:annotated_wall_ms": {
+              "zh-CN": "主线程有标注区间(ms)",
+              "en": "Annotated Wall ms"
+            },
+            "field:unannotated_running_ms": {
+              "zh-CN": "主线程无slice标注的Running(ms)",
+              "en": "Unannotated Running ms"
+            },
+            "field:unknown_state_ms": {
+              "zh-CN": "主线程调度状态未知(ms)",
+              "en": "Unknown State ms"
+            }
+          }
+        },
+        "main_thread_work_tasks": {
+          "title": {
+            "zh-CN": "主线程任务（含帧间任务与来源）",
+            "en": "Main Thread Work Tasks"
+          },
+          "columns": {
+            "task_name": {
+              "label": {
+                "zh-CN": "任务标注",
+                "en": "Task Name"
+              }
+            },
+            "phase": {
+              "label": {
+                "zh-CN": "与doFrame的关系",
+                "en": "Phase"
+              }
+            },
+            "outside_doframe_ms": {
+              "label": {
+                "zh-CN": "doFrame外",
+                "en": "Outside Doframe ms"
+              }
+            },
+            "wall_ms": {
+              "label": {
+                "zh-CN": "观测时长",
+                "en": "Wall ms"
+              }
+            },
+            "running_ms": {
+              "label": {
+                "zh-CN": "Runningms",
+                "en": "Running"
+              }
+            },
+            "hotspot_name": {
+              "label": {
+                "zh-CN": "子热点标注",
+                "en": "Hotspot Name"
+              }
+            },
+            "hotspot_exclusive_wall_ms": {
+              "label": {
+                "zh-CN": "子热点exclusive wall",
+                "en": "Hotspot Exclusive Wall ms"
+              }
+            },
+            "start_ts": {
+              "label": {
+                "zh-CN": "起点",
+                "en": "Start Ts"
+              }
+            },
+            "dur": {
+              "label": {
+                "zh-CN": "时长(ns)",
+                "en": "Dur"
+              }
+            },
+            "slice_id": {
+              "label": {
+                "zh-CN": "任务slice",
+                "en": "Slice Id"
+              }
+            },
+            "hotspot_slice_id": {
+              "label": {
+                "zh-CN": "子热点slice",
+                "en": "Hotspot Slice Id"
+              }
+            },
+            "arg_set_id": {
+              "label": {
+                "zh-CN": "参数集",
+                "en": "Arg Set Id"
+              }
+            },
+            "ancestor_path": {
+              "label": {
+                "zh-CN": "标注调用路径",
+                "en": "Ancestor Path"
+              }
+            },
+            "attribution": {
+              "label": {
+                "zh-CN": "归属范围",
+                "en": "Attribution"
+              }
+            },
+            "is_incomplete": {
+              "label": {
+                "zh-CN": "未结束标注",
+                "en": "Is Incomplete"
+              }
+            },
+            "eligible_task_count": {
+              "label": {
+                "zh-CN": "全部根任务",
+                "en": "Eligible Task Count"
+              }
+            },
+            "returned_task_count": {
+              "label": {
+                "zh-CN": "已返回根任务",
+                "en": "Returned Task Count"
+              }
+            },
+            "upid": {
+              "label": {
+                "zh-CN": "UPID",
+                "en": "UPID"
+              }
+            },
+            "utid": {
+              "label": {
+                "zh-CN": "UTID",
+                "en": "UTID"
+              }
+            },
+            "track_id": {
+              "label": {
+                "zh-CN": "轨道",
+                "en": "Track Id"
+              }
+            },
+            "parent_id": {
+              "label": {
+                "zh-CN": "父slice",
+                "en": "Parent Id"
+              }
+            },
+            "end_ts": {
+              "label": {
+                "zh-CN": "终点",
+                "en": "End Ts"
+              }
+            },
+            "raw_ts": {
+              "label": {
+                "zh-CN": "原始起点",
+                "en": "Raw Ts"
+              }
+            },
+            "raw_dur": {
+              "label": {
+                "zh-CN": "原始时长",
+                "en": "Raw Dur"
+              }
+            },
+            "runnable_ms": {
+              "label": {
+                "zh-CN": "Runnablems",
+                "en": "Runnable"
+              }
+            },
+            "runnable_preempted_ms": {
+              "label": {
+                "zh-CN": "抢占后Runnable",
+                "en": "Runnable Preempted ms"
+              }
+            },
+            "sleep_ms": {
+              "label": {
+                "zh-CN": "S等待",
+                "en": "Sleep ms"
+              }
+            },
+            "idle_state_ms": {
+              "label": {
+                "zh-CN": "I状态",
+                "en": "Idle State ms"
+              }
+            },
+            "uninterruptible_ms": {
+              "label": {
+                "zh-CN": "D或DK等待",
+                "en": "Uninterruptible ms"
+              }
+            },
+            "io_wait_ms": {
+              "label": {
+                "zh-CN": "已标记IO等待",
+                "en": "I/O Wait ms"
+              }
+            },
+            "unknown_io_wait_ms": {
+              "label": {
+                "zh-CN": "IO属性未知",
+                "en": "Unknown I/O Wait ms"
+              }
+            },
+            "unknown_state_ms": {
+              "label": {
+                "zh-CN": "未知调度状态",
+                "en": "Unknown State ms"
+              }
+            },
+            "inside_doframe_ms": {
+              "label": {
+                "zh-CN": "doFrame内",
+                "en": "Inside Doframe ms"
+              }
+            },
+            "between_doframes_ms": {
+              "label": {
+                "zh-CN": "doFrame之间",
+                "en": "Between Doframes ms"
+              }
+            },
+            "before_first_doframe_ms": {
+              "label": {
+                "zh-CN": "首次doFrame前",
+                "en": "Before First Doframe ms"
+              }
+            },
+            "after_last_doframe_ms": {
+              "label": {
+                "zh-CN": "最后doFrame后",
+                "en": "After Last Doframe ms"
+              }
+            },
+            "no_doframe_ms": {
+              "label": {
+                "zh-CN": "无doFrame观测",
+                "en": "No Doframe ms"
+              }
+            },
+            "ambiguous_annotation_wall_ms": {
+              "label": {
+                "zh-CN": "重叠根标注",
+                "en": "Ambiguous Annotation Wall ms"
+              }
+            },
+            "hotspot_arg_set_id": {
+              "label": {
+                "zh-CN": "热点参数集",
+                "en": "Hotspot Arg Set Id"
+              }
+            },
+            "hotspot_parent_id": {
+              "label": {
+                "zh-CN": "热点父slice",
+                "en": "Hotspot Parent Id"
+              }
+            },
+            "hotspot_exclusive_outside_doframe_ms": {
+              "label": {
+                "zh-CN": "热点帧外exclusive wall",
+                "en": "Hotspot Exclusive Outside Doframe ms"
+              }
+            },
+            "top_wait_state_id": {
+              "label": {
+                "zh-CN": "等待state ID",
+                "en": "Top Wait State Id"
+              }
+            },
+            "top_wait_state": {
+              "label": {
+                "zh-CN": "最长等待原状态",
+                "en": "Top Wait State"
+              }
+            },
+            "top_wait_blocked_function": {
+              "label": {
+                "zh-CN": "最长等待阻塞函数",
+                "en": "Top Wait Blocked Function"
+              }
+            },
+            "top_wait_io_wait": {
+              "label": {
+                "zh-CN": "等待IO标记",
+                "en": "Top Wait I/O Wait"
+              }
+            },
+            "top_wait_start_ts": {
+              "label": {
+                "zh-CN": "等待起点",
+                "en": "Top Wait Start Ts"
+              }
+            },
+            "top_wait_end_ts": {
+              "label": {
+                "zh-CN": "等待终点",
+                "en": "Top Wait End Ts"
+              }
+            },
+            "top_wait_overlap_ms": {
+              "label": {
+                "zh-CN": "等待观测时长",
+                "en": "Top Wait Overlap ms"
+              }
+            },
+            "selection_scope": {
+              "label": {
+                "zh-CN": "采样范围",
+                "en": "Selection Scope"
+              }
+            }
+          },
+          "synthesizeLabels": {
+            "field:task_name": {
+              "zh-CN": "主线程任务",
+              "en": "Task Name"
+            },
+            "field:outside_doframe_ms": {
+              "zh-CN": "doFrame外耗时(ms)",
+              "en": "Outside Doframe ms"
+            },
+            "field:slice_id": {
+              "zh-CN": "定位slice",
+              "en": "Slice Id"
+            },
+            "group:task_name": {
+              "zh-CN": "主线程观测任务",
+              "en": "Task Name"
+            }
+          }
         },
         "performance_summary": {
           "title": {

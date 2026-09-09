@@ -22,11 +22,90 @@ import {
 } from '../claudeSystemPrompt';
 import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes, loadPromptTemplate} from '../strategyLoader';
 import {CONCLUSION_CONTRACT_SIDECAR_MARKER, parseConclusionContractSidecar} from '../../agent/core/conclusionContract';
-import {SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../../services/verifier/deterministicClaimVerifier';
+import {runDeterministicClaimVerifier, SUPPORTED_DETERMINISTIC_CLAIM_RULES} from '../../services/verifier/deterministicClaimVerifier';
+import {bindCapturedAnchorFacts, captureEvidenceTable} from '../../services/evidence/evidenceCapture';
+import type {EvidenceAnchorV1} from '../../types/evidenceContract';
 import fs from 'fs';
 import path from 'path';
 
 describe('typed prompt with real strategy assets', () => {
+  it('binds the actual numeric declaration example to captured evidence and rejects a different value', () => {
+    const template = stripTemplateComments(loadPromptTemplate('prompt-conclusion-contract-schema')!);
+    const examples = [...template.matchAll(/^```json\n([\s\S]*?)\n```$/gm)]
+      .filter(match => !match[1].includes('{{'))
+      .map(match => JSON.parse(match[1]));
+    const example = examples.find(value => value.kind === 'numeric');
+    expect(example).toBeDefined();
+    const parsed = parseConclusionContractSidecar(`${CONCLUSION_CONTRACT_SIDECAR_MARKER}\n\`\`\`json\n${JSON.stringify({
+      schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], claims: [example],
+      relationProposals: [], uncertainties: [], nextSteps: [],
+    })}\n\`\`\`\n-->`);
+    expect(parsed.status).toBe('valid');
+    expect(parsed.bindingEligibility).toBe('eligible');
+    const claim = parsed.contract!.claims![0];
+    const ref = claim.references[0];
+    expect(claim.semantics!.scope.subjectRefs).toEqual([ref]);
+    const anchor: EvidenceAnchorV1 = {
+      version: 'evidence_contract@1', anchorId: 'anchor:template-example', evidenceRefId: ref.evidenceRefId!,
+      context: {traceId: 'trace-template-example', traceSide: 'current', producerKind: 'invoke_skill'},
+      cells: [{column: ref.column!, rowIndex: ref.rowIndex!, value: ref.value}],
+    };
+    bindCapturedAnchorFacts(anchor, captureEvidenceTable({columns: [ref.column!], rows: [{[ref.column!]: ref.value!}]}, {
+      [ref.column!]: {unit: 'ms', origin: {kind: 'skill_literal', skillId: 'example', stepId: 'metric',
+        definitionFingerprint: 'template-example-capture'}},
+    }), 0);
+    const support = {claimId: claim.id!, kind: claim.kind!, text: claim.text, semantics: claim.semantics,
+      anchors: [anchor], bindingEligibility: parsed.bindingEligibility, supportLevel: 'partial' as const};
+    expect(runDeterministicClaimVerifier({claimSupport: [support]}).claimResults[0].deterministicProof.status).toBe('proved');
+    expect(runDeterministicClaimVerifier({claimSupport: [{...support, anchors: []}]}).passed).toBe(false);
+    expect(runDeterministicClaimVerifier({claimSupport: [{...support, semantics: {...claim.semantics!,
+      numeric: {...claim.semantics!.numeric!, value: 99}},
+    }]}).claimResults[0].deterministicProof.status).toBe('rejected');
+  });
+
+  it('delivers real scrolling investigation requirements without importing legacy report recipes', () => {
+    const registry = buildStrategyRegistrySnapshotFromDefinitions({
+      definitions: getRegisteredScenes(), overlayGeneration: 'investigation-evidence-test',
+    });
+    const scene = registry.getStrategy('scrolling')!;
+    expect(scene.investigationRequirements?.length).toBeGreaterThan(0);
+    expect(scene.investigationRequirements?.some(requirement => /main.thread/i.test(requirement))).toBe(true);
+    for (const scope of ['bounded_question', 'scene_wide'] as const) {
+      for (const deliverable of ['answer', 'report'] as const) {
+        const context: ClaudeAnalysisContext = {
+          query: 'Explain the selected main-thread initialization.', strategyRegistry: registry,
+          turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', taskKind: 'investigation',
+            sceneId: 'scrolling', scope, recommendedComplexity: 'full', deliverable,
+            evidenceAccess: 'existing_only', registryFingerprint: registry.registryFingerprint},
+          codeAwareMode: 'off', codebaseIds: [],
+          selectionContext: {kind: 'area', startNs: 10, endNs: 20, tracks: [{uri: 'main', upid: 42, utid: 43}]},
+        };
+        const baseline = buildSystemPromptParts(context);
+        const budget = estimatePromptTokens(baseline.fullPrompt) + 200;
+        const parts = buildSystemPromptParts({...context, onDemandContext: true,
+          conversationSummary: 'Unverified prior context. '.repeat(20000),
+          knowledgeBaseContext: 'Optional table reference. '.repeat(20000)}, budget);
+        const requirementSegment = parts.segments.find(segment => segment.label === 'investigation_requirements')!;
+        expect(JSON.parse(requirementSegment.content).data).toEqual({sceneId: 'scrolling',
+          registryFingerprint: registry.registryFingerprint, requirements: scene.investigationRequirements});
+        expect(requirementSegment).toMatchObject({droppable: false, truncatable: false});
+        expect(parts.segments.find(segment => segment.label === 'source_use_decision')).toBeUndefined();
+        expect(JSON.parse(parts.segments.find(segment => segment.label === 'source_authorization')!.content).data)
+          .toEqual({mode: 'off', codebaseIds: [], evidenceAccess: 'existing_only'});
+        expect(JSON.parse(parts.segments.find(segment => segment.label === 'selection_context')!.content).data)
+          .toEqual(context.selectionContext);
+        expect(parts.fullPrompt).not.toContain('#### Scrolling Core Strategy');
+        expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(budget);
+        expect(estimatePromptTokens(baseline.fullPrompt)).toBeLessThanOrEqual(MAX_PROMPT_TOKENS);
+        expect(parts.droppedLabels).toContain('knowledge_base');
+        expect(parts.truncatedLabels).toContain('conversation_context');
+        expect(parts.truncatedLabels).not.toContain('investigation_requirements');
+        expect(buildQuickSystemPrompt(context)).toBe(baseline.fullPrompt);
+      }
+    }
+  });
+
   it.each(['zh-CN', 'en'] as const)('retains the real declaration example and catalog for %s without enabling report recipes', outputLanguage => {
     const registry = buildStrategyRegistrySnapshotFromDefinitions({
       definitions: getRegisteredScenes(), overlayGeneration: 'typed-protocol-test',
@@ -55,7 +134,15 @@ describe('typed prompt with real strategy assets', () => {
       expect(parsed.contract?.evidenceChain).toEqual([{conclusionId: expect.any(String), text: expect.any(String)}]);
       expect(parsed.contract?.uncertainties).toEqual([expect.any(String)]);
       expect(parsed.contract?.nextSteps).toEqual([expect.any(String)]);
-      expect(parsed.contract?.claims).toEqual([{id: expect.any(String), text: expect.any(String), kind: 'inference', references: []}]);
+      expect(parsed.contract?.claims).toEqual([{id: expect.any(String), text: expect.any(String), kind: 'inference', references: [],
+        semantics: {schemaVersion: 'claim_semantics@1', predicate: 'example.hypothesis', polarity: 'affirmed',
+          discourse: 'hypothetical', quantifier: 'one', modality: 'possible', scope: {population: 'selected_interval'}}}]);
+      const sampleClaim = parsed.contract!.claims![0];
+      const sampleProof = runDeterministicClaimVerifier({claimSupport: [{claimId: sampleClaim.id!,
+        kind: 'inference', text: sampleClaim.text, semantics: sampleClaim.semantics,
+        bindingEligibility: 'eligible', anchors: [], supportLevel: 'partial'}]});
+      expect(sampleProof.passed).toBe(false);
+      expect(sampleProof.claimResults[0].deterministicProof.status).not.toBe('proved');
       const jsonBlocks = [...declaration.content.matchAll(/^```json\n([\s\S]*?)\n```$/gm)]
         .map(match => JSON.parse(match[1]));
       expect(jsonBlocks.filter(Array.isArray)).toEqual([SUPPORTED_DETERMINISTIC_CLAIM_RULES]);

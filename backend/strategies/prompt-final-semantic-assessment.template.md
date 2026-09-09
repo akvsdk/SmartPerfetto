@@ -25,6 +25,16 @@ cannot turn a causal assertion into a numeric observation. Missing or invalid
 semantic declarations remain unknown. Preserve their IDs; do not manufacture a
 replacement declaration.
 
+For `captured.cell`, the proposition is strict equality to the explicit string,
+boolean or null `value` in its unique semantic subject reference. It describes
+one captured cell; a broader identity, execution or causal assertion is a
+predicate/scope mismatch. For `source.location`, compare the body with the
+original declared `source` reference ID, file path and line range. It only says
+that this run returned that location snapshot. Function contents, call chains,
+current disk existence, source/Trace equality, execution and causal claims are
+broader propositions. Never complete a missing original declaration from the
+source ledger, and never reinterpret those broader claims as location facts.
+
 `declarationBindingEligibility` is the server's parser state, not a field the
 answer can grant itself. `legacy_unchecked` declarations remain unknown even if
 their prose appears consistent. An absent declaration protocol with no declared
@@ -58,7 +68,7 @@ No surrounding prose. The response schema is:
 
 ```json
 {
-  "schemaVersion": "final_semantic_response@1",
+  "schemaVersion": "final_semantic_response@2",
   "bodyCoverage": {
     "status": "complete",
     "reviewedSpans": [{"start": 0, "end": 100}]
@@ -100,9 +110,22 @@ If applicability is not `applicable`, coverage must be `unknown`. Covered requir
 at least one exact body location or an existing declared claim ID. Unknown and
 duplicate references are invalid, even if other references are valid.
 
-A specific `contentLocations` entry has exactly `start`, `end`, and `text`.
-Offsets use UTF-16 code units, so an emoji outside the basic multilingual plane
-uses two units. Do not split surrogate pairs. The range must be nonempty and
-within the original body, and `text` must equal that exact substring. Locate
-repeated phrases at their actual occurrence. The backend validates every
-location and retains only offsets. Never return extra response fields.
+A specific `contentLocations` entry has exactly `text`, containing a nonempty,
+non-whitespace quotation copied exactly from `body`. The backend locates it and
+retains only its half-open UTF-16 offsets. Do not calculate or return `start` or
+`end` for these entries. Preserve spaces, line endings, punctuation and Unicode
+characters exactly; do not trim, normalize, paraphrase or repair a quotation.
+
+If the exact quotation appears more than once in the entire original `body`,
+also provide `occurrence`: a positive integer, counted from 1 in body order.
+Count every exact match, including overlapping matches. For example, `ana`
+appears twice in `banana`; the second match requires
+`{"text":"ana","occurrence":2}`. A unique quotation needs only `text`.
+An absent, ambiguous or out-of-range quotation, a split surrogate pair, duplicate
+locations, mixed offset fields or any extra fields make the response invalid.
+
+These quotation rules apply to claims, claim issues, omissions and requirements.
+`bodyCoverage.reviewedSpans` keeps the separate strict `start`/`end` format above:
+complete coverage must cover 0 through the supplied `bodyUtf16Length` without gaps.
+Quotation matching locates the reviewed meaning; it does not establish factual
+truth, evidence validity or proof. Never return extra response fields.

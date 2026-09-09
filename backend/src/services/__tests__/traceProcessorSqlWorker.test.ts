@@ -13,6 +13,7 @@ import {pathToFileURL} from 'node:url';
 import {spawn} from 'node:child_process';
 import {
   decodeQueryArgsSql,
+  encodeQueryArgs,
   encodeQueryResult,
 } from '../traceProcessorProtobuf';
 import {
@@ -28,6 +29,10 @@ import {
 } from '../selfEvolution/runManifestLifecycle';
 import type {RunManifestStore} from '../selfEvolution/runManifestStore';
 import {normalizeTraceProcessorSqlError} from '../traceProcessorSqlWorker';
+import * as nativeIdentity from '../capabilityManifestRuntimeIdentity';
+import * as nativeDocs from '../perfettoSqlDocs';
+import {createRawSqlNativeProvenance, initializeRawSqlNativeProvenance,
+  invalidateRawSqlNativeProvenance, readRawSqlCaptureFields} from '../evidence/rawSqlNativeProvenance';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -98,6 +103,52 @@ describe('TraceProcessorSqlWorker', () => {
   afterEach(() => {
     worker?.destroy();
     worker = null;
+    jest.restoreAllMocks();
+  });
+
+  it('signs typed SQL inside its queue task and invalidates opaque QueryArgs before transport', async () => {
+    const revision = 'a'.repeat(40);
+    jest.spyOn(nativeIdentity, 'resolveCapabilityTraceProcessorIdentity').mockResolvedValue({source: 'bundled', gitRevision: revision, stdlibRevision: revision});
+    jest.spyOn(nativeDocs, 'loadPerfettoSqlDocsAsset').mockReturnValue({version: 1, generatedFrom: revision, modules: [], symbolToModule: {},
+      entries: [{id: 'slice', name: 'slice', type: 'view', category: 'prelude', module: 'prelude.views', package: 'prelude', description: '', columns: [{name: 'dur', type: 'DURATION'}]}]});
+    const native = createRawSqlNativeProvenance('typed-worker', []);
+    await initializeRawSqlNativeProvenance(native.provenance, {source: 'local_binary', selectedPath: '/pinned', selectionOrigin: 'default'});
+    const response = encodeQueryResult({columnNames: ['dur'], rows: [[42]]});
+    worker = new TraceProcessorSqlWorker({processorId: 'typed-worker', traceId: 'trace-a', port: 1,
+      nativeProvenance: native.provenance, rawExecutor: async () => response});
+    expect(readRawSqlCaptureFields(await worker.query('SELECT dur FROM slice'))?.dur.unit).toBe('ns');
+    expect(readRawSqlCaptureFields(await worker.queryBounded('SELECT dur FROM slice', {maxRows: 10, maxResponseBytes: 1000}))?.dur.unit).toBe('ns');
+    await worker.enqueueRaw(encodeQueryArgs('SELECT dur FROM slice'));
+    expect(readRawSqlCaptureFields(await worker.query('SELECT dur FROM slice'))).toBeUndefined();
+  });
+
+  it.each(['queued mutation', 'external epoch change'])('checks %s at the actual queue execution boundary', async cause => {
+    const revision = 'a'.repeat(40);
+    jest.spyOn(nativeIdentity, 'resolveCapabilityTraceProcessorIdentity').mockResolvedValue({source: 'bundled', gitRevision: revision, stdlibRevision: revision});
+    jest.spyOn(nativeDocs, 'loadPerfettoSqlDocsAsset').mockReturnValue({version: 1, generatedFrom: revision, modules: [], symbolToModule: {},
+      entries: [{id: 'slice', name: 'slice', type: 'view', category: 'prelude', module: 'prelude.views', package: 'prelude', description: '', columns: [{name: 'dur', type: 'DURATION'}]}]});
+    const native = createRawSqlNativeProvenance('epoch-worker', []);
+    await initializeRawSqlNativeProvenance(native.provenance, {source: 'local_binary', selectedPath: '/pinned', selectionOrigin: 'default'});
+    const first = deferred<Buffer>();
+    const calls: string[] = [];
+    const response = encodeQueryResult({columnNames: ['dur'], rows: [[42]]});
+    worker = new TraceProcessorSqlWorker({processorId: 'epoch-worker', traceId: 'trace-a', port: 1,
+      nativeProvenance: native.provenance, rawExecutor: async input => {
+        calls.push(decodeQueryArgsSql(input.body));
+        return calls.length === 1 ? first.promise : response;
+      }});
+    const pending = worker.query('SELECT dur FROM slice');
+    await flushPromises();
+    const afterMutation = worker.query('SELECT dur FROM slice', {priority: 'p2'});
+    const mutation = worker.query('CREATE TEMP VIEW slice AS SELECT 42 AS dur', {priority: 'p0'});
+    if (cause === 'external epoch change') invalidateRawSqlNativeProvenance(native.provenance);
+    first.resolve(response);
+    const firstFields = readRawSqlCaptureFields(await pending);
+    if (cause === 'external epoch change') expect(firstFields).toBeUndefined();
+    else expect(firstFields?.dur.unit).toBe('ns');
+    await mutation;
+    expect(readRawSqlCaptureFields(await afterMutation)).toBeUndefined();
+    expect(calls).toEqual(['SELECT dur FROM slice', 'CREATE TEMP VIEW slice AS SELECT 42 AS dur', 'SELECT dur FROM slice']);
   });
 
   it('does not preempt the running query, but runs queued P0 before queued P1/P2', async () => {

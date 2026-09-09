@@ -77,7 +77,7 @@ import {getConsumableProcessIdentitySelectors, sqlUsesProcessNameFilter} from '.
 import {hasProcessIdentitySelector, PROCESS_IDENTITY_SELECTORS} from '../services/processIdentity/types';
 import type {EffectiveProcessScope} from '../services/processIdentity/effectiveProcessScope';
 import {getExactProcessScopeSupport} from '../services/skillEngine/processScopeSql';
-import {captureEvidenceTable, evidenceTableFor, type EvidenceTableWitness} from '../services/evidence/evidenceCapture';
+import {captureEvidenceTable, captureRawSqlEvidence, evidenceTableFor, type EvidenceTableWitness} from '../services/evidence/evidenceCapture';
 import {scopeMetadata, identityForScopeEvidence, mergeScopeProvenance, type EvidenceScopeProvenanceV1} from '../types/identityContract';
 import {assessScrollingJankClaimBoundary} from '../services/scrollingJankClaimBoundary';
 import { injectStdlibIncludes } from './sqlIncludeInjector';
@@ -179,15 +179,18 @@ import { backendLogPath } from '../runtimePaths';
 import {diagnosticLogIdentity} from '../utils/logger';
 import {activeCodebaseGeneration, CodebaseRegistry} from '../services/codebase/codebaseRegistry';
 import {getDefaultCodebaseRegistry} from '../services/codebase/defaultCodebaseServices';
-import {CodeLookupLedger} from '../services/codebase/codeLookupLedger';
+import {CodeLookupLedger, type CodeLookupLedgerEntry} from '../services/codebase/codeLookupLedger';
 import {PatchProposer} from '../services/codebase/patchProposer';
 import {normalizeCodeAwareMode, type CodeAwareMode} from '../services/codebase/codeAwareFeature';
 import {
   SOURCE_USE_DECISION_SCHEMA_VERSION,
+  MAX_SOURCE_REFERENCE_COUNT,
   loadSourceUseDecisionToolDescription,
   sanitizeSourceIncompleteReason,
+  sanitizeSourceReference,
   sanitizeSourceReferences,
   sanitizeSourceUseDecision,
+  type SourceExecutionScopeV1,
   type SourceReferenceV1,
   type SourceUseDecisionV1,
 } from '../services/codebase/sourceUseDecision';
@@ -199,6 +202,7 @@ import {
 } from '../services/codebase/gitNexusCodeGraphNavigator';
 import {
   filterRagLookup,
+  type SanitizedRagHit,
   type SanitizedRagResult,
 } from '../services/rag/lookupResponseFilter';
 import type {RagRetrievalResult} from '../types/sparkContracts';
@@ -1270,6 +1274,8 @@ export interface ClaudeMcpServerOptions {
 
 export interface SourceUseDecisionAccessor {
   getSourceUseDecision(): SourceUseDecisionV1 | undefined;
+  /** Missing or invalidated scope cannot establish source non-applicability. */
+  getSourceExecutionScope?(): SourceExecutionScopeV1 | undefined;
 }
 
 /**
@@ -1549,10 +1555,26 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     ? initialSourceUseDecision
     : undefined;
   let explicitSourceUseDecisionReason: string | undefined;
+  const sourceExecutionScope: SourceExecutionScopeV1 = {
+    codeAwareMode,
+    selectedCodebaseIds: [...codebaseIds],
+    hasCodebaseAccess: toolRequestScope.hasCodebaseAccess === true,
+    analysisContextFingerprint: pinnedAnalysisContextFingerprint,
+  };
   const sourceUse: SourceUseDecisionAccessor = {
     getSourceUseDecision: () => sourceUseDecision
       ? structuredClone(sourceUseDecision)
       : undefined,
+    getSourceExecutionScope: () => {
+      try {
+        assertPrivateAnalysisContextCurrent();
+        return structuredClone(sourceExecutionScope);
+      } catch {
+        // Finalization also runs on errors/cancellation. Losing scope authority
+        // must withhold a receipt rather than replace the original failure.
+        return undefined;
+      }
+    },
   };
 
   const syncSourceUseDecisionStatusToPlan = (): void => {
@@ -1572,6 +1594,31 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     syncSourceUseDecisionStatusToPlan();
   };
 
+  // Admission precedes provider delivery. Never expose a new source body or
+  // location that the bounded, current-run provenance ledger cannot retain.
+  const issuedSourceReferences = new Map<string, SourceReferenceV1>();
+  const admitSourceItems = <T>(items: readonly T[], referenceFor: (item: T) => unknown) => {
+    const known = issuedSourceReferences;
+    const admitted: T[] = [];
+    const references: SourceReferenceV1[] = [];
+    let incompleteReason: 'source_reference_limit_exceeded' | 'invalid_source_reference' | undefined;
+    for (const item of items) {
+      const reference = sanitizeSourceReference(referenceFor(item));
+      if (!reference || !codebaseIds.includes(reference.codebaseId)) {
+        incompleteReason ??= 'invalid_source_reference';
+        continue;
+      }
+      if (!known.has(reference.id) && known.size >= MAX_SOURCE_REFERENCE_COUNT) {
+        incompleteReason = 'source_reference_limit_exceeded';
+        continue;
+      }
+      known.set(reference.id, reference);
+      admitted.push(item);
+      references.push(reference);
+    }
+    return {items: admitted, references: sanitizeSourceReferences(references), incompleteReason};
+  };
+
   type SourceLookupObservation = {
     toolName: string;
     codebaseIds: readonly string[];
@@ -1582,11 +1629,17 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     incompleteReasons?: readonly string[];
   };
   const observeSourceLookup = (observation: SourceLookupObservation): void => {
-    const current = sourceUseDecision;
-    if (!current || explicitSourceUseDecisionReason) return;
+    let current = sourceUseDecision;
+    if (!current) return;
     const selected = new Set(current.selectedCodebaseIds);
     const queriedCodebaseIds = observation.codebaseIds.filter(id => selected.has(id));
     if (queriedCodebaseIds.length === 0) return;
+    if (explicitSourceUseDecisionReason) {
+      // A model's earlier decision cannot conceal later execution facts.
+      current = {...current, status: 'pending', reasonCode: undefined,
+        coverageComplete: undefined, incompleteReasons: undefined};
+      explicitSourceUseDecisionReason = undefined;
+    }
     const references = sanitizeSourceReferences(observation.references ?? [])
       .filter(reference => selected.has(reference.codebaseId));
     const incompleteReasons = [...new Set((observation.incompleteReasons ?? [])
@@ -1627,7 +1680,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     commitSourceUseDecision({
       ...current,
       status,
-      ...(reasonCode ? {reasonCode} : {}),
+      reasonCode,
       attemptedTools: [...new Set([...current.attemptedTools, observation.toolName])],
       queriedCodebaseIds: [...new Set([...current.queriedCodebaseIds, ...queriedCodebaseIds])],
       usedCodebaseIds: [...new Set([
@@ -1648,6 +1701,27 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           : {}),
       references: sanitizeSourceReferences([...current.references, ...references]),
     });
+  };
+
+  const observeSourceOperation = async <T>(
+    toolName: CodeLookupLedgerEntry['toolName'],
+    queriedCodebaseIds: readonly string[],
+    operation: () => T | Promise<T>,
+  ): Promise<T> => {
+    observeSourceLookup({toolName, codebaseIds: queriedCodebaseIds, success: false});
+    const startedAt = Date.now();
+    try {
+      return await operation();
+    } catch (error) {
+      for (const codebaseId of new Set(queriedCodebaseIds.filter(id => codebaseIds.includes(id)))) {
+        codeLookupLedger?.record({turn: 0, ts: Date.now(), toolName, codebaseId,
+          chunkIds: [], returnedReferenceCount: 0, tokensSpent: 0,
+          consentApplied: codeAwareMode === 'provider_send', outcome: 'rejected', legacyPath: false,
+          durationMs: Date.now() - startedAt});
+      }
+      await codeLookupLedger?.flush();
+      throw error;
+    }
   };
 
   const observeOnDemandSourceLookup = (
@@ -1674,31 +1748,39 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       unsupportedReason?: string;
       truncated: boolean;
     },
-  ): void => {
+  ) => {
     const rawReferences = [...(result.matches ?? []), ...(result.reference ? [result.reference] : [])];
-    const lookupKind: SourceReferenceV1['lookupKind'] = codeAwareMode === 'provider_send'
-      ? 'body'
-      : 'metadata';
-    const references = sanitizeSourceReferences(rawReferences.map(reference => ({
+    const admitted = admitSourceItems(rawReferences, reference => ({
       ...reference,
-      lookupKind,
-    })));
+      lookupKind: codeAwareMode === 'provider_send' && reference.text ? 'body' : 'metadata',
+    }));
+    const delivered = {
+      ...result,
+      ...(result.matches ? {matches: admitted.items} : {}),
+      ...(result.reference ? {reference: admitted.items[0]} : {}),
+      sourceReferences: admitted.references,
+      ...(admitted.incompleteReason ? toolName === 'search_codebase'
+        ? {coverageComplete: false, truncated: true, searchIncompleteReason: admitted.incompleteReason}
+        : {success: false, unsupportedReason: admitted.incompleteReason} : {}),
+    };
     const incompleteReasons = [
-      result.searchIncompleteReason,
+      delivered.searchIncompleteReason,
+      admitted.incompleteReason,
       ...(result.unsupportedReason === 'budget_exceeded' ? ['budget_exceeded'] : []),
-      ...(result.truncated && result.coverageComplete !== true ? ['result_truncated'] : []),
+      ...(toolName === 'search_codebase' && result.truncated && result.coverageComplete !== true ? ['result_truncated'] : []),
     ].filter((reason): reason is string => Boolean(reason));
     observeSourceLookup({
       toolName,
       codebaseIds: [result.codebaseId],
-      references,
-      bodyAvailable: rawReferences.some(reference => Boolean(reference.text)),
-      success: result.success,
-      ...(typeof result.coverageComplete === 'boolean'
-        ? {coverageComplete: result.coverageComplete}
+      references: admitted.references,
+      bodyAvailable: admitted.items.some(reference => Boolean(reference.text)),
+      success: delivered.success,
+      ...(typeof delivered.coverageComplete === 'boolean'
+        ? {coverageComplete: delivered.coverageComplete}
         : {}),
       incompleteReasons,
     });
+    return delivered;
   };
 
   const observeGraphSourceLookup = (
@@ -1716,40 +1798,55 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       truncated: boolean;
       unsupportedReason?: string;
     },
-  ): void => {
+  ) => {
+    const admitted = admitSourceItems(result.references, reference => ({...reference, lookupKind: 'graph'}));
+    const delivered = {...result, references: admitted.items, sourceReferences: admitted.references,
+      ...(admitted.incompleteReason ? {truncated: true, unsupportedReason: admitted.incompleteReason, processes: []} : {})};
     observeSourceLookup({
       toolName,
       codebaseIds: [result.codebaseId],
-      references: sanitizeSourceReferences(result.references.map(reference => ({
-        ...reference,
-        lookupKind: 'graph',
-      }))),
+      references: admitted.references,
       success: result.success,
-      ...(result.truncated ? {coverageComplete: false} : {}),
+      ...(delivered.truncated ? {coverageComplete: false} : {}),
       incompleteReasons: [
+        ...(admitted.incompleteReason ? [admitted.incompleteReason] : []),
         ...(result.truncated ? ['result_truncated'] : []),
         ...(result.unsupportedReason === 'budget_exceeded' ? ['budget_exceeded'] : []),
       ],
     });
+    return delivered;
   };
 
+  const indexedSourceReference = (hit: SanitizedRagHit) => ({
+    chunkId: hit.chunkId,
+    codebaseId: hit.metadata?.codebaseId,
+    filePath: hit.metadata?.filePath,
+    lineRange: hit.metadata?.lineRange,
+    symbol: hit.metadata?.symbol,
+    buildId: hit.metadata?.buildId,
+    commitHash: hit.metadata?.commitHash,
+    sourceGeneration: hit.metadata?.sourceGeneration,
+    lookupKind: codeAwareMode === 'provider_send' && hit.snippet ? 'indexed' : 'metadata',
+  });
   const observeIndexedSourceLookup = (
     toolName: 'lookup_app_source' | 'lookup_kernel_source' | 'lookup_aosp_source' | 'lookup_oem_sdk',
     result: SanitizedRagResult,
     queriedCodebaseIds: readonly string[],
-  ): void => {
-    const references = sanitizeSourceReferences(result.hits.map(hit => ({
-      chunkId: hit.chunkId,
-      codebaseId: hit.metadata?.codebaseId,
-      filePath: hit.metadata?.filePath,
-      lineRange: hit.metadata?.lineRange,
-      symbol: hit.metadata?.symbol,
-      buildId: hit.metadata?.buildId,
-      commitHash: hit.metadata?.commitHash,
-      sourceGeneration: hit.metadata?.sourceGeneration,
-      lookupKind: 'indexed',
-    })));
+    bodyAdmissionReason?: string,
+  ) => {
+    const registeredHits = result.hits.filter(hit => hit.metadata?.codebaseId);
+    const admitted = admitSourceItems(registeredHits, indexedSourceReference);
+    const incompleteReason = admitted.incompleteReason ?? bodyAdmissionReason;
+    const admittedHits = new Set(admitted.items);
+    const delivered = {...result,
+      hits: result.hits.filter(hit => !hit.metadata?.codebaseId || admittedHits.has(hit)),
+      sourceReferences: admitted.references,
+      ...(incompleteReason
+        ? {coverageComplete: false, searchIncompleteReason: incompleteReason}
+        : {}),
+    };
     const blockingReasons = [
+      incompleteReason,
       result.unsupportedReason,
       ...result.hits.flatMap(hit => hit.unsupportedReason === 'budget_exceeded'
         ? [hit.unsupportedReason]
@@ -1758,12 +1855,30 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
     observeSourceLookup({
       toolName,
       codebaseIds: queriedCodebaseIds,
-      references,
-      bodyAvailable: result.hits.some(hit => typeof hit.snippet === 'string' && hit.snippet.length > 0),
+      references: admitted.references,
+      bodyAvailable: delivered.hits.some(hit => typeof hit.snippet === 'string' && hit.snippet.length > 0),
       success: result.unsupportedReason === undefined,
       ...(blockingReasons.length > 0 ? {coverageComplete: false} : {}),
       incompleteReasons: blockingReasons,
     });
+    return delivered;
+  };
+  const filterIndexedSourceLookup = async (
+    toolName: Parameters<typeof observeIndexedSourceLookup>[0],
+    raw: RagRetrievalResult,
+    queriedCodebaseIds: readonly string[],
+  ) => {
+    let bodyAdmissionReason: string | undefined;
+    const filtered = await observeSourceOperation(toolName, queriedCodebaseIds, () => filterRagLookup(raw, {toolName, turn: 0, codebaseRegistry,
+      ledger: codeLookupLedger, allowProviderSend: codeAwareMode === 'provider_send',
+      sessionId: options.sessionId, knowledgeScope,
+      admitSourceHit: hit => {
+        const admitted = admitSourceItems([hit], indexedSourceReference);
+        bodyAdmissionReason ??= admitted.incompleteReason;
+        return admitted.items.length > 0;
+      },
+    }));
+    return observeIndexedSourceLookup(toolName, filtered, queriedCodebaseIds, bodyAdmissionReason);
   };
   let skillRuntimeRegistryBound = false;
   let directWorkspaceRegistryPromise:
@@ -2540,7 +2655,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const truncated = result.rows.length > 200;
         const rows = truncated ? result.rows.slice(0, 200) : result.rows;
         const success = !result.error;
-        const executionWitness = success ? captureEvidenceTable({columns: result.columns, rows: result.rows}) : undefined;
+        const executionWitness = success ? captureRawSqlEvidence(result, {traceId, traceSide: 'current'}) : undefined;
         const sqlArtifact = success && result.columns.length > 0 && result.rows.length > SQL_RAW_INLINE_ROW_LIMIT
           ? storeSqlResultArtifact(artifactStore, {
               toolName: 'execute_sql',
@@ -4199,7 +4314,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const result = ragStore.search(query, {
+      const result = await observeSourceOperation('lookup_aosp_source', effectiveCodebaseIds, () => ragStore.search(query, {
         topK: top_k ?? 5,
         kinds: ['aosp'],
         ...(effectiveCodebaseIds.length > 0 ? {codebaseIds: effectiveCodebaseIds} : {}),
@@ -4208,7 +4323,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         ...(pathPrefix ? {pathPrefix} : {}),
         scope: knowledgeScope,
         activeCodebaseGenerations: activeCodebaseGenerations(effectiveCodebaseIds),
-      });
+      }));
       if (result.results.some(hit => hit.chunk?.registryOrigin === 'codebase_registry')) {
         const scopedResult = {
           ...result,
@@ -4216,23 +4331,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             hit.chunk?.registryOrigin !== 'codebase_registry' ||
             (hit.chunk.codebaseId && effectiveCodebaseIds.includes(hit.chunk.codebaseId))),
         };
-        const filtered = await filterRagLookup(scopedResult, {
-          toolName: 'lookup_aosp_source',
-          turn: 0,
-          codebaseRegistry,
-          ledger: codeLookupLedger,
-          allowProviderSend: codeAwareMode === 'provider_send',
-          sessionId: options.sessionId,
-          knowledgeScope,
-        });
-        observeIndexedSourceLookup(
-          'lookup_aosp_source',
-          filtered,
-          effectiveCodebaseIds,
-        );
+        const delivered = await filterIndexedSourceLookup('lookup_aosp_source', scopedResult, effectiveCodebaseIds);
         await codeLookupLedger?.flush();
         assertPrivateAnalysisContextCurrent();
-        return ragToolResult(filtered, 'nested');
+        return ragToolResult(delivered, 'nested');
       }
       observeSourceLookup({
         toolName: 'lookup_aosp_source',
@@ -4276,14 +4378,14 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const result = ragStore.search(query, {
+      const result = await observeSourceOperation('lookup_oem_sdk', effectiveCodebaseIds, () => ragStore.search(query, {
         topK: top_k ?? 5,
         kinds: ['oem_sdk'],
         ...(effectiveCodebaseIds.length > 0 ? {codebaseIds: effectiveCodebaseIds} : {}),
         ...(vendorId ? {vendor: vendorId} : {}),
         scope: knowledgeScope,
         activeCodebaseGenerations: activeCodebaseGenerations(effectiveCodebaseIds),
-      });
+      }));
       if (result.results.some(hit => hit.chunk?.registryOrigin === 'codebase_registry')) {
         const scopedResult = {
           ...result,
@@ -4291,23 +4393,10 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
             hit.chunk?.registryOrigin !== 'codebase_registry' ||
             (hit.chunk.codebaseId && effectiveCodebaseIds.includes(hit.chunk.codebaseId))),
         };
-        const filtered = await filterRagLookup(scopedResult, {
-          toolName: 'lookup_oem_sdk',
-          turn: 0,
-          codebaseRegistry,
-          ledger: codeLookupLedger,
-          allowProviderSend: codeAwareMode === 'provider_send',
-          sessionId: options.sessionId,
-          knowledgeScope,
-        });
-        observeIndexedSourceLookup(
-          'lookup_oem_sdk',
-          filtered,
-          effectiveCodebaseIds,
-        );
+        const delivered = await filterIndexedSourceLookup('lookup_oem_sdk', scopedResult, effectiveCodebaseIds);
         await codeLookupLedger?.flush();
         assertPrivateAnalysisContextCurrent();
-        return ragToolResult(filtered, 'nested');
+        return ragToolResult(delivered, 'nested');
       }
       observeSourceLookup({
         toolName: 'lookup_oem_sdk',
@@ -4571,6 +4660,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       }
       const sourceBudgetStop = consumeSourceBudget('search');
       if (sourceBudgetStop) {
+        observeSourceLookup({toolName: 'search_codebase', codebaseIds: [codebaseId], success: false,
+          coverageComplete: false, incompleteReasons: [sourceBudgetStop]});
         await recordOnDemandSourceLookup({
           toolName: 'search_codebase',
           codebaseId,
@@ -4597,6 +4688,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         mode: codeAwareMode,
         pathPrefix: normalizeOptionalToolString(path_prefix),
         maxResults: max_results,
+      }).catch(async error => {
+        observeSourceLookup({toolName: 'search_codebase', codebaseIds: [codebaseId], success: false});
+        await recordOnDemandSourceLookup({toolName: 'search_codebase', codebaseId, tokensSpent: 0,
+          returnedReferenceCount: 0, outcome: 'rejected', durationMs: Date.now() - sourceLookupStartedAt});
+        throw error;
       });
       const tokensSpent = onDemandSourceTokens(result);
       if (codeLookupLedger && tokensSpent > codeLookupLedger.remainingTokens()) {
@@ -4632,23 +4728,23 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           }))}],
         };
       }
-      if (result.success && codeAwareMode === 'provider_send') {
-        registerOnDemandSourceLookupForEcho(options.sessionId, result.matches);
+      const delivered = observeOnDemandSourceLookup('search_codebase', result);
+      if (delivered.success && codeAwareMode === 'provider_send') {
+        registerOnDemandSourceLookupForEcho(options.sessionId, delivered.matches ?? []);
       }
-      observeOnDemandSourceLookup('search_codebase', result);
       await recordOnDemandSourceLookup({
         toolName: 'search_codebase',
         codebaseId,
-        tokensSpent,
-        returnedReferenceCount: result.success ? result.matches?.length ?? 0 : 0,
-        outcome: result.success
+        tokensSpent: onDemandSourceTokens(delivered),
+        returnedReferenceCount: delivered.success ? delivered.matches?.length ?? 0 : 0,
+        outcome: delivered.success
           ? 'success'
           : result.unsupportedReason?.includes('consent') ? 'consent_blocked' : 'rejected',
         durationMs: Date.now() - sourceLookupStartedAt,
       });
       assertPrivateAnalysisContextCurrent();
       return {
-        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...result}))}],
+        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...delivered}))}],
       };
     },
     {annotations: {readOnlyHint: true}},
@@ -4677,6 +4773,8 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
       }
       const sourceBudgetStop = consumeSourceBudget('read');
       if (sourceBudgetStop) {
+        observeSourceLookup({toolName: 'read_codebase_file', codebaseIds: [codebaseId], success: false,
+          incompleteReasons: [sourceBudgetStop]});
         await recordOnDemandSourceLookup({
           toolName: 'read_codebase_file',
           codebaseId,
@@ -4702,6 +4800,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         startLine: start_line,
         maxLines: max_lines,
         mode: codeAwareMode,
+      }).catch(async error => {
+        observeSourceLookup({toolName: 'read_codebase_file', codebaseIds: [codebaseId], success: false});
+        await recordOnDemandSourceLookup({toolName: 'read_codebase_file', codebaseId, tokensSpent: 0,
+          returnedReferenceCount: 0, outcome: 'rejected', durationMs: Date.now() - sourceLookupStartedAt});
+        throw error;
       });
       const tokensSpent = onDemandSourceTokens(result);
       if (codeLookupLedger && tokensSpent > codeLookupLedger.remainingTokens()) {
@@ -4728,23 +4831,23 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           }))}],
         };
       }
-      if (result.success && codeAwareMode === 'provider_send' && result.reference) {
-        registerOnDemandSourceLookupForEcho(options.sessionId, [result.reference]);
+      const delivered = observeOnDemandSourceLookup('read_codebase_file', result);
+      if (delivered.success && codeAwareMode === 'provider_send' && delivered.reference) {
+        registerOnDemandSourceLookupForEcho(options.sessionId, [delivered.reference]);
       }
-      observeOnDemandSourceLookup('read_codebase_file', result);
       await recordOnDemandSourceLookup({
         toolName: 'read_codebase_file',
         codebaseId,
-        tokensSpent,
-        returnedReferenceCount: result.success && result.reference ? 1 : 0,
-        outcome: result.success
+        tokensSpent: onDemandSourceTokens(delivered),
+        returnedReferenceCount: delivered.success && delivered.reference ? 1 : 0,
+        outcome: delivered.success
           ? 'success'
           : result.unsupportedReason?.includes('consent') ? 'consent_blocked' : 'rejected',
         durationMs: Date.now() - sourceLookupStartedAt,
       });
       assertPrivateAnalysisContextCurrent();
       return {
-        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...result}))}],
+        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...delivered}))}],
       };
     },
     {annotations: {readOnlyHint: true}},
@@ -4770,12 +4873,12 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const result = await codeGraphNavigator.query({
+      const result = await observeSourceOperation('query_code_graph', [codebaseId], () => codeGraphNavigator.query({
         codebaseId,
         scope: knowledgeScope ?? {},
         query,
         limit: max_results,
-      });
+      }));
       const tokensSpent = graphMetadataTokens(result);
       if (codeLookupLedger && tokensSpent > codeLookupLedger.remainingTokens()) {
         observeGraphSourceLookup('query_code_graph', {
@@ -4804,17 +4907,17 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           }))}],
         };
       }
-      observeGraphSourceLookup('query_code_graph', result);
+      const delivered = observeGraphSourceLookup('query_code_graph', result);
       await recordCodeGraphLookup({
         toolName: 'query_code_graph',
         codebaseId,
         tokensSpent,
-        returnedReferenceCount: result.references.length,
+        returnedReferenceCount: delivered.references.length,
         outcome: result.success ? 'success' : 'rejected',
       });
       assertPrivateAnalysisContextCurrent();
       return {
-        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...result}))}],
+        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...delivered}))}],
       };
     },
     {annotations: {readOnlyHint: true}},
@@ -4841,13 +4944,13 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const result = await codeGraphNavigator.inspectSymbol({
+      const result = await observeSourceOperation('inspect_code_symbol', [codebaseId], () => codeGraphNavigator.inspectSymbol({
         codebaseId,
         scope: knowledgeScope ?? {},
         symbol,
         filePath: normalizeOptionalToolString(file_path),
         limit: max_relations,
-      });
+      }));
       const tokensSpent = graphMetadataTokens(result);
       if (codeLookupLedger && tokensSpent > codeLookupLedger.remainingTokens()) {
         observeGraphSourceLookup('inspect_code_symbol', {
@@ -4876,17 +4979,17 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           }))}],
         };
       }
-      observeGraphSourceLookup('inspect_code_symbol', result);
+      const delivered = observeGraphSourceLookup('inspect_code_symbol', result);
       await recordCodeGraphLookup({
         toolName: 'inspect_code_symbol',
         codebaseId,
         tokensSpent,
-        returnedReferenceCount: result.references.length,
+        returnedReferenceCount: delivered.references.length,
         outcome: result.success ? 'success' : 'rejected',
       });
       assertPrivateAnalysisContextCurrent();
       return {
-        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...result}))}],
+        content: [{type: 'text' as const, text: JSON.stringify(retrievedData({...delivered}))}],
       };
     },
     {annotations: {readOnlyHint: true}},
@@ -4921,7 +5024,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const raw = ragStore.search(query, {
+      const raw = await observeSourceOperation('lookup_app_source', allowed, () => ragStore.search(query, {
         topK: top_k ?? 5,
         kinds: ['app_source'],
         codebaseIds: allowed,
@@ -4930,20 +5033,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         ...(pathPrefix ? {pathPrefix} : {}),
         scope: knowledgeScope,
         activeCodebaseGenerations: activeCodebaseGenerations(allowed),
-      });
-      const filtered = await filterRagLookup(raw, {
-        toolName: 'lookup_app_source',
-        turn: 0,
-        codebaseRegistry,
-        ledger: codeLookupLedger,
-        allowProviderSend: codeAwareMode === 'provider_send',
-        sessionId: options.sessionId,
-        knowledgeScope,
-      });
-      observeIndexedSourceLookup('lookup_app_source', filtered, allowed);
+      }));
+      const delivered = await filterIndexedSourceLookup('lookup_app_source', raw, allowed);
       await codeLookupLedger?.flush();
       assertPrivateAnalysisContextCurrent();
-      return ragToolResult(filtered, 'nested');
+      return ragToolResult(delivered, 'nested');
     },
     {annotations: {readOnlyHint: true}},
   );
@@ -4990,7 +5084,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           isError: true,
         };
       }
-      const raw = ragStore.search(query, {
+      const raw = await observeSourceOperation('lookup_kernel_source', kernelRefs.map(ref => ref!.codebaseId), () => ragStore.search(query, {
         topK: top_k ?? 5,
         kinds: ['kernel_source'],
         codebaseIds: kernelRefs.map(ref => ref!.codebaseId),
@@ -4999,24 +5093,11 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         ...(pathPrefix ? {pathPrefix} : {}),
         scope: knowledgeScope,
         activeCodebaseGenerations: activeCodebaseGenerations(kernelRefs.map(ref => ref!.codebaseId)),
-      });
-      const filtered = await filterRagLookup(raw, {
-        toolName: 'lookup_kernel_source',
-        turn: 0,
-        codebaseRegistry,
-        ledger: codeLookupLedger,
-        allowProviderSend: codeAwareMode === 'provider_send',
-        sessionId: options.sessionId,
-        knowledgeScope,
-      });
-      observeIndexedSourceLookup(
-        'lookup_kernel_source',
-        filtered,
-        kernelRefs.map(ref => ref!.codebaseId),
-      );
+      }));
+      const delivered = await filterIndexedSourceLookup('lookup_kernel_source', raw, kernelRefs.map(ref => ref!.codebaseId));
       await codeLookupLedger?.flush();
       assertPrivateAnalysisContextCurrent();
-      return ragToolResult(filtered, 'nested');
+      return ragToolResult(delivered, 'nested');
     },
     {annotations: {readOnlyHint: true}},
   );
@@ -5053,7 +5134,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         };
       }
       const resolver = new SymbolResolver(ragStore, knowledgeScope, codebaseRegistry);
-      const results = allowed.map(id => {
+      const results = await observeSourceOperation('resolve_symbol', allowed, () => allowed.map(id => {
         const ref = codebaseRegistry.get(id, knowledgeScope);
         if (kind === 'kernel' || ref?.kind === 'kernel_source') {
           return resolver.resolveKernel({
@@ -5079,22 +5160,27 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
           ...(buildId ? {buildId} : {}),
           topK: top_k ?? 5,
         });
-      });
+      }));
+      const admitted = admitSourceItems(results.flatMap(result => result.candidates),
+        candidate => ({...candidate, lookupKind: 'metadata'}));
+      const admittedCandidates = new Set(admitted.items);
+      const delivered = results.map(result => ({...result,
+        candidates: result.candidates.filter(candidate => admittedCandidates.has(candidate)),
+      }));
       observeSourceLookup({
         toolName: 'resolve_symbol',
         codebaseIds: allowed,
-        references: sanitizeSourceReferences(results.flatMap(result =>
-          result.candidates.map(candidate => ({
-            ...candidate,
-            lookupKind: 'metadata',
-          })))),
+        references: admitted.references,
         success: results.some(result => result.success),
+        ...(admitted.incompleteReason ? {coverageComplete: false, incompleteReasons: [admitted.incompleteReason]} : {}),
       });
       assertPrivateAnalysisContextCurrent();
       return {
         content: [{type: 'text' as const, text: JSON.stringify({
           success: results.some(result => result.success),
-          results,
+          results: delivered,
+          sourceReferences: admitted.references,
+          ...(admitted.incompleteReason ? {coverageComplete: false, searchIncompleteReason: admitted.incompleteReason} : {}),
         })}],
       };
     },
@@ -6564,7 +6650,7 @@ export function createClaudeMcpServer(options: ClaudeMcpServerOptions) {
         const truncated = result.rows.length > 200;
         const rows = truncated ? result.rows.slice(0, 200) : result.rows;
         const success = !result.error;
-        const executionWitness = success ? captureEvidenceTable({columns: result.columns, rows: result.rows}) : undefined;
+        const executionWitness = success ? captureRawSqlEvidence(result, {traceId: targetTraceId, traceSide: trace}) : undefined;
         const sqlArtifact = success && result.columns.length > 0 && result.rows.length > SQL_RAW_INLINE_ROW_LIMIT
           ? storeSqlResultArtifact(artifactStore, {
               toolName: 'execute_sql_on',

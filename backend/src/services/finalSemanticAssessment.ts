@@ -20,7 +20,6 @@ import {isPlainJsonObject} from '../utils/isPlainJsonObject';
 export const FINAL_SEMANTIC_RULE_VERSION = 'final_semantics@1';
 export const FINAL_SEMANTIC_INPUT_BYTE_LIMIT = 128 * 1024;
 export const FINAL_SEMANTIC_OUTPUT_BYTE_LIMIT = 64 * 1024;
-const FINAL_SEMANTIC_TIMEOUT_MS = 60_000;
 
 export interface FinalSemanticSnapshot {
   /** Parent-owned privacy projection must preserve the entire review target. */
@@ -236,17 +235,41 @@ function utf16Boundary(body: string, offset: number): boolean {
   const next = body.charCodeAt(offset);
   return !(previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF);
 }
-function parseLocations(raw: unknown, body: string, withText: boolean): SemanticContentLocation[] | undefined {
+function exactQuoteLocation(item: Record<string, unknown>, body: string): SemanticContentLocation | undefined {
+  if (!keys(item, ['text'], ['occurrence']) || !nonempty(item.text) ||
+    (hasOwn(item, 'occurrence') && (!Number.isSafeInteger(item.occurrence) || Number(item.occurrence) <= 0))) return undefined;
+  const occurrence = item.occurrence as number | undefined;
+  let start = -1;
+  let count = 0;
+  let selected = -1;
+  // Advance one UTF-16 code unit so overlapping exact matches also count.
+  while ((start = body.indexOf(item.text, start + 1)) !== -1) {
+    count += 1;
+    if (occurrence === undefined && count > 1) return undefined;
+    if (occurrence === undefined || count === occurrence) selected = start;
+    if (count === occurrence) break;
+  }
+  return selected < 0 ? undefined : {start: selected, end: selected + item.text.length};
+}
+
+function parseLocations(raw: unknown, body: string, format: 'offsets' | 'offsets_with_text' | 'exact_quote'):
+  SemanticContentLocation[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const seen = new Set<string>();
   const locations: SemanticContentLocation[] = [];
   for (const item of raw) {
-    if (!record(item) || !keys(item, withText ? ['start', 'end', 'text'] : ['start', 'end']) ||
-      !Number.isSafeInteger(item.start) || !Number.isSafeInteger(item.end)) return undefined;
-    const start = item.start as number;
-    const end = item.end as number;
+    if (!record(item)) return undefined;
+    let location: SemanticContentLocation | undefined;
+    if (format === 'exact_quote') location = exactQuoteLocation(item, body);
+    else {
+      if (!keys(item, format === 'offsets_with_text' ? ['start', 'end', 'text'] : ['start', 'end']) ||
+        !Number.isSafeInteger(item.start) || !Number.isSafeInteger(item.end)) return undefined;
+      location = {start: item.start as number, end: item.end as number};
+    }
+    if (!location) return undefined;
+    const {start, end} = location;
     if (start < 0 || end <= start || end > body.length || !utf16Boundary(body, start) || !utf16Boundary(body, end) ||
-      (withText && item.text !== body.slice(start, end)) || seen.has(`${start}:${end}`)) return undefined;
+      (format === 'offsets_with_text' && item.text !== body.slice(start, end)) || seen.has(`${start}:${end}`)) return undefined;
     seen.add(`${start}:${end}`);
     locations.push({start, end});
   }
@@ -278,11 +301,12 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
   let value: unknown;
   try { value = JSON.parse(fence ? fence[1] : text); } catch { return undefined; }
   if (!record(value) || !keys(value, ['schemaVersion', 'bodyCoverage', 'claims', 'omissions', 'requirements']) ||
-    value.schemaVersion !== 'final_semantic_response@1' || !record(value.bodyCoverage) ||
+    !member(value.schemaVersion, ['final_semantic_response@1', 'final_semantic_response@2']) || !record(value.bodyCoverage) ||
     !keys(value.bodyCoverage, ['status', 'reviewedSpans']) || !member(value.bodyCoverage.status, ['complete', 'incomplete']) ||
     !Array.isArray(value.claims) || !Array.isArray(value.omissions) || !Array.isArray(value.requirements)) return undefined;
   const {body, conclusionContract: contract} = captured.snapshot;
-  const reviewedSpans = parseLocations(value.bodyCoverage.reviewedSpans, body, false);
+  const locationFormat = value.schemaVersion === 'final_semantic_response@2' ? 'exact_quote' : 'offsets_with_text';
+  const reviewedSpans = parseLocations(value.bodyCoverage.reviewedSpans, body, 'offsets');
   if (!reviewedSpans || reviewedSpans.some((item, index) => index > 0 && item.start < reviewedSpans[index - 1].end) ||
     (value.bodyCoverage.status === 'complete' && !wholeBodyCovered(reviewedSpans, body.length))) return undefined;
   const declarations = new Map((contract?.claims ?? []).map(claim => [claim.id!, claim]));
@@ -292,12 +316,12 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
     if (!record(item) || !keys(item, ['claimId', 'consistency', 'contentLocations', 'issues']) ||
       !nonempty(item.claimId) || !declarations.has(item.claimId) || seenClaims.has(item.claimId) ||
       !member(item.consistency, ['consistent', 'inconsistent', 'unknown']) || !Array.isArray(item.issues)) return undefined;
-    const locations = parseLocations(item.contentLocations, body, true);
+    const locations = parseLocations(item.contentLocations, body, locationFormat);
     if (!locations) return undefined;
     const issues: Array<{code: SemanticIssueCode; contentLocations: SemanticContentLocation[]}> = [];
     for (const issue of item.issues) {
       if (!record(issue) || !keys(issue, ['code', 'contentLocations']) || !member(issue.code, ISSUE_CODES)) return undefined;
-      const issueLocations = parseLocations(issue.contentLocations, body, true);
+      const issueLocations = parseLocations(issue.contentLocations, body, locationFormat);
       if (!issueLocations || (issue.code !== 'declaration_not_expressed' && issue.code !== 'unclear_semantics' && !issueLocations.length)) return undefined;
       issues.push({code: issue.code, contentLocations: issueLocations});
     }
@@ -320,7 +344,7 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
   const omissions: Array<{code: 'undeclared_claim'; contentLocations: SemanticContentLocation[]}> = [];
   for (const item of value.omissions) {
     if (!record(item) || !keys(item, ['code', 'contentLocations']) || item.code !== 'undeclared_claim') return undefined;
-    const locations = parseLocations(item.contentLocations, body, true);
+    const locations = parseLocations(item.contentLocations, body, locationFormat);
     if (!locations?.length) return undefined;
     omissions.push({code: 'undeclared_claim', contentLocations: locations});
   }
@@ -335,7 +359,7 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
       !member(item.applicability, ['applicable', 'not_applicable', 'unknown']) || !member(item.coverage, ['covered', 'missing', 'unknown']) ||
       !Array.isArray(item.claimIds) || item.claimIds.some(id => typeof id !== 'string' || !declarations.has(id)) ||
       new Set(item.claimIds).size !== item.claimIds.length) return undefined;
-    const locations = parseLocations(item.contentLocations, body, true);
+    const locations = parseLocations(item.contentLocations, body, locationFormat);
     const fixed = fixedApplicability(requirementMap.get(item.requirementId)!, captured);
     if (!locations || (fixed !== undefined && item.applicability !== fixed) ||
       (item.applicability !== 'applicable' && item.coverage !== 'unknown') ||
@@ -365,7 +389,6 @@ function parseResponse(raw: string, captured: CapturedSnapshot, binding: NonNull
 
 /** One semantic request per captured runtime context; this service never reads evidence. */
 export function assessFinalSemantics(input: FinalSemanticAssessmentInput): Promise<FinalSemanticAssessment> {
-  const reviewStartedAt = Date.now();
   const {context, signal} = input;
   signal.throwIfAborted();
   let captured: CapturedSnapshot;
@@ -425,9 +448,8 @@ export function assessFinalSemantics(input: FinalSemanticAssessmentInput): Promi
     })}`;
     if (Buffer.byteLength(prompt, 'utf8') > inputBytes) return fail('coverage_incomplete', 'input_limit');
     if (!context.hasSemanticTransport) return fail('unavailable', 'missing_transport');
-    const originalDeadlineMs = context.deadlineMs;
-    if (!Number.isFinite(originalDeadlineMs)) return fail('not_checked', 'invalid_configuration');
-    const deadlineMs = Math.min(originalDeadlineMs, reviewStartedAt + FINAL_SEMANTIC_TIMEOUT_MS);
+    const deadlineMs = context.deadlineMs;
+    if (!Number.isFinite(deadlineMs)) return fail('not_checked', 'invalid_configuration');
     if (Date.now() >= deadlineMs) return fail('unavailable', 'timeout');
     try {
       const response = await context.dispatchText({prompt, systemPrompt: '', signal,

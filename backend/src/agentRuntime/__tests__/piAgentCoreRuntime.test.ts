@@ -28,6 +28,7 @@ import {
 import * as piAgentCoreRuntimeModule from '../piAgentCoreRuntime';
 import type { RuntimeToolResult, SharedToolSpec } from '../runtimeToolSpec';
 import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../runtimeToolResult';
+import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
 import {createClaudeMcpServer} from '../../agentv3/claudeMcpServer';
 import {
   createRuntimeSourceFinalizationFixture,
@@ -44,8 +45,11 @@ import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes} from 
 import * as systemPromptModule from '../../agentv3/claudeSystemPrompt';
 import {registerCodeAwareCanary, revokeCodeAwareOutputGuards, clearCodeAwareOutputGuards} from '../../services/security/codeAwareOutputRegistry';
 import * as sourceProjectionModule from '../../services/codebase/sourceClaimVerifier';
+import * as contextAuthorization from '../../services/resolvedAnalysisContext';
+import {renderConclusionContractSidecar, type ConclusionContract} from '../../agent/core/conclusionContract';
+import {inspectCandidateProtocol} from '../../services/canonicalAnalysisResult';
 import * as qualityGateModule from '../../services/finalResultQualityGate';
-import {takeFinalizationContext, FINALIZATION_MAX_OUTPUT_TOKENS} from '../analysisFinalizationContext';
+import {takeFinalizationContext} from '../analysisFinalizationContext';
 import {ArtifactStore} from '../../agentv3/artifactStore';
 import {loadPiProviderRuntimeModules} from '../engines/pi/piAgentCoreProvider';
 
@@ -849,6 +853,37 @@ describe('experimental Pi agent-core runtime contract', () => {
     }));
   });
 
+  it.each([false, true])('retains private source outcomes before transport truncation (body=%s)', includeBody => {
+    const update = projectPiAgentCoreEventToStreamingUpdate({
+      type: 'tool_execution_end', toolName: 'search_codebase', toolCallId: 'source-outcome',
+      result: {success: true, matches: Array.from({length: 20}, (_, i) => ({
+        referenceId: `source-reference-${i}`, codebaseId: 'codebase-a',
+        filePath: `src/PRIVATE_SOURCE_PATH_${i}.kt`, lineRange: {start: 1, end: 20},
+        ...(includeBody ? {text: 'PRIVATE_SOURCE_BODY'} : {}),
+      }))},
+    })!;
+    expect(() => JSON.parse(update.content.result)).toThrow();
+    expect(update.content.privateToolResultReceipt).toBeDefined();
+    const projected = projectCodeAwareStreamingUpdate('pi-source-outcome', update, true, 'en');
+    expect(projected).toMatchObject({content: {resultNarration: includeBody
+      ? 'Authorized content was read and is available to check against trace evidence'
+      : 'Candidate source or knowledge locations are available; their content has not been read'}});
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_SOURCE|privateToolResultReceipt/);
+  });
+
+  it.each([false, true])('retains private source failures across both Pi response branches (event error=%s)', isError => {
+    const update = projectPiAgentCoreEventToStreamingUpdate({
+      type: 'tool_execution_end', toolName: 'read_codebase_file', toolCallId: 'source-failure',
+      isError, result: {success: false, error: 'PRIVATE_SOURCE_FAILURE'},
+    })!;
+    expect(update.content.privateToolResultReceipt).toBeDefined();
+    const projected = projectCodeAwareStreamingUpdate('pi-source-failure', update, true, 'en');
+    expect(projected).toMatchObject({content: {
+      resultNarration: 'This tool call did not complete; collected evidence is retained', isError: true,
+    }});
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_SOURCE|privateToolResultReceipt/);
+  });
+
   it('projects private wiki results before emitting Pi agent responses', () => {
     const update = projectPiAgentCoreEventToStreamingUpdate({
       type: 'tool_execution_end',
@@ -1133,6 +1168,11 @@ describe('experimental Pi agent-core runtime contract', () => {
         codeAwareMode: 'provider_send',
         codebaseIds: [fixture.codebaseId],
       });
+      const context = takeFinalizationContext(terminal)!;
+      try {
+        expect(context.getNativeDeclaration(terminal, new AbortController().signal)?.raw).toBe(SOURCE_FINALIZATION_RAW_SOURCE);
+        expect(JSON.stringify(terminal)).not.toContain('conclusion_protocol_projection');
+      } finally {context.dispose();}
       const next = await runtime.analyze('public second run', sessionId, 'trace-pi', {
         analysisMode: 'fast',
         codeAwareMode: 'off',
@@ -1372,7 +1412,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(providerRuntimeLoader).toHaveBeenCalledTimes(2);
   });
 
-  it('bounds provider-facing Pi tool text while keeping complete tool details retrievable', async () => {
+  it('preserves complete provider-facing Pi tool text and original details', async () => {
     const longText = `${'frame evidence '.repeat(400)}TAIL_CANARY_FULL_DETAILS_ONLY`;
     const completeResult = {
       content: [{type: 'text', text: longText}],
@@ -1389,21 +1429,23 @@ describe('experimental Pi agent-core runtime contract', () => {
     const projected = await tool.execute('call-long-tool', {sql: 'select long'}, undefined);
 
     expect(projected.details).toBe(completeResult);
-    expect(projected.content.map(block => block.text).join('\n').length).toBeLessThanOrEqual(2000);
-    expect(projected.content[0].text).toContain('truncated external tool result');
-    expect(projected.content[0].text).not.toContain('TAIL_CANARY_FULL_DETAILS_ONLY');
+    expect(projected.content).toEqual([{type: 'text', text: longText}]);
     expect(JSON.stringify(projected.details)).toContain('TAIL_CANARY_FULL_DETAILS_ONLY');
   });
 
-  it('reads the original producer receipt from Pi details after provider text is shortened', async () => {
+  it('preserves producer receipt, payload and error state in provider content and Pi details', async () => {
     const original = createRuntimeToolResult({success: false, planPhaseId: 'p1', error: 'x'.repeat(14000)}, {
       decorate: text => '[accuracy] {"success":true}\n' + text,
+      isError: true,
     });
     const tool = createPiAgentCoreToolFromSharedSpec(createSharedSpec(async () => original), {
       allowedToolNames: new Set(['query_trace']),
     });
     const result = await tool.execute('receipt-pi', {sql: 'select 1'}, undefined);
-    expect(result.content[0].text.length).toBeLessThanOrEqual(2000);
+    expect(JSON.parse(result.content[0].text)).toEqual({_meta: original._meta, content: original.content, isError: true});
+    expect(readRuntimeToolResultFacts(result.content[0].text)).toEqual({success: false, planPhaseId: 'p1'});
+    expect(result.details).toBe(original);
+    expect(result.isError).toBe(true);
     expect(readRuntimeToolResultFacts(result)).toEqual({success: false, planPhaseId: 'p1'});
     const event = projectPiAgentCoreEventToStreamingUpdate({
       type: 'tool_execution_end', toolName: 'query_trace', toolCallId: 'receipt-pi', result,
@@ -1411,7 +1453,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(event).toMatchObject({type: 'agent_response', content: {isError: true}});
   });
 
-  it('bounds multi-block Pi tool text to one total provider budget without leaking later canaries', async () => {
+  it('preserves every Pi text block in the shared serialization order', async () => {
     const firstBlock = 'A'.repeat(1980);
     const laterCanary = 'LATER_BLOCK_PROVIDER_CANARY';
     const completeResult = {
@@ -1433,10 +1475,55 @@ describe('experimental Pi agent-core runtime contract', () => {
     const projected = await tool.execute('call-multi-block-tool', {sql: 'select long'}, undefined);
     const providerText = projected.content.map(block => block.text).join('\n');
 
-    expect(providerText.length).toBeLessThanOrEqual(2000);
-    expect(providerText).toContain('truncated external tool result');
-    expect(providerText).not.toContain(laterCanary);
+    expect(providerText).toBe(`${firstBlock}\nsecond block ${laterCanary}`);
     expect(JSON.stringify(projected.details)).toContain(laterCanary);
+  });
+
+  it.each(['read_codebase_file', 'search_codebase', 'lookup_app_source'] as const)
+    ('delivers complete %s JSON with source body and tail references through the Pi adapter', async toolName => {
+      const sourceBody = `object Source {\n${'  val value = "source evidence"\n'.repeat(100)}}`;
+      const sourceReferences = Array.from({length: 20}, (_, index) => ({
+        id: `source-reference-${index}`, referenceId: `source-reference-${index}`,
+        codebaseId: 'source-app', filePath: `src/Source${index}.kt`,
+        lineRange: {start: 1, end: 102}, lookupKind: toolName === 'lookup_app_source' ? 'indexed' : 'body',
+      }));
+      const reference = {referenceId: sourceReferences[0].id, codebaseId: 'source-app',
+        filePath: sourceReferences[0].filePath, lineRange: {start: 1, end: 102}, text: sourceBody};
+      const payload = toolName === 'lookup_app_source'
+        ? {success: true, result: {hits: [{chunk: {snippet: sourceBody}}], sourceReferences}}
+        : {success: true, ...(toolName === 'read_codebase_file' ? {reference} : {matches: [reference]}), sourceReferences};
+      const json = JSON.stringify(payload);
+      expect(json.length).toBeGreaterThan(4000);
+      const original = {content: [{type: 'text', text: json}]} as RuntimeToolResult;
+      const spec = {...createSharedSpec(async () => original), name: toolName};
+      const tool = createPiAgentCoreToolFromSharedSpec(spec, {allowedToolNames: new Set([toolName])});
+      const result = await tool.execute(`source-${toolName}`, {}, undefined);
+      expect(JSON.parse(result.content[0].text)).toEqual(payload);
+      expect(result.content[0].text).toContain('source evidence');
+      expect(result.content[0].text).toContain(sourceReferences[sourceReferences.length - 1].id);
+      expect(result.details).toBe(original);
+    });
+
+  it('delivers metadata-only source results without inventing a body', async () => {
+    const payload = {success: true, codeAwareMode: 'metadata_only',
+      matches: [{referenceId: 'metadata-reference', codebaseId: 'source-app', filePath: 'src/Source.kt'}],
+      sourceReferences: [{id: 'metadata-reference', codebaseId: 'source-app', filePath: 'src/Source.kt', lookupKind: 'metadata'}]};
+    const original = {content: [{type: 'text', text: JSON.stringify(payload)}]} as RuntimeToolResult;
+    const tool = createPiAgentCoreToolFromSharedSpec({...createSharedSpec(async () => original), name: 'search_codebase'}, {
+      allowedToolNames: new Set(['search_codebase']),
+    });
+    const result = await tool.execute('metadata-source', {}, undefined);
+    expect(JSON.parse(result.content[0].text)).toEqual(payload);
+    expect(JSON.parse(result.content[0].text).matches[0].text).toBeUndefined();
+  });
+
+  it('serializes non-text Pi blocks as JSON instead of coercing them to object labels', async () => {
+    const block = {type: 'resource', resource: {uri: 'test://resource', text: 'Resource evidence'}};
+    const original = {content: [{type: 'text', text: 'Explanation'}, block]} as RuntimeToolResult;
+    const tool = createPiAgentCoreToolFromSharedSpec(createSharedSpec(async () => original), {allowedToolNames: new Set(['query_trace'])});
+    const result = await tool.execute('non-text-result', {}, undefined);
+    expect(result.content[0].text).toBe(`Explanation\n${JSON.stringify(block)}`);
+    expect(result.details).toBe(original);
   });
 
   it('clears failed Pi SDK module loads so the next request can retry the same fingerprint', async () => {
@@ -3154,6 +3241,95 @@ describe('experimental Pi agent-core runtime contract', () => {
     })).toMatchObject({status, reason, sdkFinishReason: stopReason});
   });
 
+  const protocolSidecar = renderConclusionContractSidecar({schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+    conclusions: [{rank: 1, statement: 'The marker is present.'}], clusters: [], evidenceChain: [],
+    claims: [], uncertainties: [], nextSteps: []} as ConclusionContract);
+
+  it.each(['sidecar-only', 'invalid-schema'])('repairs native completed %s while preserving the pinned Pi prompt and source protocol', async kind => {
+    passVerification();
+    const first = kind === 'sidecar-only' ? protocolSidecar : protocolSidecar.replace('"focused_answer"', '"invalid-mode"');
+    const complete = `The marker is present.\n${protocolSidecar}`;
+    let originalPrompt = '';
+    FakePiAgent.promptHandler = async (agent, _input, index) => {
+      if (index === 1) originalPrompt = agent.state.systemPrompt;
+      else {
+        expect(agent.state.tools).toEqual([]);
+        expect(agent.state.systemPrompt.startsWith(originalPrompt + '\n\n')).toBe(true);
+        expect(agent.state.messages).toEqual(expect.arrayContaining([expect.objectContaining({content: [{type: 'text', text: first}]})]));
+      }
+      return [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: index === 1 ? first : complete}]}];
+    };
+    const runtime = typedRuntime(); const updates: any[] = []; runtime.on('update', update => updates.push(update));
+    const authorization = jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization');
+    try {
+      const result = await runtime.analyze('query', `pi-protocol-${kind}`, 'trace-pi', {runId: `pi-protocol-${kind}`});
+      expect(FakePiAgent.instances[0].promptCount).toBe(2);
+      expect(authorization).toHaveBeenCalledTimes(1);
+      expect(inspectCandidateProtocol(result.conclusion).canonicalBody.trim()).toBe('The marker is present.');
+      expect(result.completion).toMatchObject({status: 'completed', attemptId: '2', conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)});
+      const context = takeFinalizationContext(result)!;
+      try {expect(context.getNativeDeclaration(result, new AbortController().signal)?.raw).toBe(complete);}
+      finally {context.dispose();}
+      expect(FakePiAgent.instances[0].state.systemPrompt).toBe(originalPrompt);
+      const diagnostic = updates.filter(update => update.content?.phase === 'candidate_protocol').map(update => update.content.candidateProtocolDiagnostic);
+      expect(diagnostic.map(value => [value.stage, value.candidateIndex, value.status])).toEqual([
+        ['native', 1, kind === 'sidecar-only' ? 'valid' : 'invalid'], ['native', 2, 'valid'], ['runtime_projected', 2, 'valid'],
+      ]);
+    } finally { authorization.mockRestore(); }
+  });
+
+  it.each(['plain-body', 'sidecar-only', 'invalid-schema'])('retains the first Pi declaration when correction returns %s', async kind => {
+    passVerification();
+    const first = protocolSidecar.replace('"focused_answer"', '"invalid-mode"');
+    const second = kind === 'plain-body' ? 'The marker is present.' : kind === 'sidecar-only' ? protocolSidecar : first;
+    FakePiAgent.promptHandler = async (_agent, _input, index) => [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: index === 1 ? first : second}]}];
+    const result = await typedRuntime().analyze('query', `pi-protocol-rejected-${kind}`, 'trace-pi');
+    expect(FakePiAgent.instances[0].promptCount).toBe(2);
+    const context = takeFinalizationContext(result)!;
+    try {expect(context.getNativeDeclaration(result, new AbortController().signal)?.raw).toBe(first);}
+    finally {context.dispose();}
+    expect(result.completion?.attemptId).toBe('1');
+    expect(inspectCandidateProtocol(result.conclusion).status).toBe('invalid');
+    expect(result.terminationMessage).not.toContain('candidate_protocol_diagnostic@1');
+  });
+
+  it('does not retry a Pi candidate invalidated only by the application projection', async () => {
+    passVerification();
+    const raw = `The marker is present.\n${protocolSidecar}`;
+    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: raw}]}];
+    const realProject = sourceProjectionModule.finalizeSourceAwareAnalysisResultWithProjection;
+    const project = jest.spyOn(sourceProjectionModule, 'finalizeSourceAwareAnalysisResultWithProjection').mockImplementation((...args) => {
+      const projected = realProject(...args);
+      return {...projected, result: {...projected.result, conclusion: raw.replace('"focused_answer"', '"invalid-mode"')}};
+    });
+    const runtime = typedRuntime(); const updates: any[] = []; runtime.on('update', update => updates.push(update));
+    try {
+      await expect(runtime.analyze('query', 'pi-projection-only-invalid', 'trace-pi'))
+        .rejects.toThrow('conclusion_protocol_projection_mismatch');
+      expect(FakePiAgent.instances[0].promptCount).toBe(1);
+      expect(updates.filter(update => update.content?.phase === 'candidate_protocol').map(update =>
+        [update.content.candidateProtocolDiagnostic.stage, update.content.candidateProtocolDiagnostic.status]))
+        .toEqual([['native', 'valid'], ['runtime_projected', 'invalid']]);
+    } finally { project.mockRestore(); }
+  });
+
+  it('does not redispatch Pi source context after authorization changes', async () => {
+    passVerification();
+    FakePiAgent.promptMessages = [{role: 'assistant', stopReason: 'stop', content: [{type: 'text', text: protocolSidecar}]}];
+    const authorization = jest.spyOn(contextAuthorization, 'assertCurrentAnalysisContextAuthorization').mockImplementation(() => {
+      throw new contextAuthorization.AnalysisContextAuthorizationChangedError();
+    });
+    try {
+      const result = await typedRuntime().analyze('query', 'pi-protocol-revoked', 'trace-pi');
+      expect(FakePiAgent.instances[0].promptCount).toBe(1);
+      expect(inspectCandidateProtocol(result.conclusion).status).toBe('valid');
+      const context = takeFinalizationContext(result)!;
+      try {expect(context.getNativeDeclaration(result, new AbortController().signal)?.raw).toBe(protocolSidecar);}
+      finally {context.dispose();}
+      expect(result.completion?.attemptId).toBe('1');
+    } finally { authorization.mockRestore(); }
+  });
+
   it('binds a shorter unheaded correction to its own successful SDK attempt without reclassifying', async () => {
     const issue = {type: 'missing_evidence', severity: 'error', message: '任意语言的说明', recoveryKind: 'correct_evidence'};
     mockClaudeVerifierVerifyConclusion.mockImplementationOnce(async () => ({passed: false, heuristicIssues: [issue], llmIssues: []}))
@@ -3262,7 +3438,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
   });
 
-  it('rejects a native empty answer before a retired-session projection can turn it into visible output', async () => {
+  it('keeps an empty native answer ineligible after a revoked-session replacement', async () => {
     passVerification();
     const sessionId = 'pi-projection-empty';
     const observation = observePiProjection();
@@ -3273,8 +3449,8 @@ describe('experimental Pi agent-core runtime contract', () => {
     try {
       const result = await typedRuntime().analyze('context only', sessionId, 'trace-pi');
       const projected = observation.assertReturnedContext(result);
-      expect(result).toMatchObject({success: false, partial: true, conclusion: ''});
-      expect(projected.conclusionProjection).toMatchObject({disposition: 'preserved', inputFingerprint: analysisDeliveryFingerprint('')});
+      expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback', completion: {status: 'unknown'}});
+      expect(projected.conclusionProjection).toMatchObject({disposition: 'replaced', inputFingerprint: analysisDeliveryFingerprint('')});
     } finally { observation.restore(); clearCodeAwareOutputGuards(sessionId); }
   });
 
@@ -3382,8 +3558,9 @@ describe('experimental Pi agent-core runtime contract', () => {
         expect(piClassifierCalls[1].model).toBe(FakePiAgent.instances[0].state.model);
         expect(piClassifierCalls[1].context.tools).toEqual([]);
         expect(piClassifierCalls[1].context.messages).toHaveLength(1);
-        expect(piClassifierCalls[1].options.maxTokens).toBe(Math.min(FINALIZATION_MAX_OUTPUT_TOKENS, 4096));
-        expect(piClassifierCalls[1].options.maxTokens).toBeGreaterThan(piClassifierCalls[0].options.maxTokens);
+        expect(piClassifierCalls[1].options).not.toHaveProperty('maxTokens');
+        expect(piClassifierCalls[1].model).toMatchObject({maxTokens: 4096});
+        expect(piClassifierCalls[0].options.maxTokens).toBe(1024);
         expect(trace.query.mock.calls.length).toBe(queriesBefore);
         expect(FakePiAgent.instances).toHaveLength(1);
       } finally { context.dispose(); }
@@ -3406,6 +3583,7 @@ describe('experimental Pi agent-core runtime contract', () => {
       expect(context).toBeDefined();
       expect(context.deadlineMs).toBeGreaterThanOrEqual(beforeRun + 1000);
       expect(context.deadlineMs).toBeLessThan(Date.now() + 1000);
+      expect(context.sourceScope).toMatchObject({codeAwareMode: 'metadata_only', selectedCodebaseIds: [], hasCodebaseAccess: false});
     } finally { context.dispose(); }
   });
 
@@ -3423,6 +3601,7 @@ describe('experimental Pi agent-core runtime contract', () => {
     expect(context).toBeDefined();
     try {
       expect(context.runId).toBe('pi-cancelled-run');
+      expect(context.sourceScope).toMatchObject({codeAwareMode: 'metadata_only', selectedCodebaseIds: [], hasCodebaseAccess: false});
       expect(context.hasSemanticTransport).toBe(false);
       expect(context.deliveryContext).toMatchObject({completion: result.completion});
       expect(await context.dispatchText({prompt: 'must not dispatch', systemPrompt: '',

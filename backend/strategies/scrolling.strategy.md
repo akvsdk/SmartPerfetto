@@ -3,9 +3,16 @@
 
 ---
 scene: scrolling
-classification_description: "Scroll smoothness, frame pacing, missed deadlines and rendering performance while content moves."
+classification_description: "Scroll and window-animation smoothness, frame pacing, and main-thread work during continuous visual updates, including concurrent content loading."
 priority: 3
 effort: medium
+investigation_requirements:
+  - 'A request to analyze scrolling or animation includes main-thread cause investigation even when it also asks for frame statistics. Before concluding, inspect actual main-thread execution across the requested process and full selected window: within doFrame, between doFrames, and at the edges. FrameTimeline is outcome context and must not exclude earlier or inter-frame work. Reuse main_thread_work_summary/tasks/sources/cadence from scrolling_analysis. When new evidence is allowed, collect missing task evidence now using main_thread_frame_work or equivalent scoped SQL; do not stop at frame counters and offer main-thread analysis as a later step. A frame-count-only question does not require this investigation; existing_only permits only available evidence and explicit gaps.'
+  - 'Identify representative tasks with raw names, slice IDs, UPID/UTID, exact time ranges and Running versus Runnable/wait/unknown time. Running is CPU execution; R/R+ is runnable scheduling delay waiting for CPU, not a lock/Binder wait and not evidence of a blocker. A small Runnable total cannot exclude a critical scheduling delay; assess its timing relative to requests and scheduling competition. Unannotated Running is work with unknown instrumentation, not idle; preserve actual state boundaries when building a timeline. Preserve complete totals, sample coverage and nonadditive root/child or overlapping-track boundaries.'
+  - 'Trace task origins through observed parent/child slices, args, flow, state IDs or authorized source references. Slice names are instrumentation labels: a Handler label does not prove a message dispatch or enqueue site, and parse/inflate/bind labels do not prove implementation, business ownership or thread safety. Parent/child nesting is observed scope, not a verified source call stack. Missing origin evidence stays unknown; provide trace locators rather than invented callers or source files.'
+  - 'Keep observation and causal inference separate throughout the answer, including the opening and recommendations. Task A ending when doFrame B starts proves execution order and occupied time; say that B starts after A, not that A delayed B, unless independent request/deadline or equivalent causal evidence establishes that B was due earlier. Concurrent initialization is a candidate interference mechanism supported by this occupancy. Do not infer missed frames, refresh rate or a frame budget from doFrame cadence or an assumed 60Hz. A global VSYNC counter is only context until its display, window and relevance to the target callback are established; no unverified cadence target belongs in the proposed acceptance criteria.'
+  - 'S/I proves a sleeping/idle scheduler state, not an idle message queue, available capacity or absence of a jank cause. Neither S nor the last observed doFrame proves that the animation ended. D/DK without io_wait or a specific blocked function does not prove synchronous file IO. Distinguish observed scheduler states from the cause of a wait; unknown fields cannot be converted to zero or a named blocker.'
+  - 'Tie recommendations to evidenced tasks and preserve UI-thread requirements. A parse-like name alone cannot establish pure, independent computation: first confirm implementation and dependencies, then conditionally move eligible parsing/computation/IO to a worker. Do not describe such work as already proven independent. Do not move an entire initialization callback containing View inflation/binding or Compose updates off the main thread. Consider splitting, batching or deferring noncritical UI work; measure task occupancy and actual requested/presented cadence again without promising an unverified fix.'
 required_capabilities:
   - frame_rendering
   - cpu_scheduling
@@ -58,9 +65,18 @@ keywords:
   - glsurfaceview
   - nativeactivity
   - drawfunctor
+  - 窗口动画
+  - window animation
+  - 帧间任务
 
 final_report_contract:
   required_sections:
+    - id: main_thread_work
+      label: 主线程连续执行与任务来源
+      description: '从整个目标区间的主线程执行解释帧内和帧外任务，引用具体 slice/时间/线程状态及来源线索，说明与后续 doFrame 的时序关系；无标注或调度数据不足时明确缺口，不凭 FrameTimeline 或任务名称证明业务根因。'
+      pattern_groups:
+        - ['主线程连续执行', '帧间任务', '帧外任务', 'main[-\s]?thread work', 'inter[-\s]?frame task']
+        - ['slice', '任务', 'task', '未标注', 'unattributed', '数据不足', 'unavailable']
     - id: root_cause_distribution
       label: 掉帧与根因分布
       description: '用 jank_type_stats 报告全量掉帧类型/责任；用 batch_frame_root_cause 报告已分析帧的 reason_code，并在采样截断时明确 X/Y、coverage 和 scope，禁止外推样本百分比。'
@@ -96,6 +112,11 @@ final_report_contract:
         - ['case_id', '相似案例', '案例引用', 'case recommendation', 'case[-\s]?based']
 
 phase_hints:
+  - id: main_thread_work
+    keywords: ['主线程', '帧间', '帧外', '动画', '初始化', '内容加载', 'main thread', 'animation', 'initialization', 'content loading']
+    constraints: '先读 scrolling_analysis 的 main_thread_work_summary/tasks/cadence；已采集时不重复调用。没有这些证据时用 main_thread_frame_work 检查同一目标进程与整个区间，不以 FrameTimeline、慢帧数量或滑动手势作为前提。区分 Running、Runnable、等待与未标注时间，追查具体任务的父子 slice、args/flow/调用来源；观测到占用不等于已证明错过 deadline。'
+    critical_tools: []
+    critical: true
   - id: overview
     keywords: ['概览', 'overview', '帧', 'frame', 'jank', '卡顿', 'scrolling_analysis', '统计']
     constraints: '必须调用 scrolling_analysis 获取 jank_type_stats 全量统计和 batch 根因分析覆盖信息。注意区分 buffer_stuffing（非真实掉帧）和感知掉帧；root_cause_analysis_scope=capped_frame_sample 时不得把 reason_code 样本写成全量分布。'
@@ -113,7 +134,7 @@ phase_hints:
     critical: false
   - id: missing_frame_gap
     keywords: ['缺帧', 'gap', 'frame_production_gap', '帧间', 'production gap', '隐形缺帧']
-    constraints: '只有满足缺帧触发条件时才调用 frame_production_gap；如果 real_jank_count 足够、Buffer Stuffing 假阳性低且非 WebView/SurfaceTexture，要记录触发条件并跳过，不要重复要求 scrolling_analysis。'
+    constraints: 'frame_production_gap 只补充 FrameTimeline 区间间隙，不能替代主线程连续执行取证。无论慢帧多少，都先读已有 main_thread_work_summary/tasks/cadence；仅有尚未解释的帧产出间隙时补充 gap Skill，不把未观测到 doFrame 写成无渲染请求，也不把 DrawFrame 计数写成已证明 SF 背压。'
     critical_tools: ['frame_production_gap']
     critical: false
   - id: chrome_scroll_jank
@@ -213,23 +234,24 @@ plan_template:
 
 #### Scrolling Core Strategy
 
-**Route card**: 滑动 / 卡顿 / 掉帧 / jank / scroll / fps / list / fling
+**Route card**: 滑动 / 窗口动画 / 卡顿 / 帧间任务 / jank / scroll / animation / fps / fling
 
 **Execution contract**
 - `submit_plan` 必须覆盖 frontmatter mandatory aspects；detail 仅 informational，不能替代 Skill/SQL/artifact 证据。
 - 条件项只在用户问题、plan 或 trace 证据命中 trigger 时强制；无数据用 `skipped` + reason/waiver。
-- 核心链路：`scrolling_analysis` → `fetch_artifact` 读 root-cause/frame artifact → 代表帧深钻。
+- 核心链路：`scrolling_analysis` → 读主线程连续工作与帧结果 artifact → 按实际任务/等待追源。FrameTimeline 是出帧结果参考，不能用帧边界裁掉原因，也不能只围绕红黄帧取证。
 - TextureView 的 `signal_inventory.event_count` 是信号次数，不是帧数；`consumer_notification` cadence gap 只是时序候选。未与 FrameTimeline / present 证据明确关联前，不得称为 hidden jank、producer stall 或根因。
 
 **Required phases**
-1. Overview: 调用 `scrolling_analysis`，区分 real jank、buffer stuffing 假阳性、隐形缺帧和 scroll session 边界。
+1. Overview: 调用 `scrolling_analysis`，先读 `main_thread_work_*` 的实际主线程工作与来源，再读帧结果；整个动画/滑动区间均在范围内，不要求输入手势或 FrameTimeline 存在。
 2. Artifact read: 先用 `fetch_artifact(detail="summary")` 读取 batch/root-cause artifact。`aggregate.complete=true` 只表示当前 artifact 行已完整聚合；必须另读 `root_cause_analysis_scope`、`root_cause_analyzed_frame_count`、`root_cause_eligible_frame_count`、`root_cause_coverage_ratio`。只有 `full_frame_set + coverage=1` 才能把 reason_code 当全量分布；截断时只能报告已分析帧样本，禁止外推样本百分比。只有聚合不完整、缺字段或需要代表帧逐项证据时，才读取解决该缺口所需的最少 rows。
-3. Root-cause drill: 对主要 reason_code 选最严重代表帧，先复用 batch direct evidence，再从 `jank_frame_detail` / `frame_blocking_calls` / `blocking_chain_analysis` 中选择最小适用集合；未命中相应证据边界的工具不调用。workload_heavy 只能最后兜底。
+3. Root-cause drill: 同时解释长 doFrame 和帧外主线程任务，按任务来源、exclusive 热点、Running/Runnable/等待选择深钻；任务的时长和出现时机不能被 reason_code 占比阈值排除。复用 batch 帧证据，只有相应缺口才用 `jank_frame_detail` / `frame_blocking_calls` / `blocking_chain_analysis`。workload_heavy 最后兜底，不能替代任务名称及追查方向。
 4. Conditional branches: TextureView/WebView/RN/GL/Compose/Flutter/mixed 命中时，`submit_plan` 必须在 `expectedCalls` 写入对应 producer/embedded/SF skill（Flutter 用 `invoke_skill(flutter_scrolling_analysis)`）；缺信号时执行阶段再 `skipped + reason`，不能在 plan 阶段 waiver 掉。
 5. Display boundary: BufferQueue/Fence/SF/HWC/刷新率/resync 相关时拆 App/RT、queue/dequeue/latch、SF commit/composite/present、fence；不要默认 16.6ms。
    - 已有 `scrolling_analysis:vsync_config` artifact 时直接复用；只有 overview 缺少 VSync 证据时才调用 standalone `vsync_config`。不要在 `expectedCalls` 中无条件预占 standalone `vsync_config` 或其他仅用于补缺的工具。
 
 **Final report must include**
+- 必须显式出现 `### 主线程连续执行与任务来源`：具体任务及定位引用、帧内/帧外工作、执行/等待、后续 doFrame 时序、来源线索和对应建议；任务未标注或请求/deadline/源码证据缺失时如实说明。
 - 必须显式出现 `### 掉帧与根因分布`：先给 jank_type_stats 全量类型/责任，再给 batch 已分析帧 reason_code；同时写根因分析 X/Y、coverage 和 scope。截断时禁止外推样本百分比。
 - 必须显式出现 `### 代表帧分析`：耗时、超预算、vsync_missed、四象限/频率、关键 slice/阻塞点、因果链。
 - 必须显式出现 `### 峰值/口径指标`：真实掉帧、假阳性、最长帧、最长连续丢帧；缺数据时写缺失来源和降级口径。
@@ -239,6 +261,7 @@ plan_template:
 - `scrolling:overview_artifacts`: scrolling_analysis、artifact 字段、全局上下文和身份确认。
 - `scrolling:architecture_branches`: Flutter/TextureView/WebView/RN/GL/Compose/mixed 分支。
 - `scrolling:root_cause_drill`: reason_code 深钻、frame_blocking_calls、blocking_chain_analysis、display pipeline 边界。
+- `scrolling:main_thread_work`: 连续主线程工作、帧间任务来源及动画并发初始化。
 - `scrolling:missing_frame_gap`: frame_production_gap 触发和缺帧解释。
 - `scrolling:final_report_and_sql_fallback`: 结论结构和 SQL fallback。
 
@@ -284,8 +307,10 @@ invoke_skill("scrolling_analysis", { start_ts: "<trace_start>", end_ts: "<trace_
 ```
 - 建议传入 start_ts 和 end_ts 以获得更精确的结果
 - 如果不知道 trace 时间范围，先用 SQL 查询：
-  `SELECT printf('%d', MIN(ts)) as start_ts, printf('%d', MAX(ts + dur)) as end_ts FROM actual_frame_timeline_slice`
+  `SELECT printf('%d', trace_start()) as start_ts, printf('%d', trace_end()) as end_ts`
+- 优先保留用户选择的动画/交互时间范围；不要用首尾 FrameTimeline 或识别出的滑动 session 缩掉首帧前、末帧后以及无帧期间的主线程工作。
 - 返回结果以 artifact 引用形式返回（紧凑摘要），包含：
+  - `main_thread_work_summary` / `main_thread_work_tasks` / `main_thread_work_cadence`：实际主线程连续执行、可定位任务及 doFrame 节奏；独立于 FrameTimeline。先看覆盖率、未标注执行和任务采样范围，再按具体任务取来源证据。
   - `jank_type_stats`：掉帧类型分布，**注意 real_jank_count（真实掉帧）vs false_positive（假阳性）**
   - `scroll_sessions`：滑动区间列表
   - `input_data_check` / `input_latency_summary`：可选的 android.input 证据源检测和输入分发/处理/ACK/跟手度概览。缺数据时只能说明 trace 未包含完整 input event 链路，不可据此否定输入延迟问题
@@ -302,7 +327,7 @@ invoke_skill("scrolling_analysis", { start_ts: "<trace_start>", end_ts: "<trace_
   - 不得仅因 `hasMore=true` 自动翻完所有页；原始 rows 用于验证具体帧，不替代已有的完整聚合。
   - 用户明确要求“不要 rows / 不读原始 rows / no raw rows”时，该约束适用于本轮所有 artifact，包括小表；只能使用 summary aggregate，缺字段就报告证据边界，不能以行数少为理由绕过。
   - “不分页”单独出现时只禁止机械翻页或读完整表；“不逐帧”单独出现时只禁止 per-frame 深钻，不自动禁止小型非逐帧 artifact rows。用户显式要求查看某个 row/table 时优先满足，除非同时明确禁止 row access。
-- 如果 `buffer_tx_coverage.coverage_status = target_process_not_found`，或 `fallback_no_frame_timeline` 只有数据不可用提示而没有可用替代源，立即停止自动追加帧/架构 Skill 与探索 SQL。目标进程缺失时说明当前 trace 未包含目标包并建议核对包名或重新采集；目标进程存在但无帧源时说明 FrameTimeline/BufferTX 证据不可用。两种情况都不得写成性能正常，也不得为了完成流程改查无关进程。
+- 如果目标进程确实缺失，停止该目标的取证并说明身份缺口，不能改查无关进程。目标存在但 FrameTimeline/BufferTX 不可用时，只停止依赖帧源的统计和深钻，继续读取主线程工作证据；不得把帧源缺失写成主线程正常或不能分析任务。
 - `vsync_source = default_60hz_no_trace_timing` 只是内部默认预算，不是 trace 实测刷新率；当帧数据源不可用时，不得把 60Hz 当作设备或本次场景事实交付。
 
 **Phase 1.3 — 全局上下文检查（基于 `global_context_flags` 结果，scrolling_analysis 自动输出）：**
@@ -392,7 +417,7 @@ invoke_skill("scrolling_analysis", { start_ts: "<trace_start>", end_ts: "<trace_
 - HWC 不是 BufferQueue consumer；SurfaceFlinger 消费 buffer 后，再通过 HWC validate/accept/present 或 RenderEngine 合成。
 - 刷新率/ARR/VRR 会改变帧预算。报告必须基于 `vsync_config`、VSYNC-sf、FrameTimeline 或等价证据，不默认 16.6ms。
 - 当 `performance_summary.fps_source = buffer_tx_rising_edge_fallback` 时，必须引用 `coverage_status`、`frame_timeline_to_buffer_tx_ratio`、`frame_source_track` 和 effective span，并按覆盖模式分层：
-  - `no_frame_timeline_coverage`：只能交付目标包 BufferTX 正向 delta 支持的帧产出数和 FPS；不支持 App/SF 责任、掉帧率、峰值长帧或根因结论。相应小节标记“当前 trace 证据不可用”，不得填 0 或根据 FPS 推断无卡顿。
+  - `no_frame_timeline_coverage`：只能交付目标包 BufferTX 正向 delta 支持的帧产出数和 FPS；不能从 BufferTX 推出 App/SF 责任、掉帧率、峰值长帧或帧根因；实际主线程任务/等待仍可独立分析。相应小节标记“当前 trace 证据不可用”，不得填 0 或根据 FPS 推断无卡顿。
   - `partial_frame_timeline_coverage`：overview 帧数/FPS 以 BufferTX 为准；`jank_type_stats` / `batch_frame_root_cause` 仅是 FrameTimeline 覆盖到的 sparse sample。只能表述“已观测样本中的根因”，必须引用 `evidence_scope=partial_sample` 和 coverage ratio，不得写成全量根因分布或用样本比例估算全量帧数。
   - `frame_timeline_to_buffer_tx_ratio` = FrameTimeline 帧数 / BufferTX 产出帧数，是两个独立来源的比值，**不是有界覆盖率**（字段与标签都已按"帧数比"命名，不要再当成百分比覆盖率读）：`> 1 说明 BufferTX 少计`（track 选择或 rising-edge 判定漏帧），不代表覆盖超过 100%。此时以 FrameTimeline 为准并写明 BufferTX 少计，不要表述成“覆盖率 100.x%”。
 - GraphicBuffer/dma-buf 是图形物理内存证据面；BufferQueue/Fence slice 只能证明队列、同步和背压候选，不能单独证明图形内存泄漏或占用峰值。
@@ -467,6 +492,17 @@ invoke_skill("scrolling_analysis", { start_ts: "<trace_start>", end_ts: "<trace_
 - ❌ 仅 Level 1: "帧超时 45ms，workload_heavy"（缺少机制解释）
 <!-- /strategy-detail -->
 
+<!-- strategy-detail id="main_thread_work" title="主线程连续执行、帧间任务与来源追查" keywords="main thread,animation,Window,initialization,content loading,主线程,帧间,帧外,初始化,内容加载" -->
+**主线程连续执行是卡顿机制的取证入口。** 先读取已有 `main_thread_work_summary`、`main_thread_work_tasks`、`main_thread_work_sources`、`main_thread_work_cadence`；缺少时对同一进程、同一完整区间调用 `main_thread_frame_work`。这一步不依赖 FrameTimeline、慢帧数量、是否识别到滑动手势，也不能被帧分类的 terminal code 跳过。
+
+1. 检查覆盖范围与实际线程状态：Running 是 CPU 执行；R/R+ 是等调度；S/I、D/DK 是等待状态，单凭状态不能确定锁、IO 或空闲原因。未标注的 Running 仍是主线程执行；缺少 thread_state 时保留 unknown，不填 0。
+2. 同时查看 doFrame 内部、两次 doFrame 之间以及首尾边界的任务。相邻 doFrame 的开始间隔、前帧结束到后帧开始的时间只是实际执行节奏；没有 VSync 请求、expected deadline 或输入/呈现证据时，不据此计算丢帧数或断言任务造成了帧迟到。
+3. 对长任务以及连续短任务累计占用，列出原始名称、slice ID、UPID/UTID、时间范围、Running/等待、exclusive 子调用热点。最外层 slice 是 observed root，未必是一条完整 Looper 消息；根任务总时长与子热点不能相加，跨 track 归属不清时保留歧义。TopK 是明细样本，不代表只发生这些任务。
+4. 用 `main_thread_work_sources` 的逐行热点/等待 ID、parent/ancestor、arg_set_id、子 slice、flow/调用栈继续追查发起者。摘要缺少来源时 fetch 对应 artifact 的最少 rows；长名称/路径有省略时，按精确 slice/state/arg_set ID 查询原始表，不把被截断的 JSON 当作完整调用链。Handler/类名提供定位线索，不能仅凭名称证明“内容初始化”；源码不可用时给出可复查的 trace 定位点和需要采集/搜索的调用链。遵循共享源码访问规则，不虚构文件、行号或调用方。
+5. Window 动画与内容加载并行时，必须回答：哪些内容工作实际占据主线程、是否跨越动画区间、内部谁最耗时、是否紧接下一次 doFrame、尚缺什么因果证据。只有调用内容及时间关系支持时，才将初始化与动画竞争主线程列为根因/候选，并明确证据强度。
+6. 建议对应已观察到的工作：先确认实现与依赖，再将适合移出的解析/计算/IO 放到工作线程，不能凭 parse 等名称断言是纯计算、线程安全或可独立执行；必须在主线程执行的 View/Compose 更新可分批、减少重复或延后非首屏初始化。每条建议说明改哪个任务、为何可能改善当前占用，以及复测同一动画窗口的任务占用和实际请求/呈现节奏。Runnable 追调度竞争；有独立 Binder/锁证据才追对应等待链。全文均应区分“下一次 doFrame 在任务结束后开始”的时序事实与“任务推迟了本应更早执行的回调”的因果结论；全局 VSYNC 计数器未关联目标显示和请求时不能直接作为该任务的帧预算。
+<!-- /strategy-detail -->
+
 <!-- strategy-detail id="missing_frame_gap" title="缺帧检测和 production gap" keywords="frame_production_gap,missing frame,缺帧,production gap,Buffer Stuffing" -->
 **Phase 1.95 — 缺帧检测（满足以下任一条件时执行）：**
 
@@ -476,26 +512,25 @@ invoke_skill("scrolling_analysis", { start_ts: "<trace_start>", end_ts: "<trace_
 | `jank_type_stats` 中 `false_positive` 占比 > 50% | 大量 Buffer Stuffing 假阳性 → 管线问题可能伴随缺帧 |
 | 检测到 WebView / SurfaceTexture 架构（Phase 1.5） | 单 buffer 模式天然容易产生缺帧 |
 
-缺帧在 Perfetto 时间线上表现为帧间 gap 而非红/黄帧，`batch_frame_root_cause` 无法检出。
+本节只检查 FrameTimeline 区间的正间隙。它不等同于主线程两次 doFrame 之间的工作，不能覆盖所有未出帧时间，也不能代替前述主线程取证。
 
 ```
 invoke_skill("frame_production_gap", { process_name: "<包名>", start_ts: "<滑动起始>", end_ts: "<滑动结束>" })
 ```
 
 返回结果包含：
-- `gap_overview`：Gap 总数、分类统计（ui_no_frame / rt_no_drawframe / sf_backpressure）、最长 Gap
+- `gap_overview`：Gap 总数、观测统计（ui_no_frame / rt_no_drawframe / drawframe_observed）、最长 Gap
 - `gap_list`：每个 Gap 的详细信息（时间、VSync 数、类型、doFrame/DrawFrame 计数）
 
 **缺帧类型解读：**
 
 | Gap 类型 | 含义 | 常见原因 | 优化方向 |
 |----------|------|---------|---------|
-| `ui_no_frame` | UI Thread 未触发 doFrame | 按压/松手时无触摸事件驱动、滑动到顶/底部内容已耗尽、App 主动调用 `setFrameRate()` 限帧 | [App层] 检查 Input 事件流、滑动边界处理 |
-| `rt_no_drawframe` | 有 doFrame 但 RenderThread 未执行 DrawFrame | doFrame 中 measure/layout 判定无 dirty 区域（View 未 invalidate）、syncFrameState 超时被跳过 | [App层] 检查是否有冗余 requestLayout 但无实际绘制 |
-| `sf_backpressure` | 有 DrawFrame 但帧未被 SF 消费 | SurfaceTexture 单 buffer 覆盖（WebView/Camera）、BlastBufferQueue 背压、SF 端 dequeue 延迟 | [系统层] 检查 BufferQueue 状态、SF 合成延迟 |
-| `production_gap` | 其他原因的帧中断 | 进程被冻结（后台化）、ANR 状态、系统低内存 killing | 检查进程状态和系统级事件 |
+| `ui_no_frame` | 间隙中未观测到 doFrame | 可能没有请求，也可能主线程任务/等待延后了响应，或 tracing 不完整 | 读取实际主线程任务和请求证据，不将缺少 marker 写成无渲染请求 |
+| `rt_no_drawframe` | 观测到 doFrame，未观测到 DrawFrame | 只确立 marker 覆盖边界，尚未证明跳过绘制的原因 | 结合实际 UI→RT 工作及同步证据 |
+| `drawframe_observed` | 间隙中观测到 DrawFrame | 未证明 SF 是否消费，更未证明背压 | 只有 BufferQueue/SF/fence 证据支持时才归因消费端 |
 
-⚠️ 缺帧和肥帧可以同时存在。**先分析 batch_frame_root_cause（肥帧），再用 frame_production_gap（缺帧）补充**。
+帧内耗时、帧外工作和呈现间隙可以同时存在。即使本节没有 gap，也必须解释已经采集到的主线程长任务或未标注执行。
 <!-- /strategy-detail -->
 
 <!-- strategy-detail id="final_report_and_sql_fallback" title="滑动最终报告结构和 SQL 回退方案" keywords="conclusion,final report,SQL,fallback,掉帧与根因分布,根因样本分布,代表帧" -->
@@ -536,7 +571,7 @@ invoke_skill("jank_frame_detail", {
 
 **Phase 3 — 综合结论（全量掉帧类型统计 + 明示覆盖率的根因分析）：**
 
-**输出结构必须遵循。以下三个小节标题必须显式出现在最终报告中：`### 掉帧与根因分布`、`### 代表帧分析`、`### 峰值/口径指标`。**
+**输出结构遵循 frontmatter：报告须包含主线程连续执行与任务来源、掉帧与根因分布、代表帧分析、峰值/口径指标；缺失帧源仅限制帧指标，不删除主线程工作结论。**
 
 1. **概览**（必须包含以下数据）：
    - 先检查 `fps_source` 和 `coverage_status`。如果是 `buffer_tx_rising_edge_fallback + no_frame_timeline_coverage`，本节只交付 BufferTX 帧数/FPS/effective span/证据轨道，下述掉帧、峰值、责任与评级要求改为显式“当前 trace 证据不可用”，不能从 NULL 填 0。如果是 `partial_frame_timeline_coverage`，同样不能输出全量掉帧/峰值/评级；可以附上 sparse root rows，但必须以 coverage ratio 标记为部分样本。

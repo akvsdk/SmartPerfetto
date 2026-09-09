@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 
 import {createHash, randomUUID} from 'crypto';
+import {readRawSqlCaptureMetadata, type RawSqlNativeRow} from './rawSqlNativeProvenance';
 
 export type EvidenceScalar = string | number | boolean | null;
 export interface CapturedFieldSemantics {
@@ -15,6 +16,9 @@ export interface CapturedFieldSemantics {
   populationKey?: string;
 }
 export interface EvidenceTableWitness {readonly captureId: string}
+export interface CapturedNativeRow extends RawSqlNativeRow {
+  readonly traceSide: 'current' | 'reference';
+}
 export interface CapturedEvidenceTable {
   readonly columns: readonly string[];
   readonly rows: readonly (readonly (EvidenceScalar | undefined)[])[];
@@ -28,8 +32,11 @@ export interface CapturedAnchorFacts {
   readonly queryHash?: string;
   readonly row: Readonly<Record<string, EvidenceScalar>>;
   readonly fields: Readonly<Record<string, CapturedFieldSemantics>>;
+  readonly nativeRow?: CapturedNativeRow;
 }
 const tables = new WeakMap<EvidenceTableWitness, CapturedEvidenceTable>();
+const nativeRows = new WeakMap<EvidenceTableWitness, readonly (CapturedNativeRow | undefined)[]>();
+const rawContexts = new WeakMap<EvidenceTableWitness, Readonly<{traceId: string; traceSide: 'current' | 'reference'}>>();
 const owners = new WeakMap<object, EvidenceTableWitness>();
 const anchorFacts = new WeakMap<object, CapturedAnchorFacts>();
 
@@ -74,6 +81,33 @@ export function captureEvidenceTable(data: unknown,
 export function capturedEvidenceTable(witness: EvidenceTableWitness): CapturedEvidenceTable | undefined {
   return tables.get(witness);
 }
+
+/** Only the original, sealed native response can attach row identity to a new capture. */
+export function captureRawSqlEvidence(result: unknown,
+  context: {traceId: string; traceSide: 'current' | 'reference'}): EvidenceTableWitness {
+  const metadata = readRawSqlCaptureMetadata(result);
+  if (metadata && ((metadata.sourceTraceId && metadata.sourceTraceId !== context.traceId) ||
+      (context.traceSide !== 'current' && context.traceSide !== 'reference'))) {
+    return captureEvidenceTable(result, {}, 'trace_capture_mismatch');
+  }
+  const matches = metadata?.sourceTraceId && metadata.sourceTraceId === context.traceId &&
+    (context.traceSide === 'current' || context.traceSide === 'reference');
+  const witness = captureEvidenceTable(result, matches ? metadata.fields : undefined);
+  if (metadata && matches) {
+    rawContexts.set(witness, Object.freeze({...context}));
+    nativeRows.set(witness, freezeEvidenceValue(metadata.nativeRows.map(row => row?.traceId === context.traceId
+      ? {...row, traceSide: context.traceSide} : undefined)));
+  }
+  return witness;
+}
+
+/** Private witness lookup. Serialized table metadata cannot populate this map. */
+export function capturedNativeRow(witness: EvidenceTableWitness, rowIndex: number): CapturedNativeRow | undefined {
+  return nativeRows.get(witness)?.[rowIndex];
+}
+export function capturedRawSqlContext(witness: EvidenceTableWitness): Readonly<{traceId: string; traceSide: 'current' | 'reference'}> | undefined {
+  return rawContexts.get(witness);
+}
 export function attachEvidenceTable(owner: object, witness: EvidenceTableWitness): void {
   if (!tables.has(witness)) throw new Error('Unissued evidence table witness');
   owners.set(owner, witness);
@@ -84,6 +118,9 @@ export function bindCapturedAnchorFacts(anchor: object, witness: EvidenceTableWi
   selectedColumns?: readonly string[], referenceKey?: string): void {
   if (anchorFacts.has(anchor)) throw new Error('Captured anchor facts cannot be rebound');
   const table = tables.get(witness);
+  const rawContext = capturedRawSqlContext(witness);
+  const context = (anchor as {context?: {traceId?: string; traceSide?: string}}).context;
+  if (rawContext && (rawContext.traceId !== context?.traceId || rawContext.traceSide !== context.traceSide)) return;
   if (!table || table.unavailableReason || !Number.isSafeInteger(rowIndex) || rowIndex < 0 ||
       !table.rows[rowIndex] || new Set(table.columns).size !== table.columns.length) return;
   const selected = new Set(selectedColumns || table.columns);
@@ -95,7 +132,11 @@ export function bindCapturedAnchorFacts(anchor: object, witness: EvidenceTableWi
     if (selected.has(column) && table.fields[column]) fields[column] = structuredClone(table.fields[column]);
   });
   const hashes = new Set(Object.values(fields).map(field => field.origin.selectedSqlHash).filter(Boolean));
+  const nativeRow = capturedNativeRow(witness, rowIndex);
+  const boundNativeRow = nativeRow && context?.traceId === nativeRow.traceId && context.traceSide === nativeRow.traceSide &&
+    row[nativeRow.outputColumn] === nativeRow.id ? nativeRow : undefined;
   anchorFacts.set(anchor, freezeEvidenceValue({captureId: witness.captureId, originalRowIndex: rowIndex, row, fields,
+    ...(boundNativeRow ? {nativeRow: boundNativeRow} : {}),
     ...(referenceKey ? {referenceKey} : {}),
     ...(hashes.size === 1 ? {queryHash: [...hashes][0]} : {})}));
   freezeEvidenceValue(anchor);

@@ -5,6 +5,7 @@ const NUMERIC_RELATIVE_TOLERANCE = 1e-6;
 
 export function evidenceValuesMatch(expected: unknown, actual: unknown): boolean {
   if (actual === undefined) return false;
+  if (expected === null || actual === null) return expected === actual;
   if (expected === actual) return true;
 
   const expectedNumber = typeof expected === 'number' ? expected : Number(expected);

@@ -11,6 +11,7 @@ import {
   ExternalRpcProcessor,
   WorkingTraceProcessor,
   TraceProcessorFactory,
+  normalizeTraceProcessorRpcPort,
 } from './workingTraceProcessor';
 import type {
   TraceProcessorBoundedQueryOptions,
@@ -20,6 +21,8 @@ import {
   getTraceProcessorLeaseStore,
   type TraceProcessorLeaseMode,
   type TraceProcessorLeaseState,
+  type TraceProcessorLeaseRecord,
+  type TraceProcessorHolderType,
 } from './traceProcessorLeaseStore';
 import { traceProcessorProcessorKey } from './traceProcessorConnectionModel';
 import type { EnterpriseRepositoryScope } from './enterpriseRepository';
@@ -27,6 +30,7 @@ import {
   raceWithTraceProcessorCancellation,
   rethrowIfTraceProcessorQueryCancelled,
   throwIfTraceProcessorQueryCancelled,
+  createTraceProcessorQueryCancelledError,
 } from './traceProcessorCancellation';
 import {currentRunManifestAttributionSink} from './selfEvolution/runManifestLifecycle';
 import {splitSqlStatements} from './sqlStdlibDependencyAnalyzer';
@@ -86,6 +90,8 @@ export interface TraceProcessorLeaseQueryContext {
   leaseId: string;
   mode: TraceProcessorLeaseMode | string;
   leaseScope?: EnterpriseRepositoryScope;
+  /** Actual owner of this run, carried only by the internal ALS context. */
+  holder?: {holderType: TraceProcessorHolderType; holderRef: string};
 }
 
 interface TraceProcessorLeaseQueryContextMap {
@@ -97,6 +103,31 @@ export type TraceProcessorServiceQueryOptions = TraceProcessorQueryOptions & {
   leaseMode?: TraceProcessorLeaseMode | string;
   leaseScope?: EnterpriseRepositoryScope;
 };
+
+export interface TraceProcessorAnalysisRunPolicy {
+  sourceKind: 'local_file' | 'external_rpc' | 'unknown';
+  requiresIsolation: boolean;
+  reason: 'shared_tainted' | 'trusted' | 'untrusted_binary' | 'not_ready' | 'external_rpc';
+}
+
+export interface RunningNativeProcessorObservation {
+  readonly instanceToken: object;
+  readonly registrationToken: object;
+  readonly instanceId: string;
+  readonly traceId: string;
+  readonly status: 'unknown' | 'trusted' | 'tainted';
+  readonly nativeSchemaEligible: boolean;
+  readonly analysisRunPrivate: boolean;
+  readonly binarySelection: Readonly<Extract<ResolveCapabilityTraceProcessorIdentityInput, {source: 'local_binary'}>>;
+}
+const nativeInstanceTokens = new WeakMap<WorkingTraceProcessor, object>();
+const nativeRegistrationTokens = new WeakMap<TraceInfo, object>();
+
+/** Accept only the scoped lease store record, never frontend request metadata. */
+export function isPrivateAnalysisLease(lease: TraceProcessorLeaseRecord): boolean {
+  return lease.mode === 'isolated' && lease.holders.some(holder =>
+    holder.holderType === 'agent_run' && holder.metadata?.analysisRunPrivate === true);
+}
 
 export type TraceProcessorServiceBoundedQueryOptions =
   TraceProcessorBoundedQueryOptions & {
@@ -266,19 +297,51 @@ export class TraceProcessorService extends EventEmitter {
     traceId: string,
     options: TraceProcessorServiceQueryOptions = {},
   ): TraceProcessorLeaseQueryContext | undefined {
+    const stored = this.queryLeaseContext.getStore();
+    const inherited = stored && 'traceLeases' in stored ? stored.traceLeases[traceId]
+      : stored?.traceId === traceId ? stored : undefined;
+    if (inherited && ((options.leaseId !== undefined && options.leaseId !== inherited.leaseId) ||
+          (options.leaseMode !== undefined && options.leaseMode !== inherited.mode) ||
+          (options.leaseScope !== undefined && (options.leaseScope.tenantId !== inherited.leaseScope?.tenantId ||
+            options.leaseScope.workspaceId !== inherited.leaseScope?.workspaceId ||
+            options.leaseScope.userId !== inherited.leaseScope?.userId)))) {
+      throw createTraceProcessorQueryCancelledError('Trace processor lease context conflicts with the active run');
+    }
     if (options.leaseId) {
       return {
         traceId,
         leaseId: options.leaseId,
-        mode: options.leaseMode ?? 'shared',
-        ...(options.leaseScope ? { leaseScope: options.leaseScope } : {}),
+        mode: options.leaseMode ?? inherited?.mode ?? 'shared',
+        ...(options.leaseScope || inherited?.leaseScope ? { leaseScope: options.leaseScope ?? inherited?.leaseScope } : {}),
+        ...(inherited?.holder ? {holder: inherited.holder} : {}),
       };
     }
-    const stored = this.queryLeaseContext.getStore();
-    if (stored && 'traceLeases' in stored) {
-      return stored.traceLeases[traceId];
+    return inherited;
+  }
+
+  private requireActiveLease(
+    traceId: string,
+    context?: Pick<TraceProcessorLeaseQueryContext, 'leaseId' | 'mode' | 'leaseScope' | 'holder'>,
+  ): TraceProcessorLeaseRecord | undefined {
+    // Offline evaluators also use synthetic unscoped isolation keys. Those are
+    // not product leases; a scoped lookup never falls back to that contract.
+    if (!context?.leaseScope) return undefined;
+    const lease = getTraceProcessorLeaseStore().getLeaseById(context.leaseScope, context.leaseId);
+    const now = Date.now();
+    const validHolder = lease?.holders.some(holder => (holder.expiresAt === null || holder.expiresAt > now) &&
+      (!context.holder || (holder.holderType === context.holder.holderType && holder.holderRef === context.holder.holderRef)));
+    if (!lease || lease.traceId !== traceId || lease.mode !== context.mode ||
+        lease.tenantId !== context.leaseScope.tenantId || lease.workspaceId !== context.leaseScope.workspaceId ||
+        LEASE_RESTART_CONFLICT_STATES.has(lease.state) ||
+        (lease.expiresAt !== null && lease.expiresAt <= now) || !validHolder) {
+      throw createTraceProcessorQueryCancelledError('Trace processor lease owner is no longer active');
     }
-    return stored?.traceId === traceId ? stored : undefined;
+    return lease;
+  }
+
+  private requireActiveQueryLease(traceId: string, options: TraceProcessorServiceQueryOptions): void {
+    throwIfTraceProcessorQueryCancelled(options.signal);
+    this.requireActiveLease(traceId, this.resolveLeaseQueryContext(traceId, options));
   }
 
   /**
@@ -511,7 +574,7 @@ export class TraceProcessorService extends EventEmitter {
    */
   private async createProcessor(
     traceId: string,
-    leaseContext?: Pick<TraceProcessorLeaseQueryContext, 'leaseId' | 'mode'>,
+    leaseContext?: Pick<TraceProcessorLeaseQueryContext, 'leaseId' | 'mode' | 'leaseScope'>,
     restartOwnerToken?: LeaseRestartOwnerToken,
   ): Promise<TraceProcessor> {
     const traceOwner = this.traces.get(traceId);
@@ -520,6 +583,9 @@ export class TraceProcessorService extends EventEmitter {
     }
     const filePath = this.getTraceFilePath(traceId);
     const processorKey = this.processorKeyForLease(traceId, leaseContext?.leaseId, leaseContext?.mode);
+    const leaseIdentity = leaseContext && {leaseId: leaseContext.leaseId, mode: leaseContext.mode,
+      ...(leaseContext.leaseScope ? {leaseScope: leaseContext.leaseScope} : {})};
+    const lease = this.requireActiveLease(traceId, leaseIdentity);
     const restartInProgress = this.leaseRestartInProgress.get(processorKey);
     const restartOwner = this.leaseRestartOwnerTokens.get(processorKey);
     if (restartInProgress && restartOwner !== restartOwnerToken) {
@@ -543,14 +609,20 @@ export class TraceProcessorService extends EventEmitter {
       return this.createProcessor(traceId, leaseContext, restartOwnerToken);
     }
 
+    const analysisRunPrivate = Boolean(lease && lease.traceId === traceId && isPrivateAnalysisLease(lease));
+    const priorFactoryProcessor = TraceProcessorFactory.get(processorKey);
     const creation = TraceProcessorFactory.create(traceId, filePath, {
       processorKey,
       leaseId: leaseContext?.leaseId,
       leaseMode: leaseContext?.mode ?? 'shared',
+      ...(analysisRunPrivate ? {analysisRunPrivate: true} : {}),
     }).then(processor => {
-      if (this.traces.get(traceId) !== traceOwner) {
-        this.discardProcessor(processorKey, processor);
-        throw new Error(`Trace ${traceId} changed during processor creation`);
+      try {
+        if (this.traces.get(traceId) !== traceOwner) throw new Error(`Trace ${traceId} changed during processor creation`);
+        this.requireActiveLease(traceId, leaseIdentity);
+      } catch (error) {
+        if (processor !== priorFactoryProcessor) this.discardProcessor(processorKey, processor);
+        throw error;
       }
       this.publishProcessor(processorKey, traceId, processor);
       return processor;
@@ -623,6 +695,7 @@ export class TraceProcessorService extends EventEmitter {
   ): Promise<TraceProcessor> {
     throwIfTraceProcessorQueryCancelled(options.signal);
     const leaseContext = this.resolveLeaseQueryContext(traceId, options);
+    this.requireActiveLease(traceId, leaseContext);
     const processorKey = this.processorKeyForLease(traceId, leaseContext?.leaseId, leaseContext?.mode);
     let processor = this.processors.get(processorKey);
     if (!processor && leaseContext) {
@@ -655,6 +728,7 @@ export class TraceProcessorService extends EventEmitter {
           rethrowIfTraceProcessorQueryCancelled(err);
           throw new Error(`HTTP server not ready (auto-recovery failed: ${err.message})`);
         }
+        this.requireActiveQueryLease(traceId, options);
         return processor;
       }
       // Serialize concurrent recovery attempts for the same trace
@@ -686,7 +760,7 @@ export class TraceProcessorService extends EventEmitter {
       }
     }
 
-    throwIfTraceProcessorQueryCancelled(options.signal);
+    this.requireActiveQueryLease(traceId, options);
     return processor;
   }
 
@@ -697,8 +771,10 @@ export class TraceProcessorService extends EventEmitter {
   ): Promise<QueryResult> {
     try {
       const processor = await this.processorForQuery(traceId, options);
+      this.requireActiveQueryLease(traceId, options);
       const { leaseId: _leaseId, leaseMode: _leaseMode, leaseScope: _leaseScope, ...queryOptions } = options;
       const result = await processor.query(sql, queryOptions);
+      this.requireActiveQueryLease(traceId, options);
       recordRunManifestSqlStatements(sql, !result.error);
       return result;
     } catch (error) {
@@ -714,6 +790,7 @@ export class TraceProcessorService extends EventEmitter {
   ): Promise<QueryResult> {
     try {
       const processor = await this.processorForQuery(traceId, options);
+      this.requireActiveQueryLease(traceId, options);
       const boundedProcessor = processor as TraceProcessor & {
         queryBounded?: (
           boundedSql: string,
@@ -730,6 +807,7 @@ export class TraceProcessorService extends EventEmitter {
         ...queryOptions
       } = options;
       const result = await boundedProcessor.queryBounded(sql, queryOptions);
+      this.requireActiveQueryLease(traceId, options);
       recordRunManifestSqlStatements(sql, !result.error);
       return result;
     } catch (error) {
@@ -744,8 +822,57 @@ export class TraceProcessorService extends EventEmitter {
     options: TraceProcessorServiceQueryOptions = {},
   ): Promise<Buffer> {
     const processor = await this.processorForQuery(traceId, options);
+    this.requireActiveQueryLease(traceId, options);
+    this.invalidateNativeProvenance(traceId, options);
     const { leaseId: _leaseId, leaseMode: _leaseMode, leaseScope: _leaseScope, ...queryOptions } = options;
-    return await processor.queryRaw(body, queryOptions);
+    const result = await processor.queryRaw(body, queryOptions);
+    this.requireActiveQueryLease(traceId, options);
+    return result;
+  }
+
+  /** Opaque RPC and a disclosed native port can bypass the SQL queue. */
+  public invalidateNativeProvenance(traceId: string, options: TraceProcessorServiceQueryOptions = {}): void {
+    const lease = this.resolveLeaseQueryContext(traceId, options);
+    this.invalidateNativeProvenanceForProcessorKey(this.processorKeyForLease(traceId, lease?.leaseId, lease?.mode));
+  }
+
+  public invalidateNativeProvenanceForProcessorKey(processorKey: string): void {
+    // The factory publishes warming processors before the service can publish
+    // them. Port-pool stats can expose that port while initialization awaits I/O.
+    for (const processor of new Set([this.processors.get(processorKey), TraceProcessorFactory.get(processorKey)])) {
+      if (processor instanceof WorkingTraceProcessor) processor.invalidateNativeProvenance();
+    }
+  }
+
+  public exposeNativePort(port: number): void {
+    TraceProcessorFactory.exposeNativePort(port);
+    for (const processor of new Set(this.processors.values())) {
+      if (processor instanceof WorkingTraceProcessor && processor.httpPort === port) processor.invalidateNativeProvenance();
+    }
+  }
+
+  public isPrivateAnalysisProcessorKey(processorKey: string): boolean {
+    return [this.processors.get(processorKey), TraceProcessorFactory.get(processorKey)].some(processor =>
+      processor instanceof WorkingTraceProcessor && processor.analysisRunPrivate);
+  }
+
+  /** Defaults to the shared processor; explicit lease options inspect a newly admitted instance. */
+  public getAnalysisRunProcessorPolicy(
+    traceId: string,
+    options: TraceProcessorServiceQueryOptions = {},
+  ): TraceProcessorAnalysisRunPolicy {
+    const sourceKind = this.getTraceSourceKind(traceId) ?? 'unknown';
+    if (sourceKind === 'external_rpc') return {sourceKind, requiresIsolation: false, reason: 'external_rpc'};
+    const key = this.processorKeyForLease(traceId, options.leaseId, options.leaseMode);
+    const processor = this.processors.get(key) ?? TraceProcessorFactory.get(key);
+    if (sourceKind !== 'local_file' || !(processor instanceof WorkingTraceProcessor) ||
+        (processor.status !== 'ready' && processor.status !== 'busy')) {
+      return {sourceKind, requiresIsolation: false, reason: 'not_ready'};
+    }
+    const snapshot = processor.getNativeProvenanceSnapshot();
+    if (!snapshot.nativeSchemaEligible) return {sourceKind, requiresIsolation: false, reason: 'untrusted_binary'};
+    return {sourceKind, requiresIsolation: snapshot.status === 'tainted',
+      reason: snapshot.status === 'trusted' ? 'trusted' : snapshot.status === 'tainted' ? 'shared_tainted' : 'not_ready'};
   }
 
   /**
@@ -788,6 +915,28 @@ export class TraceProcessorService extends EventEmitter {
     return processor instanceof WorkingTraceProcessor
       ? processor.getRuntimeBinarySelection()
       : {source: 'external_rpc'};
+  }
+
+  /** Internal observation only: no endpoint, processor handle, initialization or SQL dispatch. */
+  public getRunningNativeProcessorObservation(
+    traceId: string,
+    options: TraceProcessorServiceQueryOptions = {},
+  ): RunningNativeProcessorObservation | undefined {
+    throwIfTraceProcessorQueryCancelled(options.signal);
+    const context = this.resolveLeaseQueryContext(traceId, options);
+    this.requireActiveLease(traceId, context);
+    const registration = this.traces.get(traceId);
+    const processor = this.processors.get(this.processorKeyForLease(traceId, context?.leaseId, context?.mode));
+    if (!registration || this.traceSources.get(registration) !== 'local_file' ||
+        !(processor instanceof WorkingTraceProcessor) || processor.traceId !== traceId ||
+        (processor.status !== 'ready' && processor.status !== 'busy')) return undefined;
+    let instanceToken = nativeInstanceTokens.get(processor);
+    if (!instanceToken) {instanceToken = Object.freeze({}); nativeInstanceTokens.set(processor, instanceToken);}
+    let registrationToken = nativeRegistrationTokens.get(registration);
+    if (!registrationToken) {registrationToken = Object.freeze({}); nativeRegistrationTokens.set(registration, registrationToken);}
+    return Object.freeze({instanceToken, registrationToken, instanceId: processor.id, traceId: processor.traceId,
+      ...processor.getNativeProvenanceSnapshot(), analysisRunPrivate: processor.analysisRunPrivate,
+      binarySelection: Object.freeze(processor.getRuntimeBinarySelection())});
   }
 
   public getRunningTraceSummaryInput(
@@ -867,7 +1016,8 @@ export class TraceProcessorService extends EventEmitter {
 
     const processorKey = this.processorKeyForLease(traceId, leaseId, mode);
     const processor = this.processors.get(processorKey) as WorkingTraceProcessor | undefined;
-    const port = (processor?.status === 'ready') ? processor.httpPort : undefined;
+    const port = (processor?.status === 'ready' && !this.isPrivateAnalysisProcessorKey(processorKey))
+      ? processor.httpPort : undefined;
 
     if (port) {
       this.touchTrace(traceId);
@@ -890,7 +1040,7 @@ export class TraceProcessorService extends EventEmitter {
     if (!processor) return undefined;
     return {
       status: processor.status,
-      ...(Number.isInteger(processor.httpPort) && processor.httpPort > 0
+      ...(!this.isPrivateAnalysisProcessorKey(processorKey) && Number.isInteger(processor.httpPort) && processor.httpPort > 0
         ? {port: processor.httpPort}
         : {}),
     };
@@ -904,6 +1054,11 @@ export class TraceProcessorService extends EventEmitter {
    * @param traceName - Display name for the trace
    */
   public async registerExternalRpc(traceId: string, port: number, traceName: string): Promise<void> {
+    port = normalizeTraceProcessorRpcPort(port);
+    if (TraceProcessorFactory.isPrivateAnalysisPort(port) || [...this.processors.values()].some(processor =>
+      processor instanceof WorkingTraceProcessor && processor.analysisRunPrivate && processor.httpPort === port)) {
+      throw new Error('Private analysis processor cannot accept external connections');
+    }
     console.log(`[TraceProcessorService] Registering external RPC: ${traceId} on port ${port}`);
     if (this.processorCreationInProgress.has(traceId)) {
       throw new Error(`Processor creation already in progress for trace ${traceId}`);
@@ -1044,10 +1199,14 @@ export class TraceProcessorService extends EventEmitter {
       throw new Error(`Trace ${traceId} deletion in progress`);
     }
     const key = this.processorKeyForLease(traceId, leaseId, mode);
+    const context = {leaseId, mode, ...(leaseScope ? {leaseScope} : {})};
+    this.requireActiveLease(traceId, context);
     const restartInProgress = this.leaseRestartInProgress.get(key);
     if (restartInProgress) {
       console.log(`[TraceProcessorService] Waiting for lease supervisor restart of ${key}`);
-      return restartInProgress;
+      const processor = await restartInProgress;
+      this.requireActiveLease(traceId, context);
+      return processor;
     }
 
     const existing = this.processors.get(key);
@@ -1056,12 +1215,14 @@ export class TraceProcessorService extends EventEmitter {
       return existing;
     }
     if (existing && existing.status === 'error') {
-      return this.restartLeaseProcessor(traceId, {
+      const processor = await this.restartLeaseProcessor(traceId, {
         traceId,
         leaseId,
         mode,
         ...(leaseScope ? { leaseScope } : {}),
       });
+      this.requireActiveLease(traceId, context);
+      return processor;
     }
 
     const trace = this.traces.get(traceId);
@@ -1074,7 +1235,9 @@ export class TraceProcessorService extends EventEmitter {
       throw new Error(`Trace file not found for lease ${leaseId}: ${filePath}`);
     }
 
-    return this.createProcessor(traceId, { leaseId, mode });
+    const processor = await this.createProcessor(traceId, context);
+    this.requireActiveLease(traceId, context);
+    return processor;
   }
 
   public async restartLease(
@@ -1095,6 +1258,7 @@ export class TraceProcessorService extends EventEmitter {
     traceId: string,
     leaseContext: TraceProcessorLeaseQueryContext,
   ): Promise<TraceProcessor> {
+    this.requireActiveLease(traceId, leaseContext);
     const processorKey = this.processorKeyForLease(traceId, leaseContext.leaseId, leaseContext.mode);
     const inProgress = this.leaseRestartInProgress.get(processorKey);
     if (inProgress) {
@@ -1150,6 +1314,7 @@ export class TraceProcessorService extends EventEmitter {
 
       await this.waitForProcessorCreationBeforeRestart(processorKey);
       this.throwIfLeaseRestartCancelled(processorKey, restartOwnerToken);
+      this.requireActiveLease(traceId, leaseContext);
       this.markLeaseRestarting(leaseContext);
       this.throwIfLeaseRestartCancelled(processorKey, restartOwnerToken);
       this.destroyProcessorForRestart(processorKey);

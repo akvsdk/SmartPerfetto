@@ -27,6 +27,8 @@ import {
 } from './traceProcessorCancellation';
 import type { QueryResult } from './workingTraceProcessor';
 import {currentRunManifestAttributionSink} from './selfEvolution/runManifestLifecycle';
+import {beginRawSqlNativeQuery, invalidateRawSqlNativeProvenance, sealRawSqlNativeQuery,
+  type RawSqlBootstrapCapability, type RawSqlNativeProvenance, type RawSqlNativeQuery} from './evidence/rawSqlNativeProvenance';
 
 const IS_TEST_ENV = process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID !== undefined;
 
@@ -55,6 +57,13 @@ export interface TraceProcessorSqlWorkerOptions {
   rawExecutor?: (request: TraceProcessorHttpRpcRequest) => Promise<Buffer>;
   maxQueuedTasks?: number;
   maxQueuedBytes?: number;
+  nativeProvenance?: RawSqlNativeProvenance;
+}
+
+interface SqlTaskOrigin {
+  sql: string;
+  bootstrapCapability?: RawSqlBootstrapCapability;
+  decode: (body: Buffer, query: RawSqlNativeQuery | undefined) => void;
 }
 
 interface QueueTask {
@@ -69,6 +78,7 @@ interface QueueTask {
   queuedAtMs: number;
   runtimePerformanceRecorder?: RuntimePerformanceRecorder;
   runtimePerformanceRecorded?: boolean;
+  sqlOrigin?: SqlTaskOrigin;
   onAbort?: () => void;
   resolve: (body: Buffer) => void;
   reject: (error: Error) => void;
@@ -182,6 +192,7 @@ export class TraceProcessorSqlWorker {
   private readonly rawExecutor?: (request: TraceProcessorHttpRpcRequest) => Promise<Buffer>;
   private readonly maxQueuedTasks: number;
   private readonly maxQueuedBytes: number;
+  private readonly nativeProvenance?: RawSqlNativeProvenance;
   private readonly queues: Record<TraceProcessorQueryPriority, QueueTask[]> = {
     p0: [],
     p1: [],
@@ -204,6 +215,7 @@ export class TraceProcessorSqlWorker {
     this.rawExecutor = options.rawExecutor;
     this.maxQueuedTasks = Math.max(1, options.maxQueuedTasks ?? DEFAULT_MAX_QUEUED_TASKS);
     this.maxQueuedBytes = Math.max(1, options.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES);
+    this.nativeProvenance = options.nativeProvenance;
   }
 
   get activeCount(): number {
@@ -229,16 +241,24 @@ export class TraceProcessorSqlWorker {
   }
 
   async query(sql: string, options: TraceProcessorQueryOptions = {}): Promise<QueryResult> {
+    return this.querySql(sql, options);
+  }
+
+  queryBootstrap(sql: string, capability: RawSqlBootstrapCapability, options: TraceProcessorQueryOptions = {}): Promise<QueryResult> {
+    return this.querySql(sql, options, capability);
+  }
+
+  private async querySql(sql: string, options: TraceProcessorQueryOptions, bootstrapCapability?: RawSqlBootstrapCapability): Promise<QueryResult> {
     const startTime = Date.now();
     try {
-      const response = await this.enqueueRaw(encodeQueryArgs(sql), options);
-      const parsed = decodeQueryResult(response);
-      return {
-        columns: parsed.columnNames,
-        rows: parsed.rows,
-        durationMs: Date.now() - startTime,
-        ...(parsed.error ? { error: normalizeTraceProcessorSqlError(parsed.error) } : {}),
-      };
+      let result!: QueryResult;
+      await this.enqueueRawInternal(encodeQueryArgs(sql), options, {sql, bootstrapCapability, decode: (response, query) => {
+        const parsed = decodeQueryResult(response);
+        result = {columns: parsed.columnNames, rows: parsed.rows, durationMs: Date.now() - startTime,
+          ...(parsed.error ? {error: normalizeTraceProcessorSqlError(parsed.error)} : {})};
+        sealRawSqlNativeQuery(query, result);
+      }});
+      return result;
     } catch (error: any) {
       if (isTraceProcessorQueryCancelledError(error)) {
         throw error;
@@ -266,17 +286,18 @@ export class TraceProcessorSqlWorker {
       ) {
         throw new Error('trace_processor_query_budget_invalid');
       }
-      const response = await this.enqueueRawInternal(
+      let result!: QueryResult;
+      await this.enqueueRawInternal(
         encodeQueryArgs(sql),
         options,
+        {sql, decode: (response, query) => {
+          const parsed = decodeQueryResult(response, {maxRows: options.maxRows});
+          result = {columns: parsed.columnNames, rows: parsed.rows, durationMs: Date.now() - startTime,
+            ...(parsed.error ? {error: parsed.error} : {})};
+          sealRawSqlNativeQuery(query, result);
+        }},
       );
-      const parsed = decodeQueryResult(response, {maxRows: options.maxRows});
-      return {
-        columns: parsed.columnNames,
-        rows: parsed.rows,
-        durationMs: Date.now() - startTime,
-        ...(parsed.error ? {error: parsed.error} : {}),
-      };
+      return result;
     } catch (error: any) {
       if (isTraceProcessorQueryCancelledError(error)) throw error;
       return {
@@ -289,12 +310,14 @@ export class TraceProcessorSqlWorker {
   }
 
   enqueueRaw(body: Buffer, options: TraceProcessorQueryOptions = {}): Promise<Buffer> {
+    if (this.nativeProvenance) invalidateRawSqlNativeProvenance(this.nativeProvenance);
     return this.enqueueRawInternal(body, options);
   }
 
   private enqueueRawInternal(
     body: Buffer,
     options: TraceProcessorQueryOptions & {maxResponseBytes?: number},
+    sqlOrigin?: SqlTaskOrigin,
   ): Promise<Buffer> {
     if (this.destroyed) {
       return Promise.reject(new Error(`SQL worker for processor ${this.processorId} is destroyed`));
@@ -324,6 +347,7 @@ export class TraceProcessorSqlWorker {
         deadlineAt: Date.now() + timeoutMs,
         signal: options.signal,
         maxResponseBytes: options.maxResponseBytes,
+        sqlOrigin,
         queuedAtMs: nodePerformance.now(),
         runtimePerformanceRecorder:
           currentRunManifestAttributionSink()?.runtimePerformanceRecorder,
@@ -403,6 +427,9 @@ export class TraceProcessorSqlWorker {
       if (remainingTimeoutMs <= 0) {
         throw new TraceProcessorSqlDeadlineExceededError();
       }
+      const nativeQuery = this.nativeProvenance && task.sqlOrigin
+        ? beginRawSqlNativeQuery(this.nativeProvenance, task.sqlOrigin.sql, task.sqlOrigin.bootstrapCapability)
+        : undefined;
       const request: TraceProcessorHttpRpcRequest = {
         hostname: this.hostname,
         port: this.port,
@@ -418,6 +445,7 @@ export class TraceProcessorSqlWorker {
             task.signal,
           )
         : await this.postToWorker(task, remainingTimeoutMs);
+      task.sqlOrigin?.decode(response, nativeQuery);
       this.recordSqlPerformance(task, executionStartedAtMs, 'ok');
       return response;
     } catch (error) {

@@ -60,12 +60,29 @@ export interface SourceUseDecisionV1 {
   references: SourceReferenceV1[];
 }
 
+/** Actual MCP access scope, captured privately for this analysis run. */
+export interface SourceExecutionScopeV1 {
+  codeAwareMode: CodeAwareMode;
+  selectedCodebaseIds: string[];
+  hasCodebaseAccess: boolean;
+  analysisContextFingerprint: string;
+}
+
 export interface SourceClaimBindingV1 {
   claimId: string;
   mechanismStatus: SourceMechanismStatus;
   sourceReferenceIds: string[];
   traceEvidenceRefIds: string[];
   reason?: string;
+}
+
+/** A decision to skip source cannot erase actual access or incomplete coverage. */
+export function isUnusedSourceDecision(value: SourceUseDecisionV1 | undefined): boolean {
+  return value === undefined || value.schemaVersion === SOURCE_USE_DECISION_SCHEMA_VERSION &&
+    value.status === 'not_needed' && value.coverageComplete !== false &&
+    (value.incompleteReasons === undefined || Array.isArray(value.incompleteReasons) && value.incompleteReasons.length === 0) &&
+    [value.attemptedTools, value.queriedCodebaseIds, value.usedCodebaseIds, value.references]
+      .every(items => Array.isArray(items) && items.length === 0);
 }
 
 export const MAX_SOURCE_REFERENCE_COUNT = 100;
@@ -151,7 +168,7 @@ export function loadSourceUseDecisionToolDescription(input: {
 }
 
 const MAX_SOURCE_IDENTIFIER_LENGTH = 160;
-const MAX_SOURCE_REFERENCE_ID_LENGTH = 256;
+export const MAX_SOURCE_REFERENCE_ID_LENGTH = 256;
 const MAX_SOURCE_SYMBOL_LENGTH = 256;
 const MAX_SOURCE_TOOL_COUNT = 64;
 const MAX_SOURCE_INCOMPLETE_REASON_COUNT = 20;
@@ -267,9 +284,9 @@ export function normalizeSourceReferencePath(value: unknown): string | undefined
     !normalized ||
     normalized.length > MAX_SOURCE_REFERENCE_PATH_LENGTH ||
     normalized.startsWith('/') ||
-    /^[a-z]:\//i.test(normalized) ||
+    /^[a-z]:/i.test(normalized) ||
     normalized.includes('://') ||
-    /[\u0000-\u001f\u007f]/.test(normalized)
+    /[\p{Cc}\p{Cf}\p{Cs}]/u.test(normalized)
   ) {
     return undefined;
   }
@@ -278,8 +295,7 @@ export function normalizeSourceReferencePath(value: unknown): string | undefined
     segments.some(segment =>
       !segment ||
       segment === '.' ||
-      segment === '..' ||
-      !/^[A-Za-z0-9_.@+,-]+$/.test(segment))
+      segment === '..')
   ) {
     return undefined;
   }
@@ -443,6 +459,35 @@ export function sanitizeSourceUseDecision(
   };
 }
 
+function sourceMechanismStatus(value: unknown): SourceMechanismStatus | undefined {
+  return value === 'corroborated' || value === 'compatible' || value === 'ambiguous' || value === 'unverified'
+    ? value : undefined;
+}
+
+/** Validate original declaration shape without trimming, dropping, or deduplicating values. */
+export function isSourceClaimBindingDeclaration(value: unknown): value is SourceClaimBindingV1 {
+  const required = ['claimId', 'mechanismStatus', 'sourceReferenceIds', 'traceEvidenceRefIds'];
+  if (!isRecord(value) || required.some(key => !Object.prototype.hasOwnProperty.call(value, key)) ||
+    Object.keys(value).some(key => !required.includes(key) && key !== 'reason') ||
+    typeof value.claimId !== 'string' || strictIdentifier(value.claimId, MAX_SOURCE_REFERENCE_ID_LENGTH) !== value.claimId ||
+    !sourceMechanismStatus(value.mechanismStatus) ||
+    (Object.prototype.hasOwnProperty.call(value, 'reason') && typeof value.reason !== 'string')) return false;
+  for (const references of [value.sourceReferenceIds, value.traceEvidenceRefIds]) {
+    if (!Array.isArray(references) || references.length > MAX_SOURCE_BINDING_REFERENCE_COUNT) return false;
+    for (const reference of references) {
+      if (typeof reference !== 'string' || strictIdentifier(reference, MAX_SOURCE_REFERENCE_ID_LENGTH) !== reference) return false;
+    }
+  }
+  return true;
+}
+
+/** Check the whole original array, including holes and entries for other claims. */
+export function isSourceClaimBindingsDeclaration(value: unknown): value is SourceClaimBindingV1[] {
+  if (!Array.isArray(value) || value.length > MAX_SOURCE_CLAIM_BINDING_COUNT) return false;
+  for (const binding of value) if (!isSourceClaimBindingDeclaration(binding)) return false;
+  return true;
+}
+
 export function sanitizeSourceClaimBindings(
   value: unknown,
   options: {
@@ -455,12 +500,7 @@ export function sanitizeSourceClaimBindings(
   for (const candidate of value) {
     if (!isRecord(candidate)) continue;
     const claimId = strictIdentifier(candidate.claimId, MAX_SOURCE_REFERENCE_ID_LENGTH);
-    const mechanismStatus = candidate.mechanismStatus === 'corroborated' ||
-      candidate.mechanismStatus === 'compatible' ||
-      candidate.mechanismStatus === 'ambiguous' ||
-      candidate.mechanismStatus === 'unverified'
-      ? candidate.mechanismStatus
-      : undefined;
+    const mechanismStatus = sourceMechanismStatus(candidate.mechanismStatus);
     if (!claimId || !mechanismStatus) continue;
     const sourceReferenceIds = uniqueBoundedIdentifiers(
       candidate.sourceReferenceIds,

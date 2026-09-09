@@ -69,7 +69,7 @@ import {
 import {AppSourceIngester} from '../services/rag/appSourceIngester';
 import {AospSourceIngester} from '../services/rag/aospSourceIngester';
 import {KernelSourceIngester} from '../services/rag/kernelSourceIngester';
-import {resolveSourcePathPatterns} from '../services/rag/sourceFileSelection';
+import {isSourceChunkLimitExceeded, resolveSourcePathPatterns} from '../services/rag/sourceFileSelection';
 import {SymbolResolver} from '../services/symbol/symbolResolver';
 import {codeAwareFeatureEnabled} from '../services/codebase/codeAwareFeature';
 import {
@@ -991,6 +991,22 @@ export function createRagAdminRoutes(store?: RagStore, services: RagAdminRouteSe
     if (!ref) {
       return res.status(404).json({success: false, error: `Codebase '${codebaseId}' not found`});
     }
+    const sendIndexFailure = async (error: unknown) => {
+      const capacityExceeded = isSourceChunkLimitExceeded(error);
+      const onDemandAvailable = await codebaseManagementService.onDemandAvailable(codebaseId, scope);
+      const message = capacityExceeded
+        ? 'Optional source index reached its capacity; this index attempt was rolled back.'
+        : 'Optional source index could not be built.';
+      // Preserve the legacy error field for API consumers while new UIs use
+      // the stable code and a fresh root check rather than guessing from prose.
+      return res.status(400).json({
+        success: false,
+        code: capacityExceeded ? 'CODEBASE_INDEX_CAPACITY_EXCEEDED' : 'CODEBASE_INDEX_FAILED',
+        error: error instanceof Error ? error.message : String(error),
+        message,
+        onDemandAvailable,
+      });
+    };
     try {
       const result = await (ref.kind === 'kernel_source'
         ? kernelSourceIngester.ingest(codebaseId, {...(req.body ?? {}), scope})
@@ -998,17 +1014,11 @@ export function createRagAdminRoutes(store?: RagStore, services: RagAdminRouteSe
           ? aospSourceIngester.ingest(codebaseId, {...(req.body ?? {}), scope})
           : appSourceIngester.ingest(codebaseId, {...(req.body ?? {}), scope}));
       if (!result.activationDisposition || !result.coverage) {
-        return res.status(400).json({
-          success: false,
-          error: result.errors[0]?.reason ?? 'codebase_reindex_blocked_by_security',
-        });
+        return await sendIndexFailure(new Error(result.errors[0]?.reason ?? 'codebase_reindex_blocked_by_security'));
       }
       res.json({success: true, result});
     } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
+      return await sendIndexFailure(error);
     }
   });
 

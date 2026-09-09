@@ -3,7 +3,7 @@
 
 import type {ConclusionContractClaimReference} from '../../agent/core/conclusionContract';
 import type {DataEnvelope} from '../../types/dataContract';
-import {bindCapturedAnchorFacts, capturedEvidenceTable, freezeEvidenceValue,
+import {bindCapturedAnchorFacts, capturedEvidenceTable, capturedNativeRow, capturedRawSqlContext, freezeEvidenceValue,
   type CapturedFieldSemantics, type EvidenceScalar, type EvidenceTableWitness} from './evidenceCapture';
 
 export interface EvidenceReadRequest {
@@ -49,7 +49,11 @@ const resolutions = new WeakMap<object, {witness: EvidenceTableWitness; rowIndex
 
 export function bindReadResolutionToAnchor(anchor: object, resolution: EvidenceReadResolution): void {
   const captured = resolutions.get(resolution);
-  if (captured?.rowIndex !== undefined) bindCapturedAnchorFacts(anchor, captured.witness, captured.rowIndex, captured.fields, resolution.key);
+  if (captured?.rowIndex !== undefined) {
+    const context = (anchor as {context?: {captureId?: string}}).context;
+    if (context) context.captureId = captured.witness.captureId;
+    bindCapturedAnchorFacts(anchor, captured.witness, captured.rowIndex, captured.fields, resolution.key);
+  }
 }
 export function isIssuedEvidenceReadResolution(resolution: EvidenceReadResolution): boolean {
   return resolution.status !== 'resolved' || resolutions.has(resolution);
@@ -98,6 +102,11 @@ export function createEvidenceReadView(records: () => readonly EvidenceReadRecor
         continue;
       }
       const {record, witness} = candidates[0];
+      if (record.captureId !== witness.captureId) {fail('missing', 'execution_witness_mismatch'); continue;}
+      const rawContext = capturedRawSqlContext(witness);
+      if (rawContext && (rawContext.traceId !== record.meta.traceId || rawContext.traceSide !== record.meta.traceSide)) {
+        fail('denied', 'trace_capture_mismatch'); continue;
+      }
       if (!allowed.has(`${record.meta.traceSide}:${record.meta.traceId}`)) {fail('denied', 'trace_outside_read_scope'); continue;}
       const table = capturedEvidenceTable(witness);
       if (!table || table.unavailableReason) {fail('missing', table?.unavailableReason || 'execution_witness_unavailable'); continue;}
@@ -141,6 +150,10 @@ export function createEvidenceReadView(records: () => readonly EvidenceReadRecor
       if ([...requested].some(column => !table.columns.includes(column))) {fail('missing', 'required_column_missing'); continue;}
       const needed = new Set([...requested, ...Object.keys(table.fields),
         ...['upid', 'pid', 'utid', 'tid', 'process_name', 'thread_name'].filter(column => table.columns.includes(column))]);
+      const nativeRow = rowIndex !== undefined ? capturedNativeRow(witness, rowIndex) : undefined;
+      if (nativeRow && nativeRow.traceId === record.meta.traceId && nativeRow.traceSide === record.meta.traceSide) {
+        needed.add(nativeRow.outputColumn);
+      }
       const wholeRow = !ref.column && request.requiredColumns.length === 0;
       if (rowIndex !== undefined && wholeRow) table.columns.forEach(column => needed.add(column));
       if (rowIndex !== undefined && cells + needed.size > budget.maxCells) {fail('incomplete', 'cell_read_budget_exhausted'); continue;}
@@ -154,7 +167,7 @@ export function createEvidenceReadView(records: () => readonly EvidenceReadRecor
         }
       }
       if (failed) {fail('missing', 'unsupported_raw_cell'); continue;}
-      const readBytes = JSON.stringify(record).length * 2 + Object.entries(row).reduce((total, [column, value]) =>
+      const readBytes = JSON.stringify(record).length * 2 + (nativeRow ? JSON.stringify(nativeRow).length * 2 : 0) + Object.entries(row).reduce((total, [column, value]) =>
         total + column.length * 6 + (typeof value === 'string' ? value.length * 6 : 32), 0);
       if (bytes + readBytes > budget.maxBytes || expired()) {fail('incomplete', 'evidence_read_size_or_deadline_exhausted'); continue;}
       bytes += readBytes;

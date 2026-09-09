@@ -12,7 +12,8 @@ import { pipeline } from 'stream/promises';
 import { uuidv4 } from '../utils/uuid';
 import { resolveFeatureConfig } from '../config';
 import { attachRequestContext, requireRequestContext, type RequestContext } from '../middleware/auth';
-import { getTraceProcessorService } from '../services/traceProcessorService';
+import { getTraceProcessorService, isPrivateAnalysisLease } from '../services/traceProcessorService';
+import {traceProcessorProcessorKey} from '../services/traceProcessorConnectionModel';
 import { getPortPool } from '../services/portPool';
 import { TraceProcessorFactory, type TraceProcessorRuntimeStats } from '../services/workingTraceProcessor';
 import { openEnterpriseDb } from '../services/enterpriseDb';
@@ -697,6 +698,7 @@ async function finalizeTraceUpload(
     }
 
     const traceWithPort = tps.getTraceWithPort(traceId);
+    if (traceWithPort?.port) tps.exposeNativePort(traceWithPort.port);
     if (processorError || traceWithPort?.status === 'error') {
       return {
         id: traceId,
@@ -1090,6 +1092,14 @@ router.get('/stats', async (req, res) => {
     const portPoolStats = getPortPool().getStats();
     const processorStats = TraceProcessorFactory.getStats();
     const traceService = getTraceProcessorService();
+    // Freeze privacy at the same time as the port snapshots. Cleanup during
+    // metadata I/O must not make an old private port become public afterward.
+    const privateSnapshotKeys = new Set([
+      ...processorStats.processors.map(processor => processor.processorKey ??
+        traceProcessorProcessorKey(processor.traceId, processor.leaseId, processor.leaseMode)),
+      ...portPoolStats.allocations.map(allocation => allocation.traceId),
+    ].filter(key => traceService.isPrivateAnalysisProcessorKey(key)));
+    const privateProcessorKey = (key: string) => privateSnapshotKeys.has(key) || traceService.isPrivateAnalysisProcessorKey(key);
     const serviceTraces = traceService.getAllTraces();
     const leases = enterpriseLeasesEnabled()
       ? getTraceProcessorLeaseStore().listLeases(leaseScopeFromContext(context))
@@ -1110,12 +1120,22 @@ router.get('/stats', async (req, res) => {
       }))
       .filter(allocation => allocation.ownerTraceId !== null);
     const processors = processorStats.processors.filter(processor => ownedTraceIds.has(processor.traceId));
+    const publicProcessors = processors.filter(processor => !privateProcessorKey(
+      processor.processorKey ?? traceProcessorProcessorKey(processor.traceId, processor.leaseId, processor.leaseMode)) &&
+      !TraceProcessorFactory.isPrivateAnalysisPort(processor.httpPort));
+    const publicAllocations = allocations.filter(allocation => !privateProcessorKey(allocation.traceId) &&
+      !TraceProcessorFactory.isPrivateAnalysisPort(allocation.port));
     const queueLength = processors.reduce((sum, processor) => {
       const worker = processor.sqlWorker;
       return sum + (worker ? worker.queuedP0 + worker.queuedP1 + worker.queuedP2 : 0);
     }, 0);
     const ownedLeases = leases.filter(lease => ownedTraceIds.has(lease.traceId));
     const activeLeases = ownedLeases.filter(lease => lease.state !== 'released' && lease.state !== 'failed');
+
+    for (const port of new Set([...publicProcessors.map(processor => processor.httpPort),
+      ...publicAllocations.map(allocation => allocation.port)])) {
+      traceService.exposeNativePort(port);
+    }
 
     res.json({
       success: true,
@@ -1125,7 +1145,7 @@ router.get('/stats', async (req, res) => {
           total: portPoolStats.total,
           available: portPoolStats.available,
           allocated: allocations.length,
-          allocations: allocations.map(a => ({
+          allocations: publicAllocations.map(a => ({
             port: a.port,
             traceId: a.ownerTraceId,
             processorKey: a.traceId,
@@ -1136,14 +1156,15 @@ router.get('/stats', async (req, res) => {
           count: processors.length,
           traceIds: processors.map(processor => processor.traceId),
           queueLength,
-          items: processors,
+          items: publicProcessors,
         },
         leases: {
           count: ownedLeases.length,
           activeCount: activeLeases.length,
           crashCount: ownedLeases.filter(lease => lease.state === 'crashed').length,
           holderCount: ownedLeases.reduce((sum, lease) => sum + lease.holderCount, 0),
-          items: ownedLeases.map(lease => ({
+          items: ownedLeases.filter(lease => !isPrivateAnalysisLease(lease) && !privateProcessorKey(
+            traceProcessorProcessorKey(lease.traceId, lease.id, lease.mode))).map(lease => ({
             id: lease.id,
             traceId: lease.traceId,
             mode: lease.mode,
@@ -1375,6 +1396,7 @@ router.post(
       if (!traceInfo?.port) {
         throw new Error('Isolated trace processor did not become ready');
       }
+      tps.exposeNativePort(traceInfo.port);
       recordTraceAudit(context, 'trace.read', id, {
         filename: metadata.filename,
         size: metadata.size,
@@ -1449,7 +1471,8 @@ router.get(
       leaseScopeFromContext(context),
       leaseId,
     );
-    if (!lease || !leaseHasCurrentPageHolder(lease, context)) {
+    if (!lease || isPrivateAnalysisLease(lease) || getTraceProcessorService().isPrivateAnalysisProcessorKey(
+      traceProcessorProcessorKey(lease.traceId, lease.id, lease.mode)) || !leaseHasCurrentPageHolder(lease, context)) {
       return res.json({success: true, leaseId, status: 'lease_expired'});
     }
 
@@ -1526,6 +1549,8 @@ router.get('/:id', async (req, res) => {
     // Also check TraceProcessorService for processor status
     const tps = getTraceProcessorService();
     const traceInfo = tps?.getTraceWithPort(id);
+    const visiblePort = traceInfo?.port ?? metadata.port;
+    if (visiblePort) tps.exposeNativePort(visiblePort);
 
     const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
     const lease = traceInfo?.port

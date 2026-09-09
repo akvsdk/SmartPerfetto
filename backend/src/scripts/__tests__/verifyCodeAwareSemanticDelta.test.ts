@@ -332,6 +332,8 @@ describe('real-provider semantic delta wrapper contract', () => {
       timeoutMs: number,
     ) => string[];
     evaluateSemanticConditionReport?: (input: Record<string, unknown>) => Record<string, any>;
+    runSemanticPreflight: (options: Record<string, unknown>) => Record<string, unknown>;
+    scenarioSliceSelector: (caseId: string, scenario: unknown) => Record<string, string>;
     realProviderAvailability?: (
       runtime: string,
       env?: Record<string, string | undefined>,
@@ -362,6 +364,105 @@ describe('real-provider semantic delta wrapper contract', () => {
     ]);
   });
 
+  it('permits one existing query and condition only in explicitly diagnostic preflight mode', () => {
+    const args = ['--suite', 'code-aware-semantic-delta', '--runtime', 'openai', '--preflight',
+      '--query-id', 'explicit-source-location', '--condition', 'A2'];
+    expect(wrapper.parseArgs?.(args)).toMatchObject({preflight: true, repeat: 1,
+      queryId: 'explicit-source-location', condition: 'A2', timeoutMs: 1_200_000});
+    for (const invalid of [args.concat('--repeat', '5'), args.concat('--runtime', 'all'),
+      args.concat('--query-id', 'injected-answer'), args.concat('--condition', 'A4'),
+      args.filter(arg => arg !== '--preflight'), ['--suite', 'code-aware-semantic-delta']]) {
+      expect(() => wrapper.parseArgs?.(invalid)).toThrow();
+    }
+  });
+
+  it('uses structured facts and source bindings instead of required answer wording', () => {
+    for (const query of wrapper.semanticDeltaQueries?.() ?? []) {
+      for (const condition of ['A0', 'A2', 'A3']) {
+        const args = wrapper.semanticConditionArgs?.(query, condition, 'case.json', 1000) ?? [];
+        expect(args).not.toContain('--require-text');
+        expect(args[args.indexOf('--query') + 1]).toBe(query.text);
+        expect(args).toContain('--expectation-json');
+      }
+    }
+  });
+
+  it('uses one scenario-derived target for all source conditions without changing any query', () => {
+    const scenario = JSON.parse(fs.readFileSync(path.join(repoRoot,
+      'Trace/constructed/source-analysis-semantic/scenario.json'), 'utf8'));
+    const selected = wrapper.scenarioSliceSelector('source-analysis-semantic', scenario);
+    expect(selected).toEqual({processName: 'com.smartperfetto.fixture', threadName: 'main',
+      eventName: 'StartupHooks.initializeOnMainThread#before-first-frame-sync-policy'});
+    const originalQueries = [
+      '诊断这次启动变慢的主要机制，区分本次 Trace 事实与源码机制解释。',
+      'Trace 中 StartupHooks.initializeOnMainThread#before-first-frame-sync-policy 这个标记区间持续多久？只回答 Trace 中的量化事实。',
+      '指出本次启动标记对应的源码位置、调用链和最小可操作修改点。',
+    ];
+    expect(wrapper.semanticDeltaQueries!().map(query => query.text)).toEqual(originalQueries);
+    for (const query of wrapper.semanticDeltaQueries!()) {
+      for (const condition of ['A0', 'A2', 'A3']) {
+        const args = wrapper.semanticConditionArgs!(query, condition, 'selected-case.json', 1000);
+        const parsed = parseAgentSseArgs(args);
+        expect(parsed.sliceSelectionTarget).toEqual(selected);
+        expect(parsed.query).toBe(query.text);
+        expect(parsed.selectionContext).toBeUndefined();
+        expect(parsed.traceContext).toBeUndefined();
+        expect(parsed.expectation?.facts[0]).toMatchObject({id: 'source_marker_duration', value: 42_000_000, unit: 'ns'});
+      }
+    }
+    const durationChanged = structuredClone(scenario);
+    durationChanged.signals.forEach((signal: Record<string, unknown>) => { signal.duration_ns = '999'; });
+    expect(wrapper.scenarioSliceSelector('source-analysis-semantic', durationChanged)).toEqual(selected);
+    const ambiguous = structuredClone(scenario);
+    ambiguous.signals.push(ambiguous.signals[ambiguous.signals.length - 1]);
+    expect(() => wrapper.scenarioSliceSelector('source-analysis-semantic', ambiguous)).toThrow('exactly one target slice');
+    const missingActor = structuredClone(scenario);
+    missingActor.actors.threads = [];
+    expect(() => wrapper.scenarioSliceSelector('source-analysis-semantic', missingActor)).toThrow('identities are missing or ambiguous');
+  });
+
+  it('writes unavailable preflight evidence without starting a provider or claiming full acceptance', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-preflight-unavailable-'));
+    const environment = jest.replaceProperty(process, 'env', {...process.env, DEEPSEEK_API_KEY: '', OPENAI_API_KEY: ''});
+    const output = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const options = wrapper.parseArgs!(['--suite', 'code-aware-semantic-delta', '--runtime', 'openai', '--preflight',
+        '--query-id', 'explicit-source-location', '--condition', 'A2', '--output-dir', directory]);
+      expect(wrapper.runSemanticPreflight(options)).toMatchObject({preflightPassed: false, completeAcceptance: false,
+        status: 'REAL PROVIDER NOT AVAILABLE', condition: 'A2'});
+      const artifact = JSON.parse(fs.readFileSync(path.join(directory,
+        'openai-agents-sdk/preflight/explicit-source-location/A2.preflight.json'), 'utf8'));
+      expect(artifact.passedMeaning).toBe('single_scenario_diagnostic_only_not_repeated_provider_acceptance');
+      expect(artifact.record).toBeUndefined();
+    } finally {
+      environment.restore();
+      output.mockRestore();
+      fs.rmSync(directory, {recursive: true, force: true});
+    }
+  });
+
+  it('keeps the real privacy canary inside the unchanged source ground-truth read window', () => {
+    const groundTruth = loadConstructedSourceGroundTruth(repoRoot);
+    const lines = fs.readFileSync(path.join(sourceRoot, 'StartupHooks.kt'), 'utf8').split(/\r?\n/);
+    expect(lines[8]).toContain('fun initializeOnMainThread()');
+    expect(lines.slice(groundTruth.lineRange.start - 1, groundTruth.lineRange.end).join('\n'))
+      .toContain('SEMANTIC_DELTA_PRIVATE_SOURCE_CANARY_NEVER_EMIT');
+  });
+
+  it('distinguishes canary diagnostic keys from actual leaked content', () => {
+    const canary = 'SEMANTIC_DELTA_PRIVATE_SOURCE_CANARY_NEVER_EMIT';
+    const query = wrapper.semanticDeltaQueries!()[0];
+    const report = {checks: {[`forbidsText:${canary}`]: true},
+      summary: {forbiddenTextMatches: {[canary]: false}, terminalAnalysis: {conclusion: 'Safe conclusion.'}}};
+    const evaluatePrivacy = () => wrapper.evaluateSemanticConditionReport!({query, report, condition: 'A0', sourceRoot}).privacyPassed;
+    expect(evaluatePrivacy()).toBe(true);
+    report.summary.terminalAnalysis.conclusion = canary;
+    expect(evaluatePrivacy()).toBe(false);
+    report.summary.terminalAnalysis.conclusion = 'Safe conclusion.';
+    report.summary.forbiddenTextMatches[canary] = true;
+    expect(evaluatePrivacy()).toBe(false);
+  });
+
   it('keeps Claude independently available when local Claude auth exists', () => {
     expect(wrapper.realProviderAvailability?.(
       'claude-agent-sdk',
@@ -381,11 +482,14 @@ describe('real-provider semantic delta wrapper contract', () => {
     expect(forbidden).toEqual(expect.arrayContaining([
       'backend/tests/e2e/context-fixtures/app/StartupHooks.kt',
       'StartupHooks.kt',
-      'StartupHooks.initializeOnMainThread',
-      'Application.onCreate',
       '[Code:',
     ]));
     expect(forbidden).not.toContain('avoid synchronous disk I/O before first frame');
+    // This symbol is already public trace-marker text, not source-only evidence.
+    expect(forbidden).not.toContain('StartupHooks.initializeOnMainThread');
+    // Android lifecycle names are public background knowledge, not a private-source canary.
+    expect(forbidden).not.toContain('Application.onCreate');
+    expect(forbidden.every(text => !'StartupHooks.initializeOnMainThread#before-first-frame-sync-policy'.includes(String(text)))).toBe(true);
     expect(args).toContain('--expectation-json');
 
     const evaluated = wrapper.evaluateSemanticConditionReport?.({
@@ -518,10 +622,17 @@ describe('real-provider task fact configuration', () => {
 
   it.each(['pending', 'attempted', 'not_needed'])('accepts trace-only output independently of optional source audit state %s', status => {
     const query = wrapper.semanticDeltaQueries().find((item: any) => item.kind === 'quantitative-only');
-    const report = {taskVerification: {checks: {originalClaimsVerified: true},
-      facts: {source_marker_duration: {matched: true, proposition: 'proved'}}, uncoveredFacets: []},
+    const report = {traceId: 'trace', taskVerification: {checks: {originalClaimsVerified: true, 'fact:source_marker_duration': true},
+      facts: {source_marker_duration: {matched: true, proposition: 'proved',
+        matchedClaimIds: ['duration'], matchedAnchorIds: ['anchor-duration']}}, uncoveredFacets: []},
       summary: {analysisCompletedSourceUseStatus: status, toolCallCounts: {lookup_app_source: 1},
-        terminalAnalysis: {conclusionContract: {claims: [{kind: 'numeric', semantics: {scope: {population: 'cited_rows'}}}]}}}};
+        terminalAnalysis: {conclusionContract: {claims: [{id: 'duration', kind: 'numeric', semantics: {scope: {population: 'cited_rows'}}}]},
+          claimSupport: [{claimId: 'duration', anchors: [{anchorId: 'anchor-duration', evidenceRefId: 'data-duration',
+            context: {traceId: 'trace', traceSide: 'current'}}]}],
+          claimVerificationResult: {schemaVersion: 'claim_verifier@2', claimResults: [{claimId: 'duration', status: 'verified',
+            deterministicProof: {kind: 'numeric_cell', status: 'proved', anchorIds: ['anchor-duration'], evidenceRefIds: ['data-duration']},
+            propositionCoverage: {status: 'complete', uncovered: []},
+            referenceCells: [{anchorId: 'anchor-duration', evidenceRefId: 'data-duration', column: 'dur', status: 'matched'}]}]}}}};
     expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}).sourceSemanticPassed).toBe(true);
     report.summary.terminalAnalysis.conclusionContract.claims[0].kind = 'recommendation';
     expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}).sourceSemanticPassed).toBe(false);
@@ -529,13 +640,81 @@ describe('real-provider task fact configuration', () => {
 
   it('accepts verified source bindings after a located lookup without a corroborated audit ceremony', () => {
     const query = wrapper.semanticDeltaQueries()[0];
-    const report = {taskVerification: {checks: {originalClaimsVerified: true},
-      facts: {source_marker_duration: {matched: true, proposition: 'proved'}}, uncoveredFacets: []},
+    const report = {traceId: 'trace', analysisContext: {codebaseIds: ['cb-source']},
+      taskVerification: {checks: {originalClaimsVerified: true, 'fact:source_marker_duration': true},
+      facts: {source_marker_duration: {matched: true, proposition: 'proved',
+        matchedClaimIds: ['trace-duration'], matchedAnchorIds: ['anchor-marker']}}, uncoveredFacets: []},
       summary: {analysisCompletedSourceUseStatus: 'located', analysisCompletedSourceReferenceCount: 1,
         analysisCompletedSourceBindingCount: 1, analysisCompletedSourceClaimVerifierStatus: 'passed',
         analysisCompletedSourceReferenceMembershipPassed: true, analysisCompletedSourceMechanismStatuses: ['compatible'],
-        terminalAnalysis: {conclusionContract: {sourceUseDecision: {references: [{filePath: 'StartupHooks.kt',
-          symbol: 'StartupHooks.initializeOnMainThread', lineRange: {start: 9, end: 9}}]}}}}};
-    expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}).sourceSemanticPassed).toBe(true);
+        analysisCompletedVerifiedSourceBindings: [{claimId: 'trace-duration', mechanismStatus: 'compatible',
+          sourceReferenceIds: ['source-ref-v1-issued'], traceEvidenceRefIds: ['data-marker']}],
+        terminalAnalysis: {claimSupport: [{claimId: 'trace-duration', anchors: [{anchorId: 'anchor-marker',
+          evidenceRefId: 'data-marker', context: {traceId: 'trace', traceSide: 'current'},
+          timeRange: {startTs: '1000', endTs: '42001000', unit: 'ns'}, identity: {upid: 10, utid: 11},
+          cells: [{column: 'dur', rowSelector: {slice_id: 50, track_id: 5}}]}]}],
+          claimVerificationResult: {schemaVersion: 'claim_verifier@2', claimResults: [{claimId: 'trace-duration', status: 'verified',
+            deterministicProof: {kind: 'numeric_cell', status: 'proved', anchorIds: ['anchor-marker'], evidenceRefIds: ['data-marker']},
+            propositionCoverage: {status: 'complete', uncovered: []},
+            referenceCells: [{anchorId: 'anchor-marker', evidenceRefId: 'data-marker', column: 'dur', status: 'matched'}]}]},
+          conclusionContract: {claims: [{id: 'trace-duration', kind: 'numeric'}], sourceUseDecision: {references: [{id: 'source-ref-v1-issued',
+          codebaseId: 'cb-source', lookupKind: 'body', filePath: 'StartupHooks.kt', lineRange: {start: 1, end: 20}}]}}}}};
+    expect(wrapper.evaluateSemanticConditionReport({query, report, condition: 'A3', sourceRoot}))
+      .toMatchObject({sourceSemanticPassed: true, privacyCanaryCovered: true});
+    const reference = report.summary.terminalAnalysis.conclusionContract.sourceUseDecision.references[0];
+    for (const changed of [{codebaseId: 'cb-other'}, {filePath: 'other/StartupHooks.kt'},
+      {lookupKind: 'metadata'}, {lineRange: {start: 10, end: 20}}]) {
+      const invalid = structuredClone(report);
+      invalid.summary.terminalAnalysis.conclusionContract.sourceUseDecision.references[0] = {...reference, ...changed};
+      expect(wrapper.evaluateSemanticConditionReport({query, report: invalid, condition: 'A2', sourceRoot}).sourceIdentityPassed).toBe(false);
+    }
+    for (const changed of [{sourceReferenceIds: ['source-ref-v1-unrelated']}, {claimId: 'unrelated-claim'},
+      {traceEvidenceRefIds: ['data-unrelated']}, {mechanismStatus: 'unverified'}]) {
+      const invalid = structuredClone(report);
+      invalid.summary.analysisCompletedVerifiedSourceBindings[0] = {
+        ...invalid.summary.analysisCompletedVerifiedSourceBindings[0], ...changed};
+      expect(wrapper.evaluateSemanticConditionReport({query, report: invalid, condition: 'A2', sourceRoot}).sourceIdentityPassed).toBe(false);
+    }
+    // A mechanism claim may be distinct from the numeric duration claim, while
+    // still using verified evidence for the same occurrence.
+    const mechanism = structuredClone(report);
+    const anchor = {...structuredClone(mechanism.summary.terminalAnalysis.claimSupport[0].anchors[0]),
+      anchorId: 'anchor-mechanism', evidenceRefId: 'data-mechanism'};
+    mechanism.summary.terminalAnalysis.claimSupport.push({claimId: 'mechanism', anchors: [anchor]});
+    mechanism.summary.analysisCompletedVerifiedSourceBindings[0].claimId = 'mechanism';
+    mechanism.summary.analysisCompletedVerifiedSourceBindings[0].traceEvidenceRefIds = ['data-mechanism'];
+    expect(wrapper.evaluateSemanticConditionReport({query, report: mechanism, condition: 'A2', sourceRoot}).sourceIdentityPassed).toBe(true);
+    for (const changed of [
+      {timeRange: {...anchor.timeRange, startTs: '2000'}},
+      {timeRange: {...anchor.timeRange, endTs: '1100'}},
+      {identity: {...anchor.identity, utid: 12}},
+      {timeRange: {...anchor.timeRange, endTs: '1100'}, identity: {...anchor.identity, utid: 12}},
+      {identity: {upid: 10, utid: undefined}},
+      {cells: [{...anchor.cells[0], rowSelector: {slice_id: 51, track_id: 5}}]},
+      {cells: [{...anchor.cells[0], rowSelector: {slice_id: 50, track_id: 6}}]},
+    ]) {
+      const invalid = structuredClone(mechanism);
+      Object.assign(invalid.summary.terminalAnalysis.claimSupport[1].anchors[0], changed);
+      expect(wrapper.evaluateSemanticConditionReport({query, report: invalid, condition: 'A2', sourceRoot}))
+        .toMatchObject({sourceIdentityPassed: false, sourceSemanticPassed: false});
+    }
+  });
+
+  it('requires a row locator for cross-claim reuse of a multi-row result set', () => {
+    const oracle = {anchorId: 'anchor-duration', evidenceRefId: 'data-slices',
+      context: {traceId: 'trace', traceSide: 'current'},
+      cells: [{column: 'dur', rowIndex: 0}]};
+    const sameRow = {...structuredClone(oracle), anchorId: 'anchor-mechanism'};
+    expect(wrapper.sameTraceOccurrence(sameRow, oracle)).toBe(true);
+    sameRow.cells[0].rowIndex = 1;
+    expect(wrapper.sameTraceOccurrence(sameRow, oracle)).toBe(false);
+    // Identical anchor ids must not override a contradictory concrete row.
+    sameRow.anchorId = oracle.anchorId;
+    expect(wrapper.sameTraceOccurrence(sameRow, oracle)).toBe(false);
+    expect(wrapper.sameTraceOccurrence({...sameRow, anchorId: 'other', cells: []}, oracle)).toBe(false);
+    const selected = {...oracle, cells: [{column: 'dur', rowSelector: {slice_id: 50, track_id: 5}}]};
+    expect(wrapper.sameTraceOccurrence({...selected, anchorId: 'mechanism'}, selected)).toBe(true);
+    expect(wrapper.sameTraceOccurrence({...selected, anchorId: 'mechanism',
+      cells: [{column: 'dur', rowSelector: {slice_id: 51, track_id: 5}}]}, selected)).toBe(false);
   });
 });

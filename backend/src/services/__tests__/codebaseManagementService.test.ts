@@ -68,6 +68,32 @@ function registerApp(displayName = 'App') {
   });
 }
 
+describe('live on-demand source availability', () => {
+  it('keeps an unindexed registered root available and refreshes a removed root', async () => {
+    const ref = registerApp();
+    expect(await service.onDemandAvailable(ref.codebaseId, DEFAULT_SCOPE)).toBe(true);
+    expect((await service.list(DEFAULT_SCOPE))[0]).toMatchObject({rootAvailable: true, activeIndexState: 'none'});
+    fs.renameSync(ref.rootRealpath, `${ref.rootRealpath}-moved`);
+    expect(await service.onDemandAvailable(ref.codebaseId, DEFAULT_SCOPE)).toBe(false);
+    expect((await service.list(DEFAULT_SCOPE))[0].rootAvailable).toBe(false);
+  });
+
+  it('does not treat an existing root outside the current allowlist as readable', async () => {
+    const ref = registerApp();
+    const restricted = new CodebaseManagementService({registry, store, gate: new PathSecurityGate({allowlistRoots: []})});
+    expect(await restricted.onDemandAvailable(ref.codebaseId, DEFAULT_SCOPE)).toBe(false);
+    expect((await restricted.list(DEFAULT_SCOPE))[0].rootAvailable).toBe(false);
+    expect(await service.onDemandAvailable(ref.codebaseId, OTHER_SCOPE)).toBe(false);
+  });
+
+  it('does not turn a root replaced by a regular file into an available source', async () => {
+    const ref = registerApp();
+    fs.renameSync(ref.rootRealpath, `${ref.rootRealpath}-moved`);
+    fs.writeFileSync(ref.rootRealpath, 'not a directory');
+    expect(await service.onDemandAvailable(ref.codebaseId, DEFAULT_SCOPE)).toBe(false);
+  });
+});
+
 function coverage(selectionPolicyRevision = 1): IndexCoverage {
   return {
     selectionPolicyRevision,

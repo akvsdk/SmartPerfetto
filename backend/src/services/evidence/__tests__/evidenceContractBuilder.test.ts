@@ -10,6 +10,7 @@ import {
   type QueryReviewV1,
 } from '../../../types/queryReviewContract';
 import {buildEvidenceContract} from '../evidenceContractBuilder';
+import {evidenceValuesMatch} from '../valueComparison';
 import type {EvidenceScopeProvenanceV1, IdentityResolutionV1} from '../../../types/identityContract';
 
 const queryReview: QueryReviewV1 = {
@@ -29,6 +30,55 @@ const queryReview: QueryReviewV1 = {
 };
 
 describe('evidenceContractBuilder', () => {
+  it('matches SQL null only to explicit null while keeping non-null legacy comparisons', () => {
+    expect(evidenceValuesMatch(null, null)).toBe(true);
+    for (const value of [undefined, 0, false, '', 'null']) {
+      expect(evidenceValuesMatch(null, value)).toBe(false);
+      expect(evidenceValuesMatch(value, null)).toBe(false);
+    }
+    expect(evidenceValuesMatch('54', 54)).toBe(true);
+    expect(evidenceValuesMatch(1, 1.00000001)).toBe(true);
+  });
+
+  it('retains nullable relation endpoint cells and rejects non-null substitutions in either direction', () => {
+    const cases = [
+      {expected: null, actual: null},
+      ...[0, false, '', 'null'].flatMap(value => [
+        {expected: null, actual: value}, {expected: value, actual: null},
+      ]),
+    ];
+    for (const {expected, actual} of cases) {
+      const envelope = createDataEnvelope({columns: ['io_wait'], rows: [[actual]]}, {
+        type: 'sql_result', source: 'execute_sql', title: 'Nullable scheduler evidence',
+        evidenceRefId: 'data:null-state', traceId: 'trace-null', traceSide: 'current',
+      });
+      const built = buildEvidenceContract({dataEnvelopes: [envelope], relationCandidates: [{
+        schemaVersion: 'evidence_relation_candidate@1', id: 'relation:null-state',
+        kind: 'derived', direction: 'subject_to_object',
+        subject: {evidenceRefId: 'data:null-state', rowIndex: 0, column: 'io_wait', value: expected},
+      }]});
+      expect(built.warnings).toEqual([]);
+      expect(built.anchors[0].cells![0]).toMatchObject({value: expected, actualValue: actual});
+      expect(built.relations[0]).toMatchObject(expected === actual
+        ? {verificationStatus: 'candidate', reasonCode: 'derived_not_verified'}
+        : {verificationStatus: 'rejected', reasonCode: 'relation_endpoint_value_mismatch'});
+    }
+  });
+
+  it('still rejects null relation selectors and aggregate proposal values', () => {
+    const base = {schemaVersion: 'evidence_relation_candidate@1', id: 'relation:null-schema',
+      kind: 'derived', direction: 'subject_to_object',
+      subject: {evidenceRefId: 'data:null-state', rowIndex: 0, column: 'io_wait', value: null}};
+    for (const candidate of [
+      {...base, subject: {evidenceRefId: 'data:null-state', rowSelector: {io_wait: null}}},
+      {...base, value: null},
+    ]) {
+      const built = buildEvidenceContract({relationCandidates: [candidate]} as any);
+      expect(built.relations).toEqual([]);
+      expect(built.warnings.length).toBeGreaterThan(0);
+    }
+  });
+
   describe('field scope provenance', () => {
     const target = {mode: 'exact_upid' as const, upid: 42, traceId: 'trace-a',
       traceSide: 'current' as const, identityRefId: 'identity:42'};

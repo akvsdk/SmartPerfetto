@@ -10,6 +10,9 @@
 
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import { SkillEvaluator, createSkillEvaluator, getTestTracePath, describeWithTrace } from './runner';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 
 // 使用 Android trace 文件测试 - 需要有 FrameTimeline 数据的 Android trace.
 // Fixture removed in commit 52feac55; describeWithTrace skips when missing.
@@ -541,5 +544,88 @@ describeWithTrace('scrolling_analysis input evidence on canonical trace', 'scrol
     expect(row).toHaveProperty('input_slice_ms');
     expect(row).toHaveProperty('input_events_json');
     expect(row).toHaveProperty('input_slices_json');
+  }, 120000);
+});
+
+describe('continuous main-thread work on canonical traces', () => {
+  const steps = ['main_thread_work_summary', 'main_thread_work_tasks', 'main_thread_work_sources', 'main_thread_work_cadence'];
+  it('delivers inter-frame tasks from the full scrolling Skill without target FrameTimeline rows', async () => {
+    const evaluator = createSkillEvaluator('scrolling_analysis');
+    try {
+      await evaluator.loadTrace(path.resolve(process.cwd(), '../Trace/.generated/constructed/main-thread-frame-work/trace.pftrace'));
+      const frameRows = await evaluator.executeSQL(`SELECT COUNT(*) AS count FROM actual_frame_timeline_slice a
+        JOIN process p ON p.upid=a.upid WHERE p.name='com.smartperfetto.fixture'`);
+      expect(frameRows.rows[0][0]).toBe(0);
+      const result = await evaluator.executeRuntimeSkill({package:'com.smartperfetto.fixture', enable_expert_probes:false});
+      expect(result.error).toBeUndefined();
+      expect(result.success).toBe(true);
+      const tasks = result.rawResults?.main_thread_work_tasks;
+      expect(tasks?.success).toBe(true);
+      expect(tasks?.data).toEqual(expect.arrayContaining([expect.objectContaining({
+        task_name:'ContentLoader$MainHandler: initializeContent', phase:'between_doFrames',
+        outside_doframe_ms:30,running_ms:28,runnable_ms:2,
+      })]));
+      expect((result.rawResults?.main_thread_work_sources.data as any[])?.length).toBeGreaterThan(0);
+      expect(result.displayResults.some(row => row.stepId === 'main_thread_work_tasks')).toBe(true);
+    } finally { await evaluator.cleanup(); }
+  }, 120000);
+  it.each([
+    'lacunh_heavy.pftrace', 'launch_light.pftrace',
+    'scroll_Standard-AOSP-App-Without-PreAnimation.pftrace',
+    'scroll-demo-customer-scroll.pftrace', 'Scroll-Flutter-327-TextureView.pftrace',
+    'Scroll-Flutter-SurfaceView-Wechat-Wenyiwen.pftrace',
+  ])('preserves full-window coverage and bounded task evidence: %s', async trace => {
+    const evaluator = createSkillEvaluator('scrolling_analysis');
+    try {
+      await evaluator.loadTrace(getTestTracePath(trace));
+      const candidates = await evaluator.executeSQL(`
+        SELECT p.name, p.upid FROM process p
+        JOIN thread t ON t.upid=p.upid AND t.tid=p.pid
+        JOIN thread_track tt ON tt.utid=t.utid
+        JOIN slice s ON s.track_id=tt.id
+        WHERE p.name GLOB 'com.*' AND s.dur>0
+        GROUP BY p.upid
+        ORDER BY SUM(s.name GLOB 'Choreographer#doFrame*') DESC, COUNT(*) DESC LIMIT 1`);
+      expect(candidates.error).toBeFalsy();
+      expect(candidates.rows).toHaveLength(1);
+      const packageName = String(candidates.rows[0][0]);
+      const full = await evaluator.executeStepSequence(steps, {package: packageName});
+      for (const step of full) expect({step: step.stepId, success: step.success, error: step.error})
+        .toEqual({step: step.stepId, success: true, error: undefined});
+      const windows = full[0].data.filter(row => row.phase === 'window');
+      expect(windows.length).toBeGreaterThan(0);
+      for (const row of windows) {
+        expect(typeof row.window_start_ts).toBe('string');
+        expect(typeof row.window_end_ts).toBe('string');
+        expect(row.annotated_wall_ms + row.unannotated_wall_ms).toBeCloseTo(row.wall_ms, 5);
+        expect(row.known_state_ms + row.unknown_state_ms).toBeCloseTo(row.wall_ms, 5);
+        const phases = full[0].data.filter(value => value.utid === row.utid && value.phase !== 'window');
+        expect(phases.reduce((sum, value) => sum + value.wall_ms, 0)).toBeCloseTo(row.wall_ms, 5);
+      }
+      expect(full[1].data.length).toBeLessThanOrEqual(20);
+      for (const task of full[1].data) {
+        expect(typeof task.start_ts).toBe('string');
+        expect(task.running_ms === null || task.running_ms <= task.wall_ms + 0.000001).toBe(true);
+        expect(task.returned_task_count).toBeLessThanOrEqual(task.eligible_task_count);
+      }
+      const start = BigInt(windows[0].window_start_ts);
+      const end = BigInt(windows[0].window_end_ts);
+      const boundedEnd = end < start + 500_000_000n ? end : start + 500_000_000n;
+      const bounded = await evaluator.executeStepSequence(steps, {
+        package: packageName, start_ts: String(start), end_ts: String(boundedEnd),
+      });
+      expect(bounded.every(step => step.success)).toBe(true);
+      const sources = ['skills/composite/scrolling_analysis.skill.yaml',
+        'skills/fragments/main_thread_work.sql', 'skills/fragments/main_thread_work_tasks.sql',
+        'skills/fragments/main_thread_work_cadence.sql'];
+      const evidence = {trace, package: packageName, selectedUpid: candidates.rows[0][1],
+        sourceSha256: Object.fromEntries(sources.map(file => [file,
+          crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')])),
+        fullWindow: full.map(step => ({...step, outputBytes: Buffer.byteLength(JSON.stringify(step.data))})),
+        boundedWindow: bounded.map(step => ({...step, outputBytes: Buffer.byteLength(JSON.stringify(step.data))}))};
+      const output = path.join(process.cwd(), 'test-output/main-thread-work-20260908/real-traces');
+      fs.mkdirSync(output, {recursive: true});
+      fs.writeFileSync(path.join(output, `${trace}.json`), JSON.stringify(evidence, null, 2));
+    } finally { await evaluator.cleanup(); }
   }, 120000);
 });

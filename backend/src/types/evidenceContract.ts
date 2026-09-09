@@ -77,6 +77,8 @@ export type ClaimKindV1 =
 
 export interface EvidenceContextV1 {
   traceId: string;
+  /** Original execution capture, assigned only while binding an issued evidence read. */
+  captureId?: string;
   traceSide?: EvidenceTraceSide;
   paneSide?: EvidencePaneSide;
   toolCallId?: string;
@@ -172,7 +174,7 @@ export interface EvidenceRelationEndpointV1 {
   rowIndex?: number;
   rowSelector?: Record<string, string | number | boolean>;
   column?: string;
-  value?: string | number | boolean;
+  value?: string | number | boolean | null;
 }
 
 export interface EvidenceRelationProofBindingV1 {

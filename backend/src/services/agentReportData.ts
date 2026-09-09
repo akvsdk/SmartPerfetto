@@ -35,7 +35,7 @@ import {
   projectSafeSourceProvenance,
   type SafeSourceProvenanceProjection,
 } from './codebase/sourceClaimVerifier';
-import type {SourceUseDecisionV1} from './codebase/sourceUseDecision';
+import {sanitizeSourceClaimBindings, type SourceUseDecisionV1} from './codebase/sourceUseDecision';
 
 type AgentReportSourceContext = AgentDrivenReportData['sourceContext'];
 const MAX_REPORT_SOURCE_ID = 160;
@@ -219,6 +219,21 @@ export function buildAgentDrivenReportData(
       ? {actualSourceUseDecision: result.sourceUseDecision}
       : {}),
   });
+  if (sourceProvenance) {
+    const bindingIdentity = (binding: {claimId: string; sourceReferenceIds: string[]; traceEvidenceRefIds: string[]}) =>
+      JSON.stringify([binding.claimId, [...binding.sourceReferenceIds].sort(), [...binding.traceEvidenceRefIds].sort()]);
+    const verifiedBindings = new Map(sanitizeSourceClaimBindings(cumulativeResult.sourceClaimVerificationResult?.bindings)
+      .map(binding => [bindingIdentity(binding), binding]));
+    // Keep the actual verifier's mechanism verdict. Model declarations in the
+    // conclusion contract are provenance candidates, not accepted bindings.
+    sourceProvenance.sourceClaimBindings = sourceProvenance.sourceClaimBindings.flatMap(binding => {
+      const verified = verifiedBindings.get(bindingIdentity(binding));
+      if (!verified) return [];
+      const mechanismStatus = sourceProvenance.sourceUseDecision.codeAwareMode === 'metadata_only' &&
+        verified.mechanismStatus === 'corroborated' ? 'compatible' : verified.mechanismStatus;
+      return [{...binding, mechanismStatus}];
+    });
+  }
 
   return {
     traceId: session.traceId,

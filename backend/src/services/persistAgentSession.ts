@@ -136,13 +136,13 @@ export interface PersistAgentTurnInput {
 
 function buildPersistedAssistantMessage(result: PersistAgentTurnInput['result']): string {
   const conclusion = result.conclusion || '';
-  if (result.partial !== true) return conclusion.substring(0, 10000);
+  if (result.partial !== true) return conclusion;
   const warning = [
     '> **结果完整性提示**',
     `> ${result.terminationMessage || '本次分析结果已标记为 partial，结论可能不完整。'}`,
     '',
   ].join('\n');
-  return `${warning}${conclusion}`.substring(0, 10000);
+  return `${warning}${conclusion}`;
 }
 
 function utf8Bytes(value: unknown): number {
@@ -459,10 +459,12 @@ function persistAgentState(input: PersistAgentTurnInput, appendTurnMessages: boo
                     conclusion: result.conclusion,
                     success: session.result?.success !== false,
                     language: outputLanguage,
+                    state: result,
                   }),
                   terminationMessage: projectPrivateTerminationMessage(
                     result.terminationMessage,
                     outputLanguage,
+                    result,
                   ),
                 })
               : buildPersistedAssistantMessage(result),

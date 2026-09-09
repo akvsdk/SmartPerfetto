@@ -31,6 +31,7 @@ import {
   type AnalyzeManagedSession,
 } from '../../assistant/application/agentAnalyzeSessionService';
 import { getTraceProcessorService } from '../../services/traceProcessorService';
+import {prepareAnalysisRunTraceProcessorLeases, type AnalysisRunTraceProcessorLeases} from '../../services/analysisRunTraceProcessorLease';
 import { createSessionLogger } from '../../services/sessionLogger';
 import { SessionPersistenceService } from '../../services/sessionPersistenceService';
 import { getHTMLReportGenerator } from '../../services/htmlReportGenerator';
@@ -111,6 +112,13 @@ import {
 } from '../../services/codebase/analysisSourceActivationPolicy';
 import {resetRuntimeForSourceActivation} from '../../services/codebase/analysisSourceContextTransition';
 import type {AnalysisSourceSupplementOutcome} from '../../services/codebase/analysisSourceSupplement';
+import {projectSafeSourceProvenance} from '../../services/codebase/sourceClaimVerifier';
+import {
+  sanitizeSourceReference,
+  sanitizeSourceUseDecision,
+  type SourceReferenceV1,
+  type SourceUseDecisionV1,
+} from '../../services/codebase/sourceUseDecision';
 import {
   privateAnalysisFailureMessage,
   privateAnalysisQueryMessage,
@@ -603,8 +611,15 @@ export class CliAnalyzeService {
     });
     const cliTurnPath = primaryPrivateKnowledge ? undefined : input.resolveCliTurnPath(sessionId, input.turn);
 
+    let traceProcessorLeases: AnalysisRunTraceProcessorLeases | undefined;
     try {
-      return await withRunManifestLifecycle(runManifestLifecycle, async () => {
+      traceProcessorLeases = await prepareAnalysisRunTraceProcessorLeases({
+        service: getTraceProcessorService(), scope: resolvedScope, runId: run.runId, sessionId,
+        currentTraceId: traceId, referenceTraceId: effectiveReferenceTraceId,
+        signal: run.controller.signal, assertCurrent: assertActive,
+        onInvalidated: error => run.controller.abort(error),
+      });
+      return await traceProcessorLeases.run(() => withRunManifestLifecycle(runManifestLifecycle, async () => {
         // Surface sessionId to the caller now, before analyze() starts emitting
         // events. Without this, callers must buffer events until runTurn resolves,
         // which accumulates the entire analyze run's output in memory.
@@ -628,7 +643,7 @@ export class CliAnalyzeService {
             primaryPrivateKnowledge,
             outputLanguage,
           );
-          if (!shouldExposeLiveStreamingUpdate(projectedUpdate)) return;
+          if (!projectedUpdate || !shouldExposeLiveStreamingUpdate(projectedUpdate)) return;
           try {
             assertActive();
             input.onEvent(projectedUpdate);
@@ -875,7 +890,7 @@ export class CliAnalyzeService {
           codeAwareMode: effectiveCodeAwareMode,
           privateKnowledge: primaryPrivateKnowledge,
         };
-      });
+      }));
     } catch (error) {
       if (runManifestLifecycle.state === 'collecting') {
         try {
@@ -892,6 +907,7 @@ export class CliAnalyzeService {
       }
       throw error;
     } finally {
+      traceProcessorLeases?.release();
       runManifestLifecycle.dispose();
     }
   }
@@ -1048,20 +1064,22 @@ async function runCliE2eFakeTurn(input: RunTurnInput, traceId: string): Promise<
   });
 
   const totalDurationMs = Math.max(1, Date.now() - startedAt);
-  const conclusionContract = codeAware.codeReferences.length > 0
+  const conclusionContract: AnalysisResult['conclusionContract'] = codeAware.sourceUseDecision
     ? {
         schemaVersion: 'conclusion_contract_v1',
         mode: 'focused_answer',
         conclusions: [{
           rank: 1,
-          statement: 'Deterministic code-aware CLI E2E conclusion references source-level CodeRefs.',
+          statement: codeAware.codeReferences.length > 0
+            ? 'Deterministic code-aware CLI E2E conclusion references source-level CodeRefs.'
+            : 'Deterministic code-aware CLI E2E lookup returned no source locations.',
           confidencePercent: 100,
         }],
         clusters: [],
-        evidenceChain: [{
+        evidenceChain: codeAware.codeReferences.length > 0 ? [{
           conclusionId: 'cli-e2e-code-aware',
           text: 'CodeRef metadata was resolved from the registered local codebase RAG store.',
-        }],
+        }] : [],
         claims: [],
         uncertainties: [],
         nextSteps: [],
@@ -1069,8 +1087,9 @@ async function runCliE2eFakeTurn(input: RunTurnInput, traceId: string): Promise<
           confidencePercent: 100,
           rounds: 1,
         },
-        codeReferences: codeAware.codeReferences,
-      } as AnalysisResult['conclusionContract'] & {codeReferences: CliE2eFakeCodeReference[]}
+        sourceReferences: codeAware.codeReferences,
+        sourceUseDecision: codeAware.sourceUseDecision,
+      }
     : undefined;
   const claimSupport: NonNullable<AnalysisResult['claimSupport']> = [];
   const claimVerificationResult: NonNullable<AnalysisResult['claimVerificationResult']> = {
@@ -1101,6 +1120,7 @@ async function runCliE2eFakeTurn(input: RunTurnInput, traceId: string): Promise<
       query: input.query,
       conclusion: fakeConclusion,
       conclusionContract,
+      sourceUseDecision: codeAware.sourceUseDecision,
       claimSupport,
       claimVerificationResult,
       identityResolutions: [],
@@ -1122,6 +1142,10 @@ async function runCliE2eFakeTurn(input: RunTurnInput, traceId: string): Promise<
       hypotheses: [],
       conclusion: fakeConclusion,
       ...(conclusionContract ? { conclusionContract } : {}),
+      ...(codeAware.sourceUseDecision ? {
+        sourceUseDecision: codeAware.sourceUseDecision,
+        sourceReferences: codeAware.codeReferences,
+      } : {}),
       claimSupport,
       claimVerificationResult,
       identityResolutions: [],
@@ -1148,22 +1172,19 @@ async function runCliE2eFakeTurn(input: RunTurnInput, traceId: string): Promise<
       query: privateAnalysisQueryMessage(outputLanguage),
       conclusion: durableResult.conclusion,
       conclusionContract: durableResult.conclusionContract,
+      sourceUseDecision: durableResult.sourceUseDecision,
       claimSupport: [],
+      claimVerificationResult: durableResult.claimVerificationResult,
       identityResolutions: [],
       totalDurationMs,
     }),
   };
 }
 
-interface CliE2eFakeCodeReference {
-  chunkId: string;
-  codebaseId: string;
-  filePath: string;
-  lineRange?: {start: number; end: number};
-  symbol?: string;
-}
-
-function buildCliE2eFakeCodeAwareContext(input: RunTurnInput): {codeReferences: CliE2eFakeCodeReference[]} {
+function buildCliE2eFakeCodeAwareContext(input: RunTurnInput): {
+  codeReferences: SourceReferenceV1[];
+  sourceUseDecision?: SourceUseDecisionV1;
+} {
   if (!input.codeAwareMode || input.codeAwareMode === 'off' || !input.codebaseIds?.length) {
     return {codeReferences: []};
   }
@@ -1180,33 +1201,54 @@ function buildCliE2eFakeCodeAwareContext(input: RunTurnInput): {codeReferences: 
     'LaunchConfig',
     'LoadConfig',
   ];
-  const refs = new Map<string, CliE2eFakeCodeReference>();
+  const refs = new Map<string, SourceReferenceV1>();
+  const selectedCodebaseIds = [...new Set(input.codebaseIds)];
+  const queriedCodebaseIds = new Set<string>();
 
-  for (const codebaseId of input.codebaseIds) {
+  for (const codebaseId of selectedCodebaseIds) {
     for (const symbol of symbols) {
+      queriedCodebaseIds.add(codebaseId);
       const resolved = resolver.resolveApp({symbol, codebaseId, topK: 2});
+      if (!resolved.success) continue;
       for (const candidate of resolved.candidates) {
         const ref = candidateToCodeReference(candidate, codebaseId);
-        if (ref) refs.set(ref.chunkId, ref);
+        if (ref) refs.set(ref.id, ref);
       }
     }
   }
 
-  return {codeReferences: Array.from(refs.values()).slice(0, 8)};
+  const codeReferences = Array.from(refs.values()).slice(0, 8);
+  // This records the test-only resolver execution, never a verified source claim
+  // or a production MCP ledger. Fixed symbols and topK cannot prove full coverage.
+  const sourceUseDecision = sanitizeSourceUseDecision({
+    schemaVersion: 'source_use_decision@1',
+    codeAwareMode: input.codeAwareMode,
+    selectedCodebaseIds,
+    status: codeReferences.length > 0 ? 'located' : 'attempted',
+    attemptedTools: ['SymbolResolver.resolveApp'],
+    queriedCodebaseIds: [...queriedCodebaseIds],
+    usedCodebaseIds: [...new Set(codeReferences.map(reference => reference.codebaseId))],
+    coverageComplete: false,
+    references: codeReferences,
+  }, selectedCodebaseIds);
+  return {codeReferences: sourceUseDecision?.references ?? [], sourceUseDecision};
 }
 
 function candidateToCodeReference(
   candidate: ResolvedSymbolCandidate,
-  fallbackCodebaseId: string,
-): CliE2eFakeCodeReference | undefined {
-  if (!candidate.chunkId || !candidate.filePath) return undefined;
-  return {
+  queriedCodebaseId: string,
+): SourceReferenceV1 | undefined {
+  if (!candidate.chunkId || !candidate.filePath || candidate.codebaseId !== queriedCodebaseId) {
+    return undefined;
+  }
+  return sanitizeSourceReference({
     chunkId: candidate.chunkId,
-    codebaseId: candidate.codebaseId ?? fallbackCodebaseId,
+    codebaseId: candidate.codebaseId,
     filePath: candidate.filePath,
     ...(candidate.lineRange ? {lineRange: candidate.lineRange} : {}),
     ...(candidate.symbol ? {symbol: candidate.symbol} : {}),
-  };
+    lookupKind: 'metadata',
+  });
 }
 
 function buildCliE2eFakeReportHtml(input: {
@@ -1216,11 +1258,16 @@ function buildCliE2eFakeReportHtml(input: {
   query: string;
   conclusion: string;
   conclusionContract?: unknown;
+  sourceUseDecision?: SourceUseDecisionV1;
   claimSupport?: AnalysisResult['claimSupport'];
   claimVerificationResult?: AnalysisResult['claimVerificationResult'];
   identityResolutions?: AnalysisResult['identityResolutions'];
   totalDurationMs: number;
 }): string {
+  const sourceProvenance = projectSafeSourceProvenance({
+    conclusionContract: input.conclusionContract,
+    actualSourceUseDecision: input.sourceUseDecision,
+  });
   return getHTMLReportGenerator().generateAgentDrivenHTML({
     traceId: input.traceId,
     query: input.query,
@@ -1240,6 +1287,7 @@ function buildCliE2eFakeReportHtml(input: {
       hypotheses: [],
       conclusion: input.conclusion,
       ...(input.conclusionContract ? {conclusionContract: input.conclusionContract} : {}),
+      ...(sourceProvenance ? {sourceUseDecision: sourceProvenance.sourceUseDecision} : {}),
       claimSupport: input.claimSupport,
       claimVerificationResult: input.claimVerificationResult,
       identityResolutions: input.identityResolutions,
@@ -1249,6 +1297,12 @@ function buildCliE2eFakeReportHtml(input: {
     },
     hypotheses: [],
     dialogue: [],
+    ...(sourceProvenance ? {
+      sourceContext: {
+        selected: sourceProvenance.sourceUseDecision.selectedCodebaseIds.map(codebaseId => ({codebaseId})),
+        ...sourceProvenance,
+      },
+    } : {}),
     timestamp: Date.now(),
   });
 }

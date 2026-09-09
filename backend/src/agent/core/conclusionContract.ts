@@ -2,7 +2,9 @@
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
 
-import type {CaseKnowledgeReportRecommendation} from '../../types/caseKnowledge';
+import type {CaseKnowledgeRecommendation, CaseKnowledgeReportRecommendation} from '../../types/caseKnowledge';
+import {sanitizeSourceUseDecision, sanitizeSourceReferences, sanitizeSourceClaimBindings, isSourceClaimBindingsDeclaration,
+  MAX_SOURCE_REFERENCE_ID_LENGTH, MAX_SOURCE_REFERENCE_PATH_LENGTH} from '../../services/codebase/sourceUseDecision';
 import type {EvidenceRelationCandidateV1} from '../../types/evidenceContract';
 import type {
   SourceClaimBindingV1,
@@ -58,7 +60,7 @@ export interface ConclusionContractClaimReference {
   rowIndex?: number;
   rowSelector?: Record<string, string | number | boolean>;
   column?: string;
-  value?: string | number | boolean;
+  value?: string | number | boolean | null;
   sourceRef?: string;
   sourceToolCallId?: string;
   /** Canonical durable artifact id for artifact-backed claims. */
@@ -103,6 +105,8 @@ export interface ClaimSemanticsV1 {
   };
   /** The proposition value is distinct from a cited cell's value. */
   numeric?: {operator: 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte'; value: number | string; unit: string};
+  /** Original claimed location, not metadata filled from a later lookup. */
+  source?: {sourceReferenceId: string; filePath: string; lineRange: {start: number; end: number}};
 }
 
 export interface ConclusionContractParseIssue {
@@ -110,6 +114,8 @@ export interface ConclusionContractParseIssue {
     'invalid_claim' | 'invalid_reference' | 'invalid_semantics' | 'duplicate_claim_id' |
     'invalid_relation_proposal' | 'duplicate_proposal_id' | 'untrusted_parser_metadata';
   path: string;
+  /** Fixed schema facts only; no raw values, user keys or source paths. */
+  details?: ConclusionContractStructureDetail[];
 }
 
 export type ConclusionBindingEligibility = 'eligible' | 'ineligible' | 'legacy_unchecked';
@@ -204,6 +210,84 @@ function stringList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(item => typeof item === 'string');
 }
 
+/** Fixed protocol values shared by declaration validation and private display projection. */
+export const CONCLUSION_PROTOCOL_VALUES = Object.freeze({
+  schemaVersion: 'conclusion_contract_v1',
+  semanticsSchemaVersion: 'claim_semantics@1',
+  relationSchemaVersion: 'evidence_relation_candidate@1',
+  bindingEligibility: ['eligible', 'ineligible', 'legacy_unchecked'],
+  deltaDirection: ['current_minus_reference'],
+  mode: ['initial_report', 'focused_answer', 'need_input'],
+  claimKind: ['numeric', 'categorical', 'time_range', 'identity', 'causal', 'comparison', 'inference', 'recommendation'],
+  supportLevel: ['verified', 'partial', 'inference', 'unsupported'],
+  polarity: ['affirmed', 'negated', 'undetermined'],
+  discourse: ['asserted', 'hypothetical', 'quoted', 'rejected_quote'],
+  quantifier: ['one', 'some', 'all', 'only'],
+  modality: ['certain', 'possible', 'undetermined'],
+  population: ['cited_rows', 'selected_interval', 'process_instance', 'trace', 'codebase'],
+  operator: ['eq', 'ne', 'lt', 'lte', 'gt', 'gte'],
+  relationKind: ['overlap', 'wakeup', 'blocking_state', 'binder_peer', 'lock_owner', 'comparison_delta', 'derived'],
+  direction: ['subject_to_object', 'object_to_subject', 'symmetric'],
+} as const);
+Object.values(CONCLUSION_PROTOCOL_VALUES).forEach(value => { if (Array.isArray(value)) Object.freeze(value); });
+
+/** Fixed schema facts remain self-contained in generated frontend contract types. */
+export interface ConclusionContractStructureDetail {
+  field: '$' | '$.schemaVersion' | '$.mode' | '$.conclusions' | '$.conclusions[]' |
+    '$.conclusions[].statement' | '$.conclusions[].rank' | '$.clusters' | '$.clusters[]' | '$.clusters[].cluster' |
+    '$.evidenceChain' | '$.evidenceChain[]' | '$.evidenceChain[].conclusionId' | '$.evidenceChain[].text' |
+    '$.uncertainties' | '$.uncertainties[]' | '$.nextSteps' | '$.nextSteps[]';
+  reason: 'missing_required' | 'wrong_type' | 'invalid_literal' | 'invalid_enum' | 'invalid_number';
+  expected: 'object' | 'array' | 'string' | 'finite_number' | 'conclusion_contract_v1' | 'conclusion_mode';
+  actual: 'missing' | 'undefined' | 'null' | 'array' | 'object' | 'string' |
+    'number' | 'nonfinite_number' | 'boolean' | 'other';
+}
+/** Schema-owned locations and their expected types; also constrain public diagnostics. */
+const CONCLUSION_STRUCTURE_EXPECTED = Object.freeze({
+  '$': 'object', '$.schemaVersion': CONCLUSION_PROTOCOL_VALUES.schemaVersion, '$.mode': 'conclusion_mode',
+  '$.conclusions': 'array', '$.conclusions[]': 'object',
+  '$.conclusions[].statement': 'string', '$.conclusions[].rank': 'finite_number',
+  '$.clusters': 'array', '$.clusters[]': 'object', '$.clusters[].cluster': 'string',
+  '$.evidenceChain': 'array', '$.evidenceChain[]': 'object',
+  '$.evidenceChain[].conclusionId': 'string', '$.evidenceChain[].text': 'string',
+  '$.uncertainties': 'array', '$.uncertainties[]': 'string', '$.nextSteps': 'array', '$.nextSteps[]': 'string',
+} as const satisfies Record<ConclusionContractStructureDetail['field'], ConclusionContractStructureDetail['expected']>);
+export const MAX_CONCLUSION_STRUCTURE_DETAILS = 24;
+const CONCLUSION_STRUCTURE_ACTUAL: readonly ConclusionContractStructureDetail['actual'][] = ['missing', 'undefined', 'null', 'array', 'object', 'string',
+  'number', 'nonfinite_number', 'boolean', 'other'];
+
+function structureFailureReason(field: ConclusionContractStructureDetail['field'], actual: ConclusionContractStructureDetail['actual']):
+  ConclusionContractStructureDetail['reason'] | undefined {
+  if (actual === 'missing') return field === '$' || field.endsWith('[]') ? undefined : 'missing_required';
+  const expected = CONCLUSION_STRUCTURE_EXPECTED[field];
+  if (expected === 'finite_number') return actual === 'number' ? undefined
+    : actual === 'nonfinite_number' ? 'invalid_number' : 'wrong_type';
+  if (expected === CONCLUSION_PROTOCOL_VALUES.schemaVersion) return actual === 'string' ? 'invalid_literal' : 'wrong_type';
+  if (expected === 'conclusion_mode') return actual === 'string' ? 'invalid_enum' : 'wrong_type';
+  return expected === actual ? undefined : 'wrong_type';
+}
+
+/** Reject even individually known enum values when their field/type/reason combination is impossible. */
+export function isConclusionContractStructureDetail(value: unknown): value is ConclusionContractStructureDetail {
+  if (!record(value) || Object.keys(value).length !== 4 || !keysWithin(value, ['field', 'reason', 'expected', 'actual']) ||
+    typeof value.field !== 'string' || !hasOwn(CONCLUSION_STRUCTURE_EXPECTED, value.field) ||
+    !CONCLUSION_STRUCTURE_ACTUAL.includes(value.actual as ConclusionContractStructureDetail['actual'])) return false;
+  const field = value.field as ConclusionContractStructureDetail['field'];
+  const reason = structureFailureReason(field, value.actual as ConclusionContractStructureDetail['actual']);
+  return reason !== undefined && value.reason === reason && value.expected === CONCLUSION_STRUCTURE_EXPECTED[field];
+}
+
+function structureActual(value: unknown, present: boolean): ConclusionContractStructureDetail['actual'] {
+  if (!present) return 'missing';
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'number') return Number.isFinite(value) ? 'number' : 'nonfinite_number';
+  if (typeof value === 'object' || typeof value === 'string' || typeof value === 'boolean' || typeof value === 'undefined') {
+    return typeof value as 'object' | 'string' | 'boolean' | 'undefined';
+  }
+  return 'other';
+}
+
 function oneOf(value: unknown, options: readonly string[]): value is string {
   return typeof value === 'string' && options.includes(value);
 }
@@ -225,7 +309,7 @@ function claimReference(value: unknown): value is ConclusionContractClaimReferen
   if (value.rowSelector !== undefined && (!record(value.rowSelector) ||
     Object.keys(value.rowSelector).length === 0 ||
     Object.entries(value.rowSelector).some(([key, item]) => !key || !scalar(item)))) return false;
-  return value.value === undefined || scalar(value.value);
+  return value.value === undefined || value.value === null || scalar(value.value);
 }
 
 function referenceList(value: unknown): value is ConclusionContractClaimReference[] {
@@ -240,17 +324,17 @@ export function parseClaimSemanticsDeclaration(raw: unknown, path = 'semantics')
 } {
   const invalid = () => ({rawSemantics: raw, semanticsParseIssues: [{code: 'invalid_semantics' as const, path}]});
   if (!record(raw) || !keysWithin(raw, ['schemaVersion', 'predicate', 'polarity', 'discourse',
-    'quantifier', 'modality', 'conditions', 'scope', 'numeric']) ||
-    raw.schemaVersion !== 'claim_semantics@1' || typeof raw.predicate !== 'string' ||
+    'quantifier', 'modality', 'conditions', 'scope', 'numeric', 'source']) ||
+    raw.schemaVersion !== CONCLUSION_PROTOCOL_VALUES.semanticsSchemaVersion || typeof raw.predicate !== 'string' ||
     (!raw.predicate.trim() || /\s/.test(raw.predicate)) ||
-    !oneOf(raw.polarity, ['affirmed', 'negated', 'undetermined']) ||
-    !oneOf(raw.discourse, ['asserted', 'hypothetical', 'quoted', 'rejected_quote']) ||
-    !oneOf(raw.quantifier, ['one', 'some', 'all', 'only']) ||
-    !oneOf(raw.modality, ['certain', 'possible', 'undetermined']) ||
+    !oneOf(raw.polarity, CONCLUSION_PROTOCOL_VALUES.polarity) ||
+    !oneOf(raw.discourse, CONCLUSION_PROTOCOL_VALUES.discourse) ||
+    !oneOf(raw.quantifier, CONCLUSION_PROTOCOL_VALUES.quantifier) ||
+    !oneOf(raw.modality, CONCLUSION_PROTOCOL_VALUES.modality) ||
     (raw.conditions !== undefined && !stringList(raw.conditions))) return invalid();
   const scope = raw.scope;
   if (!record(scope) || !keysWithin(scope, ['subjectRefs', 'objectRefs', 'population', 'timeRangeNs']) ||
-    !oneOf(scope.population, ['cited_rows', 'selected_interval', 'process_instance', 'trace', 'codebase']) ||
+    !oneOf(scope.population, CONCLUSION_PROTOCOL_VALUES.population) ||
     (scope.subjectRefs !== undefined && !referenceList(scope.subjectRefs)) ||
     (scope.objectRefs !== undefined && !referenceList(scope.objectRefs))) return invalid();
   if (scope.timeRangeNs !== undefined) {
@@ -262,10 +346,20 @@ export function parseClaimSemanticsDeclaration(raw: unknown, path = 'semantics')
   if (raw.numeric !== undefined) {
     const numeric = raw.numeric;
     if (!record(numeric) || !keysWithin(numeric, ['operator', 'value', 'unit']) ||
-      !oneOf(numeric.operator, ['eq', 'ne', 'lt', 'lte', 'gt', 'gte']) ||
+      !oneOf(numeric.operator, CONCLUSION_PROTOCOL_VALUES.operator) ||
       !((typeof numeric.value === 'number' && Number.isFinite(numeric.value)) ||
         (typeof numeric.value === 'string' && /^-?(?:\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(numeric.value))) ||
       typeof numeric.unit !== 'string' || !numeric.unit.trim()) return invalid();
+  }
+  if (raw.source !== undefined) {
+    const source = raw.source;
+    if (!record(source) || !keysWithin(source, ['sourceReferenceId', 'filePath', 'lineRange']) ||
+      typeof source.sourceReferenceId !== 'string' || !source.sourceReferenceId.trim() ||
+      source.sourceReferenceId.length > MAX_SOURCE_REFERENCE_ID_LENGTH || typeof source.filePath !== 'string' ||
+      !source.filePath.trim() || source.filePath.length > MAX_SOURCE_REFERENCE_PATH_LENGTH || !record(source.lineRange) ||
+      !keysWithin(source.lineRange, ['start', 'end']) || !Number.isSafeInteger(source.lineRange.start) ||
+      !Number.isSafeInteger(source.lineRange.end) || Number(source.lineRange.start) < 1 ||
+      Number(source.lineRange.end) < Number(source.lineRange.start)) return invalid();
   }
   return {semantics: structuredClone(raw) as unknown as ClaimSemanticsV1};
 }
@@ -288,8 +382,7 @@ export function parseDeclaredConclusionClaims(raw: unknown): {
     }
     if (!item.text.trim() || (item.id !== undefined && (typeof item.id !== 'string' || !item.id.trim())) ||
       (item.conclusionId !== undefined && typeof item.conclusionId !== 'string') ||
-      (item.kind !== undefined && !oneOf(item.kind, ['numeric', 'categorical', 'time_range', 'identity', 'causal', 'comparison',
-        'inference', 'recommendation']))) issues.push({code: 'invalid_claim', path});
+      (item.kind !== undefined && !oneOf(item.kind, CONCLUSION_PROTOCOL_VALUES.claimKind))) issues.push({code: 'invalid_claim', path});
     if (CLAIM_PARSER_FIELDS.some(key => hasOwn(item, key))) issues.push({code: 'untrusted_parser_metadata', path});
     const referencesValid = referenceList(item.references);
     if (!referencesValid) issues.push({code: 'invalid_reference', path: `${path}.references`});
@@ -318,7 +411,7 @@ export function parseDeclaredConclusionClaims(raw: unknown): {
       ...(!referencesValid ? {rawReferences: structuredClone(item.references)} : {}),
       ...(Array.isArray(artifactRefs) && validArtifactRefs ? {artifactRefs: structuredClone(artifactRefs) as ConclusionContractClaimItem['artifactRefs']} : {}),
       ...(stringList(item.relationRefs) ? {relationRefs: [...item.relationRefs]} : {}),
-      ...(oneOf(item.supportLevel, ['verified', 'partial', 'inference', 'unsupported'])
+      ...(oneOf(item.supportLevel, CONCLUSION_PROTOCOL_VALUES.supportLevel)
         ? {supportLevel: item.supportLevel as ConclusionClaimSupportLevel} : {}),
       ...semantics,
     });
@@ -330,15 +423,15 @@ export function parseDeclaredConclusionClaims(raw: unknown): {
 function relationProposal(value: unknown): value is EvidenceRelationCandidateV1 {
   if (!record(value) || !keysWithin(value, ['schemaVersion', 'id', 'kind', 'direction', 'subject', 'object',
     'proof', 'proofBindings', 'metricColumn', 'value', 'unit', 'deltaDirection']) ||
-    value.schemaVersion !== 'evidence_relation_candidate@1' || typeof value.id !== 'string' ||
+    value.schemaVersion !== CONCLUSION_PROTOCOL_VALUES.relationSchemaVersion || typeof value.id !== 'string' ||
     !/^proposal:[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(value.id) ||
-    !oneOf(value.kind, ['overlap', 'wakeup', 'blocking_state', 'binder_peer', 'lock_owner', 'comparison_delta', 'derived']) ||
-    !oneOf(value.direction, ['subject_to_object', 'object_to_subject', 'symmetric']) ||
+    !oneOf(value.kind, CONCLUSION_PROTOCOL_VALUES.relationKind) ||
+    !oneOf(value.direction, CONCLUSION_PROTOCOL_VALUES.direction) ||
     !claimReference(value.subject) || (value.object !== undefined && !claimReference(value.object)) ||
     (value.proof !== undefined && !claimReference(value.proof)) ||
     (value.value !== undefined && !scalar(value.value)) ||
     ['unit', 'metricColumn'].some(key => value[key] !== undefined && (typeof value[key] !== 'string' || !String(value[key]).trim())) ||
-    (value.deltaDirection !== undefined && value.deltaDirection !== 'current_minus_reference')) return false;
+    (value.deltaDirection !== undefined && !oneOf(value.deltaDirection, CONCLUSION_PROTOCOL_VALUES.deltaDirection))) return false;
   if (value.proofBindings !== undefined) {
     if (!record(value.proofBindings) || !keysWithin(value.proofBindings, ['subject', 'object'])) return false;
     for (const endpoint of [value.proofBindings.subject, value.proofBindings.object]) {
@@ -401,38 +494,78 @@ export function parseTypedConclusionContractJson(raw: string): ConclusionContrac
 /** Sidecar JSON uses canonical v1 field names. Legacy aliases stay in the legacy parser. */
 export function parseConclusionContractDeclaration(raw: unknown): {contract?: ConclusionContract; issues: ConclusionContractParseIssue[]} {
   const issues: ConclusionContractParseIssue[] = [];
-  if (!record(raw) || raw.schemaVersion !== 'conclusion_contract_v1' ||
-    !oneOf(raw.mode, ['initial_report', 'focused_answer', 'need_input']) ||
-    !Array.isArray(raw.conclusions) || !Array.isArray(raw.clusters) || !Array.isArray(raw.evidenceChain) ||
-    !stringList(raw.uncertainties) || !stringList(raw.nextSteps)) {
-    return {issues: [{code: 'invalid_contract', path: '$'}]};
+  const details: ConclusionContractStructureDetail[] = [];
+  const seenDetails = new Set<string>();
+  const check = (field: ConclusionContractStructureDetail['field'], value: unknown, valid: boolean, present = true): boolean => {
+    if (valid) return true;
+    const actual = structureActual(value, present);
+    const reason = structureFailureReason(field, actual);
+    const key = `${field}:${actual}`;
+    if (reason && !seenDetails.has(key) && details.length < MAX_CONCLUSION_STRUCTURE_DETAILS) {
+      seenDetails.add(key);
+      details.push({field, reason, expected: CONCLUSION_STRUCTURE_EXPECTED[field], actual});
+    }
+    return false;
+  };
+  const invalid = () => ({issues: [...issues, {code: 'invalid_contract' as const, path: '$', details}]});
+  if (!record(raw)) {
+    check('$', raw, false);
+    return invalid();
   }
+  const stringArray = (field: 'uncertainties' | 'nextSteps'): boolean => {
+    const value = raw[field];
+    if (!check(`$.${field}`, value, Array.isArray(value), hasOwn(raw, field))) return false;
+    let valid = true;
+    (value as unknown[]).forEach(item => {if (!check(`$.${field}[]`, item, typeof item === 'string')) valid = false;});
+    return valid;
+  };
+  const rootValid = [
+    check('$.schemaVersion', raw.schemaVersion, raw.schemaVersion === CONCLUSION_PROTOCOL_VALUES.schemaVersion, hasOwn(raw, 'schemaVersion')),
+    check('$.mode', raw.mode, oneOf(raw.mode, CONCLUSION_PROTOCOL_VALUES.mode), hasOwn(raw, 'mode')),
+    check('$.conclusions', raw.conclusions, Array.isArray(raw.conclusions), hasOwn(raw, 'conclusions')),
+    check('$.clusters', raw.clusters, Array.isArray(raw.clusters), hasOwn(raw, 'clusters')),
+    check('$.evidenceChain', raw.evidenceChain, Array.isArray(raw.evidenceChain), hasOwn(raw, 'evidenceChain')),
+    stringArray('uncertainties'), stringArray('nextSteps'),
+  ].every(Boolean);
+  if (!rootValid) return invalid();
   const rejectedRootMetadata = ROOT_PARSER_FIELDS.some(key => hasOwn(raw, key));
-  if (rejectedRootMetadata) {
-    issues.push({code: 'untrusted_parser_metadata', path: '$'});
-  }
-  const conclusionValid = raw.conclusions.every(item => record(item) && typeof item.statement === 'string' &&
-    typeof item.rank === 'number' && Number.isFinite(item.rank));
-  const clustersValid = raw.clusters.every(item => record(item) && typeof item.cluster === 'string');
-  const evidenceValid = raw.evidenceChain.every(item => record(item) && typeof item.conclusionId === 'string' && typeof item.text === 'string');
-  if (!conclusionValid || !clustersValid || !evidenceValid) return {issues: [...issues, {code: 'invalid_contract', path: '$'}]};
+  if (rejectedRootMetadata) issues.push({code: 'untrusted_parser_metadata', path: '$'});
+  let itemsValid = true;
+  (raw.conclusions as unknown[]).forEach(item => {
+    if (!record(item)) {check('$.conclusions[]', item, false); itemsValid = false; return;}
+    if (!check('$.conclusions[].statement', item.statement, typeof item.statement === 'string', hasOwn(item, 'statement'))) itemsValid = false;
+    if (!check('$.conclusions[].rank', item.rank, typeof item.rank === 'number' && Number.isFinite(item.rank), hasOwn(item, 'rank'))) itemsValid = false;
+  });
+  (raw.clusters as unknown[]).forEach(item => {
+    if (!record(item)) {check('$.clusters[]', item, false); itemsValid = false; return;}
+    if (!check('$.clusters[].cluster', item.cluster, typeof item.cluster === 'string', hasOwn(item, 'cluster'))) itemsValid = false;
+  });
+  (raw.evidenceChain as unknown[]).forEach(item => {
+    if (!record(item)) {check('$.evidenceChain[]', item, false); itemsValid = false; return;}
+    if (!check('$.evidenceChain[].conclusionId', item.conclusionId, typeof item.conclusionId === 'string', hasOwn(item, 'conclusionId'))) itemsValid = false;
+    if (!check('$.evidenceChain[].text', item.text, typeof item.text === 'string', hasOwn(item, 'text'))) itemsValid = false;
+  });
+  if (!itemsValid) return invalid();
   const claims = hasOwn(raw, 'claims') ? parseDeclaredConclusionClaims(raw.claims) : undefined;
   const relations = hasOwn(raw, 'relationProposals') ? parseDeclaredRelationProposals(raw.relationProposals) : undefined;
   issues.push(...(claims?.issues ?? []), ...(relations?.issues ?? []));
+  const sourceBindingsValid = !hasOwn(raw, 'sourceClaimBindings') || isSourceClaimBindingsDeclaration(raw.sourceClaimBindings);
+  if (!sourceBindingsValid) issues.push({code: 'invalid_reference', path: 'sourceClaimBindings'});
   const contract: ConclusionContract = {
     schemaVersion: 'conclusion_contract_v1', mode: raw.mode as ConclusionOutputMode,
     conclusions: structuredClone(raw.conclusions) as ConclusionContractConclusionItem[],
     clusters: structuredClone(raw.clusters) as ConclusionContractClusterItem[],
     evidenceChain: structuredClone(raw.evidenceChain) as ConclusionContractEvidenceItem[],
-    uncertainties: [...raw.uncertainties], nextSteps: [...raw.nextSteps],
+    uncertainties: [...raw.uncertainties as string[]], nextSteps: [...raw.nextSteps as string[]],
     ...(claims ? {claims: claims.claims, ...(hasOwn(claims, 'rawClaims') ? {rawClaims: claims.rawClaims} : {})} : {}),
     ...(relations ? {relationProposals: relations.relationProposals,
       ...(hasOwn(relations, 'rawRelationProposals') ? {rawRelationProposals: relations.rawRelationProposals} : {})} : {}),
     ...(record(raw.metadata) ? {metadata: structuredClone(raw.metadata) as ConclusionContractMetadata} : {}),
     ...(record(raw.sourceUseDecision) ? {sourceUseDecision: structuredClone(raw.sourceUseDecision) as unknown as SourceUseDecisionV1} : {}),
     ...(Array.isArray(raw.sourceReferences) ? {sourceReferences: structuredClone(raw.sourceReferences) as SourceReferenceV1[]} : {}),
-    ...(Array.isArray(raw.sourceClaimBindings) ? {sourceClaimBindings: structuredClone(raw.sourceClaimBindings) as SourceClaimBindingV1[]} : {}),
-    ...(rejectedRootMetadata ? {rawDeclaration: structuredClone(raw)} : {}),
+    ...(sourceBindingsValid && hasOwn(raw, 'sourceClaimBindings')
+      ? {sourceClaimBindings: structuredClone(raw.sourceClaimBindings) as SourceClaimBindingV1[]} : {}),
+    ...(rejectedRootMetadata || !sourceBindingsValid ? {rawDeclaration: structuredClone(raw)} : {}),
     parseIssues: issues,
     bindingEligibility: issues.length ? 'ineligible' : 'eligible',
   };
@@ -656,4 +789,110 @@ export function renderConclusionContractSidecar(contract: ConclusionContract): s
   if (serialized === undefined) throw new Error('Cannot serialize an unavailable conclusion declaration');
   const payload = serialized.replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
   return `${SIDECAR_MARKER}\n\`\`\`json\n${payload}\n\`\`\`\n-->`;
+}
+
+export function declaredFields<T extends object, K extends keyof T>(value: T, keys: readonly K[]): Pick<T, K> {
+  if (!value || typeof value !== 'object') return {} as Pick<T, K>;
+  return Object.fromEntries(keys.flatMap(key => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && 'value' in descriptor ? [[key, descriptor.value]] : [];
+  })) as Pick<T, K>;
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function stringFields<T extends object, K extends keyof T>(value: T, keys: readonly K[]): Partial<Pick<T, K>> {
+  return Object.fromEntries(Object.entries(declaredFields(value, keys)).filter(([, item]) => typeof item === 'string')) as Partial<Pick<T, K>>;
+}
+
+function numberFields<T extends object, K extends keyof T>(value: T, keys: readonly K[]): Partial<Pick<T, K>> {
+  return Object.fromEntries(Object.entries(declaredFields(value, keys)).filter(([, item]) => typeof item === 'number' && Number.isFinite(item))) as Partial<Pick<T, K>>;
+}
+
+function caseRecommendationsForResult(value: ConclusionContract['caseRecommendations']): CaseKnowledgeReportRecommendation[] {
+  const recommendations = (items: unknown): CaseKnowledgeRecommendation[] => Array.isArray(items) ? items.flatMap(item => {
+    if (!item || typeof item !== 'object') return [];
+    const fields = declaredFields(item as CaseKnowledgeRecommendation, ['id', 'priority', 'action', 'applies_when', 'risks']);
+    return typeof fields.id === 'string' && typeof fields.action === 'string' && typeof fields.applies_when === 'string' &&
+      typeof fields.risks === 'string' && ['P0', 'P1', 'P2', 'P3'].includes(fields.priority) ? [fields] : [];
+  }) : [];
+  return Array.isArray(value) ? value.flatMap(item => {
+    if (!item || typeof item.caseId !== 'string' || typeof item.title !== 'string' ||
+      !['strong', 'partial', 'background'].includes(item.matchStrength)) return [];
+    const learned = item.learnedProvenance;
+    return [{caseId: item.caseId, title: item.title, matchStrength: item.matchStrength,
+      ...stringFields(item, ['scene', 'primaryRootCause', 'evidenceGap']),
+      ...(item.evidenceRefs ? {evidenceRefs: strings(item.evidenceRefs)} : {}),
+      ...(item.matchedSignatures ? {matchedSignatures: strings(item.matchedSignatures)} : {}),
+      ...(item.missingRequiredSignatures ? {missingRequiredSignatures: strings(item.missingRequiredSignatures)} : {}),
+      recommendations: {app: recommendations(item.recommendations?.app), oem: recommendations(item.recommendations?.oem)},
+      ...(learned && typeof learned.candidateId === 'string' && typeof learned.supported === 'boolean' &&
+        Number.isFinite(learned.supportingEvidence) && Number.isFinite(learned.contradictingEvidence) ? {learnedProvenance: {
+          candidateId: learned.candidateId, supportingEvidence: learned.supportingEvidence,
+          contradictingEvidence: learned.contradictingEvidence, supported: learned.supported,
+        }} : {}),
+    }];
+  }) : [];
+}
+
+/** Raw malformed declarations remain private; typed declarations retain parser eligibility. */
+export function declaredContractForResult(contract: ConclusionContract | undefined): ConclusionContract | undefined {
+  if (!contract) return undefined;
+  const typed = declaredFields(contract, ['schemaVersion', 'mode', 'conclusions', 'clusters', 'evidenceChain',
+    'claims', 'relationProposals', 'bindingEligibility', 'sourceUseDecision', 'sourceReferences',
+    'sourceClaimBindings', 'caseRecommendations', 'uncertainties', 'nextSteps', 'metadata']);
+  if (Array.isArray(typed.conclusions)) typed.conclusions = typed.conclusions.flatMap(item =>
+    item && typeof item.statement === 'string' && Number.isFinite(item.rank) ? [{rank: item.rank, statement: item.statement,
+      ...numberFields(item, ['confidencePercent']), ...stringFields(item, ['trigger', 'supply', 'amplification'])}] : []);
+  if (Array.isArray(typed.clusters)) typed.clusters = typed.clusters.flatMap(item =>
+    item && typeof item.cluster === 'string' ? [{cluster: item.cluster, ...stringFields(item, ['description']),
+      ...numberFields(item, ['frames', 'percentage', 'omittedFrameRefs']),
+      ...(item.frameRefs ? {frameRefs: strings(item.frameRefs)} : {})}] : []);
+  if (Array.isArray(typed.evidenceChain)) typed.evidenceChain = typed.evidenceChain.flatMap(item =>
+    item && typeof item.conclusionId === 'string' && typeof item.text === 'string'
+      ? [{conclusionId: item.conclusionId, text: item.text}] : []);
+  if (Array.isArray(typed.claims)) {
+    const declarations = typed.claims.map(claim => declaredFields(claim,
+      ['id', 'conclusionId', 'text', 'kind', 'references', 'artifactRefs', 'relationRefs', 'supportLevel', 'semantics']));
+    typed.claims = parseDeclaredConclusionClaims(declarations).claims.map(claim => {
+      const {rawReferences: _references, rawSemantics: _semantics, semanticsParseIssues: _issues, ...projected} = claim;
+      if (projected.artifactRefs) projected.artifactRefs = projected.artifactRefs.map(reference => ({
+        ...reference, ...(reference.rowSelector ? {rowSelector: Object.fromEntries(Object.entries(reference.rowSelector)
+          .filter(([, item]) => typeof item === 'string' || typeof item === 'boolean' || typeof item === 'number' && Number.isFinite(item)))} : {}),
+      }));
+      return projected;
+    });
+  } else delete typed.claims;
+  if (typed.relationProposals) typed.relationProposals = parseDeclaredRelationProposals(typed.relationProposals).relationProposals;
+  if (typed.sourceUseDecision) typed.sourceUseDecision = sanitizeSourceUseDecision(typed.sourceUseDecision);
+  if (typed.sourceReferences) typed.sourceReferences = sanitizeSourceReferences(typed.sourceReferences);
+  if (typed.sourceClaimBindings) typed.sourceClaimBindings = sanitizeSourceClaimBindings(typed.sourceClaimBindings);
+  if (typed.caseRecommendations) typed.caseRecommendations = caseRecommendationsForResult(typed.caseRecommendations);
+  if (typed.uncertainties) typed.uncertainties = strings(typed.uncertainties);
+  if (typed.nextSteps) typed.nextSteps = strings(typed.nextSteps);
+  if (typed.metadata) {
+    const metadata = typed.metadata;
+    const clusterPolicy = metadata.clusterPolicy;
+    typed.metadata = {
+      ...(typeof metadata.confidencePercent === 'number' ? {confidencePercent: metadata.confidencePercent} : {}),
+      ...(typeof metadata.rounds === 'number' ? {rounds: metadata.rounds} : {}),
+      ...(typeof metadata.sceneId === 'string' ? {sceneId: metadata.sceneId} : {}),
+      ...(typeof metadata.derivedFromNarrativeEvidenceMatch === 'boolean'
+        ? {derivedFromNarrativeEvidenceMatch: metadata.derivedFromNarrativeEvidenceMatch} : {}),
+      ...(typeof metadata.replacedUnresolvableProviderClaims === 'boolean'
+        ? {replacedUnresolvableProviderClaims: metadata.replacedUnresolvableProviderClaims} : {}),
+      ...(metadata.claimDerivation === 'explicit_model_contract' || metadata.claimDerivation === 'narrative_evidence_match'
+        ? {claimDerivation: metadata.claimDerivation} : {}),
+      ...(metadata.claimVerificationScope === 'explicit_claims' || metadata.claimVerificationScope === 'sampled_narrative_evidence'
+        ? {claimVerificationScope: metadata.claimVerificationScope} : {}),
+      ...(clusterPolicy && ['required', 'optional', 'none'].includes(clusterPolicy.outputMode) &&
+        ['none', 'top', 'full'].includes(clusterPolicy.frameListMode) ? {clusterPolicy: {
+          outputMode: clusterPolicy.outputMode, frameListMode: clusterPolicy.frameListMode,
+          ...(typeof clusterPolicy.maxFramesPerCluster === 'number' ? {maxFramesPerCluster: clusterPolicy.maxFramesPerCluster} : {}),
+        }} : {}),
+    };
+  }
+  return typed;
 }

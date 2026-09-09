@@ -7,8 +7,37 @@ import { createSseBridge, extractSdkToolResultBlocks, isSdkToolResultFailure } f
 import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
 import {__testing as claudeRuntimeTesting} from '../../agentRuntime/engines/claude/claudeRuntime';
 import type { StreamingUpdate } from '../../agent/types';
+import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
+import {clearCodeAwareOutputGuards, createCodeAwareStreamingTextProjection, registerCodeAwareCanary}
+  from '../../services/security/codeAwareOutputRegistry';
 
 describe('createSseBridge', () => {
+  it.each([false, true])('retains private source outcomes before transport truncation (body=%s)', includeBody => {
+    const updates: StreamingUpdate[] = [];
+    const bridge = createSseBridge(update => updates.push(update));
+    const result = {success: true, matches: Array.from({length: 20}, (_, i) => ({
+      referenceId: `source-reference-${i}`, codebaseId: 'codebase-a',
+      filePath: `src/PRIVATE_SOURCE_PATH_${i}.kt`, lineRange: {start: 1, end: 20},
+      ...(includeBody ? {text: 'PRIVATE_SOURCE_BODY'} : {}),
+    }))};
+    bridge.handleMessage({type: 'assistant', message: {content: [{
+      type: 'tool_use', id: 'source-outcome', name: 'search_codebase', input: {},
+    }]}});
+    bridge.handleMessage({type: 'user', message: {content: [{
+      type: 'tool_result', tool_use_id: 'source-outcome', content: JSON.stringify(result),
+    }]}});
+    const update = updates.find(item => item.type === 'agent_response')!;
+    expect(() => JSON.parse(update.content.result)).toThrow();
+    expect(update.content.privateToolResultReceipt).toBeDefined();
+    const projected = projectCodeAwareStreamingUpdate('claude-source-outcome', update, true, 'en');
+    expect(projected).toMatchObject({content: {resultNarration: includeBody
+      ? 'Authorized content was read and is available to check against trace evidence'
+      : 'Candidate source or knowledge locations are available; their content has not been read'}});
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_SOURCE|privateToolResultReceipt/);
+    expect(projectCodeAwareStreamingUpdate('claude-source-outcome', JSON.parse(JSON.stringify(update)), true, 'en')).toBeNull();
+    bridge.dispose();
+  });
+
   it('does not guess tool identity for unknown results or emit duplicate responses', () => {
     const updates: StreamingUpdate[] = [];
     const bridge = createSseBridge(update => updates.push(update));
@@ -299,40 +328,94 @@ describe('createSseBridge', () => {
     expect(sourcePayload.rows[0]).toHaveLength(10_000);
   });
 
-  it('bounds fallback answer accumulation and disposes pending timers', () => {
+  it('retains complete multi-chunk answers beyond the former 256 KiB limit, including after dispose', () => {
+    const updates: StreamingUpdate[] = [];
+    const bridge = createSseBridge(update => updates.push(update));
+    const chunks = ['a'.repeat(150_000), '汉'.repeat(150_000), '\nComplete final answer tail.'];
+    for (const text of chunks) {
+      bridge.handleMessage({type: 'stream_event', event: {
+        type: 'content_block_delta', delta: {type: 'text_delta', text},
+      }});
+      bridge.flushPendingAnswer();
+    }
+    const answer = chunks.join('');
+    expect(bridge.getAccumulatedAnswer().length).toBe(answer.length);
+    expect(bridge.getAccumulatedAnswer()).toBe(answer);
+    expect(updates.filter(update => update.type === 'answer_token').map(update => update.content.token).join('')).toBe(answer);
+    expect(bridge.getAccumulatedAnswer()).not.toContain('[truncated accumulated answer]');
+    bridge.dispose();
+    bridge.dispose();
+    bridge.handleMessage({type: 'assistant', message: {content: [{type: 'text', text: 'after dispose'}]}});
+    bridge.flushPendingAnswer();
+    expect(bridge.getAccumulatedAnswer()).toBe(answer);
+    expect(updates.filter(update => update.type === 'answer_token').map(update => update.content.token).join('')).toBe(answer);
+  });
+
+  it('projects a private canary split across chunks at the former answer limit and retains the public tail', () => {
+    jest.useFakeTimers();
+    const sessionId = 'claude-answer-beyond-old-limit';
+    const canary = 'PRIVATE_CLAUDE_ANSWER_BOUNDARY_CANARY';
+    const split = Math.floor(canary.length / 2);
+    registerCodeAwareCanary(sessionId, canary);
+    const updates: StreamingUpdate[] = [];
+    const bridge = createSseBridge(update => updates.push(update), 'en', {},
+      createCodeAwareStreamingTextProjection(sessionId, 'answer'));
+    try {
+      const prefix = 'a'.repeat(256 * 1024 - split);
+      const tail = '\nPublic text after the private boundary.';
+      bridge.handleMessage({type: 'stream_event', event: {
+        type: 'content_block_delta', delta: {type: 'text_delta', text: prefix + canary.slice(0, split)},
+      }});
+      jest.advanceTimersByTime(250);
+      bridge.handleMessage({type: 'stream_event', event: {
+        type: 'content_block_delta', delta: {type: 'text_delta', text: canary.slice(split) + tail},
+      }});
+      bridge.flushPendingAnswer();
+      expect(bridge.getAccumulatedAnswer().length).toBe(prefix.length + canary.length + tail.length);
+      expect(bridge.getAccumulatedAnswer()).toBe(prefix + canary + tail);
+      const visible = updates.filter(update => update.type === 'answer_token').map(update => update.content.token).join('');
+      expect(visible).not.toContain(canary);
+      expect(visible).not.toContain(canary.slice(0, split));
+      expect(visible).not.toContain(canary.slice(split));
+      expect(visible.endsWith(tail)).toBe(true);
+      expect(visible).not.toContain('[truncated accumulated answer]');
+    } finally {
+      bridge.dispose();
+      clearCodeAwareOutputGuards(sessionId);
+      jest.useRealTimers();
+    }
+  });
+
+  it('clears a large misclassified answer when tool use is discovered and accumulates the next answer', () => {
+    const bridge = createSseBridge(() => {});
+    bridge.handleMessage({type: 'stream_event', event: {
+      type: 'content_block_delta', delta: {type: 'text_delta', text: 'intermediate '.repeat(30_000)},
+    }});
+    bridge.flushPendingAnswer();
+    bridge.handleMessage({type: 'stream_event', event: {
+      type: 'content_block_start', content_block: {type: 'tool_use', id: 'late-tool', name: 'query'},
+    }});
+    expect(bridge.getAccumulatedAnswer()).toBe('');
+    bridge.handleMessage({type: 'user', message: {content: [{type: 'tool_result', tool_use_id: 'late-tool', content: '{}'}]}});
+    bridge.handleMessage({type: 'assistant', message: {content: [{type: 'text', text: 'Actual final answer'}]}});
+    expect(bridge.getAccumulatedAnswer()).toBe('Actual final answer');
+    bridge.dispose();
+    expect(bridge.getAccumulatedAnswer()).toBe('Actual final answer');
+  });
+
+  it('disposes pending timers without emitting buffered text', () => {
     jest.useFakeTimers();
     try {
       const updates: StreamingUpdate[] = [];
-      const bridge = createSseBridge((update) => updates.push(update));
-      bridge.handleMessage({
-        type: 'assistant',
-        message: {content: [{type: 'text', text: 'a'.repeat(300_000)}]},
-      });
-
-      expect(bridge.getAccumulatedAnswer().length).toBeLessThanOrEqual(256 * 1024);
-      expect(bridge.getAccumulatedAnswer()).toContain('truncated');
-      expect(updates
-        .filter(update => update.type === 'answer_token')
-        .reduce((sum, update) => sum + String(update.content?.token ?? '').length, 0))
-        .toBeLessThanOrEqual(256 * 1024);
-
-      const pendingUpdates: StreamingUpdate[] = [];
-      const pendingBridge = createSseBridge((update) => pendingUpdates.push(update));
-      pendingBridge.handleMessage({
-        type: 'stream_event',
-        event: {
-          type: 'content_block_delta',
-          delta: {type: 'text_delta', text: 'must not flush after dispose'},
-        },
-      });
-      pendingBridge.dispose();
+      const bridge = createSseBridge(update => updates.push(update));
+      bridge.handleMessage({type: 'stream_event', event: {
+        type: 'content_block_delta', delta: {type: 'text_delta', text: 'must not flush after dispose'},
+      }});
+      bridge.dispose();
       jest.advanceTimersByTime(250);
-
-      expect(pendingUpdates).toEqual([]);
-      expect(pendingBridge.getAccumulatedAnswer()).toBe('');
-    } finally {
-      jest.useRealTimers();
-    }
+      expect(updates).toEqual([]);
+      expect(bridge.getAccumulatedAnswer()).toBe('');
+    } finally {jest.useRealTimers();}
   });
 
   it('projects private wiki tool results before emitting agent_response', () => {

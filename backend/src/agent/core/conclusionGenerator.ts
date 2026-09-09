@@ -2492,14 +2492,14 @@ function parseConclusionItemsFromMarkdownSection(sectionBody: string): Conclusio
     const line = rawLine.trim();
     if (!line) continue;
 
-    const mNum = line.match(/^([1-3])\s*[.)、]\s*(.+)$/);
-    if (mNum) {
+    const mNum = line.match(/^([1-9]\d*)\s*[.)、]\s*(.+)$/);
+    if (mNum && Number.isSafeInteger(Number(mNum[1]))) {
       numberedItems.push({ index: Number(mNum[1]), text: mNum[2].trim() });
       continue;
     }
 
-    const mC = line.match(/^C([1-3])\s*[:：]\s*(.+)$/i);
-    if (mC) {
+    const mC = line.match(/^C([1-9]\d*)\s*[:：]\s*(.+)$/i);
+    if (mC && Number.isSafeInteger(Number(mC[1]))) {
       numberedItems.push({ index: Number(mC[1]), text: mC[2].trim() });
       continue;
     }
@@ -2512,7 +2512,7 @@ function parseConclusionItemsFromMarkdownSection(sectionBody: string): Conclusio
 
   const baseItems = numberedItems.length > 0
     ? numberedItems
-    : bulletFallback.slice(0, 3).map((text, idx) => ({ index: idx + 1, text }));
+    : bulletFallback.map((text, idx) => ({ index: idx + 1, text }));
 
   const triadParts = parseTriadParts(sectionBody || '');
 
@@ -2708,7 +2708,6 @@ function sanitizeConclusionContract(
     })
     .filter(item => item.statement || item.trigger || item.supply || item.amplification)
     .sort((a, b) => a.rank - b.rank)
-    .slice(0, 3)
     .map((item, idx) => {
       let statement = item.statement;
       if (!statement) {
@@ -2765,16 +2764,14 @@ function sanitizeConclusionContract(
             frameRefs: selection.frameIds.length > 0 ? selection.frameIds : undefined,
             omittedFrameRefs: selection.omittedCount > 0 ? selection.omittedCount : undefined,
           };
-        })
-        .slice(0, 5);
+        });
 
   const evidenceChain = contract.evidenceChain
     .map((item, idx) => ({
       conclusionId: normalizeConclusionId(item.conclusionId, idx + 1),
       text: sanitizeText(item.text),
     }))
-    .filter(item => item.text)
-    .slice(0, 12);
+    .filter(item => item.text);
 
   const claims = contract.bindingEligibility !== undefined ? (contract.claims ?? []) : (contract.claims || [])
     .map((item, idx) => {
@@ -2813,8 +2810,8 @@ function sanitizeConclusionContract(
     // of claims would let an incomplete verification look like a complete pass.
     .filter(item => item.text);
 
-  const uncertainties = dedupe(contract.uncertainties).slice(0, 6);
-  const nextSteps = dedupe(contract.nextSteps).slice(0, 6);
+  const uncertainties = dedupe(contract.uncertainties);
+  const nextSteps = dedupe(contract.nextSteps);
 
   const metadata = contract.metadata
     ? {
@@ -4555,7 +4552,7 @@ function convertJsonLikeSectionsToMarkdown(
   if (conclusions.length === 0) {
     lines.push('1. 结论信息缺失（置信度: 40%）');
   } else {
-    conclusions.slice(0, 3).forEach((item, idx) => {
+    conclusions.forEach((item, idx) => {
       const conf = Number.isFinite(item.confidence) ? `（置信度: ${Math.round(item.confidence!)}%）` : '';
       lines.push(`${idx + 1}. ${item.statement}${conf}`);
     });
@@ -4566,7 +4563,7 @@ function convertJsonLikeSectionsToMarkdown(
   if (clusterLines.length === 0) {
     lines.push('- 暂无');
   } else {
-    lines.push(...clusterLines.slice(0, 5));
+    lines.push(...clusterLines);
   }
   lines.push('');
 

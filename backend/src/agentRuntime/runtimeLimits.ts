@@ -5,7 +5,6 @@
 export const DEFAULT_FULL_REQUEST_TIMEOUT_MS = 20 * 60_000;
 export const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_EXTERNAL_TOOL_RESULT_MAX_CHARS = 2_000;
-export const DEFAULT_ACCUMULATED_ANSWER_MAX_CHARS = 256 * 1024;
 export const DEFAULT_OPENAI_HISTORY_MAX_BYTES = 4 * 1024 * 1024;
 
 export type RuntimeTimeoutKind = 'request' | 'stream_idle';
@@ -37,27 +36,6 @@ export function summarizeExternalToolResult(
   const marker = `\n[truncated external tool result; originalChars=${serialized.length}]`;
   if (marker.length >= maxChars) return marker.slice(0, maxChars);
   return `${serialized.slice(0, maxChars - marker.length)}${marker}`;
-}
-
-export function appendBoundedText(input: {
-  current: string;
-  chunk: string;
-  maxChars?: number;
-  alreadyTruncated?: boolean;
-}): {text: string; truncated: boolean} {
-  const maxChars = input.maxChars ?? DEFAULT_ACCUMULATED_ANSWER_MAX_CHARS;
-  if (!input.chunk || input.alreadyTruncated) {
-    return {text: input.current, truncated: input.alreadyTruncated === true};
-  }
-  if (input.current.length + input.chunk.length <= maxChars) {
-    return {text: input.current + input.chunk, truncated: false};
-  }
-  const marker = '\n[truncated accumulated answer]';
-  const keepChars = Math.max(0, maxChars - marker.length);
-  return {
-    text: `${input.current}${input.chunk}`.slice(0, keepChars) + marker.slice(0, maxChars),
-    truncated: true,
-  };
 }
 
 export function serializedByteLength(value: unknown): number {

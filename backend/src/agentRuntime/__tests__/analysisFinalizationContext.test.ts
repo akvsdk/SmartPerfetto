@@ -6,8 +6,10 @@ import {afterEach, describe, expect, it, jest} from '@jest/globals';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import {buildStrategyRegistrySnapshotFromDefinitions} from '../../agentv3/strategyLoader';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
-import {attachFinalizationContext, takeFinalizationContext,
+import {attachFinalizationContext, takeFinalizationContext, isIssuedFinalizationContext,
   type RuntimeFinalizationContextInput} from '../analysisFinalizationContext';
+import {finalizeSourceAwareAnalysisResultWithProjection} from '../../services/codebase/sourceClaimVerifier';
+import {renderConclusionContractSidecar} from '../../agent/core/conclusionContract';
 
 const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'finalization-test'});
 
@@ -38,6 +40,58 @@ const textInput = (signal: AbortSignal, deadlineMs = Date.now() + 1000) => ({
 afterEach(() => {jest.useRealTimers();});
 
 describe('private runtime finalization context', () => {
+  function projectedFixture() {
+    const {result, input} = fixture();
+    const contract = {schemaVersion: 'conclusion_contract_v1' as const, mode: 'focused_answer' as const,
+      conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+      claims: [{id: 'original', text: 'An original declaration.', references: [{evidenceRefId: 'data:original',
+        rowSelector: {name: 'ORIGINAL_MACHINE_VALUE'}, column: 'name', value: 'ORIGINAL_MACHINE_VALUE'}]}]};
+    result.conclusion = `A useful answer.\n${renderConclusionContractSidecar(contract)}`;
+    if (input.deliveryContext.entry === 'historical_restore') throw new Error('Unexpected fixture entry');
+    input.deliveryContext.acceptedCandidate!.conclusionFingerprint = analysisDeliveryFingerprint(result.conclusion);
+    input.deliveryContext.completion = {...input.deliveryContext.completion!, ...input.deliveryContext.acceptedCandidate!};
+    const projected = finalizeSourceAwareAnalysisResultWithProjection(result, undefined, {context: input.deliveryContext});
+    input.deliveryContext = projected.deliveryContext!;
+    input.protocolProjection = projected.protocolProjection;
+    return {result, input};
+  }
+
+  it('keeps native declarations private, frozen, single-owner and disposed with the context', () => {
+    const {result, input} = projectedFixture();
+    expect(JSON.stringify(input.protocolProjection)).not.toContain('ORIGINAL_MACHINE_VALUE');
+    attachFinalizationContext(result, input);
+    expect(() => attachFinalizationContext({...result}, input)).toThrow('already_claimed');
+    const context = takeFinalizationContext(result)!;
+    const native = context.getNativeDeclaration(result, new AbortController().signal)!;
+    expect(native.raw).toContain('ORIGINAL_MACHINE_VALUE');
+    expect(Object.isFrozen(native)).toBe(true);
+    expect(JSON.stringify(context)).not.toContain('ORIGINAL_MACHINE_VALUE');
+    context.dispose();
+    expect(() => context.getNativeDeclaration(result, new AbortController().signal)).toThrow('disposed');
+    expect(() => attachFinalizationContext({...result}, input)).toThrow('projection_mismatch');
+  });
+
+  it.each(['run', 'attempt', 'body', 'claims', 'token'] as const)('rejects a changed %s before accepting a native projection', field => {
+    const {result, input} = projectedFixture();
+    if (input.deliveryContext.entry === 'historical_restore') throw new Error('Unexpected fixture entry');
+    if (field === 'run') {input.runId = 'other-run'; input.deliveryContext.acceptedCandidate!.runId = 'other-run';}
+    if (field === 'attempt') input.deliveryContext.acceptedCandidate!.attemptId = 'other-attempt';
+    if (field === 'body') result.conclusion += ' Changed.';
+    if (field === 'claims') result.conclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], claims: []};
+    if (field === 'token') input.protocolProjection = {...input.protocolProjection!};
+    expect(() => attachFinalizationContext(result, input)).toThrow('projection_mismatch');
+  });
+
+  it('checks the displayed result again when the finalizer takes the private declaration', () => {
+    const {result, input} = projectedFixture();
+    attachFinalizationContext(result, input);
+    const context = takeFinalizationContext(result)!;
+    result.conclusion += ' Changed after context attachment.';
+    expect(() => context.getNativeDeclaration(result, new AbortController().signal)).toThrow('projection_mismatch');
+    context.dispose();
+  });
+
   it('is taken once from the exact result and never copied into serializable results', () => {
     const {result, input} = fixture({dispatchText: async () => ({status: 'ok', text: 'private provider output'})});
     const before = JSON.stringify(result);
@@ -47,20 +101,29 @@ describe('private runtime finalization context', () => {
     expect(takeFinalizationContext(JSON.parse(before))).toBeUndefined();
     const context = takeFinalizationContext(result)!;
     expect(context.runId).toBe('run');
+    expect(isIssuedFinalizationContext(context)).toBe(true);
+    expect(isIssuedFinalizationContext({...context})).toBe(false);
     expect(takeFinalizationContext(result)).toBeUndefined();
     context.dispose();
+    expect(isIssuedFinalizationContext(context)).toBe(false);
     expect(() => context.hasSemanticTransport).toThrow();
   });
 
   it('detaches captured input facts before callers can mutate them', () => {
-    const {result, input} = fixture();
+    const {result, input} = fixture({sourceScope: {codeAwareMode: 'metadata_only', selectedCodebaseIds: ['source-a'],
+      hasCodebaseAccess: true, analysisContextFingerprint: 'scope-a'}});
     attachFinalizationContext(result, input);
     input.traceIdentity.currentTraceId = 'another-trace';
+    input.sourceScope!.selectedCodebaseIds.push('source-b');
+    input.sourceScope!.analysisContextFingerprint = 'scope-b';
     if (input.deliveryContext.entry !== 'historical_restore') input.deliveryContext.acceptedCandidate!.runId = 'another-run';
     const context = takeFinalizationContext(result)!;
     expect(context.traceIdentity.currentTraceId).toBe('trace');
     expect(context.deliveryContext).toMatchObject({acceptedCandidate: {runId: 'run'}});
     expect(Object.isFrozen(context.traceIdentity)).toBe(true);
+    expect(context.sourceScope).toEqual({codeAwareMode: 'metadata_only', selectedCodebaseIds: ['source-a'],
+      hasCodebaseAccess: true, analysisContextFingerprint: 'scope-a'});
+    expect(Object.isFrozen(context.sourceScope!.selectedCodebaseIds)).toBe(true);
     context.dispose();
   });
 

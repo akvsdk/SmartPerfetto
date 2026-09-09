@@ -23,6 +23,7 @@ import {
   TraceProcessorService,
   type TraceProcessor,
 } from '../traceProcessorService';
+import {detectFocusApps} from '../../agentv3/focusAppDetector';
 
 function okResult(label: string): QueryResult {
   return {
@@ -598,7 +599,7 @@ function createActiveLease(store: TraceProcessorLeaseStore, traceId: string): st
     holderType: 'agent_run',
     holderRef: 'run-a',
     runId: 'run-a',
-  }, { mode: 'isolated', now: 1000 });
+  }, { mode: 'isolated' });
   store.markStarting(scope, lease.id);
   lease = store.markReady(scope, lease.id);
   return lease.id;
@@ -622,12 +623,128 @@ async function flushPromises(): Promise<void> {
 describe('TraceProcessorService lease restart supervisor', () => {
   let db: Database.Database | null = null;
 
+  async function activeFixture(mode: 'shared' | 'isolated' = 'isolated') {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-active-lease-'));
+    const traceId = 'active-lease-trace';
+    const tracePath = path.join(tmpDir, `${traceId}.trace`);
+    await fs.writeFile(tracePath, 'trace bytes');
+    db = new Database(':memory:');
+    applyEnterpriseMinimalSchema(db);
+    seedEnterpriseGraph(db, traceId);
+    const store = new TraceProcessorLeaseStore(db);
+    setTraceProcessorLeaseStoreForTests(store);
+    const lease = store.acquireHolder(scope, traceId, {holderType: 'agent_run', holderRef: 'run-a'}, {mode});
+    store.markStarting(scope, lease.id); store.markReady(scope, lease.id);
+    const service = new TraceProcessorService(tmpDir);
+    service.registerStoredTrace({id: traceId, filename: 'fixture.trace', size: 11, filePath: tracePath});
+    return {tmpDir, traceId, service, store, lease,
+      context: {traceId, leaseId: lease.id, mode, leaseScope: scope,
+        holder: {holderType: 'agent_run' as const, holderRef: 'run-a'}}};
+  }
+
   afterEach(() => {
     jest.restoreAllMocks();
     TraceProcessorFactory.cleanup();
     setTraceProcessorLeaseStoreForTests(null);
     db?.close();
     db = null;
+  });
+
+  it('blocks real focus-detector signal-less fallback SQL after its running holder is released', async () => {
+    const fixture = await activeFixture();
+    const {tmpDir, service, store, lease, context, traceId} = fixture;
+    try {
+      const processor = fakeProcessor('cancelled-detector', traceId);
+      const firstQuery = deferred<QueryResult>();
+      const started = deferred<void>();
+      processor.query = jest.fn(async () => {started.resolve(); return firstQuery.promise;});
+      const create = jest.spyOn(TraceProcessorFactory, 'create').mockResolvedValue(processor as any);
+      await service.ensureProcessorForLease(traceId, lease.id, lease.mode, scope);
+      const query = jest.spyOn(service, 'query');
+      const detection = service.runWithLease(context, () => detectFocusApps(service, traceId));
+      await started.promise;
+      store.releaseHolder(scope, lease.id, 'agent_run', 'run-a');
+      store.beginDraining(scope, lease.id);
+      service.cleanupLeaseProcessor(traceId, lease.id, lease.mode);
+      firstQuery.reject(new Error('native query interrupted during cancellation'));
+      await expect(detection).resolves.toMatchObject({method: 'none', apps: []});
+      expect(query).toHaveBeenCalledTimes(3); // Actual detector catches and attempts its two fallbacks.
+      expect(query.mock.calls.every(call => call[2] === undefined)).toBe(true);
+      expect(processor.query).toHaveBeenCalledTimes(1);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect((service as any).processors.has(`${traceId}:lease:${lease.id}`)).toBe(false);
+      expect(TraceProcessorFactory.get(`${traceId}:lease:${lease.id}`)).toBeUndefined();
+    } finally {await fs.rm(tmpDir, {recursive: true, force: true});}
+  });
+
+  it('rejects a cancelled shared owner without destroying another holder or losing ALS pins to explicit options', async () => {
+    const {tmpDir, traceId, service, store, lease, context} = await activeFixture('shared');
+    try {
+      store.acquireHolder(scope, traceId, {holderType: 'agent_run', holderRef: 'run-b'}, {mode: 'shared'});
+      const runB = {...context, holder: {holderType: 'agent_run' as const, holderRef: 'run-b'}};
+      const shared = fakeProcessor('remaining-owner-shared', traceId);
+      const ready = deferred<TraceProcessor>();
+      const create = jest.spyOn(TraceProcessorFactory, 'create').mockImplementation(async () => ready.promise as Promise<any>);
+      const cancelled = service.runWithLease(runB, () => service.query(traceId, 'SELECT cancelled', {
+        leaseId: lease.id, // Omitting scope/mode must inherit the run pin.
+      })).then(() => null, error => error);
+      await flushPromises();
+      expect(create).toHaveBeenCalledTimes(1);
+      store.releaseHolder(scope, lease.id, 'agent_run', 'run-b');
+      ready.resolve(shared);
+      expect(await cancelled).toMatchObject({code: 'TRACE_PROCESSOR_QUERY_CANCELLED'});
+      expect(shared.query).not.toHaveBeenCalled();
+      expect(shared.destroy).not.toHaveBeenCalled();
+      await expect(service.runWithLease(context, () => service.query(traceId, 'SELECT remaining')))
+        .resolves.toMatchObject({rows: [['remaining-owner-shared']]});
+      await expect(service.runWithLease(runB, () => service.query(traceId, 'SELECT late', {leaseId: lease.id})))
+        .rejects.toMatchObject({code: 'TRACE_PROCESSOR_QUERY_CANCELLED'});
+      await expect(service.runWithLease(context, () => service.query(traceId, 'SELECT conflicting', {
+        leaseId: lease.id, leaseMode: 'isolated',
+      }))).rejects.toMatchObject({code: 'TRACE_PROCESSOR_QUERY_CANCELLED'});
+      for (const userId of [undefined, 'other-user']) {
+        await expect(service.runWithLease(context, () => service.query(traceId, 'SELECT conflicting_scope', {
+          leaseScope: {...scope, userId},
+        }))).rejects.toMatchObject({code: 'TRACE_PROCESSOR_QUERY_CANCELLED'});
+      }
+      expect(shared.query).toHaveBeenCalledTimes(1);
+      expect(shared.destroy).not.toHaveBeenCalled();
+      service.cleanupLeaseProcessor(traceId, lease.id, lease.mode);
+    } finally {await fs.rm(tmpDir, {recursive: true, force: true});}
+  });
+
+  it('discards a newly created processor whose scoped lease is released before ready publication', async () => {
+    const {tmpDir, traceId, service, store, lease} = await activeFixture();
+    try {
+      const processor = fakeProcessor('late-private-startup', traceId);
+      const ready = deferred<TraceProcessor>();
+      jest.spyOn(TraceProcessorFactory, 'create').mockImplementation(async (_id, _path, options) => {
+        (TraceProcessorFactory as any).processors.set(options!.processorKey, processor);
+        return ready.promise as Promise<any>;
+      });
+      const creation = service.ensureProcessorForLease(traceId, lease.id, lease.mode, scope).then(() => null, error => error);
+      await flushPromises();
+      store.releaseHolder(scope, lease.id, 'agent_run', 'run-a'); store.beginDraining(scope, lease.id);
+      ready.resolve(processor);
+      expect(await creation).toMatchObject({code: 'TRACE_PROCESSOR_QUERY_CANCELLED'});
+      expect(processor.destroy).toHaveBeenCalledTimes(1);
+      expect((service as any).processors.has(`${traceId}:lease:${lease.id}`)).toBe(false);
+      expect(TraceProcessorFactory.get(`${traceId}:lease:${lease.id}`)).toBeUndefined();
+    } finally {await fs.rm(tmpDir, {recursive: true, force: true});}
+  });
+
+  it.each(['missing', 'trace', 'mode', 'scope', 'expired_holder', 'expired_lease'])('rejects %s scoped lease before creating a processor', async mismatch => {
+    const {tmpDir, traceId, service, lease} = await activeFixture();
+    try {
+      const create = jest.spyOn(TraceProcessorFactory, 'create');
+      if (mismatch === 'expired_holder') db!.prepare('UPDATE trace_processor_holders SET expires_at = 1').run();
+      if (mismatch === 'expired_lease') db!.prepare('UPDATE trace_processor_leases SET expires_at = 1').run();
+      await expect(service.ensureProcessorForLease(mismatch === 'trace' ? 'other-trace' : traceId,
+        mismatch === 'missing' ? 'unknown-lease' : lease.id, mismatch === 'mode' ? 'shared' : lease.mode,
+        mismatch === 'scope' ? {...scope, workspaceId: 'other-workspace'} : scope))
+        .rejects.toMatchObject({code: 'TRACE_PROCESSOR_QUERY_CANCELLED'});
+      expect(create).not.toHaveBeenCalled();
+    } finally {await fs.rm(tmpDir, {recursive: true, force: true});}
   });
 
   it('uses one supervisor restart for concurrent crashed lease holders and preserves the lease id', async () => {

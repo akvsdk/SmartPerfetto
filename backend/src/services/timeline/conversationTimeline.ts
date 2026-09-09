@@ -170,6 +170,9 @@ export function summarizeDataEnvelopeForTimeline(
     envelopes.forEach((envelope, index) => {
       const title = sanitizeConversationText(envelope.display?.title || envelope.meta?.stepId || envelope.meta?.source);
       if (!title) return;
+      // Generated SQL titles only report transport size; the call and empty-result
+      // narration already describe execution. Keep the underlying envelope intact.
+      if (envelope.meta?.type === 'sql_result' && /^SQL (?:Query(?: Result)?|Summary) \(\d+ rows\)$/.test(title)) return;
       const source = locations[index];
       const label = showLocations
         ? (includePane ? source?.label : source?.roleLabel)

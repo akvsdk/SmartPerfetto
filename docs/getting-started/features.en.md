@@ -29,6 +29,7 @@ Output:
 
 - The AI calls backend TraceProcessor, SQL, Skills, and scene strategies.
 - The UI streams progress, SQL/Skill evidence, tables, and the final conclusion.
+- Each round places its analysis process and steps above its final conclusion, keeping each round together.
 - Conclusions should trace back to concrete time ranges, threads, slices, SQL rows, or Skill results.
 
 ### Browser Trace Tools And Local WASM
@@ -67,11 +68,13 @@ SmartPerfetto includes Android performance analysis scenarios for common trace i
 | Scenario | Example prompt | Typical output |
 |---|---|---|
 | Startup | `Analyze startup performance`, `Why is startup slow?` | Startup phase breakdown, main-thread blocking, key slices, duration metrics |
-| Scrolling/Jank | `Analyze scrolling jank`, `How was FPS in this scroll?` | FPS/Jank metrics, slow frames, UI/RenderThread/scheduler evidence |
+| Scrolling/animation/jank | `Analyze scrolling jank`, `Which content-loading tasks occupy the main thread during this window animation?` | Continuous main-thread work, tasks within/between frames, source clues, execution/wait time and frame outcomes |
 | ANR | `Analyze this ANR` | Main-thread wait, Binder/lock/scheduler signals, likely root cause |
 | Interaction latency | `Why did this tap respond slowly?` | Input-to-render path, main-thread and rendering-thread delay |
 | Memory/CPU | `Check memory pressure`, `Why is CPU high?` | Process/thread stats, scheduling and resource evidence |
 | Rendering pipeline | `Analyze this rendering path` | App, Framework, SurfaceFlinger, HWC/GPU evidence |
+
+For animations with concurrent content loading, select the full animation interval and identify the app. Analysis includes work between doFrame callbacks, window boundaries and execution without slice annotations, then checks frame outcomes. Task evidence retains slice, thread and time locators. Missing scheduling, request or source evidence remains explicit; a task name alone does not prove initialization caused a missed frame.
 
 Output:
 

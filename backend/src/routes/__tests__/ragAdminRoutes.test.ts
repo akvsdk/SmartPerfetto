@@ -1363,10 +1363,25 @@ describe('codebase routes', () => {
       expect(response.body).toMatchObject({
         success: false,
         error: expect.stringMatching(/root_outside_allowlist|blocked_by_security/),
+        code: 'CODEBASE_INDEX_FAILED',
+        onDemandAvailable: false,
       });
     } finally {
       fs.rmSync(outside, {recursive: true, force: true});
     }
+  });
+
+  it('reports optional-index capacity separately from live on-demand access', async () => {
+    const root = path.join(tmpDir, 'index-capacity');
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, 'Main.kt'), 'class Main {\n' + '  fun next() = Unit\n'.repeat(400) + '}\n');
+    const ref = registry.register({kind: 'app_source', displayName: 'Capacity', rootPath: root, ...DEFAULT_SCOPE});
+    const response = await request(app).post(`/api/rag/codebases/${ref.codebaseId}/reindex`).send({maxChunks: 1});
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({
+      success: false, code: 'CODEBASE_INDEX_CAPACITY_EXCEEDED', onDemandAvailable: true,
+    });
+    expect(registry.get(ref.codebaseId, DEFAULT_SCOPE)?.activeGeneration).toBeUndefined();
   });
 
   it('deletes only the scoped codebase and every indexed generation', async () => {

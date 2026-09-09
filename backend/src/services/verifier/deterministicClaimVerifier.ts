@@ -36,6 +36,8 @@ type Unit = {dimension: string; numerator: bigint; denominator: bigint};
 const hasOwn = (value: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(value, key);
 const proofKinds: Readonly<Record<string, DeterministicClaimProofKind>> = Object.freeze({
   'numeric.cell': 'numeric_cell',
+  'captured.cell': 'captured_cell',
+  'source.location': 'source_location',
   'interval.overlap': 'interval_overlap',
   'comparison.delta': 'comparison_delta',
 });
@@ -247,10 +249,20 @@ function proof(
   reason: string,
   anchors: EvidenceAnchorV1[] = [],
 ): DeterministicClaimProof {
+  const nativeRows = [...new Set(anchors)].flatMap(anchor => {
+    const facts = getCapturedAnchorFacts(anchor);
+    const native = facts?.nativeRow;
+    if (!native || native.traceId !== anchor.context.traceId || native.traceSide !== anchor.context.traceSide ||
+        facts.captureId !== anchor.context.captureId) return [];
+    return [{anchorId: anchor.anchorId, evidenceRefId: anchor.evidenceRefId, captureId: facts.captureId,
+      traceId: native.traceId, traceSide: native.traceSide, relation: native.relation, idColumn: native.idColumn,
+      id: native.id, schemaFingerprint: native.schemaFingerprint}];
+  });
   return {
     kind, status, reason,
     anchorIds: [...new Set(anchors.map(anchor => anchor.anchorId))],
     evidenceRefIds: [...new Set(anchors.map(anchor => anchor.evidenceRefId))],
+    ...(nativeRows.length ? {nativeRows} : {}),
   };
 }
 
@@ -278,6 +290,26 @@ function numericProof(claim: ClaimSupportV1, semantics: ClaimSemanticsV1): Deter
   if (!actual || !expected) return proof(kind, 'candidate', 'exact_numeric_value_unavailable', anchors);
   const matched = numericOperator(compare(scale(actual, actualUnit), scale(expected, expectedUnit)), semantics.numeric.operator);
   return proof(kind, matched ? 'proved' : 'rejected', matched ? 'numeric_operator_proved' : 'numeric_operator_rejected', anchors);
+}
+
+/** Proves only the explicitly declared nonnumeric value of one captured cell. */
+function capturedCellProof(claim: ClaimSupportV1, semantics: ClaimSemanticsV1): DeterministicClaimProof {
+  const kind = 'captured_cell';
+  if (semantics.scope.subjectRefs?.length !== 1 || semantics.scope.objectRefs?.length) {
+    return proof(kind, 'candidate', 'captured_scope_requires_one_cell');
+  }
+  if (semantics.numeric) return proof(kind, 'candidate', 'captured_numeric_not_supported');
+  const subject = semantics.scope.subjectRefs[0];
+  if (!subject.column || !hasOwn(subject, 'value')) return proof(kind, 'candidate', 'captured_declaration_missing');
+  if (subject.value !== null && typeof subject.value !== 'string' && typeof subject.value !== 'boolean') {
+    return proof(kind, 'candidate', 'captured_numeric_not_supported');
+  }
+  const resolved = resolveCell(claim, subject);
+  if ('reason' in resolved) return proof(kind, 'candidate', resolved.reason);
+  const {anchor, value} = resolved.value;
+  const matched = exactPrimitiveMatch(subject.value, value);
+  return proof(kind, matched ? 'proved' : 'rejected',
+    matched ? 'captured_cell_value_proved' : 'captured_cell_value_rejected', [anchor]);
 }
 
 function exactNanoseconds(value: EvidenceScalar, field: CapturedFieldSemantics): bigint | undefined {
@@ -390,6 +422,10 @@ function deterministicProof(claim: ClaimSupportV1, references: ClaimReferenceVer
   if (!semantics) return proof(kind, 'not_checked', 'semantics_not_declared');
   if (claim.bindingEligibility !== 'eligible') return proof(kind, 'candidate', 'binding_eligibility_unchecked');
   if (kind === 'none') return proof(kind, 'candidate', 'unsupported_predicate');
+  // Source locations are evaluated against the private current-run source ledger
+  // by the shared finalizer, never against Trace anchors or model metadata here.
+  if (kind === 'source_location') return proof(kind, 'not_checked', 'source_evidence_required');
+  if (semantics.source) return proof(kind, 'candidate', 'source_declaration_not_supported');
   if (references.some(reference => reference.status === 'missing' || reference.status === 'ambiguous' || reference.status === 'value_mismatch')) {
     return proof(kind, 'candidate', 'reference_cells_unresolved');
   }
@@ -402,9 +438,11 @@ function deterministicProof(claim: ClaimSupportV1, references: ClaimReferenceVer
   if (semantics.scope.population !== 'cited_rows') return proof(kind, 'candidate', 'proposition_population_unproved');
   if (semantics.scope.timeRangeNs) return proof(kind, 'candidate', 'proposition_window_unproved');
   if ((kind === 'numeric_cell' && claim.kind !== 'numeric') || (kind === 'interval_overlap' && claim.kind !== 'time_range') ||
+      (kind === 'captured_cell' && claim.kind !== 'identity' && claim.kind !== 'categorical') ||
       (kind === 'comparison_delta' && claim.kind !== 'comparison')) return proof(kind, 'candidate', 'claim_kind_predicate_mismatch');
   switch (kind) {
     case 'numeric_cell': return numericProof(claim, semantics);
+    case 'captured_cell': return capturedCellProof(claim, semantics);
     case 'interval_overlap': return intervalProof(claim, semantics);
     case 'comparison_delta': return comparisonProof(claim, semantics);
   }
@@ -414,7 +452,7 @@ function coverageFor(proved: DeterministicClaimProof, references: ClaimReference
   if (proved.status === 'proved') return {
     status: 'complete',
     covered: ['predicate', 'polarity', 'discourse', 'quantifier', 'modality', 'conditions', 'scope',
-      ...(proved.kind === 'interval_overlap' ? [] : ['numeric'])],
+      ...(proved.kind === 'captured_cell' ? ['value'] : proved.kind === 'interval_overlap' ? [] : ['numeric'])],
     uncovered: [],
     reason: 'complete_typed_proposition_proved',
   };

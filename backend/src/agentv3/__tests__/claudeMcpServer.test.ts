@@ -42,6 +42,7 @@ import {readRuntimeToolResultFacts} from '../../agentRuntime/runtimeToolResult';
 import * as runtimeToolSpec from '../../agentRuntime/runtimeToolSpec';
 import {sanitizeSourceReference} from '../../services/codebase/sourceUseDecision';
 import {verifySourceClaimBindings} from '../../services/codebase/sourceClaimVerifier';
+import * as resolvedAnalysisContext from '../../services/resolvedAnalysisContext';
 
 // ── Mock dependencies ────────────────────────────────────────────────────
 
@@ -7196,6 +7197,230 @@ describe('createClaudeMcpServer', () => {
   });
 
   describe('source-use decision', () => {
+    it.each(['provider_send', 'metadata_only'] as const)('records %s reads after a stop and publishes bindable Unicode references', async mode => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-source-delivery-'));
+      try {
+        const root = path.join(tmpDir, 'app');
+        fs.mkdirSync(path.join(root, '源码'), {recursive: true});
+        const filePath = '源码/Startup Hooks.kt';
+        fs.writeFileSync(path.join(root, filePath), Array.from({length: 100}, (_, i) => `class Source${i}`).join('\n'));
+        const codebaseRegistry = new CodebaseRegistry(path.join(tmpDir, 'codebases.json'));
+        const ref = codebaseRegistry.register({kind: 'app_source', displayName: 'Source', rootPath: root,
+          rootAuthorization: 'native_picker', sendToProvider: true});
+        const {tools, sourceUse} = createTestServer({codeAwareMode: mode, codebaseIds: [ref.codebaseId], codebaseRegistry});
+        await callTool(tools, 'record_source_use_decision', {status: 'not_needed',
+          reason: 'The current trace facts initially appear sufficient for this question.'});
+        const read = await callTool(tools, 'read_codebase_file', {file_path: filePath, start_line: 10, max_lines: 5});
+        expect(read.success).toBe(true);
+        expect(read.truncated).toBe(true);
+        expect(read.sourceReferences).toEqual([expect.objectContaining({filePath, id: expect.stringMatching(/^source-ref-v1-/)})]);
+        const actual = sourceUse.getSourceUseDecision()!;
+        expect(actual.status).toBe(mode === 'provider_send' ? 'corroborated' : 'located');
+        expect(actual.reasonCode).toBeUndefined();
+        expect(actual.coverageComplete).toBeUndefined();
+        expect(actual.references).toEqual(read.sourceReferences);
+        expect(actual.attemptedTools).toEqual(['read_codebase_file']);
+        const verification = verifySourceClaimBindings({actualSourceUseDecision: actual,
+          conclusionContract: {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+            conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+            claims: [{id: 'source', kind: 'inference', text: 'A candidate source location', references: []}],
+            sourceClaimBindings: [{claimId: 'source', mechanismStatus: 'compatible',
+              sourceReferenceIds: [read.sourceReferences[0].id], traceEvidenceRefIds: []}]}});
+        expect(verification.status).toBe('passed');
+      } finally { fs.rmSync(tmpDir, {recursive: true, force: true}); }
+    });
+
+    it('admits at most 100 distinct references across calls and codebases without delivering unrecorded bodies', async () => {
+      const sourceAccess = {read: jest.fn(async () => ({success: false, codebaseId: 'app-a', truncated: false})), search: jest.fn(async (input: {codebaseId: string; query: string}) => ({
+        success: true, codebaseId: input.codebaseId, matches: Array.from({length: 20}, (_, i) => ({
+          referenceId: `lookup-${input.query}-${i}`, codebaseId: input.codebaseId,
+          filePath: `src/Batch${input.query}File${i}.kt`, lineRange: {start: 1, end: 1}, text: `class Batch${input.query}File${i}`,
+        })), truncated: false, coverageComplete: true, backend: 'node' as const,
+        enumerationBackend: 'node-walk' as const, backendFidelity: 'exact' as const,
+      }))};
+      const {tools, sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: ['app-a', 'app-b'],
+        onDemandSourceAccess: sourceAccess});
+      for (let i = 0; i < 5; i++) {
+        const result = await callTool(tools, 'search_codebase', {codebase_id: i % 2 ? 'app-b' : 'app-a', query: String(i)});
+        expect(result.matches).toHaveLength(20);
+        expect(result.sourceReferences).toHaveLength(20);
+      }
+      const overflow = await callTool(tools, 'search_codebase', {codebase_id: 'app-b', query: '5'});
+      expect(overflow.matches).toEqual([]);
+      expect(overflow.sourceReferences).toEqual([]);
+      expect(overflow.coverageComplete).toBe(false);
+      expect(overflow.searchIncompleteReason).toBe('source_reference_limit_exceeded');
+      const duplicate = await callTool(tools, 'search_codebase', {codebase_id: 'app-a', query: '0'});
+      expect(duplicate.matches).toHaveLength(20);
+      expect(sourceUse.getSourceUseDecision()?.references).toHaveLength(100);
+      expect(sourceUse.getSourceUseDecision()?.coverageComplete).toBe(false);
+    });
+
+    it.each(['refused', 'throws'] as const)('records an actual %s source attempt after an earlier stop', async outcome => {
+      const sourceAccess = {search: jest.fn<OnDemandSourceAccessService['search']>(),
+        read: jest.fn<OnDemandSourceAccessService['read']>(async () => {
+          if (outcome === 'throws') throw new Error('source_path_outside_provider_grant');
+          return {success: false, codebaseId: 'app-a', truncated: false, unsupportedReason: 'provider_send_not_consented'};
+        })};
+      const {tools, sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: ['app-a'],
+        onDemandSourceAccess: sourceAccess});
+      await callTool(tools, 'record_source_use_decision', {status: 'not_needed',
+        reason: 'Trace facts initially appear sufficient without further source investigation.'});
+      await callTool(tools, 'read_codebase_file', {file_path: 'src/Foo.kt'}).catch(() => undefined);
+      expect(sourceAccess.read).toHaveBeenCalledTimes(1);
+      expect(sourceUse.getSourceUseDecision()).toMatchObject({status: 'attempted',
+        attemptedTools: ['read_codebase_file'], queriedCodebaseIds: ['app-a'], usedCodebaseIds: [], references: []});
+      expect(sourceUse.getSourceUseDecision()?.reasonCode).toBeUndefined();
+    });
+
+    it.each([
+      ['query_code_graph', {query: ' '}, 'query_invalid'],
+      ['inspect_code_symbol', {symbol: ' '}, 'symbol_invalid'],
+      ['inspect_code_symbol', {symbol: 'Foo', file_path: '../outside/Foo.kt'}, 'source_path_invalid'],
+    ] as const)('records a rejected %s graph operation after a stop without inventing references', async (toolName, args, reason) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-graph-rejected-'));
+      try {
+        const root = path.join(tmpDir, 'source');
+        fs.mkdirSync(path.join(root, '.gitnexus'), {recursive: true});
+        const registry = new CodebaseRegistry(path.join(tmpDir, 'registry.json'));
+        const ref = registry.register({kind: 'app_source', displayName: 'Source', rootPath: root,
+          rootAuthorization: 'native_picker', sendToProvider: true});
+        const ledger = new CodeLookupLedger('graph-rejected', 1000, 1, path.join(tmpDir, 'ledger.jsonl'));
+        const {tools, sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: [ref.codebaseId],
+          codebaseRegistry: registry, codeLookupLedger: ledger});
+        await callTool(tools, 'record_source_use_decision', {status: 'not_needed',
+          reason: 'Trace facts initially appear sufficient without further source investigation.'});
+        await expect(callTool(tools, toolName, args)).rejects.toThrow(reason);
+        expect(sourceUse.getSourceUseDecision()).toMatchObject({status: 'attempted', attemptedTools: [toolName],
+          queriedCodebaseIds: [ref.codebaseId], usedCodebaseIds: [], references: []});
+        expect(sourceUse.getSourceUseDecision()?.reasonCode).toBeUndefined();
+        expect(ledger.getEntries()).toEqual([expect.objectContaining({toolName, outcome: 'rejected',
+          returnedReferenceCount: 0, tokensSpent: 0, chunkIds: []})]);
+      } finally { fs.rmSync(tmpDir, {recursive: true, force: true}); }
+    });
+
+    it.each([
+      ['app_source', 'lookup_app_source'], ['aosp', 'lookup_aosp_source'],
+      ['kernel_source', 'lookup_kernel_source'], ['oem_sdk', 'lookup_oem_sdk'],
+      ['app_source', 'resolve_symbol'],
+    ] as const)('records %s acquisition exceptions in %s after a stop', async (kind, toolName) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-indexed-rejected-'));
+      try {
+        const root = path.join(tmpDir, 'source');
+        fs.mkdirSync(root);
+        const registry = new CodebaseRegistry(path.join(tmpDir, 'registry.json'));
+        const ref = registry.register({kind, displayName: 'Source', rootPath: root, sendToProvider: true});
+        const search = jest.fn<RagStore['search']>(() => {throw new Error('source_store_unavailable');});
+        const ledger = new CodeLookupLedger('indexed-rejected', 1000, 1, path.join(tmpDir, 'ledger.jsonl'));
+        const {tools, sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: [ref.codebaseId],
+          codebaseRegistry: registry, codeLookupLedger: ledger, ragStore: {search}});
+        await callTool(tools, 'record_source_use_decision', {status: 'not_needed',
+          reason: 'Trace facts initially appear sufficient without further source investigation.'});
+        await expect(callTool(tools, toolName, {query: 'Foo', symbol: 'Foo', codebase_id: ref.codebaseId, path_prefix: 'src'}))
+          .rejects.toThrow('source_store_unavailable');
+        expect(search).toHaveBeenCalledTimes(1);
+        expect(sourceUse.getSourceUseDecision()).toMatchObject({status: 'attempted', attemptedTools: [toolName],
+          queriedCodebaseIds: [ref.codebaseId], usedCodebaseIds: [], references: []});
+        expect(sourceUse.getSourceUseDecision()?.reasonCode).toBeUndefined();
+        expect(ledger.getEntries()).toEqual([expect.objectContaining({toolName, outcome: 'rejected',
+          returnedReferenceCount: 0, tokensSpent: 0, chunkIds: []})]);
+      } finally { fs.rmSync(tmpDir, {recursive: true, force: true}); }
+    });
+
+    it('records a post-retrieval source filter exception without granting source evidence', async () => {
+      const filter = jest.spyOn(ragLookupFilter, 'filterRagLookup').mockRejectedValueOnce(new Error('source_filter_unavailable'));
+      try {
+        const {tools, sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: ['app-a'],
+          ragStore: {search: jest.fn<RagStore['search']>(query => ({...makeSparkProvenance({source: 'test'}),
+            query, results: [], probed: ['app_source'], retrievedAt: Date.now()}))}});
+        await callTool(tools, 'record_source_use_decision', {status: 'not_needed',
+          reason: 'Trace facts initially appear sufficient without further source investigation.'});
+        await expect(callTool(tools, 'lookup_app_source', {query: 'Foo'})).rejects.toThrow('source_filter_unavailable');
+        expect(sourceUse.getSourceUseDecision()).toMatchObject({status: 'attempted',
+          attemptedTools: ['lookup_app_source'], queriedCodebaseIds: ['app-a'], usedCodebaseIds: [], references: []});
+      } finally { filter.mockRestore(); }
+    });
+
+    it('keeps incomplete search coverage after an exact read without losing a positive source binding', async () => {
+      const sourceAccess = {search: jest.fn<OnDemandSourceAccessService['search']>(async () => ({
+        success: true, codebaseId: 'app-a', matches: [], truncated: true, coverageComplete: false,
+        searchIncompleteReason: 'time_budget', backend: 'node', enumerationBackend: 'node-walk', backendFidelity: 'degraded',
+      })), read: jest.fn<OnDemandSourceAccessService['read']>(async () => ({success: true, codebaseId: 'app-a',
+        reference: {referenceId: 'source-positive', codebaseId: 'app-a', filePath: 'src/Foo.kt',
+          lineRange: {start: 10, end: 20}, text: 'class Foo'}, truncated: true}))};
+      const {tools, sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: ['app-a'],
+        onDemandSourceAccess: sourceAccess});
+      await callTool(tools, 'search_codebase', {query: 'Foo'});
+      const read = await callTool(tools, 'read_codebase_file', {file_path: 'src/Foo.kt'});
+      const actual = sourceUse.getSourceUseDecision()!;
+      expect(actual).toMatchObject({status: 'search_incomplete', coverageComplete: false,
+        references: read.sourceReferences, usedCodebaseIds: ['app-a']});
+      const verified = verifySourceClaimBindings({actualSourceUseDecision: actual,
+        conclusionContract: {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+          conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
+          claims: [{id: 'source', kind: 'inference', text: 'A candidate source implementation', references: []}],
+          sourceClaimBindings: [{claimId: 'source', mechanismStatus: 'compatible',
+            sourceReferenceIds: [read.sourceReferences[0].id], traceEvidenceRefIds: []}]}});
+      expect(verified.status).toBe('passed');
+    });
+
+    it.each([
+      ['app_source', 'lookup_app_source'], ['aosp', 'lookup_aosp_source'],
+      ['kernel_source', 'lookup_kernel_source'], ['oem_sdk', 'lookup_oem_sdk'],
+    ] as const)('enforces provider reference admission before %s patch grants and across tool kinds', async (kind, toolName) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-index-reference-admission-'));
+      try {
+        const scope = {tenantId: 'admission-tenant', workspaceId: 'admission-workspace', userId: 'admission-user'};
+        const root = path.join(tmpDir, 'source');
+        fs.mkdirSync(path.join(root, 'src'), {recursive: true});
+        fs.writeFileSync(path.join(root, 'src/Extra.c'), 'void Extra() {}');
+        const registry = new CodebaseRegistry(path.join(tmpDir, 'registry.json'));
+        const ref = registry.register({kind, displayName: 'Source', rootPath: root, rootAuthorization: 'native_picker', sendToProvider: true, ...scope});
+        registry.activateIndexGeneration(ref.codebaseId, scope, ref.indexGeneration, {lastIngestStatus: 'ok',
+          activeGeneration: 'admission-generation', contentFingerprint: 'a'.repeat(64), chunkCount: 101});
+        const store = new RagStore(path.join(tmpDir, 'rag.json'));
+        const batchNames = ['alphabet', 'bravox', 'charliex', 'deltax', 'echox', 'foxtrotx'];
+        store.addChunks(Array.from({length: 101}, (_, i) => ({chunkId: `source-chunk-${i}`, kind,
+          registryOrigin: 'codebase_registry' as const, codebaseId: ref.codebaseId, sourceGeneration: 'admission-generation',
+          uri: `codebase://${ref.codebaseId}/src/File${i}.c`, filePath: `src/File${i}.c`, lineRange: {start: 1, end: 1},
+          symbol: batchNames[Math.floor(i / 20)], snippet: `void ${batchNames[Math.floor(i / 20)]}() { /* ${i} */ }`,
+          license: 'Apache-2.0', indexedAt: Date.now()})), scope);
+        const ledger = new CodeLookupLedger('indexed-admission', 100_000, 2, path.join(tmpDir, 'ledger.jsonl'));
+        const graphResult: CodeGraphNavigationResult = {success: true, codebaseId: ref.codebaseId,
+          references: [{referenceId: 'graph-extra', codebaseId: ref.codebaseId, filePath: 'src/Extra.c'}],
+          processes: [], graph: {engine: 'gitnexus', freshness: 'current', verificationRequired: true}, truncated: false};
+        const server = createTestServer({codeAwareMode: 'provider_send', codebaseIds: [ref.codebaseId],
+          codebaseRegistry: registry, ragStore: store, codeLookupLedger: ledger,
+          knowledgeScope: scope,
+          codeGraphNavigator: {query: async () => graphResult, inspectSymbol: async () => graphResult}});
+        for (let batch = 0; batch < 5; batch++) {
+          const result = await callTool(server.tools, toolName, {query: batchNames[batch], symbol: batchNames[batch],
+            codebase_id: ref.codebaseId, path_prefix: 'src', top_k: 20});
+          expect(result.result.sourceReferences).toHaveLength(20);
+          expect(result.result.hits.every((hit: {snippet?: string}) => typeof hit.snippet === 'string')).toBe(true);
+        }
+        const overflow = await callTool(server.tools, toolName, {query: batchNames[5], symbol: batchNames[5],
+          codebase_id: ref.codebaseId, path_prefix: 'src', top_k: 20});
+        expect(overflow.result.hits).toEqual([]);
+        expect(overflow.result.sourceReferences).toEqual([]);
+        expect(overflow.result.searchIncompleteReason).toBe('source_reference_limit_exceeded');
+        expect(ledger.hasPriorLookupOf('source-chunk-100')).toBe(false);
+        expect(ledger.hasPriorLookupOf('source-chunk-0')).toBe(true);
+        const read = await callTool(server.tools, 'read_codebase_file', {file_path: 'src/Extra.c'});
+        expect(read).toMatchObject({success: false, sourceReferences: [], unsupportedReason: 'source_reference_limit_exceeded'});
+        expect(read.reference).toBeUndefined();
+        for (const graphTool of ['query_code_graph', 'inspect_code_symbol']) {
+          const graph = await callTool(server.tools, graphTool, {query: 'Extra', symbol: 'Extra'});
+          expect(graph.references).toEqual([]);
+          expect(graph.sourceReferences).toEqual([]);
+        }
+        const resolved = await callTool(server.tools, 'resolve_symbol', {symbol: batchNames[5]});
+        expect(resolved.sourceReferences).toEqual([]);
+        expect(resolved.results.flatMap((result: {candidates: unknown[]}) => result.candidates)).toEqual([]);
+        expect(server.sourceUse.getSourceUseDecision()?.references).toHaveLength(100);
+      } finally { fs.rmSync(tmpDir, {recursive: true, force: true}); }
+    });
+
     it('keeps existing-only source authorization without a pending task or invented observations', () => {
       const {tools, sourceUse} = createTestServer({allowNewEvidence: false,
         codeAwareMode: 'provider_send', codebaseIds: ['app-codebase']});
@@ -7245,6 +7470,32 @@ describe('createClaudeMcpServer', () => {
       (first.selectedCodebaseIds as string[]).push('mutated-outside');
       expect(sourceUse.getSourceUseDecision()?.selectedCodebaseIds)
         .toEqual(['app-codebase']);
+    });
+
+    it('provides actual source execution scope even when no source decision exists', () => {
+      const inactive = createTestServer({codeAwareMode: 'off', codebaseIds: ['ignored-codebase']}).sourceUse;
+      expect(inactive.getSourceUseDecision()).toBeUndefined();
+      expect(inactive.getSourceExecutionScope?.()).toEqual({codeAwareMode: 'off', selectedCodebaseIds: [],
+        hasCodebaseAccess: false, analysisContextFingerprint: expect.any(String)});
+      const {sourceUse} = createTestServer({codeAwareMode: 'metadata_only', codebaseIds: ['app-a', 'app-a']});
+      const scope = sourceUse.getSourceExecutionScope?.()!;
+      expect(scope).toEqual({codeAwareMode: 'metadata_only', selectedCodebaseIds: ['app-a'],
+        hasCodebaseAccess: true, analysisContextFingerprint: expect.any(String)});
+      scope.selectedCodebaseIds.push('other-source');
+      scope.codeAwareMode = 'off';
+      expect(sourceUse.getSourceExecutionScope?.()).toMatchObject({codeAwareMode: 'metadata_only', selectedCodebaseIds: ['app-a']});
+    });
+
+    it.each(['revoked', 'registry-unavailable'])('withholds source execution scope without throwing when authorization is %s', reason => {
+      const fingerprint = jest.spyOn(resolvedAnalysisContext, 'buildAnalysisContextAuthorizationFingerprint').mockReturnValue('authorized');
+      try {
+        const {sourceUse} = createTestServer({codeAwareMode: 'provider_send', codebaseIds: ['app-a']});
+        expect(sourceUse.getSourceExecutionScope?.()?.hasCodebaseAccess).toBe(true);
+        if (reason === 'revoked') fingerprint.mockReturnValue('authorization-changed');
+        else fingerprint.mockImplementation(() => {throw new Error('registry unavailable');});
+        expect(() => sourceUse.getSourceExecutionScope?.()).not.toThrow();
+        expect(sourceUse.getSourceExecutionScope?.()).toBeUndefined();
+      } finally {fingerprint.mockRestore();}
     });
 
     it('caps metadata lookup at located and lets provider source bodies corroborate', async () => {
@@ -7311,9 +7562,13 @@ describe('createClaudeMcpServer', () => {
           ragStore,
           knowledgeScope: scope,
         });
-        await callTool(indexed.tools, 'lookup_app_source', {
+        const indexedResult = await callTool(indexed.tools, 'lookup_app_source', {
           query: 'StartupHooks',
         });
+        expect(indexedResult.result.sourceReferences).toEqual(indexed.sourceUse.getSourceUseDecision()?.references);
+        const resolved = await callTool(indexed.tools, 'resolve_symbol', {symbol: 'StartupHooks'});
+        expect(resolved.sourceReferences).toEqual([expect.objectContaining({chunkId: 'indexed-startup-hooks', lookupKind: 'metadata'})]);
+        expect(indexed.sourceUse.getSourceUseDecision()?.references).toEqual(expect.arrayContaining(resolved.sourceReferences));
 
         expect(metadata.sourceUse.getSourceUseDecision()).toEqual(expect.objectContaining({
           status: 'located',
@@ -7331,7 +7586,7 @@ describe('createClaudeMcpServer', () => {
         }));
         expect(indexed.sourceUse.getSourceUseDecision()).toEqual(expect.objectContaining({
           status: 'corroborated',
-          references: [expect.objectContaining({lookupKind: 'indexed'})],
+          references: expect.arrayContaining([expect.objectContaining({lookupKind: 'indexed'})]),
         }));
       } finally {
         fs.rmSync(tmpDir, {recursive: true, force: true});
@@ -7971,6 +8226,8 @@ describe('createClaudeMcpServer', () => {
           graph: {engine: 'gitnexus', freshness: 'stale', verificationRequired: true},
         }));
         expect(inspect.references[0].referenceId).toBe(`graph-${refB.codebaseId}`);
+        expect(query.sourceReferences).toEqual(inspect.sourceReferences);
+        expect(query.sourceReferences[0]).toMatchObject({lookupKind: 'graph', id: expect.stringMatching(/^source-ref-v1-/)});
         expect(sourceUse.getSourceUseDecision()).toEqual(expect.objectContaining({
           status: 'located',
           references: expect.arrayContaining([

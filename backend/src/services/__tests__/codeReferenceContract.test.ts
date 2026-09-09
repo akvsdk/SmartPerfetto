@@ -17,11 +17,15 @@ describe('codeReferenceContract', () => {
   it.each([
     'app/src/main/java/demo/StartupHooks.kt:L10-L20',
     'StartupHooks.kt:L10-L20',
+    '源码/启动流程.kt:L10-L20',
+    'feature modules/Main Screen.kt:L10-L20',
     'filePath: app/src/main/java/demo/StartupHooks.kt, lineRange: 10-20',
     'filePath: StartupHooks.kt, lineRange: 10-20',
     '{"filePath":"app/src/main/java/demo/StartupHooks.kt","lineRange":{"start":10,"end":20}}',
+    '{"filePath":"源码/Main Screen.kt","lineRange":{"start":10,"end":20}}',
     'filePath: app/src/main/java/demo/StartupHooks.kt, chunkId: chunk-1, 行号不可用',
     'filePath = app/src/main/java/demo/StartupHooks.kt; chunkId = chunk-1; line number unavailable',
+    'filePath: 源码/Main Screen.kt; referenceId: source-1; 行号不可用',
   ])('accepts a locatable source reference: %s', reference => {
     expect(hasConcreteCodeReference(reference)).toBe(true);
   });
@@ -35,6 +39,8 @@ describe('codeReferenceContract', () => {
     'filePath: app/src/main/java/demo/StartupHooks.kt',
     'filePath: app/src/main/java/demo/StartupHooks.kt, chunkId: chunk-1',
     'filePath and lineRange are required',
+    '/Users/demo/Secret.kt:L10-L20',
+    '../outside/Secret.kt:L10-L20',
   ])('rejects a non-locatable source mention: %s', reference => {
     expect(hasConcreteCodeReference(reference)).toBe(false);
   });

@@ -8,7 +8,7 @@ import {tmpdir} from 'node:os';
 import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
 import {resolveRuntimeTurnPolicy, type RuntimeTurnPolicy} from '../../runtimeTurnPolicy';
 import {runClaudeIntentTransport} from './claudeIntentTransport';
-import {attachFinalizationContext, FINALIZATION_MAX_OUTPUT_TOKENS, type RuntimeFinalizationContextInput} from '../../analysisFinalizationContext';
+import {attachFinalizationContext, type RuntimeFinalizationContextInput} from '../../analysisFinalizationContext';
 import {analysisDeliveryFingerprint, type AnalysisCandidateIdentity, type AnalysisCompletion, type AnalysisOutputOrigin, type AnalysisDeliveryContext} from '../../../types/analysisDelivery';
 import type {ReadonlyStrategyRegistrySnapshot} from '../../../services/selfEvolution/effectiveRuntimeRegistryContext';
 import * as fs from 'fs';
@@ -842,10 +842,11 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       });
     };
     let finalizationSetup: {
-      input: Omit<RuntimeFinalizationContextInput, 'deliveryContext' | 'sourceUse' | 'evidenceReadView'>;
+      input: Omit<RuntimeFinalizationContextInput, 'deliveryContext' | 'sourceUse' | 'evidenceReadView' | 'protocolProjection'>;
       ownerKey: string;
     } | undefined;
-    const attachAcceptedFinalization = (result: AnalysisResult, deliveryContext: AnalysisDeliveryContext, allowSemantic: boolean) => {
+    const attachAcceptedFinalization = (result: AnalysisResult, deliveryContext: AnalysisDeliveryContext, allowSemantic: boolean,
+      protocolProjection?: RuntimeFinalizationContextInput['protocolProjection']) => {
       if (!finalizationSetup || attemptNumber === 0 ||
           (!hasAcceptedSdkFinal() && !acceptedRawBody?.trim())) return;
       const store = this.artifactStores.get(sessionId);
@@ -855,8 +856,9 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         ...(identity.referenceTraceId ? [{traceId: identity.referenceTraceId, traceSide: 'reference' as const}] : []),
       ];
       attachFinalizationContext(result, {
-        ...finalizationSetup.input, deliveryContext,
+        ...finalizationSetup.input, deliveryContext, protocolProjection,
         sourceUse: sourceUse?.getSourceUseDecision(),
+        sourceScope: sourceUse?.getSourceExecutionScope?.(),
         evidenceReadView: store?.createEvidenceReadView({allowedTraces, ownerKey: finalizationSetup.ownerKey}),
         dispatchText: allowSemantic && result.completion?.status === 'completed' &&
           result.outputOrigin === 'sdk_final' && result.conclusion.trim().length > 0
@@ -870,17 +872,15 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       // Empty native output remains empty and unsuccessful before any guard can
       // substitute a user-facing explanation for private content.
       const partial = failed || rawBody.trim().length === 0 || completion.status !== 'completed';
-      const receipt = sanitizeCodeAwareStructuredTextWithReceipt(sessionId, rawBody);
       const projection = finalizeSourceAwareAnalysisResultWithProjection({
         sessionId,
         success: !failed && rawBody.trim().length > 0 &&
           (completion.status === 'completed' || completion.status === 'incomplete'),
         findings, hypotheses: (this.sessionHypotheses.get(sessionId) ?? []).map(h => this.toProtocolHypothesis(h)),
-        conclusion: receipt.text, confidence: estimateAnalysisConfidence({findings, partial}),
+        conclusion: rawBody, confidence: estimateAnalysisConfidence({findings, partial}),
         rounds: observedRunTurns(), totalDurationMs: Date.now() - startTime,
         partial: partial || undefined, turnIntent, completion, outputOrigin: acceptedOrigin,
       }, sourceUse, {
-        priorProjection: receipt,
         context: {entry: 'runtime_draft', acceptedCandidate: bindCandidate(rawBody), completion,
           outputOrigin: acceptedOrigin, turnIntent},
       });
@@ -960,11 +960,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
         ? runtimeConfig.quickPathPerTurnMs * runtimeConfig.maxTurns
         : resolveFullRequestTimeoutMs(runtimeConfig.fullPathPerTurnMs, runtimeConfig.maxTurns,
           runtimeConfig.fullRequestTimeoutMs));
-      const finalizationEnv = Object.freeze({...sdkEnv,
-        // Supported by the bundled Claude SDK environment schema and native
-        // output-limit diagnostic. This applies only to the isolated review call.
-        CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(FINALIZATION_MAX_OUTPUT_TOKENS),
-      });
+      const finalizationEnv = Object.freeze({...sdkEnv});
       const finalizationModel = resolvedConfig.model;
       const finalizationBinaryOptions = Object.freeze({...getSdkBinaryOption(finalizationEnv)});
       finalizationSetup = {
@@ -2009,7 +2005,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
           .catch(err => console.warn('[ClaudeRuntime] Negative pattern save failed:', diagnosticLogIdentity((err as Error).message)));
       }
 
-      attachAcceptedFinalization(finalAnalysisResult, deliveryContext, !executionLease.signal.aborted);
+      attachAcceptedFinalization(finalAnalysisResult, deliveryContext, !executionLease.signal.aborted, projectedCandidate.protocolProjection);
       return finalAnalysisResult;
     } catch (error) {
       runtimePerformanceOutcome = runtimeOutcomeFromError(
@@ -2045,7 +2041,7 @@ export class ClaudeRuntime extends EventEmitter implements IOrchestrator {
       applyFinalResultQualityGate({result: failedResult, query,
         sceneType: turnIntent?.sceneId, context: failedProjection.deliveryContext,
         deferFocusedEvidenceFinalization: true});
-      attachAcceptedFinalization(failedResult, failedProjection.deliveryContext, false);
+      attachAcceptedFinalization(failedResult, failedProjection.deliveryContext, false, failedProjection.protocolProjection);
       return failedResult;
     } finally {
       const finalizationPhase = runtimePerformance.startPhase('finalization');

@@ -3,6 +3,9 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import type {CodeLookupLedgerEntry} from '../../services/codebase/codeLookupLedger';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   privateProjectedSourceEventType,
   successfulCodeLookupToolCounts,
@@ -14,9 +17,480 @@ import {
   taskAcceptanceStatus,
   assertVerificationTraceReady,
   loadVerificationTracePair,
+  collectSseSummary,
+  recordVerificationFailureAndCancel,
+  VerificationSseTimeoutError,
+  VerificationSliceSelectionError,
+  parseSliceSelectionTarget,
+  resolveVerificationSliceSelection,
+  installVerificationDiagnostics,
+  writeVerificationDiagnostics,
+  prepareAgentSseNativeOracle,
+  collectAgentSseOracleEvidence,
+  parseArgs as parseVerificationArgs,
   type TerminalAnalysisEvidence,
 } from '../verifyAgentSseScrolling';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
+import * as nativeCapture from '../../services/evidence/rawSqlNativeProvenance';
+import type {PerfettoSqlDocsAsset} from '../../services/perfettoSqlDocs';
+import type {RunningNativeProcessorObservation, TraceInfo} from '../../services/traceProcessorService';
+import type {AnalysisRunTraceProcessorLeases} from '../../services/analysisRunTraceProcessorLease';
+
+describe('transparent verification diagnostics', () => {
+  const stops: Array<() => unknown> = [];
+  afterEach(() => {stops.splice(0).forEach(stop => stop()); jest.restoreAllMocks();});
+  function fixture() {
+    let time = 100;
+    const payload = {model: 'private-model', choices: [{finish_reason: 'stop', message: {content: 'PRIVATE_BODY'}}]};
+    const jsonPromise = Promise.resolve(payload);
+    const json = jest.fn(function(this: unknown, ..._args: unknown[]) {return jsonPromise;});
+    const response = {status: 200, json};
+    const fetchPromise = Promise.resolve(response);
+    const fetch = jest.fn(function(this: unknown, ..._args: unknown[]) {return fetchPromise;});
+    const fetchTarget = {fetch};
+    const result = {columns: ['PRIVATE_COLUMN'], rows: [['PRIVATE_CELL']]};
+    const queryPromise = Promise.resolve(result);
+    const query = jest.fn(function(this: unknown, ..._args: unknown[]) {return queryPromise;});
+    const queryPrototype = {query, queryBounded: query};
+    const processor = Object.assign(Object.create(queryPrototype), {analysisRunPrivate: true,
+      getNativeProvenanceSnapshot: () => ({status: 'trusted', nativeSchemaEligible: true})});
+    const diagnostics = installVerificationDiagnostics({phase: () => 'analysis_stream', fetchTarget, queryPrototype, now: () => time});
+    stops.push(() => diagnostics.stop());
+    return {diagnostics, fetchTarget, fetch, fetchPromise, response, json, jsonPromise, payload,
+      queryPrototype, processor, query, queryPromise, result, time: (value: number) => {time = value;}};
+  }
+
+  it('returns the original promises and objects while preserving this, args and capture identity', async () => {
+    const globalFetch = globalThis.fetch;
+    const target = fixture();
+    const fields = new WeakMap<object, any>([[target.result, {PRIVATE_COLUMN: {unit: 'ns'}}]]);
+    jest.spyOn(nativeCapture, 'readRawSqlCaptureFields').mockImplementation(value => fields.get(value as object));
+    const signal = new AbortController().signal;
+    const init = {body: JSON.stringify({model: 'requested-private-model', stream: false, messages: ['PRIVATE_PROMPT']}), signal};
+    const fetched = target.fetchTarget.fetch('https://provider.invalid/v1/chat/completions', init);
+    expect(fetched).toBe(target.fetchPromise);
+    expect(target.fetch.mock.contexts[0]).toBe(target.fetchTarget);
+    expect(target.fetch.mock.calls[0]).toEqual(['https://provider.invalid/v1/chat/completions', init]);
+    expect(await fetched).toBe(target.response);
+    expect(target.json).not.toHaveBeenCalled();
+    expect(target.response.json()).toBe(target.jsonPromise);
+    expect(await target.jsonPromise).toBe(target.payload);
+    expect(target.json.mock.contexts[0]).toBe(target.response);
+    const options = {signal};
+    expect(target.processor.query('SELECT dur FROM slice', options)).toBe(target.queryPromise);
+    expect(await target.queryPromise).toBe(target.result);
+    expect(target.query.mock.contexts[0]).toBe(target.processor);
+    expect(target.query.mock.calls[0]).toEqual(['SELECT dur FROM slice', options]);
+    expect(nativeCapture.readRawSqlCaptureFields).toHaveBeenCalledWith(target.result);
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.fetch[0]).toMatchObject({state: 'json_fulfilled', stream: false, httpStatus: 200, finishReason: 'stop', outputChars: 12});
+    expect(snapshot.sql[0]).toMatchObject({state: 'fulfilled', analysisRunPrivate: true, pureRead: true,
+      nativeStatusAtCall: 'trusted', nativeStatusAtSettle: 'trusted', directProjection: true,
+      captureFieldsPresent: true, captureFieldCount: 1});
+    expect(JSON.stringify(snapshot)).not.toMatch(/PRIVATE_|private-model|SELECT|provider\.invalid/);
+    expect(globalThis.fetch).toBe(globalFetch);
+    expect(target.fetchTarget.fetch).toBe(target.fetch);
+    expect(target.response.json).toBe(target.json);
+  });
+
+  it.each(['fetch', 'json'] as const)('distinguishes pending %s and ignores late completion after a frozen stop', async stage => {
+    const target = fixture();
+    let settle!: (value: any) => void;
+    const pending = new Promise<any>(resolve => {settle = resolve;});
+    if (stage === 'fetch') target.fetch.mockReturnValue(pending);
+    else target.json.mockReturnValue(pending);
+    const returned = target.fetchTarget.fetch('https://provider.invalid/responses', {body: '{"model":"m"}'});
+    if (stage === 'json') {(await returned).json();}
+    target.time(160);
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.fetch[0].state).toBe(stage === 'fetch' ? 'fetch_pending' : 'json_pending');
+    expect(snapshot.fetch[0]).not.toHaveProperty('outputChars');
+    const serialized = JSON.stringify(snapshot);
+    settle(stage === 'fetch' ? target.response : target.payload);
+    await pending;
+    await Promise.resolve();
+    expect(JSON.stringify(snapshot)).toBe(serialized);
+    expect(Object.isFrozen(snapshot.fetch[0])).toBe(true);
+    expect(target.diagnostics.stop()).toBe(snapshot);
+  });
+
+  it('preserves rejection and observes abort without aborting or rewriting input', async () => {
+    const target = fixture();
+    const controller = new AbortController();
+    const error = new Error('PRIVATE_FAILURE');
+    const rejected = Promise.reject(error);
+    target.fetch.mockReturnValue(rejected);
+    const returned = target.fetchTarget.fetch('https://provider.invalid/responses', {signal: controller.signal});
+    expect(returned).toBe(rejected);
+    expect(controller.signal.aborted).toBe(false);
+    controller.abort(error);
+    await expect(returned).rejects.toBe(error);
+    expect(target.diagnostics.stop().fetch[0]).toMatchObject({state: 'fetch_rejected', abortObservedElapsedMs: 0});
+  });
+
+  it('does not read opaque request bodies, response headers or an unused streamed json body', async () => {
+    const target = fixture();
+    const opaque = {text: jest.fn(() => {throw new Error('PRIVATE_REQUEST');})};
+    Object.defineProperty(target.response, 'headers', {get: () => {throw new Error('PRIVATE_HEADER');}});
+    await target.fetchTarget.fetch('https://provider.invalid/responses', {body: opaque});
+    await target.fetchTarget.fetch('https://provider.invalid/chat/completions', {body: '{"stream":true}'});
+    expect(opaque.text).not.toHaveBeenCalled();
+    expect(target.json).not.toHaveBeenCalled();
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.fetch[0]).toMatchObject({stream: 'unknown', state: 'headers_received'});
+    expect(snapshot.fetch[1]).toMatchObject({stream: true, state: 'headers_received'});
+    expect(snapshot.fetch.every(row => row.outputChars === undefined)).toBe(true);
+  });
+
+  it('observes fetch(Request) by URL without reading its body or inferring input and model metadata', async () => {
+    const target = fixture();
+    const request = new Request('https://provider.invalid/v1/chat/completions', {method: 'POST', body: 'PRIVATE_REQUEST'});
+    const forbiddenRead = jest.fn(() => {throw new Error('PRIVATE_READ');});
+    Object.defineProperty(request, 'body', {get: forbiddenRead});
+    Object.defineProperty(request, 'headers', {get: forbiddenRead});
+    Object.defineProperty(request, 'clone', {value: forbiddenRead});
+    Object.defineProperty(request, 'text', {value: forbiddenRead});
+    const promise = target.fetchTarget.fetch(request);
+    expect(promise).toBe(target.fetchPromise);
+    expect(await promise).toBe(target.response);
+    expect(target.fetch.mock.calls[0][0]).toBe(request);
+    expect(forbiddenRead).not.toHaveBeenCalled();
+    expect(request.bodyUsed).toBe(false);
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.fetch[0]).toMatchObject({endpoint: 'chat_completions', state: 'headers_received',
+      requestMetadata: 'unavailable', stream: 'unknown'});
+    expect(snapshot.fetch[0]).not.toHaveProperty('inputBytes');
+    expect(snapshot.fetch[0]).not.toHaveProperty('requestedModelHash');
+    expect(JSON.stringify(snapshot)).not.toContain('PRIVATE');
+  });
+
+  it.each([
+    ['SELECT 42 AS value FROM slice', false],
+    ['SELECT dur / 1e6 AS value FROM slice', false],
+    ['SELECT dur, dur / 1e6 AS value FROM slice', true],
+    ['SELECT * FROM slice', true],
+  ] as const)('records direct projection candidates independently of native capture: %s', async (sql, directProjection) => {
+    const target = fixture();
+    expect(target.processor.query(sql)).toBe(target.queryPromise);
+    await target.queryPromise;
+    expect(target.diagnostics.stop().sql[0]).toMatchObject({pureRead: true, directProjection,
+      captureFieldsPresent: false, captureFieldCount: 0});
+  });
+
+  it('reserves bounded slots at call time including requests that never settle', () => {
+    const target = fixture();
+    target.fetch.mockReturnValue(new Promise<any>(() => undefined));
+    target.query.mockReturnValue(new Promise<any>(() => undefined));
+    for (let index = 0; index < 34; index++) target.fetchTarget.fetch('https://provider.invalid/responses');
+    for (let index = 0; index < 130; index++) target.processor.queryBounded('SELECT dur FROM slice');
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.fetch).toHaveLength(32);
+    expect(snapshot.sql).toHaveLength(128);
+    expect(snapshot).toMatchObject({fetchDroppedCount: 2, sqlDroppedCount: 2});
+  });
+
+  it('restores exact json descriptors and preserves a third-party replacement', async () => {
+    const target = fixture();
+    const descriptor = {value: target.json, enumerable: false, configurable: true, writable: false};
+    Object.defineProperty(target.response, 'json', descriptor);
+    await target.fetchTarget.fetch('https://provider.invalid/responses');
+    const replacement = jest.fn(() => target.fetchPromise);
+    target.fetchTarget.fetch = replacement;
+    expect(target.diagnostics.stop().restoreConflicts).toBe(1);
+    expect(target.fetchTarget.fetch).toBe(replacement);
+    expect(Object.getOwnPropertyDescriptor(target.response, 'json')).toEqual(descriptor);
+  });
+
+  it('restores inherited json methods without leaving an own property and tolerates readonly methods', async () => {
+    const target = fixture();
+    const response = Object.create({json: target.json});
+    response.status = 200;
+    target.fetch.mockReturnValue(Promise.resolve(response));
+    await target.fetchTarget.fetch('https://provider.invalid/responses');
+    expect(Object.prototype.hasOwnProperty.call(response, 'json')).toBe(true);
+    target.diagnostics.stop();
+    expect(Object.prototype.hasOwnProperty.call(response, 'json')).toBe(false);
+
+    const readonly = fixture();
+    Object.defineProperty(readonly.response, 'json', {value: readonly.json, configurable: false, writable: false});
+    expect(await readonly.fetchTarget.fetch('https://provider.invalid/responses')).toBe(readonly.response);
+    expect(readonly.diagnostics.stop().observationFailures).toBe(1);
+    expect(readonly.response.json).toBe(readonly.json);
+  });
+
+  it.each(['fetch', 'query'] as const)('preserves a synchronous %s exception without copying error text', kind => {
+    const target = fixture();
+    const error = new Error('PRIVATE_EXCEPTION');
+    const invoke = kind === 'fetch'
+      ? () => target.fetchTarget.fetch('https://provider.invalid/responses')
+      : () => target.processor.query('SELECT dur FROM slice');
+    target[kind].mockImplementation(() => {throw error;});
+    let caught: unknown;
+    try {invoke();} catch (value) {caught = value;}
+    expect(caught).toBe(error);
+    expect(JSON.stringify(target.diagnostics.stop())).not.toContain('PRIVATE_EXCEPTION');
+  });
+
+  it('counts response-protocol text without retaining text or trusting provider status fields', async () => {
+    const target = fixture();
+    const payload = {model: 'PRIVATE_MODEL', status: 'PRIVATE_STATUS', output: [
+      {type: 'message', content: [{type: 'output_text', text: 'PRIVATE_ANSWER'}]},
+    ]};
+    const promise = Promise.resolve(payload);
+    target.json.mockReturnValue(promise as any);
+    await target.fetchTarget.fetch('https://provider.invalid/responses');
+    expect(target.response.json()).toBe(promise);
+    expect(await promise).toBe(payload);
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.fetch[0]).toMatchObject({state: 'json_fulfilled', responseStatus: 'unknown', outputChars: 14});
+    expect(JSON.stringify(snapshot)).not.toContain('PRIVATE');
+  });
+
+  it('keeps observer failures and unknown provider enums out of business results', async () => {
+    const target = fixture();
+    target.payload.choices[0].finish_reason = 'PRIVATE_FINISH';
+    await target.fetchTarget.fetch('https://provider.invalid/responses', {body: '{invalid PRIVATE_JSON'});
+    expect(await target.response.json()).toBe(target.payload);
+    const snapshot = target.diagnostics.stop();
+    expect(snapshot.observationFailures).toBe(1);
+    expect(snapshot.fetch[0].finishReason).toBe('unknown');
+    expect(JSON.stringify(snapshot)).not.toContain('PRIVATE');
+  });
+
+  it('does not replace the original exit state when diagnostic persistence fails', () => {
+    const target = fixture();
+    const exitCode = process.exitCode;
+    const log = jest.spyOn(console, 'error').mockImplementation(() => {throw new Error('PRIVATE_LOG_FAILURE');});
+    jest.spyOn(fs, 'mkdirSync').mockImplementation(() => {throw new Error('PRIVATE_PATH');});
+    expect(writeVerificationDiagnostics('/private/report', target.diagnostics.stop())).toBe(false);
+    expect(log).toHaveBeenCalledWith('diagnostic_write_failed');
+    expect(process.exitCode).toBe(exitCode);
+  });
+});
+
+describe('current-trace slice selection resolution', () => {
+  const selector = {processName: 'com.example.target', threadName: 'main', eventName: 'Target event'};
+  const columns = ['event_id', 'ts', 'track_id', 'utid', 'upid'];
+  const match = () => ({columns, rows: [[7, '40919952686988', 19, 11, 10]], durationMs: 1});
+
+  it('parses only a bounded identity selector and rejects conflicting input scopes', () => {
+    expect(parseSliceSelectionTarget(selector)).toEqual(selector);
+    const args = ['--select-slice-json', JSON.stringify(selector)];
+    expect(parseVerificationArgs(args).sliceSelectionTarget).toEqual(selector);
+    for (const value of [null, [], {}, {...selector, eventName: ''}, {...selector, threadName: 'main\n'},
+      {...selector, eventName: 'event\u0000'}, {...selector, eventName: 'event\u0085'},
+      {...selector, processName: 'p'.repeat(257)}, {...selector, eventName: 'x'.repeat(1025)},
+      {...selector, eventName: 1}, {...selector, dur: 42_000_000}]) {
+      expect(() => parseSliceSelectionTarget(value)).toThrow('SLICE_SELECTION_INVALID');
+    }
+    expect(() => parseVerificationArgs(args.concat(args))).toThrow('SLICE_SELECTION_INVALID');
+    const direct = ['--selection-context-json', JSON.stringify({kind: 'track_event', eventId: 9, ts: 1})];
+    expect(() => parseVerificationArgs(args.concat(direct))).toThrow('SLICE_SELECTION_INVALID');
+    expect(() => parseVerificationArgs(direct.concat(args))).toThrow('SLICE_SELECTION_INVALID');
+  });
+
+  it('reads a bounded selector file without allowing a large or non-object payload', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-selector-'));
+    const filePath = path.join(directory, 'selector.json');
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(selector));
+      expect(parseVerificationArgs(['--select-slice-json', `@${filePath}`]).sliceSelectionTarget).toEqual(selector);
+      for (const raw of ['null', 'invalid json', ' '.repeat(8193)]) {
+        fs.writeFileSync(filePath, raw);
+        expect(() => parseVerificationArgs(['--select-slice-json', `@${filePath}`])).toThrow('SLICE_SELECTION_INVALID');
+      }
+    } finally { fs.rmSync(directory, {recursive: true, force: true}); }
+  });
+
+  it('queries only this loaded trace, escapes literals, and returns an identity-only frontend selection', async () => {
+    const queryBounded = jest.fn(async () => match());
+    const escaped = {processName: "App' OR 1=1 --", threadName: "main's", eventName: "event'); DROP TABLE slice; --"};
+    const result = await resolveVerificationSliceSelection({service: {queryBounded}, traceId: 'loaded-current-trace',
+      selector: escaped, timeoutMs: 1_200_000});
+    expect(queryBounded).toHaveBeenCalledWith('loaded-current-trace', expect.any(String),
+      expect.objectContaining({timeoutMs: 10_000, maxRows: 2, maxResponseBytes: 16 * 1024, signal: expect.any(AbortSignal)}));
+    const sql = (queryBounded.mock.calls[0] as unknown as [string, string])[1];
+    expect(sql).toContain("p.name = 'App'' OR 1=1 --'");
+    expect(sql).toContain("t.name = 'main''s'");
+    expect(sql).toContain("s.name = 'event''); DROP TABLE slice; --'");
+    expect(sql).toContain('LIMIT 2');
+    expect(sql).not.toContain('s.dur');
+    expect(result.selectionContext).toEqual({kind: 'track_event', source: 'track_event_selection',
+      eventId: 7, ts: 40919952686988});
+    expect(result.identity).toEqual({traceId: 'loaded-current-trace', table: 'slice',
+      eventId: 7, ts: 40919952686988, trackId: 19, utid: 11, upid: 10});
+    expect(result.purpose).toBe('input_scope_not_verified_evidence');
+  });
+
+  it.each([
+    ['SLICE_SELECTION_NOT_FOUND', {columns, rows: [], durationMs: 1}],
+    ['SLICE_SELECTION_AMBIGUOUS', {columns, rows: [match().rows[0], match().rows[0]], durationMs: 1}],
+    ['SLICE_SELECTION_QUERY_FAILED', {...match(), error: 'private query error'}],
+    ['SLICE_SELECTION_INVALID_IDENTITY', {...match(), columns: ['id', 'ts', 'track_id', 'utid', 'upid']}],
+    ['SLICE_SELECTION_INVALID_IDENTITY', {...match(), rows: [[7, '9007199254740992', 19, 11, 10]]}],
+    ['SLICE_SELECTION_INVALID_IDENTITY', {...match(), rows: [[-1, 1000, 19, 11, 10]]}],
+    ['SLICE_SELECTION_INVALID_IDENTITY', {...match(), rows: [[7, null, 19, 11, 10]]}],
+  ])('fails with %s before analysis can start', async (code, response) => {
+    const queryBounded = jest.fn(async () => response as ReturnType<typeof match>);
+    const startAnalysis = jest.fn();
+    await expect(resolveVerificationSliceSelection({service: {queryBounded}, traceId: 'current', selector, timeoutMs: 1000})
+      .then(startAnalysis)).rejects.toThrow(String(code));
+    expect(startAnalysis).not.toHaveBeenCalled();
+  });
+
+  it('propagates pre-cancellation and a real timeout to the bounded query', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const neverQuery = jest.fn(async () => match());
+    await expect(resolveVerificationSliceSelection({service: {queryBounded: neverQuery}, traceId: 'current',
+      selector, timeoutMs: 1000, signal: controller.signal})).rejects.toThrow('SLICE_SELECTION_CANCELLED');
+    expect(neverQuery).not.toHaveBeenCalled();
+    const queryBounded = jest.fn((_traceId: string, _sql: string, options: {signal?: AbortSignal}) =>
+      new Promise<ReturnType<typeof match>>((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => reject(options.signal?.reason), {once: true});
+      }));
+    await expect(resolveVerificationSliceSelection({service: {queryBounded}, traceId: 'current', selector, timeoutMs: 10}))
+      .rejects.toThrow('SLICE_SELECTION_TIMEOUT');
+  });
+
+  it('records selection failure distinctly without cancellation or provider text when no run was started', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-selector-failure-'));
+    try {
+      const request = jest.fn();
+      const result = await recordVerificationFailureAndCancel({baseUrl: 'http://verifier.invalid',
+        outputPath: path.join(directory, 'failure.json'), phase: 'selection_resolution', startedAt: Date.now(),
+        timeoutMs: 1000, error: new VerificationSliceSelectionError('SLICE_SELECTION_AMBIGUOUS')}, request);
+      expect(result).toMatchObject({errorCode: 'SLICE_SELECTION_AMBIGUOUS', cancellation: 'not_owned', completeAcceptance: false});
+      expect(request).not.toHaveBeenCalled();
+    } finally { fs.rmSync(directory, {recursive: true, force: true}); }
+  });
+});
+
+describe('owned SSE verifier lifecycle', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('retains at most four shared-schema candidate diagnostics without private surrounding fields or admission authority', async () => {
+    const diagnostic = {schemaVersion: 'candidate_protocol_diagnostic@1', stage: 'native', candidateIndex: 1,
+      status: 'invalid', sidecarStatus: 'invalid', typedJsonStatus: 'not_checked',
+      issueCodes: ['invalid_reference'], issueCount: 1, rawChars: 1000, canonicalChars: 0,
+      projectionKind: 'protocol_projection'};
+    const invalid = [
+      {...diagnostic, raw: 'PRIVATE_PROTOCOL_CANARY'},
+      {...diagnostic, path: '/private/source'},
+      {...diagnostic, claimId: 'PRIVATE_PROTOCOL_CANARY'},
+      {...diagnostic, issueCodes: ['PRIVATE_PROTOCOL_CANARY']},
+      {...diagnostic, rawChars: -1},
+    ];
+    const valid = [diagnostic, {...diagnostic, stage: 'runtime_projected'},
+      {...diagnostic, candidateIndex: 2}, {...diagnostic, candidateIndex: 2, stage: 'runtime_projected'}];
+    const events = [
+      {phase: 'unrelated', candidateProtocolDiagnostic: diagnostic},
+      ...[...invalid, ...valid, ...valid].map(candidateProtocolDiagnostic => ({phase: 'candidate_protocol',
+        candidateProtocolDiagnostic, message: 'PRIVATE_PROTOCOL_CANARY', path: '/private/source'})),
+    ].map(data => `event: progress\ndata: ${JSON.stringify(data)}\n\n`).join('') +
+      'event: analysis_completed\ndata: {"success":false,"conclusion":"","partial":true}\n\n';
+    jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(events));
+    const summary = await collectSseSummary('http://verifier.invalid', 'session', 1000,
+      {requiredText: [], forbiddenText: []}, {runId: 'run'});
+    expect(summary.candidateProtocolDiagnostics).toEqual(valid);
+    expect(JSON.stringify(summary)).not.toContain('PRIVATE_PROTOCOL_CANARY');
+    expect(JSON.stringify(summary)).not.toContain('/private/source');
+    expect(summary.terminalAnalysis?.success).toBe(false);
+    expect(summary.analysisCompletedPartial).toBe(true);
+  });
+
+  it('turns a stalled owned stream into a typed timeout and releases its reader', async () => {
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => new Response(new ReadableStream({
+      start(controller) {
+        options?.signal?.addEventListener('abort', () => controller.error(options.signal?.reason), {once: true});
+      },
+    })));
+    await expect(collectSseSummary('http://verifier.invalid', 'session', 10,
+      {requiredText: [], forbiddenText: []}, {runId: 'run-2'})).rejects.toBeInstanceOf(VerificationSseTimeoutError);
+    expect(fetch).toHaveBeenCalledWith('http://verifier.invalid/api/agent/v1/runs/run-2/stream',
+      expect.objectContaining({signal: expect.any(AbortSignal)}));
+  });
+
+  it('extracts actual verified binding identities without persisting private reasons', async () => {
+    const binding = {claimId: 'duration', mechanismStatus: 'compatible',
+      sourceReferenceIds: ['source-ref-v1-issued'], traceEvidenceRefIds: ['data-marker']};
+    const payload = {success: true, conclusion: 'Safe conclusion.',
+      sourceUseDecision: {references: [{id: 'source-ref-v1-issued'}]},
+      sourceClaimVerificationResult: {schemaVersion: 'source_claim_verifier@1', status: 'passed',
+        bindings: [{...binding, reason: 'private source content'}]}};
+    jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(`event: analysis_completed\ndata: ${JSON.stringify(payload)}\n\n`));
+    const summary = await collectSseSummary('http://verifier.invalid', 'session', 1000,
+      {requiredText: [], forbiddenText: []}, {runId: 'run'});
+    expect(summary.analysisCompletedVerifiedSourceBindings).toEqual([binding]);
+    expect(JSON.stringify(summary)).not.toContain('private source content');
+  });
+
+  it('retains private tool telemetry and safe actual source use when a failed terminal has no conclusion contract', async () => {
+    const sourceUseDecision = {schemaVersion: 'source_use_decision@1', codeAwareMode: 'provider_send',
+      selectedCodebaseIds: ['cb-source'], queriedCodebaseIds: ['cb-source'], usedCodebaseIds: ['cb-source'],
+      status: 'corroborated', attemptedTools: ['search_codebase', 'read_codebase_file'],
+      rootPath: '/private/source', query: 'private query text',
+      references: [{codebaseId: 'cb-source', filePath: 'StartupHooks.kt', lookupKind: 'body',
+        referenceId: 'source-read', lineRange: {start: 9, end: 9}, text: 'private source text'}]};
+    const terminal = {success: false, conclusion: 'Output limit reached.', partial: true,
+      terminationReason: 'output_limit', sourceUseDecision,
+      completion: {schemaVersion: 1, status: 'failed'}};
+    const events = [
+      {event: 'tool_call', data: {toolName: 'search_codebase', message: 'Searching source.', args: {query: 'private query text'}}},
+      {event: 'tool_call', data: {toolName: 'mcp__smartperfetto__read_codebase_file', args: {filePath: '/private/source'}}},
+      {event: 'agent_task_dispatched', data: {toolName: 'execute_sql'}},
+      {event: 'analysis_completed', data: terminal},
+    ];
+    jest.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(events
+      .map(item => `event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`).join('')));
+    const summary = await collectSseSummary('http://verifier.invalid', 'session', 1000,
+      {requiredText: [], forbiddenText: []}, {runId: 'run'});
+    expect(summary.toolCallCounts).toMatchObject({search_codebase: 1, read_codebase_file: 1, execute_sql: 1});
+    expect(summary.analysisCompletedSourceUseDecision).toMatchObject({status: 'corroborated',
+      references: [{id: expect.stringMatching(/^source-ref-v1-/), filePath: 'StartupHooks.kt', lineRange: {start: 9, end: 9}}]});
+    expect(summary.terminalAnalysis?.conclusionContract).toBeUndefined();
+    expect(summary.analysisCompletedPartial).toBe(true);
+    for (const privateText of ['/private/source', 'private query text', 'private source text']) {
+      expect(JSON.stringify(summary)).not.toContain(privateText);
+    }
+    const assessment = evaluateAgentSseExpectation({terminal: summary.terminalAnalysis, expectation, traceId: 'trace-current'});
+    expect(assessment.checks.taskCompleted).toBe(false);
+    expect(assessment.checks.originalClaimsVerified).toBe(false);
+    expect(taskAcceptanceStatus(Object.values(assessment.checks).every(Boolean), assessment.uncoveredFacets).completeAcceptance).toBe(false);
+    const wrapper = require('../../../scripts/run-deepseek-agent-e2e.cjs');
+    const evaluated = wrapper.evaluateSemanticConditionReport({condition: 'A2',
+      query: wrapper.semanticDeltaQueries()[0], sourceRoot: path.resolve(__dirname, '../../../tests/e2e/context-fixtures/app'),
+      report: {passed: false, analysisContext: {codebaseIds: ['cb-source']}, taskVerification: assessment, summary}});
+    expect(evaluated).toMatchObject({traceFactPassed: false, sourceSemanticPassed: false, privacyCanaryCovered: true});
+  });
+
+  it.each(['confirmed', 'wrong_run', 'rejected', 'failed'])(
+    'persists a safe failure before cancellation and records %s without widening ownership', async outcome => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-verifier-lifecycle-'));
+      const outputPath = path.join(directory, 'failure.json');
+      try {
+        const request = jest.fn(async (url: string | URL | Request, options?: RequestInit) => {
+          expect(JSON.parse(fs.readFileSync(outputPath, 'utf8')).cancellation).toBe('pending');
+          expect(url).toBe('http://verifier.invalid/api/agent/v1/owned-session/cancel');
+          expect(JSON.parse(String(options?.body))).toEqual({runId: 'owned-run'});
+          expect(options?.signal).toBeInstanceOf(AbortSignal);
+          if (outcome === 'failed') throw new Error('/private/source secret provider response');
+          return new Response(JSON.stringify({success: outcome !== 'rejected', sessionId: 'owned-session',
+            runId: outcome === 'wrong_run' ? 'other-run' : 'owned-run'}), {status: outcome === 'rejected' ? 409 : 200});
+        });
+        const result = await recordVerificationFailureAndCancel({baseUrl: 'http://verifier.invalid',
+          outputPath, phase: 'follow_up_stream', startedAt: Date.now() - 20, timeoutMs: 10,
+          sessionId: 'owned-session', runId: 'owned-run', error: new VerificationSseTimeoutError()}, request);
+        expect(result).toMatchObject({errorCode: 'SSE_TIMEOUT', phase: 'follow_up_stream', completeAcceptance: false,
+          cancellation: outcome === 'wrong_run' ? 'rejected' : outcome});
+        expect(result.durationMs).toBeGreaterThanOrEqual(20);
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(fs.readFileSync(outputPath, 'utf8')).not.toContain('secret');
+      } finally {
+        fs.rmSync(directory, {recursive: true, force: true});
+      }
+    });
+});
 
 const expectation = parseAgentSseExpectation({schemaVersion: 1,
   intent: {taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'},
@@ -59,7 +533,361 @@ function evaluate(terminal = terminalFixture()) {
     oracleRows: {frame_count: [{total_frames: 1912}]}});
 }
 
+describe('independent native row oracle', () => {
+  afterEach(() => {jest.useRealTimers();});
+  const nativeExpectation = () => parseAgentSseExpectation({schemaVersion: 1,
+    intent: {taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'}, facts: [{
+      id: 'duration', kind: 'numeric', columns: ['dur'], unit: 'ns', value: 42_000_000, verification: 'proved',
+      oracle: {sql: 'SELECT id AS row_id, dur FROM slice WHERE id = 7', column: 'dur', unit: 'ns',
+        anchorMatch: {startTs: 'start_ts', upid: 'upid', nativeRow: {relation: 'slice', idColumn: 'id', oracleColumn: 'row_id'}}},
+    }]});
+  function pinFixture() {
+    const trace = {id: 'trace-current', status: 'ready'} as TraceInfo;
+    const observation: RunningNativeProcessorObservation = Object.freeze({instanceToken: Object.freeze({}),
+      registrationToken: Object.freeze({}), instanceId: 'instance', traceId: trace.id, status: 'trusted',
+      nativeSchemaEligible: true, analysisRunPrivate: false,
+      binarySelection: Object.freeze({source: 'local_binary', selectedPath: '/fixture/binary', selectionOrigin: 'default'})});
+    const service = {getTrace: jest.fn(() => trace), getRunningNativeProcessorObservation: jest.fn(() => observation),
+      getRunningCapabilityTraceProcessorInput: jest.fn(() => observation.binarySelection)};
+    const identity = {source: 'bundled' as const, gitRevision: 'formal-revision', stdlibRevision: 'formal-revision'};
+    const docs = {version: 1, generatedFrom: 'formal-revision', modules: [], symbolToModule: {}, entries: [
+      {id: 'slice', name: 'slice', package: 'prelude', type: 'table', module: '', category: '', description: '',
+        columns: [{name: 'id', type: 'ID'}, {name: 'dur', type: 'DURATION'}]},
+    ]} as PerfettoSqlDocsAsset;
+    const resolveIdentity = jest.fn(async () => identity);
+    const loadDocs = jest.fn(() => docs);
+    const expectation = nativeExpectation();
+    return {trace, observation, service, identity, docs, resolveIdentity, loadDocs, expectation,
+      prepare: () => prepareAgentSseNativeOracle({expectation, traceId: trace.id, service}, {resolveIdentity, loadDocs})};
+  }
+  async function fixture() {
+    const pin = pinFixture();
+    const oracle = await pin.prepare();
+    const terminal = terminalFixture('The observed duration is 42000000 ns.');
+    const claim = terminal.conclusionContract!.claims![0];
+    const support = terminal.claimSupport![0];
+    const anchor = support.anchors[0];
+    const proof = terminal.claimVerificationResult!.claimResults[0];
+    const reference = {...claim.references[0], column: 'dur', value: 42_000_000};
+    claim.references = [reference];
+    claim.semantics!.scope.subjectRefs = [reference];
+    claim.semantics!.numeric = {operator: 'eq', value: 42_000_000, unit: 'ns'};
+    support.semantics = JSON.parse(JSON.stringify(claim.semantics));
+    anchor.context.captureId = 'capture-original';
+    anchor.cells = [{column: 'dur', rowIndex: 0, value: 42_000_000, actualValue: 42_000_000, unit: 'ns'}];
+    proof.referenceCells![0].column = 'dur';
+    proof.deterministicProof!.nativeRows = [{...oracle.schemas.duration,
+      anchorId: anchor.anchorId, evidenceRefId: anchor.evidenceRefId,
+      captureId: anchor.context.captureId, traceSide: 'current', id: 7}];
+    const oracleRows = {duration: [{row_id: 7, dur: 42_000_000, start_ts: '1000', upid: 10}]};
+    return {pin, oracle, terminal, claim, support, anchor, proof, oracleRows,
+      evaluate: () => evaluateAgentSseExpectation({terminal, expectation: pin.expectation, traceId: 'trace-current',
+        oracleRows, oracleNativeSchemas: oracle.schemas})};
+  }
+
+  function groupFixture() {
+    const target = pinFixture();
+    const scope = {tenantId: 'test', workspaceId: 'test', userId: 'test'};
+    let inside = false;
+    const observation = {...target.observation, analysisRunPrivate: true};
+    const entry = {side: 'current', privateProcessor: true, lease: {id: 'oracle-lease', traceId: target.trace.id, mode: 'isolated'},
+      context: {traceId: target.trace.id, leaseId: 'oracle-lease', mode: 'isolated', leaseScope: scope,
+        holder: {holderType: 'agent_run', holderRef: ''}}};
+    target.service.getRunningNativeProcessorObservation.mockImplementation((_id?: string, options?: any) => {
+      if (!inside) return {...target.observation, status: 'tainted'};
+      expect(options.leaseId).toBe(entry.lease.id);
+      expect(options.leaseScope).toBe(scope);
+      return observation;
+    });
+    const query = jest.fn(async (_id: string, _sql: string, options?: any) => {
+      expect(inside).toBe(true);
+      expect(options.leaseId).toBe(entry.lease.id);
+      expect(options.leaseScope).toBe(scope);
+      return {columns: ['dur', 'row_id'], rows: [[42_000_000, 7]]};
+    });
+    const service = {...target.service, query};
+    const release = jest.fn();
+    const run = jest.fn(async (callback: () => Promise<any>) => {
+      inside = true;
+      try {return await callback();} finally {inside = false;}
+    });
+    const group = {entries: [entry], assertCurrent: jest.fn(), run, release} as unknown as AnalysisRunTraceProcessorLeases;
+    const prepareLeases = jest.fn(async (args: any) => {entry.context.holder.holderRef = args.runId; return group;});
+    return {...target, service, scope, entry, group, observation, query, release, run, prepareLeases,
+      collect: (deadlineMs = Date.now() + 1000, signal?: AbortSignal) => collectAgentSseOracleEvidence({
+        expectation: target.expectation, traceId: target.trace.id, service: service as any, scope, deadlineMs, signal,
+      }, {prepareLeases, resolveIdentity: target.resolveIdentity, loadDocs: target.loadDocs})};
+  }
+
+  it('pins and queries inside one formally prepared oracle group, then releases it without exporting owner tokens', async () => {
+    const target = groupFixture();
+    const result = await target.collect();
+    expect(result.rows.duration).toEqual([{dur: 42_000_000, row_id: 7}]);
+    expect(result.schemas.duration.schemaFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(target.prepareLeases).toHaveBeenCalledTimes(1);
+    expect(target.run).toHaveBeenCalledTimes(1);
+    expect(target.query).toHaveBeenCalledTimes(1);
+    expect(target.query.mock.calls[0][1]).toBe(target.expectation.facts[0].oracle!.sql);
+    expect(target.prepareLeases.mock.calls[0][0]).toMatchObject({currentTraceId: 'trace-current', scope: target.scope,
+      runId: expect.stringMatching(/^verification-oracle-/), sessionId: expect.stringMatching(/^verification-oracle-/), signal: expect.any(AbortSignal)});
+    expect(target.release).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(result)).not.toMatch(/instanceToken|registrationToken|oracle-lease/);
+  });
+
+  it('does not rebuild an oracle group after a query taints it', async () => {
+    const target = groupFixture();
+    target.expectation.facts.push({...target.expectation.facts[0], id: 'second',
+      oracle: {...target.expectation.facts[0].oracle!, sql: 'SELECT id AS row_id, dur FROM slice WHERE id = 8'}});
+    target.query.mockImplementation(async () => {target.observation.status = 'tainted'; return {columns: ['dur', 'row_id'], rows: [[42_000_000, 7]]};});
+    await expect(target.collect()).rejects.toThrow('Task native row oracle unavailable');
+    expect(target.query).toHaveBeenCalledTimes(1);
+    expect(target.prepareLeases).toHaveBeenCalledTimes(1);
+    expect(target.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the legacy non-native oracle path free of new lease admission', async () => {
+    const target = groupFixture();
+    delete target.expectation.facts[0].oracle!.anchorMatch!.nativeRow;
+    target.query.mockResolvedValue({columns: ['dur', 'row_id'], rows: [[42_000_000, 7]]});
+    expect((await target.collect()).rows.duration).toHaveLength(1);
+    expect(target.prepareLeases).not.toHaveBeenCalled();
+    expect(target.query.mock.calls[0]).toEqual(['trace-current', target.expectation.facts[0].oracle!.sql]);
+  });
+
+  it.each(['query', 'preparation'] as const)('bounds a stalled %s by the original deadline and releases late ownership', async stage => {
+    jest.useFakeTimers({now: 1000});
+    const target = groupFixture();
+    let settle!: (value: any) => void;
+    const pending = new Promise<any>(resolve => {settle = resolve;});
+    if (stage === 'query') target.query.mockReturnValue(pending);
+    else target.prepareLeases.mockReturnValue(pending);
+    const result = target.collect(1100);
+    const rejected = expect(result).rejects.toMatchObject({name: 'TimeoutError'});
+    await jest.advanceTimersByTimeAsync(100);
+    await rejected;
+    expect(target.prepareLeases).toHaveBeenCalledTimes(1);
+    expect(target.prepareLeases.mock.calls[0][0].signal.aborted).toBe(true);
+    settle(stage === 'query' ? {columns: ['dur', 'row_id'], rows: [[42_000_000, 7]]} : target.group);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(target.release).toHaveBeenCalledTimes(1);
+    if (stage === 'preparation') expect(target.run).not.toHaveBeenCalled();
+  });
+
+  it('does not begin preparation after the original deadline or parent cancellation', async () => {
+    const expired = groupFixture();
+    await expect(expired.collect(Date.now() - 1)).rejects.toMatchObject({name: 'TimeoutError'});
+    expect(expired.prepareLeases).not.toHaveBeenCalled();
+    const cancelled = groupFixture();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(cancelled.collect(Date.now() + 1000, controller.signal)).rejects.toMatchObject({name: 'AbortError'});
+    expect(cancelled.prepareLeases).not.toHaveBeenCalled();
+  });
+
+  it.each(['preparation', 'query', 'outer completion'] as const)(
+    'rejects %s after the absolute deadline even when the timer has not run', async stage => {
+      jest.useFakeTimers({now: 1000});
+      const target = groupFixture();
+      if (stage === 'outer completion') {
+        const run = target.run.getMockImplementation()!;
+        target.run.mockImplementation(async callback => {
+          const result = await run(callback);
+          jest.setSystemTime(1100);
+          return result;
+        });
+      } else if (stage === 'query') {
+        const query = target.query.getMockImplementation()!;
+        target.query.mockImplementation(async (...args) => {
+          const result = await query(...args);
+          jest.setSystemTime(1100);
+          return result;
+        });
+      } else {
+        const prepare = target.prepareLeases.getMockImplementation()!;
+        target.prepareLeases.mockImplementation(async args => {
+          const group = await prepare(args);
+          jest.setSystemTime(1100);
+          return group;
+        });
+      }
+      await expect(target.collect(1100)).rejects.toMatchObject({name: 'TimeoutError'});
+      expect(target.prepareLeases).toHaveBeenCalledTimes(1);
+      expect(target.prepareLeases.mock.calls[0][0].signal.aborted).toBe(true);
+      expect(target.query).toHaveBeenCalledTimes(stage === 'preparation' ? 0 : 1);
+      expect(target.run).toHaveBeenCalledTimes(1);
+      expect(target.release).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+  it('rejects invalid absolute deadlines before preparing an owner', async () => {
+    const target = groupFixture();
+    for (const deadline of [NaN, Infinity, -Infinity]) {
+      await expect(target.collect(deadline)).rejects.toThrow('Task native row oracle deadline invalid');
+    }
+    expect(target.prepareLeases).not.toHaveBeenCalled();
+  });
+
+  it('observes cancellation when the deadline crosses at try entry before the first race', async () => {
+    jest.useFakeTimers({now: 1000});
+    const target = groupFixture();
+    const unhandled = jest.fn();
+    process.on('unhandledRejection', unhandled);
+    // Admission and timer setup see time remaining; try-entry validation sees expiry.
+    const now = jest.spyOn(Date, 'now').mockReturnValueOnce(1000).mockReturnValueOnce(1000).mockReturnValue(1100);
+    try {
+      await expect(target.collect(1100)).rejects.toMatchObject({name: 'TimeoutError'});
+      expect(target.prepareLeases).not.toHaveBeenCalled();
+      expect(target.run).not.toHaveBeenCalled();
+      expect(target.query).not.toHaveBeenCalled();
+      expect(target.release).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+      process.removeListener('unhandledRejection', unhandled);
+    }
+  });
+
+  it('preserves a synchronous preparation error without an unhandled rejection or unowned cleanup', async () => {
+    jest.useFakeTimers({now: 1000});
+    const target = groupFixture();
+    const failure = new Error('preparation failed');
+    target.prepareLeases.mockImplementation(() => {throw failure;});
+    const unhandled = jest.fn();
+    process.on('unhandledRejection', unhandled);
+    try {
+      await expect(target.collect(1100)).rejects.toBe(failure);
+      expect(target.prepareLeases).toHaveBeenCalledTimes(1);
+      expect(target.prepareLeases.mock.calls[0][0].signal.aborted).toBe(true);
+      expect(target.run).not.toHaveBeenCalled();
+      expect(target.query).not.toHaveBeenCalled();
+      expect(target.release).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.removeListener('unhandledRejection', unhandled);
+    }
+  });
+
+  it('builds the expected schema from actual identity and formal docs without reading a candidate proof', async () => {
+    const target = pinFixture();
+    const pin = await target.prepare();
+    expect(pin.schemas.duration).toEqual({...nativeCapture.resolveRawSqlNativeRowSchema(target.identity, target.docs, 'slice'), traceId: 'trace-current'});
+    expect(Object.isFrozen(pin.schemas.duration)).toBe(true);
+    expect(target.resolveIdentity).toHaveBeenCalledWith(target.observation.binarySelection);
+    expect(JSON.stringify(pin.schemas)).not.toContain('/fixture/binary');
+  });
+
+  it.each(['instanceToken', 'registrationToken', 'instanceId', 'traceId', 'status', 'nativeSchemaEligible', 'analysisRunPrivate', 'binary'] as const)(
+    'rejects %s drift even when the other instance properties still match', async field => {
+      const target = pinFixture();
+      const pin = await target.prepare();
+      const changed = {...target.observation};
+      if (field === 'instanceToken' || field === 'registrationToken') changed[field] = Object.freeze({});
+      else if (field === 'instanceId' || field === 'traceId') changed[field] = 'other';
+      else if (field === 'status') changed.status = 'tainted';
+      else if (field === 'nativeSchemaEligible') changed.nativeSchemaEligible = false;
+      else if (field === 'analysisRunPrivate') changed.analysisRunPrivate = true;
+      else changed.binarySelection = {...changed.binarySelection, selectedPath: '/another/binary'};
+      target.service.getRunningNativeProcessorObservation.mockReturnValue(changed);
+      await expect(pin.assertCurrent()).rejects.toThrow('Task native row oracle unavailable');
+    });
+
+  it('rejects a replacement registration object or a processor swapped during async identity resolution', async () => {
+    const target = pinFixture();
+    const pin = await target.prepare();
+    target.service.getTrace.mockReturnValue({...target.trace});
+    await expect(pin.assertCurrent()).rejects.toThrow('Task native row oracle unavailable');
+    const swapped = pinFixture();
+    swapped.resolveIdentity.mockImplementation(async () => {
+      swapped.service.getRunningNativeProcessorObservation.mockReturnValue({...swapped.observation, instanceToken: {}});
+      return swapped.identity;
+    });
+    await expect(swapped.prepare()).rejects.toThrow('Task native row oracle unavailable');
+  });
+
+  it.each(['revision', 'duplicateTable', 'multipleIds', 'identity', 'scope', 'missing'] as const)(
+    'fails before analysis when independent %s authority is unavailable', async change => {
+      const target = pinFixture();
+      if (change === 'revision') target.docs.generatedFrom = 'different-revision';
+      if (change === 'duplicateTable') target.docs.entries.push({...target.docs.entries[0]});
+      if (change === 'multipleIds') target.docs.entries[0].columns!.push({name: 'other_id', type: 'ID'});
+      if (change === 'identity') target.resolveIdentity.mockResolvedValue({source: 'custom', binarySha256: 'untrusted'} as any);
+      if (change === 'scope') target.service.getRunningNativeProcessorObservation.mockReturnValue({...target.observation, analysisRunPrivate: true});
+      if (change === 'missing') target.service.getRunningNativeProcessorObservation.mockReturnValue(undefined as any);
+      await expect(target.prepare()).rejects.toThrow('Task native row oracle unavailable');
+    });
+
+  it('uses the issued numeric operand row when the result did not include timestamp or process columns', async () => {
+    const target = await fixture();
+    expect(target.anchor.timeRange).toBeUndefined();
+    expect(target.anchor.identity).toBeUndefined();
+    expect(target.evaluate().facts.duration.proposition).toBe('proved');
+  });
+
+  it.each(['id', 'traceId', 'traceSide', 'relation', 'idColumn', 'schemaFingerprint', 'anchorId', 'evidenceRefId', 'captureId'] as const)(
+    'rejects another %s even when its scalar value is the same 42 ms', async field => {
+      const target = await fixture();
+      const row = target.proof.deterministicProof!.nativeRows![0];
+      if (field === 'id') row.id = 8;
+      else if (field === 'traceSide') row.traceSide = 'reference';
+      else if (field === 'schemaFingerprint') row.schemaFingerprint = '0'.repeat(64);
+      else row[field] = 'other';
+      expect(target.evaluate().facts.duration.matched).toBe(false);
+    });
+
+  it.each(['duplicate', 'missingCapture', 'candidate', 'wrongUnit', 'wrongValue', 'incompleteCoverage'] as const)(
+    'does not let native metadata bypass %s verification', async change => {
+      const target = await fixture();
+      if (change === 'duplicate') target.proof.deterministicProof!.nativeRows!.push({...target.proof.deterministicProof!.nativeRows![0]});
+      if (change === 'missingCapture') delete target.anchor.context.captureId;
+      if (change === 'candidate') target.proof.deterministicProof!.status = 'candidate';
+      if (change === 'wrongUnit') target.claim.semantics!.numeric!.unit = 'frames';
+      if (change === 'wrongValue') target.claim.semantics!.numeric!.value = 43_000_000;
+      if (change === 'incompleteCoverage') target.proof.propositionCoverage!.uncovered.push('typed_proposition');
+      target.support.semantics = JSON.parse(JSON.stringify(target.claim.semantics));
+      expect(target.evaluate().facts.duration.matched).toBe(false);
+    });
+
+  it('keeps the strict legacy timestamp/process fallback and ignores JSON row metadata outside a current proof', async () => {
+    const target = await fixture();
+    const publicCopy = JSON.parse(JSON.stringify(target.proof.deterministicProof!.nativeRows));
+    delete target.proof.deterministicProof!.nativeRows;
+    Object.assign(target.anchor, {nativeRows: publicCopy});
+    expect(target.evaluate().facts.duration.matched).toBe(false);
+    target.anchor.timeRange = {startTs: '1000', endTs: '42001000', unit: 'ns', source: 'row'};
+    target.anchor.identity = {upid: 10};
+    expect(target.evaluate().facts.duration.matched).toBe(true);
+    target.anchor.identity.upid = 11;
+    expect(target.evaluate().facts.duration.matched).toBe(false);
+    target.anchor.identity.upid = 10;
+    target.anchor.timeRange.startTs = '2000';
+    expect(target.evaluate().facts.duration.matched).toBe(false);
+  });
+
+  it.each([{columns: ['dur'], rows: [[42_000_000]]}, {columns: ['dur', 'row_id'], rows: [[42_000_000, '7']]},
+    {columns: ['dur', 'row_id', 'row_id'], rows: [[42_000_000, 7, 8]]}])('rejects an absent, non-native or ambiguous oracle ID', async result => {
+    await expect(collectAgentSseOracleRows(nativeExpectation(), async () => result)).rejects.toThrow('Task fact oracle unavailable');
+  });
+});
+
 describe('Agent SSE verification evidence', () => {
+  it('accepts only an authored native row tuple, never an expected fingerprint copied into configuration', () => {
+    const input = structuredClone(expectation);
+    const nativeRow = {relation: 'slice', idColumn: 'id', oracleColumn: 'row_id'};
+    input.facts[0].oracle!.anchorMatch = {startTs: 'start_ts', upid: 'upid', nativeRow};
+    expect(parseAgentSseExpectation(input).facts[0].oracle?.anchorMatch?.nativeRow).toEqual(nativeRow);
+    for (const invalid of [null, {}, {...nativeRow, idColumn: ''}, {...nativeRow, oracleColumn: 1},
+      {...nativeRow, relation: 'slice; SELECT'}, {...nativeRow, schemaFingerprint: 'public-proof-value'}]) {
+      const changed = structuredClone(input);
+      changed.facts[0].oracle!.anchorMatch!.nativeRow = invalid as any;
+      expect(() => parseAgentSseExpectation(changed)).toThrow('Invalid --expectation-json');
+    }
+  });
+
   it('admits only a ready trace and preserves the processor startup error', () => {
     expect(() => assertVerificationTraceReady('trace', {status: 'ready'})).not.toThrow();
     for (const status of ['uploading', 'processing', 'error'] as const) {
@@ -132,7 +960,9 @@ describe('task fact oracle (deterministic composition, not a model semantic benc
   });
   it.each(['There are 1912 frames.', '共记录 1912 帧。', 'The trace contains 1,912 frames.'])
     ('accepts equivalent output without titles or a prescribed tool path: %s', text => {
-      expect(Object.values(evaluate(terminalFixture(text)).checks).every(Boolean)).toBe(true);
+      const result = evaluate(terminalFixture(text));
+      expect(Object.values(result.checks).every(Boolean)).toBe(true);
+      expect(result.facts.frame_count).toMatchObject({matchedClaimIds: ['frames'], matchedAnchorIds: ['anchor:frames']});
     });
 
   it('does not accept successful tool counts when no original claims or raw proof exist', () => {
@@ -141,6 +971,8 @@ describe('task fact oracle (deterministic composition, not a model semantic benc
     const result = evaluate(terminal);
     expect(result.checks.originalClaimsVerified).toBe(false);
     expect(result.facts.frame_count.matched).toBe(false);
+    expect(result.facts.frame_count.matchedClaimIds).toEqual([]);
+    expect(result.facts.frame_count.matchedAnchorIds).toEqual([]);
   });
 
   it('keeps the wrong proposition 9999 separate from an unrelated correctly cited 1912', () => {

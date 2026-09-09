@@ -82,6 +82,8 @@ export interface FilterContext {
   externalKnowledgeRegistry?: ExternalKnowledgeSourceRegistry;
   knowledgeSourceIds?: string[];
   knowledgeScope?: ExternalKnowledgeScope;
+  /** Runs after source authorization/redaction, before body delivery or patch-ledger grants. */
+  admitSourceHit?: (hit: SanitizedRagHit) => boolean;
 }
 
 function isUserCodebaseChunk(chunk: RagChunk): boolean {
@@ -507,13 +509,20 @@ export async function filterRagLookup(
       continue;
     }
 
-    hits.push({
+    const sourceHit: SanitizedRagHit = {
       chunkId: hit.chunkId,
       score: hit.score,
       metadata: metadata(chunk),
       snippet: redacted.text,
       redactedCount: redacted.redactedCount,
-    });
+    };
+    if (ctx.admitSourceHit && !ctx.admitSourceHit(sourceHit)) {
+      ctx.ledger?.record({turn: ctx.turn, ts: Date.now(), toolName: ctx.toolName,
+        codebaseId: chunk.codebaseId, chunkIds: [], consentApplied: true,
+        tokensSpent: 0, outcome: 'budget_exceeded', legacyPath: false});
+      continue;
+    }
+    hits.push(sourceHit);
     ctx.ledger?.record({
       turn: ctx.turn,
       ts: Date.now(),

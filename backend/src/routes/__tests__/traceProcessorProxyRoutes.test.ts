@@ -49,6 +49,7 @@ let upstreamSockets: Set<NetSocket>;
 let upstreamPort: number;
 let lease: TraceProcessorLeaseRecord;
 let queryRawMock: jest.MockedFunction<(traceId: string, body: Buffer, options?: any) => Promise<Buffer>>;
+let exposeNativePortMock: jest.Mock;
 let restartLeaseMock: jest.MockedFunction<(
   traceId: string,
   leaseId: string,
@@ -183,6 +184,7 @@ beforeEach(async () => {
     });
   });
   upstreamServer.on('upgrade', (req, socket) => {
+    expect(exposeNativePortMock).toHaveBeenCalledWith(upstreamPort);
     expect(req.url).toBe('/websocket');
     expect(req.headers.origin).toBe('http://127.0.0.1:10000');
     socket.write(
@@ -203,6 +205,7 @@ beforeEach(async () => {
   seedEnterpriseGraph();
   lease = createReadyLease();
   queryRawMock = jest.fn(async (_traceId: string, body: Buffer) => body);
+  exposeNativePortMock = jest.fn();
   restartLeaseMock = jest.fn(async (traceId, leaseId, _mode, restartScope) => {
     const store = getTraceProcessorLeaseStore();
     store.markCrashed(restartScope, leaseId);
@@ -238,6 +241,8 @@ beforeEach(async () => {
       processor: {status: 'ready'},
     })),
     queryRaw: queryRawMock,
+    isPrivateAnalysisProcessorKey: jest.fn(() => false),
+    exposeNativePort: exposeNativePortMock,
     restartLease: restartLeaseMock,
   } as any);
 });
@@ -263,6 +268,53 @@ afterEach(async () => {
 });
 
 describe('trace processor lease proxy routes', () => {
+  it.each(['status', 'query', 'heartbeat'])('rejects private analysis %s before acquiring a frontend holder or forwarding', async endpoint => {
+    const store = getTraceProcessorLeaseStore();
+    let privateLease = store.acquireHolder(scope, 'trace-a', {holderType: 'agent_run', holderRef: 'private-run',
+      metadata: {analysisRunPrivate: true}}, {mode: 'isolated'});
+    store.markStarting(scope, privateLease.id);
+    privateLease = store.markReady(scope, privateLease.id);
+    const before = store.getLeaseById(scope, privateLease.id);
+    const response = await ssoHeaders(request(makeApp()).post(`/api/tp/${privateLease.id}/${endpoint}`).send({visibility: 'visible'}));
+    expect(response.status).toBe(403);
+    expect(response.body.details).toContain('Private analysis processor');
+    expect(store.getLeaseById(scope, privateLease.id)).toEqual(before);
+    expect(queryRawMock).not.toHaveBeenCalled();
+    expect(exposeNativePortMock).not.toHaveBeenCalled();
+    expect(upstreamSockets.size).toBe(0);
+  });
+
+  it('rejects a private analysis WebSocket capability before opening an upstream connection', async () => {
+    const store = getTraceProcessorLeaseStore();
+    const privateLease = store.acquireHolder(scope, 'trace-a', {holderType: 'agent_run', holderRef: 'private-websocket',
+      metadata: {analysisRunPrivate: true}}, {mode: 'isolated'});
+    store.markStarting(scope, privateLease.id); store.markReady(scope, privateLease.id);
+    const proxyServer = http.createServer(makeApp());
+    proxyServer.on('upgrade', (req, socket, head) => {handleTraceProcessorProxyUpgrade(req, socket, head);});
+    const proxyPort = await listen(proxyServer);
+    try {
+      process.env.SMARTPERFETTO_SSO_TRUSTED_HEADERS = 'false';
+      const capability = issueTraceProcessorProxyCapability({context: {
+        tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a', authType: 'api_key',
+        roles: ['api_key'], scopes: ['trace:read'], requestId: 'private-upgrade', windowId: 'window-a',
+      }, leaseId: privateLease.id});
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        const req = http.request({host: '127.0.0.1', port: proxyPort, path: `/api/tp/${privateLease.id}/websocket`, headers: {
+          Upgrade: 'websocket', Connection: 'Upgrade', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+          'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Protocol': capability.protocol,
+        }});
+        req.setTimeout(5000, () => req.destroy(new Error('private websocket response timeout')));
+        req.on('response', res => {res.resume(); resolve(res.statusCode);});
+        req.on('upgrade', (_res, socket) => {socket.destroy(); reject(new Error('Private websocket unexpectedly upgraded'));});
+        req.on('error', reject); req.end();
+      });
+      expect(status).toBe(403);
+      expect(store.getLeaseById(scope, privateLease.id)?.holders.map(holder => holder.holderType)).toEqual(['agent_run']);
+      expect(exposeNativePortMock).not.toHaveBeenCalled();
+      expect(upstreamSockets.size).toBe(0);
+    } finally {await closeServer(proxyServer);}
+  });
+
   it('rejects unauthenticated websocket upgrades when a legacy API key is configured', async () => {
     process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'false';
     process.env.SMARTPERFETTO_SSO_TRUSTED_HEADERS = 'false';

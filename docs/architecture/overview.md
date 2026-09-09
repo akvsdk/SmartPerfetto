@@ -105,9 +105,9 @@ Web UI 的两个 AI 入口共享同一鉴权边界，但不共享 trace 前置�
 
 - `/assistant` 的 `ConversationPage` 是 Conversation-first 入口；没有加载 Trace 时也能进行
   普通多轮对话，附加 Trace 后才进入 trace-aware 对话。
-- 已授权源码与本轮实际使用源码是两个状态。普通对话 run 保持源码 dormant，先完成并展示
-  主回答；只有显式源码意图或 Trace 给出窄代码锚点时才进入有界源码阶段。自动源码补充
-  通过独立 SSE 生命周期追加，不进入后续 dormant 主对话历史，失败也不改变主 run 状态。
+- 已授权源码与本轮实际使用源码是两个状态。当前显式选择使共享源码工具可用于主分析，
+  模型根据问题与 Trace 锚点决定是否调用；注册和选择均不要求先建索引。实际调用持续更新
+  运行账本，模型可见引用须先完成容量准入并可用于同一轮核验，不能从模型声明推断读取事实。
 - 已加载 Trace 的 `AIPanel`、侧边栏和浮窗共享当前页面、当前 Trace 的
   `AnalysisBackendConnection`。后台上传完成只产生连接候选；只有 scoped lease 对应的
   native processor 状态为 ready，AI 分析才可使用该后端。
@@ -127,6 +127,10 @@ cookie credentials，也不会把非 OIDC 401 当作 OIDC authority 失效。本
 新增环境变量或配置项；provider、runtime 和 endpoint 仍来自现有配置源。
 
 ## 主分析数据流
+
+卡顿机制取证以目标进程主线程的连续执行为入口。`main_thread_frame_work` 与 `scrolling_analysis` 的顶层工作表复用 SQL fragments，按实际 doFrame、任务和 thread_state 拆分区间并保留来源标识；FrameTimeline 仅补充出帧结果。嵌套热点、跨轨道歧义、未标注执行和缺失调度数据分别标记，不能重复计时或用缺失值代替空闲。顶层工作表同时进入 display、synthesize 和 artifact，避免嵌套 Skill 只投影首个结果而丢失任务。
+
+策略 frontmatter 的 `investigation_requirements` 独立于报告格式。共享 typed-intent 提示构造器从本轮固定的策略快照中读取这些取证义务，供 investigation 的 answer/report 使用；具体问题仅应用相关义务，fact/acknowledgement 不增加调查流程，`existing_only` 不因此获得取证权限。旧快照可以省略此可选字段，新字段参与快照指纹。
 
 OIDC 模式下，静态入口先通过 `/api/auth/session` 完成门禁，未就绪时不加载 Perfetto
 bundle。回调建立后端 Session 后，所有浏览器请求的 tenant、user 和 workspace 都以后端

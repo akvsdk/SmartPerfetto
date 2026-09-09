@@ -13,6 +13,8 @@ const MAX_SQL_MESSAGE_CHARS = 300;
 
 export interface ToolNarrationOptions {
   tracePairContext?: TracePairContext;
+  /** Narrate execution without model-authored arguments or private locators. */
+  privateContext?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -301,7 +303,7 @@ export function formatToolCallNarration(
   options: ToolNarrationOptions = {},
 ): string {
   const toolName = shortToolName(readString(rawToolName) || 'unknown');
-  const args = asRecord(rawArgs);
+  const args = options.privateContext ? {} : asRecord(rawArgs);
 
   switch (toolName) {
     case 'submit_plan': {
@@ -315,6 +317,7 @@ export function formatToolCallNarration(
       MAX_PLAN_MESSAGE_CHARS);
     }
     case 'update_plan_phase': {
+      if (options.privateContext) return localize(language, '更新当前分析阶段的状态', 'Update the current analysis phase');
       const phaseId = readString(args.phaseId || args.id) || 'phase';
       const status = readString(args.status) || readString(args.state) || 'updated';
       const summary = readString(args.summary || args.evidence || args.evidenceSummary);
@@ -331,6 +334,7 @@ export function formatToolCallNarration(
         : localize(language, '修订分析计划：根据已发现证据调整后续步骤', 'Revise analysis plan: adjust next steps based on evidence'));
     }
     case 'invoke_skill': {
+      if (options.privateContext) return localize(language, '运行分析 Skill，采集 Trace 证据', 'Run an analysis Skill to collect trace evidence');
       const skillId = readString(args.skillId) || readString(args.skill) || 'unknown_skill';
       const purpose = skillPurpose(skillId, language);
       const params = paramSummary(args.params);
@@ -568,6 +572,7 @@ export function formatToolCallNarration(
         : localize(language, '检索外部知识：补充官方文档之外的解释', 'Search external knowledge: add context beyond the official docs'));
     }
     default:
+      if (options.privateContext) return '';
       return shorten(localize(language, `调用工具 ${toolName}`, `Call tool ${toolName}`));
   }
 }
@@ -602,6 +607,77 @@ export interface ToolResultNarrationInput {
   /** Runtime-reported failure, independent of any `success` field in the body. */
   isError?: boolean;
   language?: OutputLanguage;
+  /** Only deterministic outcome fields may enter private-run progress. */
+  privateContext?: boolean;
+}
+
+function privateToolOutcome(
+  input: ToolResultNarrationInput,
+  toolName: string,
+  body: Record<string, unknown>,
+  language: OutputLanguage,
+): string {
+  if (toolResultIsFailure(input)) {
+    return localize(language, '本次工具执行未完成，正在保留已获取的证据', 'This tool call did not complete; collected evidence is retained');
+  }
+  const sourceRefs = Array.isArray(body.sourceRefs) ? body.sourceRefs : undefined;
+  const chunkRefs = Array.isArray(body.chunkRefs) ? body.chunkRefs : undefined;
+  const references = sourceRefs ?? chunkRefs;
+  if (references && body.outcome === 'success') {
+    if (references.length === 0) {
+      return localize(language, '本次查询没有返回可用的源码或知识定位', 'This lookup returned no usable source or knowledge references');
+    }
+    const hasBody = references.some(reference => {
+      const record = asRecord(reference);
+      return typeof record.snippetLength === 'number' && record.snippetLength > 0;
+    });
+    return hasBody
+      ? localize(language, '已读取授权内容，可与 Trace 证据核对实现', 'Authorized content was read and is available to check against trace evidence')
+      : localize(language, '已取得候选源码或知识位置，尚未读取正文', 'Candidate source or knowledge locations are available; their content has not been read');
+  }
+  if (toolName === 'execute_sql' || toolName === 'execute_sql_on') {
+    const rows = readCount(body.totalRows) ?? readCount(body.rowCount) ?? readCount(body.rows);
+    return rows === 0 ? localize(language, 'SQL 未查到匹配数据', 'SQL matched no rows') : '';
+  }
+  if (toolName === 'update_plan_phase' && body.allPhasesComplete === true) {
+    return localize(language, '全部计划阶段已完成', 'All plan phases complete');
+  }
+  return '';
+}
+
+const privateToolResultReceipts = new WeakMap<object, Readonly<{
+  toolName: string;
+  zh: string;
+  en: string;
+  isError: boolean;
+}>>();
+
+/**
+ * Issue a local capability while the intact projected result is still available.
+ * The token serializes to an empty object; JSON and model-authored flags cannot
+ * recreate the WeakMap identity or supply a narration trusted by the boundary.
+ */
+export function issuePrivateToolResultNarrationReceipt(input: Pick<ToolResultNarrationInput,
+  'toolName' | 'result' | 'isError'>): object | undefined {
+  const toolName = shortToolName(readString(input.toolName));
+  const body = readToolResultBody(input.result);
+  const zh = privateToolOutcome(input, toolName, body, 'zh-CN');
+  const en = privateToolOutcome(input, toolName, body, 'en');
+  if (!zh && !en) return undefined;
+  const token = Object.freeze({});
+  privateToolResultReceipts.set(token, Object.freeze({toolName, zh, en, isError: toolResultIsFailure(input)}));
+  return token;
+}
+
+export function readPrivateToolResultNarrationReceipt(
+  token: unknown,
+  toolName: string,
+  language: OutputLanguage,
+): {message: string; isError: boolean} | undefined {
+  if (!token || typeof token !== 'object') return undefined;
+  const receipt = privateToolResultReceipts.get(token);
+  if (!receipt || receipt.toolName !== shortToolName(readString(toolName))) return undefined;
+  return {message: language === 'en' ? receipt.en : receipt.zh, isError: receipt.isError};
 }
 
 /** Decode the intact, already privacy-projected result before transport truncation. */
@@ -720,6 +796,8 @@ export function formatToolResultNarration(input: ToolResultNarrationInput): stri
   const toolName = shortToolName(readString(input.toolName) || 'unknown');
   const args = asRecord(input.args);
   const body = readToolResultBody(input.result);
+
+  if (input.privateContext) return privateToolOutcome(input, toolName, body, language);
 
   if (toolResultIsFailure(input)) {
     return narrateToolFailure(toolName, body, language);

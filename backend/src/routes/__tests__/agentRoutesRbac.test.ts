@@ -74,6 +74,35 @@ function makeApp(): express.Express {
   return app;
 }
 
+/** Keep registration, lease storage and ALS real; simulate native/provider execution. */
+async function registeredTraceFixture(
+  traces: Array<{traceId: string; tracePath: string}>,
+  executeRuntime?: () => Promise<unknown>,
+): Promise<TraceProcessorService> {
+  const service = new TraceProcessorService(process.env.UPLOAD_DIR);
+  for (const {traceId, tracePath} of traces) {
+    service.registerStoredTrace({id: traceId, filename: `${traceId}.trace`,
+      size: (await fs.stat(tracePath)).size, filePath: tracePath});
+  }
+  jest.spyOn(service, 'getOrLoadTrace').mockImplementation(async traceId => {
+    const trace = service.getTrace(traceId);
+    if (!trace) throw new Error(`missing registered Trace fixture: ${traceId}`);
+    return trace;
+  });
+  jest.spyOn(service, 'ensureProcessorForLease').mockImplementation(async traceId => ({
+    id: `processor-${traceId}`, traceId, status: 'ready', activeQueries: 0,
+    query: jest.fn(async () => ({columns: [], rows: [], durationMs: 1})),
+    queryRaw: jest.fn(async () => Buffer.alloc(0)), destroy: jest.fn(),
+  }));
+  jest.spyOn(service, 'query').mockResolvedValue({columns: [], rows: [], durationMs: 1});
+  if (executeRuntime) {
+    // Hold only the provider execution boundary: request state, leases and ALS remain real.
+    process.env.SMARTPERFETTO_AGENT_RUNTIME = 'claude-agent-sdk';
+    jest.spyOn(ClaudeRuntime.prototype, 'analyze').mockImplementation(async () => await executeRuntime() as AnalysisResult);
+  }
+  return service;
+}
+
 function viewerHeaders(req: request.Test): request.Test {
   return req
     .set('X-SmartPerfetto-SSO-User-Id', 'viewer-user')
@@ -1123,27 +1152,7 @@ describe('agent route RBAC', () => {
         workspaceId: 'workspace-a',
         userId: 'analyst-user',
       });
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async () => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        getTrace: jest.fn(() => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        ensureProcessorForLease: jest.fn(async () => undefined),
-        runWithLease: jest.fn(() => createDeferredRuntime(deferreds).promise),
-        query: jest.fn(async () => ({columns: [], rows: [], durationMs: 1})),
-      } as any);
+      setTraceProcessorServiceForTests(await registeredTraceFixture([{traceId, tracePath}], () => createDeferredRuntime(deferreds).promise));
 
       const app = makeApp();
       const analyze = await analystHeaders(
@@ -1400,16 +1409,8 @@ describe('agent route RBAC', () => {
         workspaceId: 'workspace-a',
         userId: 'analyst-user',
       });
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async () => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-      } as any);
+      const traceProcessorService = await registeredTraceFixture([{traceId, tracePath}]);
+      setTraceProcessorServiceForTests(traceProcessorService);
 
       const scope = { tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'analyst-user' };
       leaseStore = getTraceProcessorLeaseStore();
@@ -1426,6 +1427,8 @@ describe('agent route RBAC', () => {
 
       expect(res.status).toBe(409);
       expect(res.body.code).toBe('TRACE_PROCESSOR_LEASE_UNAVAILABLE');
+      expect(res.body.error).toBe(`Trace processor lease ${lease.id} is draining`);
+      expect(traceProcessorService.ensureProcessorForLease).not.toHaveBeenCalled();
     } finally {
       leaseStore?.close();
       setTraceProcessorLeaseStoreForTests(null);
@@ -1435,6 +1438,7 @@ describe('agent route RBAC', () => {
 
   it('selects an isolated lease for full analysis runs', async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-agent-lease-mode-'));
+    const deferreds: DeferredRuntime[] = [];
     let leaseStore: ReturnType<typeof getTraceProcessorLeaseStore> | null = null;
     try {
       const traceId = 'trace-full-analysis';
@@ -1458,27 +1462,7 @@ describe('agent route RBAC', () => {
         workspaceId: 'workspace-a',
         userId: 'analyst-user',
       });
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async () => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        getTrace: jest.fn(() => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        ensureProcessorForLease: jest.fn(async () => undefined),
-        runWithLease: jest.fn(async (_lease, fn: () => Promise<unknown>) => fn()),
-        query: jest.fn(async () => ({ columns: [], rows: [], durationMs: 1 })),
-      } as any);
+      setTraceProcessorServiceForTests(await registeredTraceFixture([{traceId, tracePath}], () => createDeferredRuntime(deferreds).promise));
 
       const res = await analystHeaders(request(makeApp()).post('/api/agent/v1/analyze'))
         .send({
@@ -1503,6 +1487,7 @@ describe('agent route RBAC', () => {
       });
       expect(['active', 'idle']).toContain(analysisLease?.state);
     } finally {
+      await rejectPendingDeferredRuntimes(deferreds, 'full-analysis cleanup');
       leaseStore?.close();
       setTraceProcessorLeaseStoreForTests(null);
       await fs.rm(tmpDir, { recursive: true, force: true });
@@ -1535,27 +1520,7 @@ describe('agent route RBAC', () => {
         workspaceId: 'workspace-a',
         userId: 'analyst-user',
       });
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async () => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        getTrace: jest.fn(() => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        ensureProcessorForLease: jest.fn(async () => undefined),
-        runWithLease: jest.fn(() => createDeferredRuntime(deferreds).promise),
-        query: jest.fn(async () => ({ columns: [], rows: [], durationMs: 1 })),
-      } as any);
+      setTraceProcessorServiceForTests(await registeredTraceFixture([{traceId, tracePath}], () => createDeferredRuntime(deferreds).promise));
 
       const analyzeRes = await analystHeaders(request(makeApp()).post('/api/agent/v1/analyze'))
         .send({ traceId, query: 'analyze this trace' });
@@ -1727,27 +1692,7 @@ describe('agent route RBAC', () => {
         workspaceId: 'workspace-a',
         userId: 'analyst-user',
       });
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async () => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        getTrace: jest.fn(() => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 11,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        ensureProcessorForLease: jest.fn(async () => undefined),
-        runWithLease: jest.fn(() => createDeferredRuntime(deferreds).promise),
-        query: jest.fn(async () => ({ columns: [], rows: [], durationMs: 1 })),
-      } as any);
+      setTraceProcessorServiceForTests(await registeredTraceFixture([{traceId, tracePath}], () => createDeferredRuntime(deferreds).promise));
 
       const app = makeApp();
       const analyzeRes = await analystHeaders(request(app).post('/api/agent/v1/analyze'))
@@ -1854,14 +1799,11 @@ describe('agent route RBAC', () => {
       });
 
       const traceProcessorService = new TraceProcessorService(process.env.UPLOAD_DIR);
-      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockImplementation(async (id: string) => ({
-        id,
-        filename: `${id}.trace`,
-        size: id === referenceTraceId ? 21 : 19,
-        filePath: id === referenceTraceId ? referenceTracePath : tracePath,
-        uploadTime: new Date(),
-        status: 'ready',
-      }));
+      for (const [id, filePath] of [[traceId, tracePath], [referenceTraceId, referenceTracePath]]) {
+        traceProcessorService.registerStoredTrace({id, filename: `${id}.trace`,
+          size: (await fs.stat(filePath)).size, filePath});
+      }
+      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockImplementation(async id => traceProcessorService.getTrace(id)!);
       jest.spyOn(traceProcessorService, 'ensureProcessorForLease').mockResolvedValue({
         id: 'processor-dual-pane',
         traceId,
@@ -2061,22 +2003,9 @@ describe('agent route RBAC', () => {
         userId: 'analyst-user',
       });
       const traceProcessorService = new TraceProcessorService(process.env.UPLOAD_DIR);
-      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockResolvedValue({
-        id: traceId,
-        filename: `${traceId}.trace`,
-        size: 11,
-        filePath: tracePath,
-        uploadTime: new Date(),
-        status: 'ready',
-      });
-      jest.spyOn(traceProcessorService, 'getTrace').mockReturnValue({
-        id: traceId,
-        filename: `${traceId}.trace`,
-        size: 11,
-        filePath: tracePath,
-        uploadTime: new Date(),
-        status: 'ready',
-      });
+      const registeredTrace = traceProcessorService.registerStoredTrace({id: traceId,
+        filename: `${traceId}.trace`, size: 11, filePath: tracePath});
+      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockResolvedValue(registeredTrace);
       const readyProcessor: TraceProcessor = {
         id: `processor-${traceId}`,
         traceId,
@@ -2140,7 +2069,12 @@ describe('agent route RBAC', () => {
         });
 
       expect(analyzeRes.status).toBe(200);
-      await new Promise(resolve => setTimeout(resolve, 25));
+      const scope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'analyst-user'};
+      const completionDeadline = Date.now() + 2_000;
+      while (getAnalysisRunLifecycle(scope, analyzeRes.body.runId)?.status !== 'completed' && Date.now() < completionDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      expect(getAnalysisRunLifecycle(scope, analyzeRes.body.runId)?.status).toBe('completed');
 
       const streamRes = await analystHeaders(
         request(app)
@@ -2208,7 +2142,7 @@ describe('agent route RBAC', () => {
         await writeTraceMetadata({
           id: item.traceId,
           filename: `${item.traceId}.trace`,
-          size: 16,
+          size: (await fs.stat(item.tracePath)).size,
           uploadedAt: new Date().toISOString(),
           status: 'ready',
           path: item.tracePath,
@@ -2218,35 +2152,9 @@ describe('agent route RBAC', () => {
         });
       }
 
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async (traceId: string) => {
-          const item = traces.get(traceId);
-          if (!item) throw new Error(`missing trace fixture: ${traceId}`);
-          return {
-            id: item.traceId,
-            filename: `${item.traceId}.trace`,
-            size: 16,
-            filePath: item.tracePath,
-            uploadTime: new Date(),
-            status: 'ready',
-          };
-        }),
-        getTrace: jest.fn((traceId: string) => {
-          const item = traces.get(traceId);
-          if (!item) return undefined;
-          return {
-            id: item.traceId,
-            filename: `${item.traceId}.trace`,
-            size: 16,
-            filePath: item.tracePath,
-            uploadTime: new Date(),
-            status: 'ready',
-          };
-        }),
-        ensureProcessorForLease: jest.fn(async () => undefined),
-        runWithLease: jest.fn(() => createDeferredRuntime(deferreds).promise),
-        query: jest.fn(async () => ({ columns: [], rows: [], durationMs: 1 })),
-      } as any);
+      setTraceProcessorServiceForTests(await registeredTraceFixture(
+        [...traces.values()], () => createDeferredRuntime(deferreds).promise,
+      ));
 
       const app = makeApp();
       const [analyzeA, analyzeB] = await Promise.all([
@@ -2435,7 +2343,7 @@ describe('agent route RBAC', () => {
         await writeTraceMetadata({
           id: traceId,
           filename: `${traceId}.trace`,
-          size: 16,
+          size: (await fs.stat(tracePath)).size,
           uploadedAt: new Date().toISOString(),
           status: 'ready',
           path: tracePath,
@@ -2444,27 +2352,7 @@ describe('agent route RBAC', () => {
           userId: 'analyst-user',
         });
 
-        setTraceProcessorServiceForTests({
-          getOrLoadTrace: jest.fn(async () => ({
-            id: traceId,
-            filename: `${traceId}.trace`,
-            size: 16,
-            filePath: tracePath,
-            uploadTime: new Date(),
-            status: 'ready',
-          })),
-          getTrace: jest.fn(() => ({
-            id: traceId,
-            filename: `${traceId}.trace`,
-            size: 16,
-            filePath: tracePath,
-            uploadTime: new Date(),
-            status: 'ready',
-          })),
-          ensureProcessorForLease: jest.fn(async () => undefined),
-          runWithLease: jest.fn(() => makeDeferred().promise),
-          query: jest.fn(async () => ({ columns: [], rows: [], durationMs: 1 })),
-        } as any);
+        setTraceProcessorServiceForTests(await registeredTraceFixture([{traceId, tracePath}], () => makeDeferred().promise));
 
         const app = makeApp();
         const analyzeA = await analystHeaders(
@@ -2627,7 +2515,7 @@ describe('agent route RBAC', () => {
       await writeTraceMetadata({
         id: traceId,
         filename: `${traceId}.trace`,
-        size: 16,
+        size: (await fs.stat(tracePath)).size,
         uploadedAt: new Date().toISOString(),
         status: 'ready',
         path: tracePath,
@@ -2636,27 +2524,7 @@ describe('agent route RBAC', () => {
         userId: 'analyst-user',
       });
 
-      setTraceProcessorServiceForTests({
-        getOrLoadTrace: jest.fn(async () => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 16,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        getTrace: jest.fn(() => ({
-          id: traceId,
-          filename: `${traceId}.trace`,
-          size: 16,
-          filePath: tracePath,
-          uploadTime: new Date(),
-          status: 'ready',
-        })),
-        ensureProcessorForLease: jest.fn(async () => undefined),
-        runWithLease: jest.fn(() => makeDeferred().promise),
-        query: jest.fn(async () => ({ columns: [], rows: [], durationMs: 1 })),
-      } as any);
+      setTraceProcessorServiceForTests(await registeredTraceFixture([{traceId, tracePath}], () => makeDeferred().promise));
 
       const app = makeApp();
       const analyzeA = await analystHeaders(

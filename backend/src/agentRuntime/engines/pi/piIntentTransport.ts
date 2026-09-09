@@ -7,14 +7,15 @@ import {intentTransportTextResult, runIntentTransport, type IntentTransportInput
 
 export interface PiIntentTransportInput extends IntentTransportInput {
   providerRuntime: Pick<PiAgentCoreProviderRuntime, 'model' | 'streamFn'>;
-  maxOutputTokens: number;
+  maxOutputTokens?: number;
 }
 
 /** Reuses the resolved Pi provider and its captured auth without creating an Agent. */
 export function runPiIntentTransport(input: PiIntentTransportInput) {
   return runIntentTransport(input, async scope => {
     const {model, streamFn} = input.providerRuntime;
-    if (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens <= 0
+    if ((input.maxOutputTokens !== undefined
+      && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens <= 0))
       || !Number.isFinite(model.maxTokens) || model.maxTokens <= 0) {
       return {status: 'unavailable', reason: 'invalid_configuration'};
     }
@@ -26,7 +27,7 @@ export function runPiIntentTransport(input: PiIntentTransportInput) {
       signal: scope.signal,
       timeoutMs: scope.remainingMs(),
       maxRetries: 0,
-      maxTokens: Math.min(input.maxOutputTokens, model.maxTokens),
+      ...(input.maxOutputTokens !== undefined ? {maxTokens: Math.min(input.maxOutputTokens, model.maxTokens)} : {}),
       cacheRetention: 'none',
     }).result();
     scope.throwIfInactive();

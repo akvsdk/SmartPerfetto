@@ -28,6 +28,12 @@ const mockCodebaseGet = jest.fn();
 const mockKnowledgeSourceGet = jest.fn();
 const mockPrepareSession = jest.fn();
 const mockRunManifestLifecycles: any[] = [];
+let mockLeaseGroupActive = false;
+const mockReleaseTraceLeases = jest.fn();
+const mockPrepareTraceLeases = jest.fn<any>();
+jest.mock('../../../services/analysisRunTraceProcessorLease', () => ({
+  prepareAnalysisRunTraceProcessorLeases: (...args: unknown[]) => mockPrepareTraceLeases(...args),
+}));
 const capabilityManifest = {
   schemaVersion: 'capability_manifest_attribution@1',
   resolution: {
@@ -223,6 +229,13 @@ function deferred<T>() {
 describe('CliAnalyzeService runTurn final quality gate', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockLeaseGroupActive = false;
+    mockPrepareTraceLeases.mockReset();
+    mockPrepareTraceLeases.mockImplementation(async () => ({entries: [], assertCurrent: jest.fn(),
+      release: mockReleaseTraceLeases, run: async (fn: () => Promise<unknown>) => {
+        mockLeaseGroupActive = true;
+        try {return await fn();} finally {mockLeaseGroupActive = false;}
+      }}));
     mockRunManifestLifecycles.length = 0;
     mockSecurityCleanups.length = 0;
     mockFinalizeAnalysisResult.mockReset();
@@ -262,6 +275,33 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
       rounds: 1,
       totalDurationMs: 1000,
     });
+  });
+
+  it('owns one Trace lease group through runtime and finalization, then releases it', async () => {
+    mockAnalyze.mockImplementationOnce(async () => {
+      expect(mockLeaseGroupActive).toBe(true);
+      return {sessionId: 'cli-session-quality', success: true, findings: [], hypotheses: [],
+        conclusion: 'A scoped answer.', confidence: 0.8, rounds: 1, totalDurationMs: 1};
+    });
+    mockFinalizeAnalysisResult.mockImplementationOnce(async input => {
+      expect(mockLeaseGroupActive).toBe(true);
+      return {result: input.result};
+    });
+    await new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli', referenceTraceId: 'reference-cli',
+      query: 'Read the captured data', onEvent: jest.fn()});
+    expect(mockPrepareTraceLeases).toHaveBeenCalledTimes(1);
+    expect(mockPrepareTraceLeases).toHaveBeenCalledWith(expect.objectContaining({currentTraceId: 'trace-cli',
+      referenceTraceId: 'reference-cli', runId: expect.any(String), sessionId: 'cli-session-quality', signal: expect.any(AbortSignal)}));
+    expect(mockReleaseTraceLeases).toHaveBeenCalledTimes(1);
+    expect(mockLeaseGroupActive).toBe(false);
+  });
+
+  it('releases the run lease group when the runtime fails', async () => {
+    mockAnalyze.mockRejectedValueOnce(new Error('synthetic runtime failure'));
+    await expect(new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli',
+      query: 'A bounded query', onEvent: jest.fn()})).rejects.toThrow('synthetic runtime failure');
+    expect(mockReleaseTraceLeases).toHaveBeenCalledTimes(1);
+    expect(mockFinalizeAnalysisResult).not.toHaveBeenCalled();
   });
 
   it('defaults codebase-only CLI analysis to private metadata mode', async () => {

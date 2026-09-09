@@ -108,6 +108,75 @@ function verify(input: {
 }
 
 describe('verifySourceClaimBindings', () => {
+  test.each(['compatible', 'corroborated', 'ambiguous', 'unverified'] as const)(
+    'does not accept an empty %s binding when selected source was never read', mechanismStatus => {
+      const declaration = contract('The selected source has not been investigated.');
+      declaration.sourceClaimBindings = [{claimId: 'claim-1', mechanismStatus,
+        sourceReferenceIds: [], traceEvidenceRefIds: []}];
+      const unusedSource = decision(reference(), {status: 'not_needed', reasonCode: 'not_needed',
+        attemptedTools: [], queriedCodebaseIds: [], usedCodebaseIds: [], references: []});
+      for (const semanticsPolicy of ['declared', 'legacy'] as const) {
+        const result = verifySourceClaimBindings({conclusionContract: declaration,
+          actualSourceUseDecision: unusedSource, semanticsPolicy});
+        expect(result.status).toBe('failed');
+        expect(result.bindings).toEqual([]);
+        expect(result.issues).toContainEqual(expect.objectContaining({claimId: 'claim-1',
+          severity: 'error', code: 'source_reference_not_returned'}));
+      }
+    });
+
+  test('rejects a binding whose malformed source IDs sanitize to an empty list', () => {
+    const result = verify({binding: {claimId: 'claim-1', mechanismStatus: 'compatible',
+      sourceReferenceIds: ['', 'invalid source id'], traceEvidenceRefIds: []}});
+    expect(result.status).toBe('failed');
+    expect(result.bindings).toEqual([]);
+    expect(result.issues).toContainEqual(expect.objectContaining({code: 'source_reference_not_returned'}));
+  });
+
+  test.each(['metadata', 'body'] as const)('still accepts a compatible binding to actual %s evidence', lookupKind => {
+    const source = reference(lookupKind);
+    const result = verify({sourceReference: source,
+      sourceUseDecision: decision(source, {codeAwareMode: lookupKind === 'metadata' ? 'metadata_only' : 'provider_send'}),
+      binding: {claimId: 'claim-1', mechanismStatus: 'compatible',
+        sourceReferenceIds: [source.id], traceEvidenceRefIds: []}});
+    expect(result.status).toBe('passed');
+    expect(result.bindings).toEqual([{claimId: 'claim-1', mechanismStatus: 'compatible',
+      sourceReferenceIds: [source.id], traceEvidenceRefIds: []}]);
+  });
+
+  test.each(['referenceId', 'chunkId'] as const)('binds an unambiguous tool-visible %s from the current ledger', key => {
+    const source = sanitizeSourceReference({[key]: 'returned-lookup', codebaseId: 'app-source',
+      filePath: '源码/Startup Hooks.kt', lineRange: {start: 10, end: 20}, lookupKind: 'body'})!;
+    const result = verify({sourceReference: source, binding: {claimId: 'claim-1', mechanismStatus: 'compatible',
+      sourceReferenceIds: ['returned-lookup'], traceEvidenceRefIds: []}});
+    expect(result.status).toBe('passed');
+    expect(result.bindings[0]?.sourceReferenceIds).toEqual([source.id]);
+  });
+
+  test('rejects ambiguous legacy aliases while keeping each issued canonical ID usable', () => {
+    const first = reference();
+    const second = sanitizeSourceReference({...first, lineRange: {start: 10, end: 30}})!;
+    const actual = decision(first, {references: [first, second]});
+    const binding = {claimId: 'claim-1', mechanismStatus: 'compatible', traceEvidenceRefIds: []};
+    expect(verify({sourceUseDecision: actual, binding: {...binding, sourceReferenceIds: [first.referenceId]}})
+      .issues).toContainEqual(expect.objectContaining({code: 'source_reference_not_returned'}));
+    expect(verify({sourceUseDecision: actual, binding: {...binding, sourceReferenceIds: [second.id]}}).status).toBe('passed');
+  });
+
+  test('does not accept model-created aliases or a reference from a previous run', () => {
+    const source = reference();
+    const declaration = contract();
+    declaration.sourceReferences = [{...source, id: 'model-alias'}];
+    declaration.sourceClaimBindings = [{claimId: 'claim-1', mechanismStatus: 'compatible',
+      sourceReferenceIds: ['model-alias'], traceEvidenceRefIds: []}];
+    expect(verifySourceClaimBindings({conclusionContract: declaration, actualSourceUseDecision: decision(source)})
+      .issues).toContainEqual(expect.objectContaining({code: 'source_reference_not_returned'}));
+    declaration.sourceClaimBindings[0].sourceReferenceIds = [source.id];
+    expect(verifySourceClaimBindings({conclusionContract: declaration,
+      actualSourceUseDecision: decision(source, {status: 'pending', references: []})})
+      .issues).toContainEqual(expect.objectContaining({code: 'source_reference_not_returned'}));
+  });
+
   test('does not promote source text and a verified interval into a native mechanism proof', () => {
     const source = reference();
     const declaration = contract();

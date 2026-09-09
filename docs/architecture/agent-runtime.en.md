@@ -333,18 +333,31 @@ The product takes the context from the exact result before copying it. The
 context fixes the provider, original absolute deadline, trace identity and
 evidence-read scope. The owner checks current-run identity, cancellation and
 authorization across awaits. Semantic review runs at most once, has no tools,
-and has a separate 60-second limit bounded by the original deadline and user
-cancellation. A timeout records unavailable assurance while preserving the body
+and uses the original absolute run deadline. Starting or rereading the review
+does not reset or extend that budget. User cancellation or context disposal
+aborts the review. A timeout records unavailable assurance while preserving the body
 and native completion; review does not rewrite the body or reduce causal
 propositions to numeric ones. Unknown review alone does not fail a focused answer;
 full reports still require their report-assessment contract. The body, native completion and original claims
 are independent inputs; valid JSON and model agreement alone are not proof.
 
+Semantic review adds no application output-token cap. OpenAI sends only an
+explicit `maxOutputTokens` captured for this run; Claude preserves the captured
+SDK environment; Pi uses the pinned model's native SDK capability when no
+explicit cap is supplied. Classifiers retain their separate small-protocol
+budgets. Provider and SDK output limits still apply, as do complete-terminal-state
+checks and the 64 KiB guard on the completed review JSON.
+The shared OpenCode model configuration does not invent context/output capacity:
+omitted capacity uses SDK defaults, unknown context does not trigger proactive
+capacity-threshold compaction, and actual context overflow still uses native
+reactive compaction. This does not promise equivalent long-session behavior to
+a model with known capacity or add capacity fields to the model JSON interface.
+
 `final_report_contract` remains strategy frontmatter in the pinned registry.
 `claudeVerifier` supplies structured delivery diagnostics without an additional
 semantic LLM or misdiagnosis-word matching. The finite catalog is authoritative
-in `SUPPORTED_DETERMINISTIC_CLAIM_RULES`: currently `numeric.cell`,
-`interval.overlap` and `comparison.delta`. Missing original witnesses, trusted
+in `SUPPORTED_DETERMINISTIC_CLAIM_RULES`. Each rule proves only its explicitly
+covered proposition. Missing original witnesses, trusted
 units/field semantics or coverage retain candidate/unknown states. Equal values
 or endpoints do not establish general causality. Complete claim status joins
 captured evidence with semantic review of the current proposition. Reports, CLI

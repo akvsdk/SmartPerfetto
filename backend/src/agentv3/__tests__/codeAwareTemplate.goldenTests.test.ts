@@ -63,6 +63,13 @@ describe('code-aware.template golden rules', () => {
     expect(contract).toContain('contradictory=reject');
   });
 
+  it.each(['zh', 'en'] as const)('explains provider-visible source binding IDs in the %s contract', language => {
+    const contract = loadPromptTemplate(`prompt-code-reference-contract-${language}`) ?? '';
+    for (const field of ['sourceReferences', 'result.sourceReferences', 'sourceClaimBindings', 'sourceReferenceIds',
+      'traceEvidenceRefIds', 'claimId', 'mechanismStatus']) expect(contract).toContain(field);
+    expect(contract).toContain('compatible');
+  });
+
   it.each(getRegisteredScenes().map(definition => [definition.scene]))(
     'injects source contracts for discovered Full scene %s and excludes them in trace-only mode',
     scene => {

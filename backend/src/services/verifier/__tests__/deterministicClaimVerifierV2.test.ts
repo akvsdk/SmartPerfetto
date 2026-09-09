@@ -93,6 +93,78 @@ function claim(anchors: EvidenceAnchorV1[], overrides: Partial<ClaimSupportV1> =
 const verify = (item: ClaimSupportV1) => runDeterministicClaimVerifier({claimSupport: [item]}).claimResults[0];
 const metric = (overrides: Partial<AnchorInput> = {}) => anchor({row: {value: 1}, fields: {value: literal()}, column: 'value', expected: 1, ...overrides});
 
+describe('captured.cell finite proof', () => {
+  function captured(value: EvidenceScalar, declared: EvidenceScalar = value): ClaimSupportV1 {
+    const evidence = anchor({row: {value}, column: 'value', expected: value});
+    return claim([evidence], {kind: 'categorical', semantics: semantics(evidence, {
+      predicate: 'captured.cell', numeric: undefined,
+      scope: {population: 'cited_rows', subjectRefs: [{...reference(evidence, 'value'), value: declared}]},
+    })});
+  }
+
+  it.each(['main', '', '1', true, false, null])('proves only the original nonnumeric value %j', value => {
+    const output = verify(captured(value));
+    expect(output.deterministicProof).toMatchObject({kind: 'captured_cell', status: 'proved'});
+    expect(output.propositionCoverage).toMatchObject({status: 'complete', covered: expect.arrayContaining(['value'])});
+    expect(output.status).toBe('partial'); // Final semantic assessment remains required.
+  });
+
+  it.each([
+    {actual: 'main', expected: 'Main'}, {actual: 'main', expected: ' main'},
+    {actual: true, expected: 'true'}, {actual: null, expected: 'null'},
+    {actual: 1, expected: '1'},
+  ])('does not coerce or normalize $actual to $expected', ({actual, expected}) => {
+    expect(verify(captured(actual, expected)).deterministicProof).toMatchObject({status: 'rejected'});
+  });
+
+  it('cannot use an observed reference value as an omitted proposition or bypass numeric units', () => {
+    const missing = captured(null);
+    delete missing.semantics!.scope.subjectRefs![0].value;
+    expect(verify(missing).deterministicProof.reason).toBe('captured_declaration_missing');
+    expect(verify(captured(42)).deterministicProof.reason).toBe('captured_numeric_not_supported');
+    const numeric = captured('42');
+    numeric.semantics!.numeric = {operator: 'eq', value: 42, unit: 'ms'};
+    expect(verify(numeric).deterministicProof.reason).toBe('captured_numeric_not_supported');
+  });
+
+  it('requires an explicit column and uniquely captured original row', () => {
+    const item = captured('main');
+    delete item.semantics!.scope.subjectRefs![0].column;
+    expect(verify(item).deterministicProof.reason).toBe('captured_declaration_missing');
+    const wrongRow = captured('main');
+    wrongRow.semantics!.scope.subjectRefs![0].rowIndex = 1;
+    expect(verify(wrongRow).deterministicProof.status).not.toBe('proved');
+    const absentColumn = captured(null);
+    absentColumn.semantics!.scope.subjectRefs![0].column = 'absent';
+    expect(verify(absentColumn).deterministicProof.status).not.toBe('proved');
+    const ambiguous = captured('main');
+    const duplicate = anchor({row: {value: 'main'}, column: 'value', expected: 'main'});
+    ambiguous.anchors.push(duplicate);
+    expect(verify(ambiguous).deterministicProof.reason).toBe('semantic_reference_ambiguous');
+  });
+
+  it('does not accept deserialized or forged captures', () => {
+    const item = captured('main');
+    item.anchors = JSON.parse(JSON.stringify(item.anchors));
+    expect(verify(item).deterministicProof.status).not.toBe('proved');
+  });
+
+  it.each(['numeric', 'causal', 'time_range', 'comparison'] as const)('does not prove %s claims', kind => {
+    const item = captured('main');
+    item.kind = kind;
+    expect(verify(item).deterministicProof.reason).toBe('claim_kind_predicate_mismatch');
+  });
+
+  it.each([
+    {polarity: 'negated'}, {discourse: 'hypothetical'}, {modality: 'possible'},
+    {quantifier: 'all'}, {conditions: ['unless another thread']},
+  ] as Partial<ClaimSemanticsV1>[])('preserves qualified or broader propositions %j', overrides => {
+    const item = captured('main');
+    Object.assign(item.semantics!, overrides);
+    expect(verify(item).deterministicProof.status).not.toBe('proved');
+  });
+});
+
 describe('claim_verifier@2 reference cells', () => {
   it('keeps literal reference equality separate from a complete proposition', () => {
     const evidence = metric();
@@ -589,6 +661,44 @@ describe('prepared reference outcomes across capture, builder and verifier', () 
     expect(output.passed).toBe(false);
     expect(built.anchors[0].cells![0].value).toBe('54');
     expect(getCapturedAnchorFacts(built.anchors[0])?.row.value).toBe(54);
+  });
+
+  it('preserves explicit null from declaration through prepared capture and builder without proving a number or cause', async () => {
+    const ref = {evidenceRefId: 'data:prepared', rowIndex: 0, column: 'value', value: null};
+    const {output, built} = await preparedFixture({reference: ref, rows: [[null]], declaredNumber: 0});
+    expect(built.anchors[0].cells![0]).toMatchObject({value: null, actualValue: null, isSqlNull: true});
+    expect(getCapturedAnchorFacts(built.anchors[0])?.row.value).toBeNull();
+    expect(output.claimResults[0].referenceCells[0].status).toBe('matched');
+    expect(output.claimResults[0].deterministicProof.status).not.toBe('proved');
+    expect(output.claimResults[0].deterministicProof.reason).toBe('exact_numeric_value_unavailable');
+    expect(output.passed).toBe(false);
+    const causal = runDeterministicClaimVerifier({claimSupport: [{...built.claimSupport[0],
+      kind: 'causal', text: 'The missing IO flag proves that IO caused the delay.',
+      semantics: {...built.claimSupport[0].semantics!, predicate: 'causal.blocking', numeric: undefined},
+    }]});
+    expect(causal.claimResults[0].deterministicProof.status).not.toBe('proved');
+    expect(causal.passed).toBe(false);
+  });
+
+  it.each([0, false, '', 'null'] as const)('does not turn null into %j through the prepared evidence chain', async value => {
+    for (const [expected, actual] of [[null, value], [value, null]] as const) {
+      const {output, built} = await preparedFixture({rows: [[actual]],
+        reference: {evidenceRefId: 'data:prepared', rowIndex: 0, column: 'value', value: expected}});
+      expect(built.anchors[0].cells![0]).toHaveProperty('value', expected);
+      expect(output.claimResults[0].referenceCells[0].status).toBe('value_mismatch');
+      expect(output.passed).toBe(false);
+    }
+  });
+
+  it('distinguishes explicit null from an omitted expectation or absent captured column', async () => {
+    const omitted = await preparedFixture({rows: [[null]],
+      reference: {evidenceRefId: 'data:prepared', rowIndex: 0, column: 'value'}});
+    expect(omitted.built.anchors[0].cells![0]).not.toHaveProperty('value');
+    expect(omitted.output.claimResults[0].referenceCells[0].status).toBe('not_checked');
+    const missing = await preparedFixture({rows: [[null]],
+      reference: {evidenceRefId: 'data:prepared', rowIndex: 0, column: 'absent', value: null}});
+    expect(missing.output.claimResults[0].referenceCells[0].status).toBe('missing');
+    expect(missing.output.passed).toBe(false);
   });
 
   it.each([

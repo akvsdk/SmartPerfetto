@@ -113,7 +113,7 @@ async function main() {
   assert.equal(noCodebaseRun.ok, true);
   assertFile(noCodebaseRun.reportPath, 'no-codebase report');
   assertFileNotContains(noCodebaseRun.reportPath, 'CodeRef', 'no-codebase report');
-  assertFileNotContains(noCodebaseRun.reportPath, '代码引用与 Patch|Code References and Patches', 'no-codebase report');
+  assertFileNotContains(noCodebaseRun.reportPath, '本轮返回的源码位置|Source locations returned in this run', 'no-codebase report');
 
   const preview = parseJson(runCli('codebase preview', ['codebase', 'preview', appRoot]).stdout);
   assert.equal(preview.blocked, false);
@@ -258,11 +258,15 @@ async function main() {
   assert.match(heavyRun.conclusion, /LoadSimulator\.kt/);
   assertFile(heavyRun.reportPath, 'heavy report');
   assertFile(heavyRun.turnReportPath, 'heavy turn report');
-  assertFileContains(heavyRun.reportPath, '代码引用与 Patch|Code References and Patches', 'heavy report');
-  assertFileContains(heavyRun.reportPath, 'launch-aosp/src/main/java/com/example/launch/aosp/MainActivity.kt:22-27', 'heavy report');
+  assertFileContains(heavyRun.reportPath, '本轮返回的源码位置|Source locations returned in this run', 'heavy report');
+  assertFileContains(heavyRun.reportPath, 'launch-aosp/src/main/java/com/example/launch/aosp/MainActivity\\.kt:L22-L27', 'heavy report');
   assertFileContains(heavyRun.reportPath, 'launch-common/src/main/java/com/example/launch/common/LoadSimulator.kt', 'heavy report');
   assertFileNotContains(heavyRun.reportPath, appRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'heavy report');
   assertFileNotContains(heavyRun.reportPath, 'class LoadSimulator', 'heavy report');
+  assertFileContains(heavyRun.turnReportPath, '本轮返回的源码位置|Source locations returned in this run', 'heavy turn report');
+  assertFileContains(heavyRun.turnReportPath, 'launch-aosp/src/main/java/com/example/launch/aosp/MainActivity\\.kt:L22-L27', 'heavy turn report');
+  assertFileNotContains(heavyRun.turnReportPath, appRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'heavy turn report');
+  assertFileNotContains(heavyRun.turnReportPath, 'class LoadSimulator', 'heavy turn report');
 
   const lightRun = parseJson(runCli(
     'light code-aware run',
@@ -283,7 +287,7 @@ async function main() {
   assert.match(lightRun.conclusion, /CodeRef/);
   assert.match(lightRun.conclusion, /LaunchConfig|LoadConfig/);
   assertFile(lightRun.reportPath, 'light report');
-  assertFileContains(lightRun.reportPath, '代码引用与 Patch|Code References and Patches', 'light report');
+  assertFileContains(lightRun.reportPath, '本轮返回的源码位置|Source locations returned in this run', 'light report');
 
   const reportJsonPath = path.join(outputDir, 'heavy-report.json');
   runCli('heavy report export json', ['report', 'export', heavyRun.sessionId, '--format', 'json', '--out', reportJsonPath]);
@@ -300,7 +304,8 @@ async function main() {
 
   const reportHtmlPath = path.join(outputDir, 'heavy-report.html');
   runCli('heavy report export html', ['report', 'export', heavyRun.sessionId, '--format', 'html', '--out', reportHtmlPath]);
-  assertFileContains(reportHtmlPath, '代码引用与 Patch|Code References and Patches', 'html report');
+  assertFileContains(reportHtmlPath, '本轮返回的源码位置|Source locations returned in this run', 'html report');
+  assertFileContains(reportHtmlPath, 'launch-aosp/src/main/java/com/example/launch/aosp/MainActivity\\.kt:L22-L27', 'html report');
   assertFileContains(reportHtmlPath, 'launch-common/src/main/java/com/example/launch/common/LoadSimulator.kt', 'html report');
   assertFileNotContains(reportHtmlPath, appRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'html report');
   assertFileNotContains(reportHtmlPath, 'class LoadSimulator', 'html report');

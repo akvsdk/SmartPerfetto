@@ -313,6 +313,11 @@ skills:
     workflow: scrolling
     disposition: exported
     destination: references/generated/skills/frame_production_gap.md
+  main_thread_frame_work:
+    source: backend/skills/composite/main_thread_frame_work.skill.yaml
+    workflow: scrolling
+    disposition: exported
+    destination: references/generated/skills/main_thread_frame_work.md
   frame_ui_time_breakdown:
     source: backend/skills/atomic/frame_ui_time_breakdown.skill.yaml
     workflow: scrolling

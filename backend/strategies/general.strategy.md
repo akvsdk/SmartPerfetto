@@ -6,6 +6,9 @@ scene: general
 classification_description: "A specific question, trace fact, acknowledgement or analysis request without a more relevant specialized scene."
 priority: 99
 effort: high
+investigation_requirements:
+  - 'When the question concerns animation or main-thread jank, inspect same-scope continuous main-thread tasks and scheduling states, including work outside doFrame; FrameTimeline is an outcome reference. Reuse existing evidence, or use main_thread_frame_work/equivalent SQL only when new evidence is allowed. Keep other questions within their requested scope.'
+  - 'For those investigations, retain task slice/state IDs, exact times and source uncertainty. Running is CPU execution; R/R+ waits for CPU scheduling, not a lock/Binder. S does not prove an idle queue; unqualified D does not prove IO. Task-before-doFrame execution order alone does not prove delayed callbacks or missed frames; keep interference a hypothesis until causal evidence supports it. Do not assume a refresh rate or use an unrelated global VSYNC as the target budget. Names and nested slices are instrumentation clues, not verified callers, implementation or thread safety. Confirm dependencies before recommending independent worker execution, and keep UI inflation/binding on the main thread.'
 required_capabilities:
   - cpu_scheduling
 optional_capabilities: []
@@ -83,7 +86,8 @@ keywords: []
 | **不确定方向** | `invoke_skill("scene_reconstruction")` → 按场景路由 | 先做全局场景还原，再针对性深钻 |
 
 **场景专用快速路由**（如果用户的问题明确匹配以下场景，直接使用对应策略）：
-- **滑动/卡顿**: scrolling_analysis → jank_frame_detail (逐帧深钻)
+- **滑动/窗口动画卡顿**: scrolling_analysis → 主线程连续工作与任务来源 → 按证据补充帧/等待深钻。FrameTimeline 只是出帧结果参考。
+- **帧间任务/动画并发内容加载/缺少 FrameTimeline**: main_thread_frame_work（目标进程、完整区间）→ 具体 root task 与 exclusive 子热点、Running/等待、父子 slice/args/flow 追源。没有 doFrame 不能推断没有绘制请求；仅有任务时序不能证明 missed deadline。用 trace 定位点引导追查来源，按已证实的工作给出移出计算/IO、分批或延后非首屏 UI 初始化等建议；不可将必须在主线程的 UI 操作移到后台。
 - **启动**: startup_analysis → startup_detail
 - **ANR**: anr_analysis → anr_detail
 - **点击/触摸**: click_response_analysis → click_response_detail (逐事件深钻)

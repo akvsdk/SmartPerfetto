@@ -45,6 +45,7 @@ import type {
   SourceClaimBindingV1,
   SourceUseDecisionV1,
 } from './codebase/sourceUseDecision';
+import {sanitizeSourceReferences} from './codebase/sourceUseDecision';
 
 interface ClaimSourceLookupEntry {
   label: string;
@@ -5305,6 +5306,22 @@ export class HTMLReportGenerator {
         ].map(item => `<code>${this.escapeHtml(item)}</code>`).join(' · ')
       : '';
     const bindings = sourceContext.sourceClaimBindings ?? [];
+    const selectedIds = new Set(selected.map(source => source.codebaseId));
+    const references = sanitizeSourceReferences(decision?.references)
+      .filter(reference => selectedIds.has(reference.codebaseId));
+    const referencesHtml = references.length > 0
+      ? `<div class="source-context-column">
+          <div class="source-context-title">${localize(outputLanguage, '本轮返回的源码位置', 'Source locations returned in this run')}</div>
+          <ul class="source-context-list">${references.map(reference => {
+            const location = reference.filePath + (reference.lineRange
+              ? `:L${reference.lineRange.start}-L${reference.lineRange.end}` : '');
+            return `<li class="source-context-item">
+              <div class="source-context-name"><code>${this.escapeHtml(location)}</code></div>
+              <div class="source-context-meta">${this.escapeHtml(reference.id)} · ${this.escapeHtml(reference.lookupKind)}</div>
+            </li>`;
+          }).join('')}</ul>
+        </div>`
+      : '';
     const visibleBindings = bindings.slice(0, 20);
     const bindingsHtml = visibleBindings.length > 0
       ? `<div class="source-context-column">
@@ -5345,6 +5362,7 @@ export class HTMLReportGenerator {
             : `<div class="empty-state">${this.escapeHtml(lookupStatus)}</div>`}
         </div>
         ${bindingsHtml}
+        ${referencesHtml}
       </div>
     </div>`;
   }

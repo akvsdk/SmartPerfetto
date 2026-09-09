@@ -44,7 +44,7 @@ import {buildStrategyRegistrySnapshotFromDefinitions, getRegisteredScenes} from 
 import type {AnalysisTurnIntentDecision} from '../../agentRuntime/analysisTurnIntent';
 import {resolveRuntimeTurnPolicy} from '../../agentRuntime/runtimeTurnPolicy';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
-import {takeFinalizationContext, FINALIZATION_MAX_OUTPUT_TOKENS} from '../../agentRuntime/analysisFinalizationContext';
+import {takeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
 import {ArtifactStore} from '../artifactStore';
 import * as claudeMcpServer from '../claudeMcpServer';
 import * as claudeSystemPrompt from '../claudeSystemPrompt';
@@ -1202,7 +1202,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     } finally {projection.mockRestore(); clearCodeAwareOutputGuards(sessionId); sessionContextManager.remove(sessionId);}
   });
 
-  it('keeps native empty success empty before a revoked guard can supply explanatory text', async () => {
+  it('keeps an empty native answer ineligible after a revoked-session replacement', async () => {
     intentDecision = {...defaultIntent, taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'};
     const sessionId = 'claude-projection-native-empty';
     revokeCodeAwareOutputGuards(sessionId);
@@ -1214,8 +1214,8 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
     });
     try {
       const result = await runtime.analyze('Question', sessionId, 'trace', {analysisMode: 'fast'});
-      expect(projection.mock.results[0].value.conclusionProjection.disposition).toBe('preserved');
-      expect(result).toMatchObject({success: false, partial: true, conclusion: ''});
+      expect(projection.mock.results[0].value.conclusionProjection.disposition).toBe('replaced');
+      expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback', completion: {status: 'unknown'}});
     } finally {projection.mockRestore(); clearCodeAwareOutputGuards(sessionId); sessionContextManager.remove(sessionId);}
   });
 
@@ -1249,13 +1249,15 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
       expect(claudeSdkMock.__getQueryCalls()).toHaveLength(1);
       context = takeFinalizationContext(result);
       expect(context?.deliveryContext).toMatchObject({entry: 'runtime_draft', completion: result.completion});
+      expect(context?.sourceScope).toMatchObject({codeAwareMode: 'metadata_only', selectedCodebaseIds: [], hasCodebaseAccess: false});
     } finally {context?.dispose(); insights.mockRestore(); savePattern.mockRestore(); sessionContextManager.remove(sessionId);}
   });
 
-  it('attaches one exact-result context with an independent pinned primary review transport and the actual store view', async () => {
+  it.each([undefined, '32768'])('attaches a pinned primary review with only the captured explicit output cap %s and the actual store view', async outputLimit => {
     intentDecision = {...defaultIntent, taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'};
     const sessionId = 'claude-finalization-context';
     const outputBudgetBefore = process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+    restoreEnvValue('CLAUDE_CODE_MAX_OUTPUT_TOKENS', outputLimit);
     const traceProcessor = {query: jest.fn(async () => ({columns: [], rows: []})), getTrace: () => undefined};
     const runtime = new ClaudeRuntime(traceProcessor as any,
       {model: 'pinned-primary-review', lightModel: 'pinned-light-answer', enableSubAgents: false});
@@ -1299,6 +1301,7 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
       expect(reads).toEqual([{key: 'missing-ref', status: 'missing', reason: 'evidence_not_retained'}]);
       expect(traceProcessor.query).not.toHaveBeenCalled();
       const originalDeadline = context!.deadlineMs;
+      process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '2048';
       const review = await context!.dispatchText({prompt: 'Review current claim semantics', systemPrompt: 'Semantic review',
         signal: new AbortController().signal, deadlineMs: originalDeadline + 60_000, outputByteLimit: 64 * 1024});
       expect(review).toMatchObject({status: 'ok', text: reviewBody});
@@ -1306,13 +1309,16 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
       const sdkCalls = claudeSdkMock.__getQueryCalls();
       expect(sdkCalls).toHaveLength(2);
       expect(sdkCalls[1].options).toMatchObject({model: 'pinned-primary-review', maxTurns: 1,
-        tools: [], allowedTools: [], mcpServers: {}, persistSession: false,
-        env: {CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(FINALIZATION_MAX_OUTPUT_TOKENS)}});
+        tools: [], allowedTools: [], mcpServers: {}, persistSession: false});
+      expect(sdkCalls[1].options.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe(outputLimit);
       expect(sdkCalls[1].options.resume).toBeUndefined();
       expect(sdkCalls[1].options.cwd).not.toBe(sdkCalls[0].options.cwd);
       await expect(fs.stat(reviewDirectory!)).rejects.toMatchObject({code: 'ENOENT'});
-      expect(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe(outputBudgetBefore);
-    } finally {context?.dispose(); readView.mockRestore(); sessionContextManager.remove(sessionId);}
+      expect(process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('2048');
+    } finally {
+      restoreEnvValue('CLAUDE_CODE_MAX_OUTPUT_TOKENS', outputBudgetBefore);
+      context?.dispose(); readView.mockRestore(); sessionContextManager.remove(sessionId);
+    }
   });
 
   it('retains the projected cancelled candidate without a new semantic dispatch', async () => {
@@ -2677,6 +2683,11 @@ describe('ClaudeRuntime enterprise runtime_snapshots session map', () => {
         codeAwareMode: 'provider_send',
         codebaseIds: [fixture.codebaseId],
       });
+      const context = takeFinalizationContext(terminal)!;
+      try {
+        expect(context.getNativeDeclaration(terminal, new AbortController().signal)?.raw).toBe(SOURCE_FINALIZATION_RAW_SOURCE);
+        expect(JSON.stringify(terminal)).not.toContain('conclusion_protocol_projection');
+      } finally {context.dispose();}
       const next = await runtime.analyze('public second run', sessionId, traceId, {
         analysisMode: 'fast',
         codeAwareMode: 'off',

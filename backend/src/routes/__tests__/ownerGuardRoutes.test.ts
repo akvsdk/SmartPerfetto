@@ -550,7 +550,7 @@ describe('owner guard for agent session routes', () => {
         'Private source or knowledge analysis request (original content not persisted)',
       );
       expect(res.body.report.summary.terminationMessage).toBe(
-        'Analysis did not complete; detailed model or tool errors are hidden by the privacy policy.',
+        'Parts of this result remain incomplete or have not passed checks; detailed diagnostics are hidden by the privacy policy.',
       );
       expect(res.body.report.summary.terminationMessage).not.toContain('PRIVATE_TERMINATION_CANARY');
       expect(JSON.stringify(res.body)).not.toMatch(/PRIVATE_[A-Z_]+_CANARY/);

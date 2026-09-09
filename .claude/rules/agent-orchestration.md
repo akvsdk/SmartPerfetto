@@ -10,18 +10,21 @@ Do not split simple, single-file, low-risk tasks only because multiple agents
 are available. The primary agent may handle those directly and run the normal
 project checks.
 
-Use orchestration for non-trivial work when the problem has independent domains,
-parallel read-only investigation would reduce risk, or an independent review is
-needed before or after implementation. If a task starts simple but discovers
+Use orchestration for non-trivial work when a bounded, independent workstream
+would save time or improve quality, or an independent review is required before
+or after implementation. Keep shared state and sequential decisions with the
+primary agent; available capacity alone is not a reason to delegate.
+If a task starts simple but discovers
 runtime, security, release, public-contract, generated-artifact, submodule, or
 cross-surface risk, upgrade to this workflow.
 
 ## Authority
 
-Current repository truth has priority: `AGENTS.md`, the relevant
-`.claude/rules/` files, the user's current authorization, GitNexus rules, and
-the project verification rules outrank memory, old reports, and agent
-preference.
+Follow the instruction priority in `AGENTS.md`: system/platform constraints
+first, then the user's current explicit instructions, then scoped project
+rules. Skills, memory, old reports, and agent preferences do not override that
+authority. Verify project facts against current source, scripts, tests, and
+runtime evidence.
 
 The primary agent owns:
 
@@ -29,7 +32,7 @@ The primary agent owns:
 - Architecture, task decomposition, and ownership boundaries.
 - Git, commit, push, branch, PR, release, and deployment authority.
 - Real status and diff inspection before accepting any handoff.
-- Staged change detection, project gate reruns, and final acceptance.
+- Staged change detection, applicable project verification, and final acceptance.
 
 Sub-agents and reviewers provide candidate evidence. They do not change the
 repository authority model.
@@ -120,8 +123,12 @@ work. Shared files and shared dependency stacks are serialized.
 
 A sub-agent report is candidate evidence only. Before accepting it, the primary
 agent checks the live repository status, actual diff, touched paths, generated
-outputs, and forbidden-path boundaries. Then the primary agent reruns the
-project gates that prove the accepted change.
+outputs, and forbidden-path boundaries. The primary agent verifies the gate
+evidence against the combined result and runs missing or invalidated checks.
+Reuse a passing check only when its relevant files, dependencies, configuration,
+and execution environment are unchanged; a worker's claim of success alone is
+not evidence. Follow `.claude/rules/testing.md`, including required PR/release
+gates, without repeating valid checks solely because a handoff occurred.
 
 Send fixes back to the original worker when its ownership and context are still
 valid. If ownership changed, context expired, or the fix crosses boundaries, the

@@ -24,10 +24,14 @@ import {
 import {
   ENTERPRISE_DATA_DIR_ENV,
   writeTraceMetadata,
+  readTraceMetadata,
+  ensureTraceProcessorLeaseBackingMetadata,
 } from '../../services/traceMetadataStore';
 import { setTraceProcessorServiceForTests } from '../../services/traceProcessorService';
 import { getTraceProcessorLeaseStore, setTraceProcessorLeaseStoreForTests } from '../../services/traceProcessorLeaseStore';
 import { TraceProcessorFactory } from '../../services/workingTraceProcessor';
+import {getPortPool} from '../../services/portPool';
+import * as traceMetadataStore from '../../services/traceMetadataStore';
 import {TRACE_PROCESSOR_CAPABILITY_SECRET_ENV} from '../../services/traceProcessorProxyCapability';
 import {setPublicHttpDownloadForTests} from '../../services/publicHttpDownload';
 import traceRoutes from '../simpleTraceRoutes';
@@ -73,6 +77,10 @@ let fakeTraceProcessorService: {
   getTraceWithPort: jest.Mock;
   getTraceWithLeasePort: jest.Mock;
   getLeaseProcessorSnapshot: jest.Mock;
+  invalidateNativeProvenance: jest.Mock;
+  invalidateNativeProvenanceForProcessorKey: jest.Mock;
+  exposeNativePort: jest.Mock;
+  isPrivateAnalysisProcessorKey: jest.Mock;
   registerStoredTrace: jest.Mock;
   ensureProcessorForLease: jest.Mock;
   cleanupLeaseProcessor: jest.Mock;
@@ -381,6 +389,10 @@ beforeEach(async () => {
     getTraceWithPort: jest.fn(() => undefined),
     getTraceWithLeasePort: jest.fn(() => undefined),
     getLeaseProcessorSnapshot: jest.fn(() => undefined),
+    invalidateNativeProvenance: jest.fn(),
+    invalidateNativeProvenanceForProcessorKey: jest.fn(),
+    exposeNativePort: jest.fn(),
+    isPrivateAnalysisProcessorKey: jest.fn(() => false),
     registerStoredTrace: jest.fn((input: any) => ({
       ...input,
       uploadTime: new Date(),
@@ -430,6 +442,53 @@ afterEach(async () => {
 });
 
 describe('enterprise trace metadata routes', () => {
+  it('creates personal lease backing once without changing existing trace or user records', async () => {
+    process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'false';
+    const scope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'};
+    const metadata = {id: 'personal-backing', filename: 'capture.trace', size: 24,
+      uploadedAt: new Date(0).toISOString(), status: 'ready', path: path.join(uploadDir, 'capture.trace')};
+    await writeTraceMetadata(metadata);
+    ensureTraceProcessorLeaseBackingMetadata(metadata, scope);
+    const db = openEnterpriseDb(dbPath);
+    try {
+      db.prepare('UPDATE users SET email = ?, display_name = ?, updated_at = ? WHERE id = ?')
+        .run('actual@example.test', 'Actual Person', 17, scope.userId);
+      const userBefore = db.prepare('SELECT * FROM users WHERE id = ?').get(scope.userId);
+      const traceBefore = readTraceAsset(metadata.id);
+      ensureTraceProcessorLeaseBackingMetadata({...metadata, filename: 'display-only.trace', status: 'processing'}, scope);
+      ensureTraceProcessorLeaseBackingMetadata({...metadata, id: 'second-backing'}, scope);
+      expect(db.prepare('SELECT * FROM users WHERE id = ?').get(scope.userId)).toEqual(userBefore);
+      expect(readTraceAsset(metadata.id)).toEqual(traceBefore);
+      expect(readTraceAsset('second-backing')).toBeTruthy();
+      expect(await readTraceMetadata(metadata.id)).toEqual(metadata);
+      expect(process.env[ENTERPRISE_FEATURE_FLAG_ENV]).toBe('false');
+    } finally {db.close();}
+  });
+
+  it.each([
+    {path: '/different/capture.trace'}, {size: 99}, {externalRpc: true, port: 9178},
+  ])('rejects conflicting lease backing identity without overwriting the registered trace: %j', changed => {
+    const scope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'};
+    const metadata = {id: 'backing-conflict', filename: 'capture.trace', size: 24,
+      uploadedAt: new Date(0).toISOString(), status: 'ready', path: path.join(uploadDir, 'capture.trace')};
+    ensureTraceProcessorLeaseBackingMetadata(metadata, scope);
+    const before = readTraceAsset(metadata.id);
+    expect(() => ensureTraceProcessorLeaseBackingMetadata({...metadata, ...changed}, scope))
+      .toThrow('Trace processor lease backing identity conflicts with the registered Trace');
+    expect(readTraceAsset(metadata.id)).toEqual(before);
+  });
+
+  it('preserves external RPC backing identity without inventing a local Trace path', () => {
+    const scope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'};
+    const metadata = {id: 'external-backing', filename: 'external', size: 0,
+      uploadedAt: new Date(0).toISOString(), status: 'ready', externalRpc: true, port: 9178};
+    ensureTraceProcessorLeaseBackingMetadata(metadata, scope);
+    expect(readTraceAsset(metadata.id)?.local_path).toBe('external-rpc:9178');
+    expect(JSON.parse(readTraceAsset(metadata.id)!.metadata_json)).toMatchObject({externalRpc: true, port: 9178});
+    expect(() => ensureTraceProcessorLeaseBackingMetadata({...metadata, port: 9179}, scope))
+      .toThrow('Trace processor lease backing identity conflicts with the registered Trace');
+  });
+
   it('opens an authorized stored trace through an isolated viewer lease', async () => {
     const app = makeApp();
     const traceId = 'viewer-trace';
@@ -471,6 +530,7 @@ describe('enterprise trace metadata routes', () => {
     );
 
     expect(response.status).toBe(200);
+    expect(fakeTraceProcessorService.exposeNativePort).toHaveBeenCalledWith(9123);
     expect(response.body.trace).toEqual(expect.objectContaining({
       id: traceId,
       port: 9123,
@@ -561,6 +621,86 @@ describe('enterprise trace metadata routes', () => {
     expect(fakeTraceProcessorService.getTraceWithLeasePort).not.toHaveBeenCalled();
     expect(fakeTraceProcessorService.ensureProcessorForLease).not.toHaveBeenCalled();
     expect(store.getLeaseById(leaseScope, lease.id)).toEqual(before);
+  });
+
+  it('rejects private analysis connection status even if a frontend holder was already attached', async () => {
+    const scope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'};
+    await writeTraceMetadata({id: 'private-connection', filename: 'private.trace', size: 1,
+      uploadedAt: new Date().toISOString(), status: 'ready', ...scope});
+    const store = getTraceProcessorLeaseStore();
+    const lease = store.acquireHolder(scope, 'private-connection', {holderType: 'agent_run', holderRef: 'private-run',
+      metadata: {analysisRunPrivate: true}}, {mode: 'isolated'});
+    store.markStarting(scope, lease.id); store.markReady(scope, lease.id);
+    store.acquireHolderForLease(scope, lease.id, {holderType: 'frontend_http_rpc', holderRef: 'window-private',
+      windowId: 'window-private', metadata: {userId: 'user-a'}});
+    const before = store.getLeaseById(scope, lease.id);
+    const response = await scopedSsoHeaders(request(makeWorkspaceApp()).get(
+      `/api/workspaces/workspace-a/traces/leases/${lease.id}/connection`), {windowId: 'window-private'});
+    expect(response.body).toEqual({success: true, leaseId: lease.id, status: 'lease_expired'});
+    expect(fakeTraceProcessorService.getLeaseProcessorSnapshot).not.toHaveBeenCalled();
+    expect(fakeTraceProcessorService.exposeNativePort).not.toHaveBeenCalled();
+    expect(store.getLeaseById(scope, lease.id)).toEqual(before);
+  });
+
+  it.each([['true', false], ['false', false], ['true', true], ['false', true]] as const)(
+    'keeps private ports hidden after stats I/O with enterprise=%s and public-port reuse=%s', async (enabled, reverseReuse) => {
+    process.env[ENTERPRISE_FEATURE_FLAG_ENV] = enabled;
+    const traceId = 'private-stats';
+    const scope = {tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'user-a'};
+    const metadata = {id: traceId, filename: 'private-stats.trace', size: 1,
+      uploadedAt: new Date().toISOString(), status: 'ready', ...scope};
+    await writeTraceMetadata(metadata);
+    ensureTraceProcessorLeaseBackingMetadata(metadata, scope);
+    const store = getTraceProcessorLeaseStore();
+    const lease = store.acquireHolder(scope, traceId, {holderType: 'agent_run', holderRef: 'private-stats-run',
+      metadata: {analysisRunPrivate: true}}, {mode: 'isolated'});
+    const privateKey = `${traceId}:lease:${lease.id}`;
+    const processors = [
+      {kind: 'owned_process' as const, processorId: 'shared', processorKey: traceId, traceId,
+        status: 'ready' as const, activeQueries: 0, httpPort: 9177, rssBytes: 32, rssSampleSource: 'ps' as const},
+      {kind: 'owned_process' as const, processorId: 'private', processorKey: privateKey, traceId,
+        leaseId: lease.id, leaseMode: 'isolated', status: 'initializing' as const, activeQueries: 0,
+        httpPort: 9188, rssBytes: 64, rssSampleSource: 'ps' as const,
+        sqlWorker: {running: true, queuedP0: 2, queuedP1: 0, queuedP2: 0, usesWorkerThread: true}},
+    ];
+    const originalStats = TraceProcessorFactory.getStats();
+    jest.spyOn(TraceProcessorFactory, 'getStats').mockReturnValue({...originalStats, count: 2,
+      traceIds: [traceId], processorKeys: [traceId, privateKey], processors});
+    const portPool = getPortPool();
+    jest.spyOn(portPool, 'getStats').mockReturnValue({...portPool.getStats(), allocated: 2, allocations: [
+      {port: 9177, traceId, allocatedAt: new Date(1)}, {port: 9188, traceId: privateKey, allocatedAt: new Date(1)},
+    ]});
+    fakeTraceProcessorService.getAllTraces.mockReturnValue([{id: traceId, filename: 'private-stats.trace',
+      size: 1, uploadTime: new Date(), status: 'ready'}]);
+    let privateStillPresent = true;
+    let publicPortWasReused = false;
+    fakeTraceProcessorService.isPrivateAnalysisProcessorKey.mockImplementation((key: unknown) => privateStillPresent && key === privateKey);
+    jest.spyOn(TraceProcessorFactory, 'isPrivateAnalysisPort').mockImplementation(port => publicPortWasReused && port === 9177);
+    const countMetadata = traceMetadataStore.countTraceMetadataForContext;
+    let metadataEntered!: () => void;
+    let resumeMetadata!: () => void;
+    const entered = new Promise<void>(resolve => {metadataEntered = resolve;});
+    const resume = new Promise<void>(resolve => {resumeMetadata = resolve;});
+    jest.spyOn(traceMetadataStore, 'countTraceMetadataForContext').mockImplementation(async context => {
+      metadataEntered();
+      await resume;
+      return countMetadata(context);
+    });
+    const pendingResponse = ssoHeaders(request(makeApp()).get('/api/traces/stats')).then(response => response);
+    await entered;
+    privateStillPresent = false; // The old private instance was removed while metadata was loading.
+    publicPortWasReused = reverseReuse; // Another private key now owns the old public allocation's port.
+    resumeMetadata();
+    const response = await pendingResponse;
+    expect(response.status).toBe(200);
+    const publicPorts = reverseReuse ? [] : [9177];
+    expect(response.body.stats.processors).toEqual(expect.objectContaining({count: 2, queueLength: 2}));
+    expect(response.body.stats.processors.items.map((item: {httpPort: number}) => item.httpPort)).toEqual(publicPorts);
+    expect(response.body.stats.portPool.allocated).toBe(2);
+    expect(response.body.stats.portPool.allocations.map((item: {port: number}) => item.port)).toEqual(publicPorts);
+    expect(JSON.stringify(response.body)).not.toContain('9188');
+    expect(JSON.stringify(response.body)).not.toContain(lease.id);
+    expect(fakeTraceProcessorService.exposeNativePort.mock.calls).toEqual(publicPorts.map(port => [port]));
   });
 
   it.each(['pending', 'starting', 'restarting'])(
@@ -1396,6 +1536,8 @@ describe('enterprise trace metadata routes', () => {
 
     expect(statsRes.status).toBe(200);
     expect(statsRes.body.stats.processors.queueLength).toBe(8);
+    expect(fakeTraceProcessorService.exposeNativePort.mock.calls.map(call => call[0]))
+      .toEqual(expect.arrayContaining(statsRes.body.stats.processors.items.map((processor: any) => processor.httpPort)));
     const leaseItems = statsRes.body.stats.leases.items as Array<{
       id: string;
       mode: string;

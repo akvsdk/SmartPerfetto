@@ -41,6 +41,9 @@ The [Android Performance Ecosystem](https://github.com/Gracker/android-performan
 
 - Analyzes Android Perfetto traces for scrolling jank, startup, ANR,
   interaction latency, memory, game, and rendering-pipeline issues.
+- Investigates continuous main-thread work during scrolling and window animations,
+  including tasks between doFrame callbacks, their execution/wait time and source
+  clues. FrameTimeline provides outcome evidence; missing frames do not hide tasks.
 - Keeps Perfetto's timeline and SQL workflow, then adds an AI Assistant for
   evidence-backed conclusions, follow-up questions, comparisons, and reports.
 - Uses deterministic YAML Skills and Markdown strategies so factual evidence,
@@ -48,7 +51,9 @@ The [Android Performance Ecosystem](https://github.com/Gracker/android-performan
 - Optionally selects registered local source per run, uses bounded on-demand
   lookup without requiring an index, and separates trace occurrence from
   `CodeRef` mechanism evidence in safe Web, report, CLI, snapshot, and API
-  provenance.
+  provenance. Choose a folder and **Add and use for analysis** to get started;
+  see the [source analysis guide](docs/getting-started/code-aware-analysis.en.md)
+  for excluded paths and optional indexing.
 - Sends UI selections as identity and time bounds only; the backend re-queries
   descriptive facts and runs `/anr` or `/jank` through the same evidence and
   verification pipeline.
@@ -106,6 +111,9 @@ keeping Qoder PAT or `qodercli` authentication separate.
 3. Open the AI Assistant panel.
 4. Ask a question such as `Analyze scrolling jank`, `Why is startup slow?`, or
    `Analyze the ANR in this trace`.
+
+Each round shows its analysis process and steps above its final conclusion,
+which stays before the next round's question.
 
 For CLI use:
 

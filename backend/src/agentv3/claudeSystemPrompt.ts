@@ -630,9 +630,10 @@ type TypedTurnPromptContext = Partial<ClaudeAnalysisContext> & {
 };
 
 /**
- * The typed path has one presentation contract for every runtime budget. Scene
- * prose, quick-answer recipes, and lexical plan triggers belong to the legacy
- * path only. Identity and authorization are separate from trimmable context.
+ * The typed path has one presentation contract for every runtime budget. Pinned
+ * investigation evidence obligations apply within the question and access scope;
+ * legacy scene prose, quick-answer recipes, and lexical plan triggers stay out.
+ * Identity, authorization, and evidence obligations are not trimmable context.
  */
 function buildTypedTurnSystemPromptParts(
   context: TypedTurnPromptContext,
@@ -692,6 +693,13 @@ function buildTypedTurnSystemPromptParts(
     data(3, 'scene_context', {
       sceneId: strategy.scene, description: strategy.classificationDescription,
       requiredCapabilities: strategy.requiredCapabilities, optionalCapabilities: strategy.optionalCapabilities,
+    });
+  }
+  if (intent.status === 'resolved' && intent.taskKind === 'investigation'
+    && strategy?.investigationRequirements?.length) {
+    data(3, 'investigation_requirements', {
+      sceneId: strategy.scene, registryFingerprint: registry.registryFingerprint,
+      requirements: strategy.investigationRequirements,
     });
   }
   if (intent.status === 'resolved' && policy.requiresReport) {

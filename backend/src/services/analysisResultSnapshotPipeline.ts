@@ -638,6 +638,7 @@ export function persistCompletedAnalysisResultSnapshot(
     sessionId: input.sessionId, success: input.success ?? true,
     findings: [], hypotheses: [], conclusion: input.conclusion ?? '',
     confidence: input.confidence ?? 0, rounds: 0, totalDurationMs: 0,
+    partial: input.partial, terminationReason: projectPrivateTerminationReason(input.terminationReason), terminationMessage: input.terminationMessage,
     turnIntent: input.turnIntent, completion: input.completion, outputOrigin: input.outputOrigin,
     runtimeAppendix: input.runtimeAppendix, reportAssessment: input.reportAssessment, deliveryAssurance: input.deliveryAssurance,
     conclusionContract: input.conclusionContract as AnalysisResult['conclusionContract'],
@@ -662,7 +663,7 @@ export function persistCompletedAnalysisResultSnapshot(
         claimVerificationResult: privateResult?.claimVerificationResult,
         identityResolutions: privateResult?.identityResolutions,
         terminationReason: projectPrivateTerminationReason(input.terminationReason),
-        terminationMessage: projectPrivateTerminationMessage(input.terminationMessage, outputLanguage),
+        terminationMessage: projectPrivateTerminationMessage(input.terminationMessage, outputLanguage, privateResult ?? input),
         analysisReceipt: privateResult?.analysisReceipt,
         uiActionProposals: projectPrivateUiActionProposals(
           input.sessionId,

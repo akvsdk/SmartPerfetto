@@ -63,14 +63,12 @@ import { verifyConclusion } from '../claude/claudeVerifier';
 import {
   createCodeAwareStreamingTextProjection,
   sanitizeCodeAwareText,
-  sanitizeCodeAwareTextWithReceipt,
-  type CodeAwareTextProjectionReceipt,
 } from '../../../services/security/codeAwareOutputRegistry';
 import { analysisContextUsesPrivateKnowledge } from '../../../services/resolvedAnalysisContext';
 import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
-import {formatToolCallNarration, formatToolResultNarration} from '../../../agentv3/toolNarration';
+import {formatToolCallNarration, formatToolResultNarration, issuePrivateToolResultNarrationReceipt} from '../../../agentv3/toolNarration';
 import {planPhaseUpdatedContent} from '../../../agentv3/planPhaseEvents';
 import {readRuntimeToolResultFacts} from '../../runtimeToolResult';
 import type {RuntimeToolObserver} from '../../runtimeToolObserver';
@@ -305,9 +303,8 @@ function bindQoderDelivery(
   sdkFinishReason?: string,
   projectionOptions: {
     sourceUse?: Parameters<typeof finalizeSourceAwareAnalysisResultWithProjection>[1];
-    project?: (body: string) => CodeAwareTextProjectionReceipt;
   } = {},
-): AnalysisDeliveryContext {
+): {context: AnalysisDeliveryContext; protocolProjection?: ReturnType<typeof finalizeSourceAwareAnalysisResultWithProjection>['protocolProjection']} {
   const runId = executionLease.key.runId!;
   const candidate = {
     runId, attemptId: 'main', candidateRef: `${runId}:qoder:main`,
@@ -323,16 +320,12 @@ function bindQoderDelivery(
   const nativeContext: AnalysisDeliveryContext = {
     entry: 'runtime_draft', acceptedCandidate: candidate, completion, outputOrigin, turnIntent,
   };
-  const priorProjection = projectionOptions.project
-    ? projectionOptions.project(result.conclusion)
-    : sanitizeCodeAwareTextWithReceipt(result.sessionId, result.conclusion);
-  result.conclusion = priorProjection.text;
   const projected = finalizeSourceAwareAnalysisResultWithProjection(result, projectionOptions.sourceUse, {
-    priorProjection, context: nativeContext,
+    context: nativeContext,
   });
   if (!projected.deliveryContext) throw new Error('Qoder delivery context was lost during privacy projection');
   if (projected.conclusionProjection.disposition === 'replaced') result.confidence = 0;
-  return projected.deliveryContext;
+  return {context: projected.deliveryContext, protocolProjection: projected.protocolProjection};
 }
 
 const QODER_LIGHT_MODEL_PURPOSES = new Set([
@@ -354,13 +347,13 @@ interface QoderActiveSession {
   assistantText: string;
   toolCallCount: number;
   turnIntent?: AnalysisTurnIntent;
-  sourceUse?: Parameters<typeof finalizeSourceAwareAnalysisResultWithProjection>[1];
+  sourceUse?: ReturnType<typeof createClaudeMcpServer>['sourceUse'];
   timedOut?: boolean;
   timeoutMs?: number;
   deadlineMs?: number;
   strategyRegistry?: ReadonlyStrategyRegistrySnapshot;
   artifactStore?: ArtifactStore;
-  delivery?: {result: AnalysisResult; context: AnalysisDeliveryContext};
+  delivery?: {result: AnalysisResult} & ReturnType<typeof bindQoderDelivery>;
   dispatchText?: (input: IntentTransportInput) => Promise<IntentTransportResult>;
   armMainBudget(timeoutMs: number): void;
 }
@@ -469,10 +462,10 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
           result.terminationMessage = timeoutText;
           runtimePerformanceOutcome = 'error';
         }
-        const context = bindQoderDelivery(result, executionLease, sessionState.turnIntent, 'runtime_fallback',
+        const {context, protocolProjection} = bindQoderDelivery(result, executionLease, sessionState.turnIntent, 'runtime_fallback',
           sessionState.timedOut ? 'incomplete' : 'cancelled', sessionState.timedOut ? 'timeout' : 'cancelled',
           undefined, {sourceUse: sessionState.sourceUse});
-        sessionState.delivery = {result, context};
+        sessionState.delivery = {result, context, protocolProjection};
         return result;
       }
       const message = describeQoderSdkError(error);
@@ -481,9 +474,9 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         confidence: 0, rounds: 0, totalDurationMs: Date.now() - analysisStartedAt,
         partial: true, terminationReason: 'execution_error', terminationMessage: message,
       };
-      const context = bindQoderDelivery(result, executionLease, sessionState.turnIntent, 'runtime_fallback', 'failed', 'provider_error',
+      const {context, protocolProjection} = bindQoderDelivery(result, executionLease, sessionState.turnIntent, 'runtime_fallback', 'failed', 'provider_error',
         undefined, {sourceUse: sessionState.sourceUse});
-      sessionState.delivery = {result, context};
+      sessionState.delivery = {result, context, protocolProjection};
       return result;
     } finally {
       clearTimeout(mainBudgetTimer);
@@ -500,8 +493,9 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
             runId: executionLease.key.runId!, sessionId, deadlineMs: sessionState.deadlineMs,
             turnIntent: sessionState.turnIntent, strategyRegistry: sessionState.strategyRegistry,
             traceIdentity: {currentTraceId: traceId, referenceTraceId: normalizedOptions.referenceTraceId},
-            deliveryContext: sessionState.delivery.context,
+            deliveryContext: sessionState.delivery.context, protocolProjection: sessionState.delivery.protocolProjection,
             sourceUse: sessionState.sourceUse?.getSourceUseDecision(),
+            sourceScope: sessionState.sourceUse?.getSourceExecutionScope?.(),
             evidenceReadView: sessionState.artifactStore?.createEvidenceReadView({
               allowedTraces: [{traceId, traceSide: 'current'},
                 ...(normalizedOptions.referenceTraceId
@@ -905,6 +899,9 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
       const resultFacts = readRuntimeToolResultFacts(rawResult);
       const codeReferences = extractSourceLookupCodeReferences(toolName, rawResult);
       const projectedResult = projectToolResultForExternalSurface(toolName, rawResult);
+      const privateToolResultReceipt = issuePrivateToolResultNarrationReceipt({
+        toolName, result: projectedResult, isError: resultFacts.success === false,
+      });
       const resultText = summarizeExternalToolResult(projectedResult);
       recordPlanOrPrePlanToolCall(planState, {
         toolCallId,
@@ -936,6 +933,7 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
           taskId: toolCallId,
           toolName,
           result: resultText,
+          ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
           resultNarration: formatToolResultNarration({
             toolName,
             args: params,
@@ -1209,12 +1207,12 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
         terminationReason,
         terminationMessage: nativeCompleted ? undefined : sdkErrorText,
       };
-      const deliveryContext = bindQoderDelivery(result, executionLease, turnIntent, outputOrigin,
+      const {context: deliveryContext, protocolProjection} = bindQoderDelivery(result, executionLease, turnIntent, outputOrigin,
         sdkResultMeta.status === 'completed' && !nativeCompleted ? 'unknown' : sdkResultMeta.status,
         sdkResultMeta.reason, sdkResultMeta.stopReason,
-        {sourceUse, project: body => activeAnswerProjection.projectCompleteWithReceipt(body)});
+        {sourceUse});
       sessionState.assistantText = result.conclusion;
-      sessionState.delivery = {result, context: deliveryContext};
+      sessionState.delivery = {result, context: deliveryContext, protocolProjection};
       const verificationPhase = runtimePerformance.startPhase('verification');
       try {
         const verification = await verifyConclusion(result.findings, result.conclusion, {
@@ -1318,10 +1316,10 @@ export class QoderRuntime extends EventEmitter implements IOrchestrator {
           ? abortedMessage
           : errorMessage,
       };
-      const context = bindQoderDelivery(result, executionLease, turnIntent, 'runtime_fallback',
+      const {context, protocolProjection} = bindQoderDelivery(result, executionLease, turnIntent, 'runtime_fallback',
         isAborted ? 'cancelled' : 'failed', isAborted ? 'cancelled' : 'provider_error',
         undefined, {sourceUse});
-      sessionState.delivery = {result, context};
+      sessionState.delivery = {result, context, protocolProjection};
       return result;
     } finally {
       sessionState.sdkQuery = undefined;

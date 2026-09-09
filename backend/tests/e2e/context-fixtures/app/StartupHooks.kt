@@ -6,7 +6,7 @@ object StartupHooks {
   const val SOURCE_CONTEXT_MARKER = "E2E_CONTEXT_MARKER_SOURCE"
   const val TRACE_SOURCE_MARKER = "StartupHooks.initializeOnMainThread#before-first-frame-sync-policy"
 
-  fun initializeOnMainThread() {
+  fun initializeOnMainThread() { // SEMANTIC_DELTA_PRIVATE_SOURCE_CANARY_NEVER_EMIT
     // This synthetic synchronous disk read is intentionally described in source
     // so the analyzer must distinguish source context from trace evidence.
     val startupPolicy = "avoid synchronous disk I/O before first frame"

@@ -4,6 +4,7 @@
 
 import {
   buildStrategyRegistrySnapshot,
+  buildStrategyRegistrySnapshotFromDefinitions,
   fingerprintStrategyDefinition,
   getFinalReportContract,
   getPhaseHints,
@@ -14,6 +15,7 @@ import {
   loadStrategies,
   type StrategyRegistryContribution,
 } from '../strategyLoader';
+import fs from 'fs';
 import {withEffectiveRuntimeRegistrySnapshot} from '../../services/selfEvolution/effectiveRuntimeRegistryContext';
 
 const scope = {
@@ -171,5 +173,55 @@ describe('strategy registry snapshots', () => {
       ...base,
       sourcePath: '/another/install/backend/strategies/scrolling.strategy.md',
     })).toBe(fingerprintStrategyDefinition(base));
+  });
+
+  it('loads and trims declared investigation requirements without changing absent legacy fields', () => {
+    const sourcePath = loadStrategies().get('scrolling')!.sourcePath;
+    const readFileSync = fs.readFileSync;
+    const read = jest.spyOn(fs, 'readFileSync').mockImplementation((file, options) =>
+      String(file) === sourcePath
+        ? '---\nscene: scrolling\ninvestigation_requirements: ["  Follow the observed work.  "]\n---\nFixture core.'
+        : readFileSync(file, options));
+    try {
+      const loaded = loadStrategies().get('scrolling')!;
+      expect(loaded.investigationRequirements).toEqual(['Follow the observed work.']);
+      expect(Object.isFrozen(loaded.investigationRequirements)).toBe(true);
+      read.mockImplementation((file, options) => String(file) === sourcePath
+        ? '---\nscene: scrolling\n---\nLegacy core.' : readFileSync(file, options));
+      const legacy = loadStrategies().get('scrolling')!;
+      expect(legacy).not.toHaveProperty('investigationRequirements');
+      const snapshot = buildStrategyRegistrySnapshotFromDefinitions({definitions: [legacy], overlayGeneration: 'legacy'});
+      expect(snapshot.getStrategy('scrolling')).not.toHaveProperty('investigationRequirements');
+    } finally {read.mockRestore();}
+  });
+
+  it.each(['null', '[]', '"a scalar"', '[42]', '["valid", "  "]', '["valid", null]'])(
+    'rejects malformed investigation requirements: %s', declaration => {
+      const sourcePath = loadStrategies().get('scrolling')!.sourcePath;
+      const readFileSync = fs.readFileSync;
+      const read = jest.spyOn(fs, 'readFileSync').mockImplementation((file, options) =>
+        String(file) === sourcePath
+          ? `---\nscene: scrolling\ninvestigation_requirements: ${declaration}\n---\nFixture core.`
+          : readFileSync(file, options));
+      try {expect(() => loadStrategies()).toThrow('strategy_invalid_investigation_requirements');}
+      finally {read.mockRestore();}
+    },
+  );
+
+  it('pins investigation requirements in an independent frozen array and semantic fingerprint', () => {
+    const base = loadStrategies().get('scrolling')!;
+    const requirements = ['Explain the actual main-thread work.'];
+    const definition = {...base, investigationRequirements: requirements};
+    const snapshot = buildStrategyRegistrySnapshotFromDefinitions({definitions: [definition], overlayGeneration: 'one'});
+    const pinned = snapshot.getStrategy('scrolling')!;
+    expect(pinned.investigationRequirements).toEqual(requirements);
+    expect(pinned.investigationRequirements).not.toBe(requirements);
+    expect(Object.isFrozen(pinned.investigationRequirements)).toBe(true);
+    expect(() => pinned.investigationRequirements!.push('mutate the pin')).toThrow();
+    requirements[0] = 'Changed evidence boundary.';
+    expect(pinned.investigationRequirements).toEqual(['Explain the actual main-thread work.']);
+    expect(fingerprintStrategyDefinition(definition)).not.toBe(fingerprintStrategyDefinition(pinned));
+    const updated = buildStrategyRegistrySnapshotFromDefinitions({definitions: [definition], overlayGeneration: 'one'});
+    expect(updated.registryFingerprint).not.toBe(snapshot.registryFingerprint);
   });
 });

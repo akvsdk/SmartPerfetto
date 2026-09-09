@@ -141,6 +141,8 @@ export interface StrategyDefinition {
   requiredCapabilities: string[];
   /** Capability IDs that enhance analysis but are not required */
   optionalCapabilities: string[];
+  /** Scoped evidence obligations for typed investigations, independent of report presentation. */
+  investigationRequirements?: string[];
   /** Phase-level hints for mid-analysis restatement injection. */
   phaseHints: PhaseHint[];
   /**
@@ -371,6 +373,16 @@ function parseStrategyFile(filePath: string): StrategyDefinition | null {
   const compoundPatternStrings = (frontmatter.compound_patterns as string[] | undefined) || [];
   const compoundPatterns = compoundPatternStrings.map(p => new RegExp(p, 'i'));
 
+  const rawInvestigationRequirements = frontmatter.investigation_requirements;
+  let investigationRequirements: string[] | undefined;
+  if (rawInvestigationRequirements !== undefined) {
+    if (!Array.isArray(rawInvestigationRequirements) || rawInvestigationRequirements.length === 0
+      || !rawInvestigationRequirements.every(nonEmptyString)) {
+      throw new Error(`strategy_invalid_investigation_requirements:${filePath}`);
+    }
+    investigationRequirements = rawInvestigationRequirements.map(requirement => requirement.trim());
+  }
+
   const rawHints = (frontmatter.phase_hints as Array<Record<string, unknown>> | undefined) || [];
   const phaseHints: PhaseHint[] = rawHints.map(h => ({
     id: (h.id as string) || '',
@@ -454,6 +466,7 @@ function parseStrategyFile(filePath: string): StrategyDefinition | null {
     compoundPatterns,
     requiredCapabilities: (frontmatter.required_capabilities as string[]) || [],
     optionalCapabilities: (frontmatter.optional_capabilities as string[]) || [],
+    ...(investigationRequirements ? {investigationRequirements} : {}),
     phaseHints,
     planTemplate,
     finalReportContract,
@@ -483,6 +496,8 @@ function cloneStrategyDefinition(definition: StrategyDefinition): StrategyDefini
     ),
     requiredCapabilities: [...definition.requiredCapabilities],
     optionalCapabilities: [...definition.optionalCapabilities],
+    ...(definition.investigationRequirements
+      ? {investigationRequirements: [...definition.investigationRequirements]} : {}),
     phaseHints: definition.phaseHints.map(hint => ({
       ...hint,
       keywords: [...hint.keywords],

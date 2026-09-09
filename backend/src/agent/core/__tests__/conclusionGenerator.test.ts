@@ -16,9 +16,55 @@ import type { Finding, Intent } from '../../types';
 import type { SharedAgentContext } from '../../types/agentProtocol';
 import type { ProgressEmitter } from '../orchestratorTypes';
 import type { ModelRouter } from '../modelRouter';
-import {parseConclusionContractSidecar, parseTypedConclusionContractJson, renderConclusionContractSidecar,
+import {parseConclusionContractSidecar, parseTypedConclusionContractJson, parseConclusionContractDeclaration, renderConclusionContractSidecar,
   type ConclusionContract, type ClaimSemanticsV1,
 } from '../conclusionContract';
+
+describe('complete generated conclusion collections', () => {
+  const collection = (prefix: string, count: number) => Array.from({length: count}, (_, index) => `${prefix} ${index + 1}`);
+
+  it('keeps every legacy JSON conclusion, cluster, evidence item, uncertainty and next step', () => {
+    const raw = JSON.stringify({schema_version: 'conclusion_contract_v1',
+      conclusion: collection('Conclusion', 4).map((statement, index) => ({rank: index + 1, statement})),
+      clusters: collection('Cluster', 6).map((description, index) => ({cluster: `K${index + 1}`, description})),
+      evidence_chain: collection('Evidence', 13).map(text => ({conclusion_id: 'C4', evidence: [text]})),
+      uncertainties: collection('Uncertainty', 7), next_steps: collection('Next action', 7)});
+    const contract = deriveConclusionContract(raw)!;
+    expect(contract.conclusions).toHaveLength(4);
+    expect(contract.clusters).toHaveLength(6);
+    expect(contract.evidenceChain).toHaveLength(13);
+    expect(contract.uncertainties).toHaveLength(7);
+    expect(contract.nextSteps).toHaveLength(7);
+    for (const rendered of [renderConclusionContractMarkdown(contract), normalizeConclusionOutput(raw)]) {
+      for (const tail of ['Conclusion 4', 'Cluster 6', 'Evidence 13', 'Uncertainty 7', 'Next action 7']) {
+        expect(rendered).toContain(tail);
+      }
+    }
+  });
+
+  it.each(['number', 'claim', 'bullet'] as const)('retains all %s conclusions through Markdown roundtrip', style => {
+    const statements = collection('Observed statement', 12);
+    const body = `## 结论（按可能性排序）\n${statements.map((text, index) =>
+      `${style === 'number' ? `${index + 1}.` : style === 'claim' ? `C${index + 1}:` : '-'} ${text}`).join('\n')}`;
+    const contract = deriveConclusionContract(body)!;
+    expect(contract.conclusions.map(item => item.statement)).toEqual(statements);
+    const rendered = renderConclusionContractMarkdown(contract);
+    expect(deriveConclusionContract(rendered)?.conclusions.map(item => item.statement)).toEqual(statements);
+    expect(normalizeConclusionOutput(rendered)).toContain('Observed statement 12');
+  });
+
+  it('keeps generated JSON-like conclusion and cluster tails before Markdown normalization', () => {
+    const raw = ['conclusion:', ...collection('Observed conclusion', 4).map(statement => JSON.stringify({statement})),
+      'clusters:', ...collection('Cluster detail', 6).map((description, index) => JSON.stringify({cluster: `K${index + 1}`, description})),
+      'evidence_chain:', JSON.stringify({conclusion_id: 'C4', evidence: ['Evidence for the final conclusion']}),
+      'uncertainties:', 'Uncertainty remains', 'next_steps:', 'Inspect the recorded event'].join('\n');
+    const normalized = normalizeConclusionOutput(raw);
+    expect(normalized).toContain('Observed conclusion 4');
+    expect(normalized).toContain('Cluster detail 6');
+    expect(deriveConclusionContract(normalized)?.conclusions).toHaveLength(4);
+    expect(deriveConclusionContract(normalized)?.clusters).toHaveLength(6);
+  });
+});
 
 describe('conclusionGenerator', () => {
   let mockModelRouter: jest.Mocked<Partial<ModelRouter>>;
@@ -1403,6 +1449,103 @@ describe('versioned conclusion declaration sidecar', () => {
     return '<!-- smartperfetto:conclusion-contract@1\n```json\n' + JSON.stringify(raw) + '\n```\n-->';
   }
 
+  const sourceBinding = {claimId: 'claim:original', mechanismStatus: 'compatible' as const,
+    sourceReferenceIds: ['source-ref-v1-original'], traceEvidenceRefIds: []};
+
+  it.each(['absent', 'empty', 'duplicate'] as const)('preserves %s original source-binding declarations', mode => {
+    const original = contract();
+    if (mode === 'empty') original.sourceClaimBindings = [];
+    if (mode === 'duplicate') original.sourceClaimBindings = [sourceBinding, {...sourceBinding}];
+    for (const parsed of [parseConclusionContractSidecar(rawSidecar(original)), parseTypedConclusionContractJson(JSON.stringify(original))]) {
+      expect(parsed).toMatchObject({status: 'valid', bindingEligibility: 'eligible', issues: []});
+      expect(parsed.contract?.sourceClaimBindings).toEqual(original.sourceClaimBindings);
+      expect(Object.prototype.hasOwnProperty.call(parsed.contract, 'sourceClaimBindings')).toBe(mode !== 'absent');
+    }
+  });
+
+  it.each([
+    null, {}, 'bindings', 1, [null], [{}], [{...sourceBinding, claimId: undefined}],
+    [{...sourceBinding, sourceReferenceIds: undefined}], [{...sourceBinding, traceEvidenceRefIds: null}],
+    [{...sourceBinding, sourceReferenceIds: [null]}], [{...sourceBinding, claimId: ' claim:original '}],
+    [{...sourceBinding, sourceReferenceIds: [' source-ref-v1-original ']}],
+    [{...sourceBinding, mechanismStatus: 'verified'}], [{...sourceBinding, reason: 1}],
+    [sourceBinding, {claimId: 'other'}], [sourceBinding, null],
+  ])('keeps malformed original source bindings invalid through typed and sidecar round trips: %j', sourceClaimBindings => {
+    const original = {...contract(), sourceClaimBindings};
+    for (const parsed of [parseConclusionContractSidecar(rawSidecar(original)), parseTypedConclusionContractJson(JSON.stringify(original))]) {
+      expect(parsed).toMatchObject({status: 'invalid', bindingEligibility: 'ineligible', issues: [
+        {code: 'invalid_reference', path: 'sourceClaimBindings'},
+      ]});
+      expect(parsed.contract?.rawDeclaration).toEqual(JSON.parse(JSON.stringify(original)));
+      const reparsed = parseConclusionContractSidecar(renderConclusionContractSidecar(parsed.contract!));
+      expect(reparsed).toMatchObject({status: 'invalid', bindingEligibility: 'ineligible'});
+      expect(reparsed.rawPayload).toEqual(parsed.rawPayload);
+    }
+  });
+
+  it.each([undefined, new Array(1), [{...sourceBinding, sourceReferenceIds: new Array(1)}],
+    [{...sourceBinding, traceEvidenceRefIds: new Array(1)}]])('rejects explicit undefined or sparse local bindings: %j', sourceClaimBindings => {
+    const parsed = parseConclusionContractDeclaration({...contract(), sourceClaimBindings});
+    expect(parsed).toMatchObject({contract: {bindingEligibility: 'ineligible'}, issues: [
+      {code: 'invalid_reference', path: 'sourceClaimBindings'},
+    ]});
+    expect(Object.prototype.hasOwnProperty.call(parsed.contract?.rawDeclaration, 'sourceClaimBindings')).toBe(true);
+  });
+
+  it('round-trips an original source location without inferring or normalizing its tuple', () => {
+    const original = contract();
+    original.claims![0].semantics!.source = {sourceReferenceId: 'source-ref-v1-original',
+      filePath: '目录/Probe "Data".kt', lineRange: {start: 9, end: 15}};
+    const parsed = parseConclusionContractSidecar(rawSidecar(original));
+    expect(parsed.status).toBe('valid');
+    expect(parsed.contract?.claims![0].semantics?.source).toEqual(original.claims![0].semantics!.source);
+    const roundTrip = parseConclusionContractSidecar(renderConclusionContractMarkdown(parsed.contract!, {includeMachineSidecar: true}));
+    expect(roundTrip.contract?.claims![0].semantics?.source).toEqual(original.claims![0].semantics!.source);
+  });
+
+  it.each([
+    {}, {sourceReferenceId: 'id', filePath: 'File.kt'},
+    {sourceReferenceId: '', filePath: 'File.kt', lineRange: {start: 1, end: 2}},
+    {sourceReferenceId: 'id', filePath: 'File.kt', lineRange: {start: 0, end: 2}},
+    {sourceReferenceId: 'id', filePath: 'File.kt', lineRange: {start: 2, end: 1}},
+    {sourceReferenceId: 'id', filePath: 'File.kt', lineRange: {start: '1', end: 2}},
+    {sourceReferenceId: 'id', filePath: 'File.kt', lineRange: {start: 1, end: 2}, verified: true},
+  ])('retains invalid source declarations as invalid: %j', source => {
+    const original = structuredClone(contract()) as any;
+    original.claims[0].semantics.source = source;
+    const parsed = parseConclusionContractSidecar(rawSidecar(original));
+    expect(parsed.status).toBe('invalid');
+    expect(parsed.contract?.claims![0].rawSemantics).toEqual(original.claims[0].semantics);
+  });
+
+  it('preserves explicit SQL null in reference values and relation endpoints', () => {
+    const original = contract();
+    original.claims![0].references[0].value = null;
+    original.claims![0].semantics!.scope.subjectRefs![0].value = null;
+    original.relationProposals![0].subject.value = null;
+    const parsed = parseConclusionContractSidecar(rawSidecar(original));
+    expect(parsed).toMatchObject({status: 'valid', bindingEligibility: 'eligible', issues: []});
+    expect(parsed.contract?.claims![0].references[0]).toHaveProperty('value', null);
+    expect(parsed.contract?.claims![0].semantics?.scope.subjectRefs![0]).toHaveProperty('value', null);
+    expect(parsed.contract?.relationProposals![0].subject).toHaveProperty('value', null);
+    const roundTrip = parseConclusionContractSidecar(renderConclusionContractMarkdown(parsed.contract!, {includeMachineSidecar: true}));
+    expect(roundTrip.contract?.claims).toEqual(original.claims);
+    expect(roundTrip.contract?.relationProposals).toEqual(original.relationProposals);
+  });
+
+  it.each(['rowSelector', 'numeric', 'proposal_value'] as const)(
+    'does not widen %s to accept null when reference values become nullable', target => {
+      const invalid = structuredClone(contract()) as any;
+      if (target === 'rowSelector') invalid.claims[0].references[0].rowSelector = {code: null};
+      if (target === 'numeric') invalid.claims[0].semantics.numeric.value = null;
+      if (target === 'proposal_value') invalid.relationProposals[0].value = null;
+      const parsed = parseConclusionContractSidecar(rawSidecar(invalid));
+      expect(parsed.status).toBe('invalid');
+      expect(parsed.bindingEligibility).toBe('ineligible');
+      expect(parsed.issues.length).toBeGreaterThan(0);
+    },
+  );
+
   it('round-trips typed declarations, exact scalar types and proposal IDs without proof', () => {
     const original = contract();
     const markdown = renderConclusionContractMarkdown(original, {includeMachineSidecar: true});
@@ -1428,6 +1571,74 @@ describe('versioned conclusion declaration sidecar', () => {
     expect(result.status).toBe('valid');
     expect(result.contract?.claims?.[0].semantics?.predicate).toBe('future.metric@7');
     expect(result.contract?.claims?.[0]).not.toHaveProperty('supportLevel');
+  });
+
+  it.each([
+    ['missing', undefined, 'missing', 'missing_required'],
+    ['null', null, 'null', 'wrong_type'],
+    ['array', [], 'array', 'wrong_type'],
+    ['object', {private: 'PRIVATE_STRUCTURE_CANARY'}, 'object', 'wrong_type'],
+    ['literal', 'PRIVATE_STRUCTURE_CANARY', 'string', 'invalid_enum'],
+  ])('explains a %s root mode without exposing its value or admitting the declaration', (_label, value, actual, reason) => {
+    const input: Record<string, unknown> = {...contract(), mode: value};
+    if (value === undefined) delete input.mode;
+    const parsed = parseConclusionContractSidecar(rawSidecar(input));
+    expect(parsed).toMatchObject({status: 'invalid', bindingEligibility: 'ineligible', issues: [{
+      code: 'invalid_contract', path: '$', details: [{field: '$.mode', expected: 'conclusion_mode', actual, reason}],
+    }]});
+    expect(parsed.issues).toHaveLength(1);
+    expect(parsed.contract).toBeUndefined();
+    expect(parsed.rawPayload).toEqual(input);
+    expect(JSON.stringify(parsed.issues)).not.toContain('PRIVATE_STRUCTURE_CANARY');
+  });
+
+  it.each([NaN, Infinity, -Infinity])('distinguishes nonfinite rank %s without changing finite numeric boundaries', rank => {
+    const invalid = parseConclusionContractDeclaration({...contract(), conclusions: [{rank, statement: 'Synthetic'}]});
+    expect(invalid.issues).toMatchObject([{code: 'invalid_contract', path: '$', details: [{
+      field: '$.conclusions[].rank', expected: 'finite_number', actual: 'nonfinite_number', reason: 'invalid_number',
+    }]}]);
+    expect(invalid.contract).toBeUndefined();
+    for (const finite of [0, -0, -1, Number.MAX_VALUE, Number.MIN_VALUE]) {
+      expect(parseConclusionContractDeclaration({...contract(), conclusions: [{rank: finite, statement: ''}]}).issues).toEqual([]);
+    }
+  });
+
+  it('reports numeric overflow parsed from JSON as nonfinite while preserving the original rejection', () => {
+    const raw = rawSidecar({...contract(), conclusions: [{rank: 7, statement: 'Synthetic'}]}).replace(/"rank":\s*7/, '"rank":1e400');
+    expect(parseConclusionContractSidecar(raw)).toMatchObject({status: 'invalid', bindingEligibility: 'ineligible', issues: [{
+      code: 'invalid_contract', details: [{field: '$.conclusions[].rank', expected: 'finite_number',
+        actual: 'nonfinite_number', reason: 'invalid_number'}],
+    }]});
+  });
+
+  it('does not reclassify typed JSON with a wrong schemaVersion while sidecars diagnose the fixed literal', () => {
+    const input = {...contract(), schemaVersion: 'PRIVATE_STRUCTURE_CANARY'};
+    expect(parseTypedConclusionContractJson(JSON.stringify(input))).toMatchObject({status: 'absent', issues: []});
+    expect(parseConclusionContractSidecar(rawSidecar(input))).toMatchObject({status: 'invalid', issues: [{
+      code: 'invalid_contract', path: '$', details: [{field: '$.schemaVersion', expected: 'conclusion_contract_v1',
+        actual: 'string', reason: 'invalid_literal'}],
+    }]});
+  });
+
+  it('deduplicates repeated collection shape failures without inflating the original parse issue count', () => {
+    const parsed = parseConclusionContractDeclaration({...contract(), conclusions: Array.from({length: 100}, () => ({rank: '1', statement: null}))});
+    expect(parsed.issues).toHaveLength(1);
+    expect(parsed.issues).toMatchObject([{details: [
+      {field: '$.conclusions[].statement', expected: 'string', actual: 'null', reason: 'wrong_type'},
+      {field: '$.conclusions[].rank', expected: 'finite_number', actual: 'string', reason: 'wrong_type'},
+    ]}]);
+  });
+
+  it('caps unique structure details while preserving one root rejection and avoiding user keys or values', () => {
+    const invalidItems = [{}, null, [], 'PRIVATE_STRUCTURE_CANARY', 0, false, undefined, Infinity, () => undefined];
+    const parsed = parseConclusionContractDeclaration({...contract(), conclusions: invalidItems,
+      clusters: invalidItems, evidenceChain: invalidItems});
+    expect(parsed.contract).toBeUndefined();
+    expect(parsed.issues).toHaveLength(1);
+    const details = parsed.issues[0].details!;
+    expect(details).toHaveLength(24);
+    expect(new Set(details.map(detail => `${detail.field}:${detail.actual}`)).size).toBe(24);
+    expect(JSON.stringify(details)).not.toContain('PRIVATE_STRUCTURE_CANARY');
   });
 
   it.each(['uncertainties', 'nextSteps'] as const)(
@@ -1643,7 +1854,9 @@ describe('versioned conclusion declaration sidecar', () => {
         const parsed = parseTypedConclusionContractJson(text);
         expect(parsed.status).toBe('invalid');
         expect(parsed.bindingEligibility).toBe('ineligible');
-        expect(parsed.issues).toEqual([{code: 'invalid_contract', path: '$'}]);
+        expect(parsed.issues).toEqual([{code: 'invalid_contract', path: '$', details: [defect === 'invalid-mode'
+          ? {field: '$.mode', expected: 'conclusion_mode', actual: 'string', reason: 'invalid_enum'}
+          : {field: '$.uncertainties', expected: 'array', actual: 'missing', reason: 'missing_required'}]}]);
         expect(parsed.raw).toBe(text);
         expect(parsed.rawPayload).toEqual(input);
         expect(parsed.contract).toBeUndefined();

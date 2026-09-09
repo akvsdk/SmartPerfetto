@@ -128,7 +128,7 @@ function isRelationEndpoint(value: unknown): value is EvidenceRelationEndpointV1
   for (const key of ['evidenceRefId', 'sourceToolCallId', 'sourceRef', 'artifactId', 'sourceArtifactId', 'column']) {
     if (value[key] !== undefined && (typeof value[key] !== 'string' || !String(value[key]).trim())) return false;
   }
-  return value.value === undefined || isPrimitive(value.value);
+  return value.value === undefined || value.value === null || isPrimitive(value.value);
 }
 
 function isProofBinding(value: unknown): boolean {
@@ -709,8 +709,8 @@ function buildCell(ref: ConclusionContractClaimReference, row: Record<string, un
     ...(ref.rowSelector ? { rowSelector: ref.rowSelector } : {}),
     column: ref.column,
     ...(rawValue === null ? { isSqlNull: true } : {}),
-    ...(ref.value !== undefined && ['string', 'number', 'boolean'].includes(typeof ref.value)
-      ? { value: ref.value as string | number | boolean }
+    ...(ref.value === null || (ref.value !== undefined && ['string', 'number', 'boolean'].includes(typeof ref.value))
+      ? { value: ref.value }
       : {}),
     ...(hasActualValue && (rawValue === null || ['string', 'number', 'boolean'].includes(typeof rawValue))
       ? { actualValue: rawValue as string | number | boolean | null }

@@ -258,6 +258,8 @@ export function projectStoredConclusionSourceMetadata<T>(contract: T, actualDeci
   const allowed = new Set(references.map(reference => reference.id));
   const bindings = sanitizeSourceClaimBindings(record.sourceClaimBindings, {referenceIdAliases: aliases})
     .filter(binding => binding.sourceReferenceIds.every(id => allowed.has(id)));
+  // Keep absent optional declarations absent so storage alone cannot change a signed contract.
   return preserveProjectedFieldOrder(contract, {...rest, sourceUseDecision: {...decision, references}, sourceReferences: references,
-    sourceClaimBindings: bindings} as T);
+    ...(Object.prototype.hasOwnProperty.call(record, 'sourceClaimBindings') && record.sourceClaimBindings !== undefined
+      ? {sourceClaimBindings: bindings} : {})} as T);
 }

@@ -2,15 +2,17 @@
 
 [English](code-aware-analysis.en.md) | [中文](code-aware-analysis.md)
 
-Code-Aware Analysis lets SmartPerfetto reference local source trees while analyzing a trace. It maps app frames, native frames, and kernel symbols to `CodeRef` metadata. Registration only makes a codebase selectable; it never attaches that codebase to a session automatically. The user must select it for the current analysis. A registered root that is still reachable works immediately with bounded `search_codebase` / `read_codebase_file`; no SmartPerfetto index is required first. Indexing is an optional accelerator for semantic/symbol lookup and patch workflows. Outputs preserve only `referenceId` or `chunkId`, relative paths, line ranges, and symbols. Raw source text is not persisted into sessions, reports, or exports.
+Code-Aware Analysis lets SmartPerfetto inspect selected local source on demand and connect trace anchors to `CodeRef` locations. A live registered root supports bounded search and reading without an index. **Add and use for analysis** combines explicit provider consent with the current selection; **Add only** registers a selectable codebase without enabling it. Indexing is optional acceleration for semantic/symbol lookup and patch workflows. Raw source text is not persisted in sessions, reports, or exports.
 
 ## Enable It
 
 1. Start the backend with `./start.sh`.
 2. Open AI Assistant settings in Perfetto UI and select `Codebases`.
-3. Prefer **Choose folder** when adding a codebase, then run preview. Display name is optional and defaults to the folder name.
-4. Register it and start analysis immediately. SmartPerfetto reindexing is optional acceleration and still powers semantic/symbol lookup and patch workflows; it is independent of optional external code-graph acceleration.
-5. Use code-aware mode in analysis, or pass `--code-aware metadata_only|provider_send` and `--codebase-id <id>` in the CLI.
+3. Choose a folder and optionally add excluded paths. The name defaults to the folder name. Source kind, allowed access scope, and build metadata remain in advanced settings.
+4. Choose **Add and use for analysis** to let the analysis model receive bounded, redacted snippets from this authorized scope. In metadata-only mode, **Add for locate-only analysis** preserves that mode. **Add only** changes neither the current selection nor provider body consent.
+5. Start analysis without building an index. Indexing and audit controls remain in advanced settings. CLI users explicitly select `--code-aware metadata_only|provider_send` and `--codebase-id <id>`.
+
+When source mode is off, Add and use selects only the new codebase. In provider-send mode it appends the new codebase; in metadata-only mode it preserves locate-only access. It never activates dormant old selections or silently upgrades existing metadata-only permissions.
 
 CLI example:
 
@@ -44,36 +46,40 @@ Registered codebases and knowledge sources are never exposed to a session automa
 | Current selection | Effective behavior |
 |---|---|
 | No IDs | Normal trace-only path; `fast` can remain lightweight |
-| `--codebase-id` only | Authorizes `metadata_only` by default; ordinary questions keep source dormant and preserve the requested Fast/Auto/Full mode |
-| `--code-aware metadata_only` + codebase ID | Explicit source questions use metadata-only `CodeRef` values with at most 1 search, 2 reads, and 6 seconds |
-| `--code-aware provider_send` + codebase ID | Explicit source questions may send filtered text after dual consent, under the same 1/2/6-second budget |
+| `--codebase-id` only | Authorizes `metadata_only` by default and preserves the requested Fast/Auto/Full mode |
+| `--code-aware metadata_only` + codebase ID | The model may locate source on demand, receiving only `CodeRef` metadata |
+| `--code-aware provider_send` + codebase ID | Bounded search and redacted text reads are available within the authorized scope intersection |
 | `--code-aware off` + codebase ID | Invalid input; the source selection is rejected instead of silently ignored |
-| `--knowledge-source-id` only | Uses the authorized private external RAG source and the full runtime |
-| Codebase ID + knowledge source ID | External RAG still requires the full runtime; source activation remains query-driven |
+| `--knowledge-source-id` only | Uses the authorized private external RAG source and preserves the requested budget mode |
+| Codebase ID + knowledge source ID | Uses the selected authorized source and knowledge contexts, each within its access boundary |
 
 A source codebase needs only a live registered root. Missing active generations or indexed chunks do not block analysis. External knowledge remains RAG-backed and still requires consent plus a completed index. If the registered source path is moved, unmounted, or deleted, Web/CLI returns `ANALYSIS_CONTEXT_CODEBASE_ROOT_UNAVAILABLE`; restore that path or register it again.
 
-Selecting source no longer forces `--analysis-mode fast|auto` to `full`. Reference traces and private RAG remain full-runtime capabilities. `provider_send` requires two independent authorizations: `--send-to-provider` at codebase registration and `--code-aware provider_send` for the current run.
+Analysis budget and evidence permission are independent: selecting source, reference traces, or private RAG does not automatically promote the requested `fast|auto` mode to `full`. `provider_send` requires two independent authorizations: `--send-to-provider` at codebase registration and `--code-aware provider_send` for the current run.
 
 ## When Source Is Used
 
-Selecting source establishes authorization; it does not inject source into every run. Web, API, CLI, and all five production runtimes share one activation policy:
+Selection makes authorized source tools available to the current model. It does not inject the entire repository or infer authorization from keywords. Web, API, CLI, and all five production runtimes share this boundary:
 
-- Ordinary Fast/Auto/Full questions keep source dormant: no source tools are registered, no model turns are added, and repository size stays off the primary critical path.
-- Explicit requests for source files, functions, implementation, or call paths expose only `list_codebases`, `search_codebase`, and `read_codebase_file`. The source budget is 1 search, 2 reads, and 6 seconds. Full still retains Trace, Skill, and SQL tools.
-- Only an explicitly Full request for a deep or complete source review starts a detached deep-source supplement after the primary Full conclusion. The primary conclusion, HTML report, and analysis snapshot are already fixed; cancellation or failure never rewrites them. Web messages and CLI `source-supplement.json` persist the supplement separately.
-- A source-activation transition resets provider/runtime context and replays only bounded, safe, non-source-derived text while preserving UI history.
+- The model decides whether the question and trace anchors warrant lookup. Ask it to check the selected source when an implementation explanation is needed; quantitative questions can be answered from trace evidence alone.
+- Calls respect the current run budget, path filters, provider consent, and bounded output capacity. The primary flow does not implicitly apply a fixed 1-search/2-read/6-second policy.
+- No lookup means no claim of source use. Actual calls continue updating the execution ledger even after an earlier explicit not-needed decision.
+- Source selection or authorization changes are checked against session identity and authorization fingerprints; invalid private context cannot be reused.
 
 Each run retains `SourceUseDecisionV1`:
 
 | Field | Meaning |
 |---|---|
-| `status` | `pending` / `attempted` are in-progress states. Lookup may produce `located` / `corroborated`, or terminate as `not_needed`, `disallowed`, `no_queryable_anchor`, `ambiguous_candidates`, `not_found_complete`, `search_incomplete`, or `unverified` |
-| `reasonCode` | Only a controlled structured code is retained; model-authored free-text reasons do not enter safe output |
+| `status` | Tracks pending, attempted, located, body-available, or incomplete lookup states; it is separate from mechanism verification |
+| `reasonCode` | Controlled reason code; model-authored free-text reasons do not enter safe output |
 | `selectedCodebaseIds` | Codebases explicitly selected for this request |
-| `queriedCodebaseIds` | Codebases actually searched |
-| `usedCodebaseIds` | Codebases that actually produced safe `CodeRef` values |
-| `coverageComplete` / `incompleteReasons` | Distinguishes a complete no-match from time budgets, traversal errors, or other incomplete searches. Only a complete search can support a source-absence claim |
+| `queriedCodebaseIds` | Codebases against which source tools actually ran |
+| `usedCodebaseIds` | Codebases that produced safe `CodeRef` values, including locate-only references |
+| `coverageComplete` / `incompleteReasons` | Search coverage; reading a requested window does not make search incomplete, and incomplete search cannot prove source absence |
+
+The returned `sourceReferences[].id` can be used directly in `sourceClaimBindings[].sourceReferenceIds`. References must come from actual current-run outputs within the current selection. Model-invented references and ambiguous aliases are rejected. At reference capacity, tools report the limit rather than delivering references the verifier cannot accept. The Web receipt distinguishes located source, supplied snippets, and actual verification outcomes; a model's mechanism declaration is not a passed check.
+
+The process view retains safe tool-call and result summaries. It omits raw queries, source text, absolute roots, and intermediate model text, without replacing every event with repetitive privacy messages.
 
 ## Evidence Order And Optional Code Graphs
 
@@ -92,15 +98,13 @@ optional `native_symbols` step extracts function, module, and build-id values
 from CPU-profile samples. Both narrow search and never replace current-trace
 evidence or the later bounded source verification.
 
-Automatic Web-conversation enrichment has a stricter tool surface: only
-`list_codebases`, `search_codebase`, and `read_codebase_file` are exposed.
-Graph, indexed lookup, Trace, shell, and patch tools are unavailable. An
-ordinary dormant primary analysis receives no source tools, so repository size
-cannot add model turns to the primary answer.
+Indexing, code graphs, and on-demand reading are separate capabilities. Search and reading remain available without an index; trace anchors can locate source when graph navigation is unavailable. Only actually returned and verified references can support a mechanism binding.
 
 `query_code_graph` and `inspect_code_symbol` return metadata only: `codebaseId`, relative `CodeRef` values, sanitized process/symbol metadata, `graph.freshness`, and `graph.verificationRequired`. They never return raw source text or absolute roots. When a registration uses `pathFilters` or `excludeGlobs`, SmartPerfetto omits whole-repository process summaries whose path scope cannot be proven; authorized relative `CodeRef` values remain available. If GitNexus is missing, unavailable, incompatible, times out, or fails, the graph tool returns a structured unavailable result (`success=false` plus `unsupportedReason`). A stale index returns navigation metadata marked `freshness="stale"`. In either case, the AI/strategy continues through the existing `search_codebase` / `read_codebase_file` path, so registration, selection, and trace analysis remain available. SmartPerfetto does not install, bundle, redistribute, or automatically create or refresh a GitNexus index.
 
 GitNexus is an independent optional third-party tool. Its [official project](https://github.com/abhigyanpatwari/GitNexus) and [npm package](https://www.npmjs.com/package/gitnexus) currently declare the [PolyForm Noncommercial 1.0.0](https://github.com/abhigyanpatwari/GitNexus/blob/main/LICENSE) license. Review the upstream terms and confirm that your intended use is permitted before enabling it, especially for commercial use. This is not legal advice.
+
+An optional-index capacity failure rolls back that indexing attempt and retains the previous index. The UI separates index state from freshly checked root availability. A moved, inaccessible, or disallowed root is never reported as readable. **Allowed source access scope** affects both indexing and on-demand reads; excluded paths also constrain provider disclosure.
 
 ## Supported Codebases
 
@@ -225,3 +229,24 @@ node backend/scripts/run-deepseek-agent-e2e.cjs \
 Claude, OpenAI, Pi, OpenCode, and Qoder results are reported independently as
 `PASSED`, `FAILED`, or `REAL PROVIDER NOT AVAILABLE`; missing credentials are
 not a pass.
+
+Use a single-scenario diagnostic to investigate a failure before repeating the
+matrix. It does not replace five repetitions or certify uncovered recommendation
+semantics:
+
+```bash
+node backend/scripts/run-deepseek-agent-e2e.cjs \
+  --suite code-aware-semantic-delta --runtime openai-agents-sdk \
+  --preflight --query-id explicit-source-location --condition A2
+```
+
+`A0` selects no source, `A2` registers only, and `A3` registers and indexes.
+Diagnostics retain actual tool calls, source references, completion and
+verification status; successful retrieval alone cannot pass delivery acceptance.
+Prompts guide main-answer length; OpenAI requests omit an application output
+cap by default, and Claude answer streams are not clipped at an accumulated
+character threshold. Structured conclusion parsing and fallback display retain
+all valid items, and saved history does not clip answer tails at a fixed character
+count. An explicit `OPENAI_MAX_OUTPUT_TOKENS` must be a positive
+integer. Provider limits still apply, and changing the budget does not change
+acceptance criteria.

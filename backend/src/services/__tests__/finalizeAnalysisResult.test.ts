@@ -4,7 +4,7 @@
 
 import {afterEach, describe, expect, it, jest} from '@jest/globals';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
-import {parseConclusionContractDeclaration, type ConclusionContract} from '../../agent/core/conclusionContract';
+import {parseConclusionContractDeclaration, renderConclusionContractSidecar, type ConclusionContract} from '../../agent/core/conclusionContract';
 import {attachFinalizationContext, takeFinalizationContext} from '../../agentRuntime/analysisFinalizationContext';
 import type {IntentTransportInput, IntentTransportResult} from '../../agentRuntime/intentTransport';
 import {ArtifactStore} from '../../agentv3/artifactStore';
@@ -15,7 +15,10 @@ import type {EvidenceScopeProvenanceV1, IdentityResolutionV1} from '../../types/
 import {captureEvidenceTable} from '../evidence/evidenceCapture';
 import {finalizeAnalysisResult, type AnalysisFinalizationOwner} from '../finalizeAnalysisResult';
 import {clearAllCodeAwareOutputGuards, registerCodeAwareCanary,
-  registerPrivateAnalysisQueryForEcho, sanitizeCodeAwareText} from '../security/codeAwareOutputRegistry';
+  registerPrivateAnalysisQueryForEcho, registerOnDemandSourceLookupForEcho, sanitizeCodeAwareText} from '../security/codeAwareOutputRegistry';
+import {sanitizeSourceReference, type SourceUseDecisionV1} from '../codebase/sourceUseDecision';
+import {finalizeSourceAwareAnalysisResultWithProjection} from '../codebase/sourceClaimVerifier';
+import {canonicalizeAnalysisResult} from '../canonicalAnalysisResult';
 
 const registry = buildStrategyRegistrySnapshotFromDefinitions({definitions: [], overlayGeneration: 'final-result-test'});
 
@@ -23,19 +26,22 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
   omissions?: boolean; report?: boolean; providerQuery?: {text: string; analysisContextFingerprint?: string};
   identity?: IdentityResolutionV1; scope?: EvidenceScopeProvenanceV1;
   deadlineMs?: number;
+  source?: {marker: string; declaredMarker?: string; invalid?: boolean};
   dispatch?: (input: IntentTransportInput) => Promise<IntentTransportResult>} = {}) {
-  const body = options.body ?? 'The captured value is 49.';
-  const ref = {evidenceRefId: 'data:count', rowIndex: 0, column: 'count', value: 49};
+  const body = options.body ?? (options.source ? 'The captured name identifies the source marker.' : 'The captured value is 49.');
+  const ref = {evidenceRefId: 'data:count', rowIndex: 0, column: options.source ? 'name' : 'count',
+    value: options.source ? options.source.declaredMarker ?? options.source.marker : 49};
   const declared: ConclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
     conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [],
-    claims: options.claim === false ? [] : [{id: 'count', kind: 'numeric', text: body, references: [ref],
-      semantics: {schemaVersion: 'claim_semantics@1', predicate: 'numeric.cell', polarity: 'affirmed',
+    claims: options.claim === false ? [] : [{id: 'count', kind: options.source ? 'identity' : 'numeric', text: body, references: [ref],
+      semantics: {schemaVersion: 'claim_semantics@1', predicate: options.source ? 'identity.marker' : 'numeric.cell', polarity: 'affirmed',
         discourse: 'asserted', quantifier: 'one', modality: 'certain',
-        scope: {population: 'cited_rows', subjectRefs: [ref]}, numeric: {operator: 'eq', value: 49, unit: 'count'}}}]};
+        scope: {population: 'cited_rows', subjectRefs: [ref]},
+        ...(options.source ? {} : {numeric: {operator: 'eq' as const, value: 49, unit: 'count'}})}}]};
   const result: AnalysisResult = {sessionId: 'final-result-test', conclusion: body, success: true,
     confidence: 0.8, findings: [], hypotheses: [], rounds: 1, totalDurationMs: 1,
     conclusionContract: parseConclusionContractDeclaration(declared).contract};
-  const envelope = createDataEnvelope({columns: ['count'], rows: [[49]]}, {
+  const envelope = createDataEnvelope({columns: [ref.column], rows: [[options.source?.marker ?? 49]]}, {
     type: 'sql_result', source: 'execute_sql', title: 'Count', evidenceRefId: 'data:count',
     traceId: 'trace', traceSide: 'current', executionStatus: 'observed', identityResolution: options.identity,
     scopeProvenance: options.scope});
@@ -43,15 +49,36 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
   if (options.capture !== false) store.registerStandaloneEvidenceCapture(captureEvidenceTable(envelope.data, {
     count: {unit: 'count', origin: {kind: 'native_producer', definitionFingerprint: 'count-v1'}},
   }), {meta: envelope.meta, display: envelope.display});
+  let sourceUse: SourceUseDecisionV1 | undefined;
+  if (options.source) {
+    const reference = sanitizeSourceReference({referenceId: 'source-read', codebaseId: 'source-app',
+      filePath: 'src/Probe.kt', lineRange: {start: 1, end: 1}, lookupKind: 'body'})!;
+    sourceUse = {schemaVersion: 'source_use_decision@1', codeAwareMode: 'provider_send',
+      selectedCodebaseIds: ['source-app'], status: 'corroborated', attemptedTools: ['read_codebase_file'],
+      queriedCodebaseIds: ['source-app'], usedCodebaseIds: ['source-app'], coverageComplete: true, references: [reference]};
+    declared.sourceClaimBindings = [{claimId: 'count', mechanismStatus: 'compatible', sourceReferenceIds: [reference.id],
+      traceEvidenceRefIds: ['data:count']}];
+    registerOnDemandSourceLookupForEcho(result.sessionId, [{...reference, referenceId: 'source-read',
+      text: `Trace.beginSection("${options.source.marker}");\nTrace.endSection("${options.source.declaredMarker ?? options.source.marker}");`}]);
+    result.conclusion = `${body}\n${options.source.invalid
+      ? '<!-- smartperfetto:conclusion-contract@1\n```json\n' + JSON.stringify({...declared, verified: true}) + '\n```\n-->'
+      : renderConclusionContractSidecar(declared)}`;
+    delete result.conclusionContract;
+  }
   const candidate = {runId: 'run', attemptId: 'attempt', candidateRef: 'candidate',
-    conclusionFingerprint: analysisDeliveryFingerprint(body)};
+    conclusionFingerprint: analysisDeliveryFingerprint(result.conclusion)};
+  const nativeDelivery = {entry: 'runtime_draft' as const, acceptedCandidate: candidate, outputOrigin: 'sdk_final' as const,
+    completion: {...candidate, schemaVersion: 1 as const, runtimeKind: 'openai-agents-sdk' as const, status: 'completed' as const}};
+  const projection = sourceUse ? finalizeSourceAwareAnalysisResultWithProjection(result,
+    {getSourceUseDecision: () => sourceUse!}, {context: nativeDelivery}) : undefined;
+  const semanticBody = canonicalizeAnalysisResult(result).result.conclusion;
   const controller = new AbortController();
   const owner: AnalysisFinalizationOwner = {runId: 'run', signal: controller.signal,
     isCurrent: () => true, assertAuthorized: () => {}};
   const dispatch = jest.fn(options.dispatch ?? (async (): Promise<IntentTransportResult> => {
-    const location = {start: 0, end: body.length, text: body};
+    const location = {start: semanticBody.indexOf(body), end: semanticBody.indexOf(body) + body.length, text: body};
     return {status: 'ok', text: JSON.stringify({schemaVersion: 'final_semantic_response@1',
-      bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: body.length}]},
+      bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: semanticBody.length}]},
       claims: options.claim === false ? [] : [{claimId: 'count',
         consistency: options.inconsistent ? 'inconsistent' : 'consistent', contentLocations: [location],
         issues: options.inconsistent ? [{code: 'numeric_mismatch', contentLocations: [location]}] : []}],
@@ -70,11 +97,11 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
   attachFinalizationContext(result, {runId: 'run', sessionId: result.sessionId, deadlineMs: options.deadlineMs ?? Date.now() + 10_000,
     strategyRegistry: pinnedRegistry, traceIdentity: {currentTraceId: 'trace'},
     providerQuery: options.providerQuery,
+    sourceUse, protocolProjection: projection?.protocolProjection,
     turnIntent: {schemaVersion: 1, status: 'resolved', source: 'semantic', registryFingerprint: pinnedRegistry.registryFingerprint,
       taskKind: 'fact', sceneId: 'general', scope: options.report ? 'scene_wide' : 'bounded_question', recommendedComplexity: 'quick',
       deliverable: options.report ? 'report' : 'answer', evidenceAccess: 'existing_only'},
-    deliveryContext: {entry: 'runtime_draft', acceptedCandidate: candidate, outputOrigin: 'sdk_final',
-      completion: {...candidate, schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'completed'}},
+    deliveryContext: projection?.deliveryContext ?? nativeDelivery,
     evidenceReadView: store.createEvidenceReadView({allowedTraces: [{traceId: 'trace', traceSide: 'current'}], ownerKey: 'run'}),
     dispatchText: dispatch});
   const context = takeFinalizationContext(result)!;
@@ -85,6 +112,108 @@ function fixture(options: {body?: string; capture?: boolean; claim?: boolean; in
 afterEach(() => {clearAllCodeAwareOutputGuards(); jest.useRealTimers();});
 
 describe('shared final analysis boundary', () => {
+  it('reviews exact native declaration prose against the actual projected body after a source echo collision', async () => {
+    const marker = 'synthetic_source_marker_long_name';
+    const target = fixture({source: {marker}, body: `The captured name is ${marker}.`, dispatch: async input => {
+      const snapshot = JSON.parse(input.prompt.slice(input.prompt.lastIndexOf('\n\n{') + 2));
+      const location = {start: 0, end: snapshot.body.length, text: snapshot.body};
+      return {status: 'ok', text: JSON.stringify({schemaVersion: 'final_semantic_response@1',
+        bodyCoverage: {status: 'complete', reviewedSpans: [{start: 0, end: snapshot.body.length}]},
+        claims: [{claimId: 'count', consistency: 'consistent', contentLocations: [location], issues: []}],
+        omissions: [], requirements: []})};
+    }});
+    const final = await target.run();
+    expect(target.dispatch).toHaveBeenCalledTimes(1);
+    expect(final.semanticAssessment?.status).toBe('checked');
+    const prompt = target.dispatch.mock.calls[0][0].prompt;
+    const snapshot = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n{') + 2));
+    expect(snapshot.body).toBe(final.result.conclusion);
+    expect(snapshot.body).not.toContain(marker);
+    expect(snapshot.conclusionContract.claims[0].text).toBe(`The captured name is ${marker}.`);
+    expect(JSON.stringify(final.result)).not.toContain(marker);
+  });
+
+  it('matches original captured source-marker cells while redacting their public declaration', async () => {
+    const marker = 'synthetic_source_marker_long_name';
+    const target = fixture({source: {marker}});
+    expect(target.result.conclusion).not.toContain(marker);
+    const final = await target.run();
+    expect(final.result.conclusionContract?.bindingEligibility).toBe('eligible');
+    expect(final.result.claimVerificationResult?.claimResults[0]).toMatchObject({status: 'partial',
+      referenceResults: [{status: 'matched'}]});
+    expect(final.semanticAssessment?.status).toBe('checked');
+    expect(target.dispatch).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(target.dispatch.mock.calls)).toContain(marker);
+    expect(JSON.stringify(final.result)).not.toContain(marker);
+  });
+
+  it('does not turn different originals into a match when both display as the same CodeRef', async () => {
+    const target = fixture({source: {marker: 'synthetic_source_marker_one_name', declaredMarker: 'synthetic_source_marker_two_name'}});
+    const final = await target.run();
+    expect(final.result.claimVerificationResult?.claimResults[0]).toMatchObject({status: 'unsupported',
+      referenceResults: [{status: 'value_mismatch'}]});
+  });
+
+  it('retains the semantic review reason alongside an independent failed claim', async () => {
+    const marker = 'synthetic_source_marker_one_name';
+    const target = fixture({source: {marker, declaredMarker: 'synthetic_source_marker_two_name'}});
+    registerCodeAwareCanary(target.result.sessionId, marker);
+    const final = await target.run();
+    expect(final.semanticAssessment).toMatchObject({reason: 'input_projection_incomplete'});
+    expect(final.result.claimVerificationResult).toMatchObject({status: 'failed', passed: false,
+      notCheckedReason: 'input_projection_incomplete', claimResults: [{status: 'unsupported'}]});
+    expect(target.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('does not invent an unavailable reason when a completed semantic review rejects a claim', async () => {
+    const target = fixture({inconsistent: true});
+    const final = await target.run();
+    expect(final.semanticAssessment).toMatchObject({status: 'checked', consistency: 'inconsistent'});
+    expect(final.result.claimVerificationResult).toMatchObject({status: 'failed', passed: false,
+      claimResults: [{status: 'unsupported'}]});
+    expect(final.result.claimVerificationResult?.notCheckedReason).toBeUndefined();
+    expect(target.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores tampered display evidence and continues to compare the original issued capture', async () => {
+    const marker = 'synthetic_source_marker_long_name';
+    const target = fixture({source: {marker}});
+    target.envelope.data.rows[0][0] = 'FORGED_DISPLAY_CELL';
+    const final = await target.run();
+    expect(final.result.claimVerificationResult?.claimResults[0].referenceResults?.[0].status).toBe('matched');
+    expect(JSON.stringify(target.dispatch.mock.calls)).not.toContain('FORGED_DISPLAY_CELL');
+  });
+
+  it.each(['claims', 'source'] as const)('rejects changed public %s after the private declaration was attached', async field => {
+    const target = fixture({source: {marker: 'synthetic_source_marker_long_name'}});
+    if (field === 'claims') target.result.conclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+      conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], claims: []};
+    else target.result.sourceUseDecision!.references = [];
+    await expect(target.run()).rejects.toThrow('projection_mismatch');
+    expect(target.dispatch).not.toHaveBeenCalled();
+  });
+
+  it.each(['canary', 'private_query'] as const)('does not restore captured values protected by a %s into semantic input', async kind => {
+    const marker = 'synthetic_source_marker_long_name';
+    const target = fixture({source: {marker}});
+    if (kind === 'canary') registerCodeAwareCanary(target.result.sessionId, marker);
+    else registerPrivateAnalysisQueryForEcho(target.result.sessionId, marker);
+    const final = await target.run();
+    expect(final.result.claimVerificationResult?.claimResults[0].referenceResults?.[0].status).toBe('matched');
+    expect(final.semanticAssessment).toMatchObject({status: 'coverage_incomplete', reason: 'input_projection_incomplete'});
+    expect(target.dispatch).not.toHaveBeenCalled();
+    expect(JSON.stringify(final.result)).not.toContain(marker);
+  });
+
+  it('keeps the native invalid declaration ineligible after source projection', async () => {
+    const target = fixture({source: {marker: 'synthetic_source_marker_long_name', invalid: true}});
+    const final = await target.run();
+    expect(final.result.conclusionContract?.bindingEligibility).toBe('ineligible');
+    expect(final.result.claimVerificationResult?.passed).toBe(false);
+    expect(target.dispatch).not.toHaveBeenCalled();
+    expect(JSON.stringify(final.result)).not.toContain('synthetic_source_marker_long_name');
+  });
+
   const capturedIdentity: IdentityResolutionV1 = {version: 'identity_contract@1', identityRefId: 'identity:target',
     status: 'verified', target: {traceId: 'trace', traceSide: 'current', upid: 42, source: 'skill_param'},
     processes: [{upid: 42, confidence: 1, matchSources: ['upid']}], threads: [], warnings: []};
@@ -161,8 +290,8 @@ describe('shared final analysis boundary', () => {
     const pending = target.run();
     await jest.advanceTimersByTimeAsync(0);
     expect(target.dispatch).toHaveBeenCalledTimes(1);
-    expect(target.dispatch.mock.calls[0][0].deadlineMs).toBe(61_000);
-    await jest.advanceTimersByTimeAsync(60_000);
+    expect(target.dispatch.mock.calls[0][0].deadlineMs).toBe(901_000);
+    await jest.advanceTimersByTimeAsync(900_000);
     const finalized = await pending;
     expect(finalized.semanticAssessment).toMatchObject({status: 'unavailable', reason: 'timeout', consistency: 'unknown',
       binding: {canonicalCandidate: candidate}});

@@ -120,6 +120,17 @@ class SessionCodeAwareOutputGuard {
     return textProjectionReceipt(text, projected.text, projected.replaced);
   }
 
+  projectProtocolLiteral(text: string): string {
+    if (this.overflowed) return PRIVATE_OUTPUT_SUPPRESSED;
+    const stream = new LLMEchoOutputStream();
+    try {
+      for (const registration of this.registrations) {
+        if (registration.kind !== 'snippet') this.apply(stream, registration);
+      }
+      return stream.write(text) + stream.flush();
+    } finally { stream.destroy(); }
+  }
+
   private projectCompleteOutcome(text: string): {text: string; replaced: boolean} {
     if (this.overflowed) return {text: PRIVATE_OUTPUT_SUPPRESSED, replaced: true};
     const stream = this.createStream();
@@ -383,6 +394,22 @@ export function sanitizeCodeAwareStructuredTextWithReceipt(
     return textProjectionReceipt(text, PRIVATE_OUTPUT_SUPPRESSED, true);
   }
   return sanitizeCodeAwareTextWithReceipt(sessionId, text);
+}
+
+/** Only validated, product-defined protocol literals may use this narrower role. */
+export function projectCodeAwareProtocolLiteral(sessionId: string | undefined, literal: string): string {
+  if (!sessionId) return literal;
+  const guard = touchGuard(sessionId);
+  if (!guard && sessionWasRevoked(sessionId)) return PRIVATE_OUTPUT_SUPPRESSED;
+  return guard ? guard.projectProtocolLiteral(literal) : literal;
+}
+
+/** Input-role text from issued current reads or exact-bound native declarations; never arbitrary model text. */
+export const projectCodeAwareAuthorizedInputText = projectCodeAwareProtocolLiteral;
+
+/** Issues a complete text mapping after a bounded, field-aware security projection. */
+export function issueCodeAwareStructuredProjectionReceipt(input: string, text: string, replaced = false): CodeAwareTextProjectionReceipt {
+  return textProjectionReceipt(input, text, replaced);
 }
 
 function sanitizeStructuredTextValue(

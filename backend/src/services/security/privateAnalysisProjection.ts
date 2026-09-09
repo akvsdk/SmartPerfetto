@@ -9,7 +9,7 @@ import type {AnalysisReceipt} from '../../types/dataContract';
 import type {DataEnvelope, UiActionProposalV1} from '../../types/dataContract';
 import type {ConclusionContract} from '../../agent/core/conclusionContract';
 import type {ClaimSupportV1} from '../../types/evidenceContract';
-import type {ClaimVerificationResult} from '../../types/claimVerification';
+import type {ClaimVerificationResult, DeterministicNativeRowIdentity} from '../../types/claimVerification';
 import type {IdentityResolutionV1} from '../../types/identityContract';
 import {sanitizeCodeAwareText} from './codeAwareOutputRegistry';
 import type {CodeLookupSummary} from '../codebase/codeLookupLedger';
@@ -26,6 +26,7 @@ import {
 } from './analysisDeliveryProjection';
 import {sanitizeSourceClaimBindings, sanitizeSourceReferences} from '../codebase/sourceUseDecision';
 import {isPlainJsonObject} from '../../utils/isPlainJsonObject';
+import {projectConclusionContractForDisplay, projectConclusionProtocol} from './conclusionProtocolProjection';
 
 type PrivateFinding = AnalysisResult['findings'][number];
 type PrivateHypothesis = AnalysisResult['hypotheses'][number];
@@ -229,24 +230,52 @@ export function projectPrivateConclusion(input: {
   conclusion: unknown;
   success: boolean;
   language: OutputLanguage;
+  state?: Partial<Pick<AnalysisResult, 'completion' | 'partial'>> & {terminationReason?: unknown};
 }): string {
-  if (!input.success) return privateAnalysisFailureMessage(input.language);
-  return sanitizeCodeAwareText(input.sessionId, String(input.conclusion ?? ''));
+  if (!input.success) {
+    const completion = input.state?.completion?.status;
+    if (completion === 'failed' || completion === 'cancelled' || completion === 'incomplete') {
+      return privateAnalysisFailureMessage(input.language);
+    }
+    const reason = projectPrivateTerminationReason(input.state?.terminationReason);
+    if (completion === 'completed' || reason === 'quality_gate_failed' || reason === 'plan_incomplete') {
+      return localize(input.language,
+        '回答已生成，但结果尚未通过检查；详细内容已按隐私策略隐藏。',
+        'An answer was generated, but the result has not passed checks; details are hidden by the privacy policy.');
+    }
+    return localize(input.language,
+      '分析结果未能确认；详细内容已按隐私策略隐藏。',
+      'The analysis result could not be confirmed; details are hidden by the privacy policy.');
+  }
+  return projectConclusionProtocol(input.sessionId, String(input.conclusion ?? '')).text;
 }
 
-export function projectPrivateTerminationReason(value: unknown): string | undefined {
+export function projectPrivateTerminationReason(value: unknown): AnalysisResult['terminationReason'] {
   return typeof value === 'string' && SAFE_TERMINATION_REASONS.has(value)
-    ? value
+    ? value as AnalysisResult['terminationReason']
     : undefined;
 }
 
 export function projectPrivateTerminationMessage(
   value: unknown,
   language: OutputLanguage,
+  state?: Partial<Pick<AnalysisResult, 'success' | 'partial' | 'completion'>> & {terminationReason?: unknown},
 ): string | undefined {
-  return value === undefined || value === null || value === ''
-    ? undefined
-    : privateAnalysisFailureMessage(language);
+  const completion = state?.completion?.status;
+  if (completion === 'failed' || completion === 'cancelled' || completion === 'incomplete') {
+    return privateAnalysisFailureMessage(language);
+  }
+  const reason = projectPrivateTerminationReason(state?.terminationReason);
+  if (state?.partial === true || reason || completion === 'completed' && state?.success === false) {
+    return localize(language,
+      '分析结果存在未完成或未通过检查的部分；详细诊断已按隐私策略隐藏。',
+      'Parts of this result remain incomplete or have not passed checks; detailed diagnostics are hidden by the privacy policy.');
+  }
+  if (completion === 'completed') return undefined;
+  if (state?.success === false) return privateAnalysisFailureMessage(language);
+  return value === undefined || value === null || value === '' ? undefined : localize(language,
+    '详细分析诊断已按隐私策略隐藏。',
+    'Detailed analysis diagnostics are hidden by the privacy policy.');
 }
 
 export function projectPrivateAnalysisReceipt(
@@ -360,7 +389,7 @@ export function projectPrivateConclusionContract(
   sessionId: string,
   contract: ConclusionContract | undefined,
 ): ConclusionContract | undefined {
-  return contract ? projectPrivateStructuredValue(sessionId, contract) : undefined;
+  return projectConclusionContractForDisplay(sessionId, contract);
 }
 
 export function projectPrivateClaimSupport(
@@ -370,11 +399,45 @@ export function projectPrivateClaimSupport(
   return support ? support.map(item => projectPrivateStructuredValue(sessionId, item)) : undefined;
 }
 
+/** Display metadata only. This never issues a witness or restores native proof authority. */
+function projectPrivateNativeRows(sessionId: string, claim: ClaimVerificationResult['claimResults'][number]):
+  {rows?: DeterministicNativeRowIdentity[]; invalid: boolean} {
+  const proof = claim.deterministicProof;
+  if (proof?.nativeRows === undefined) return {invalid: false};
+  const input: unknown = proof.nativeRows;
+  if (!Array.isArray(input) || input.length > MAX_PRIVATE_PROVENANCE_IDS ||
+      !['numeric_cell', 'captured_cell', 'interval_overlap', 'comparison_delta'].includes(proof.kind)) return {invalid: true};
+  const keys = ['anchorId', 'evidenceRefId', 'captureId', 'traceId', 'traceSide', 'relation', 'idColumn', 'id', 'schemaFingerprint'];
+  const references = claim.referenceCells ?? claim.referenceResults ?? [];
+  const anchors = new Set<string>();
+  const rows: DeterministicNativeRowIdentity[] = [];
+  for (const row of input) {
+    if (!isPlainJsonObject(row) || Object.keys(row).length !== keys.length || keys.some(key => !Object.prototype.hasOwnProperty.call(row, key)) ||
+        !['anchorId', 'evidenceRefId', 'captureId', 'traceId'].every(key => typeof row[key] === 'string' &&
+          /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,159}$/.test(row[key] as string) && privateSourceTextUnchanged(sessionId, row[key] as string)) ||
+        !['relation', 'idColumn'].every(key => typeof row[key] === 'string' && /^[a-z_][a-z0-9_]{0,159}$/.test(row[key] as string) &&
+          privateSourceTextUnchanged(sessionId, row[key] as string)) ||
+        (row.traceSide !== 'current' && row.traceSide !== 'reference') || !privateSourceTextUnchanged(sessionId, row.traceSide) ||
+        typeof row.id !== 'number' || !Number.isSafeInteger(row.id) || row.id < 0 ||
+        typeof row.schemaFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(row.schemaFingerprint) ||
+        !privateSourceTextUnchanged(sessionId, row.schemaFingerprint) ||
+        !proof.anchorIds.includes(row.anchorId as string) || !proof.evidenceRefIds.includes(row.evidenceRefId as string) ||
+        !references.some(reference => reference.anchorId === row.anchorId && reference.evidenceRefId === row.evidenceRefId) ||
+        anchors.has(row.anchorId as string)) return {invalid: true};
+    anchors.add(row.anchorId as string);
+    rows.push({anchorId: row.anchorId as string, evidenceRefId: row.evidenceRefId as string, captureId: row.captureId as string,
+      traceId: row.traceId as string, traceSide: row.traceSide, relation: row.relation as string, idColumn: row.idColumn as string,
+      id: row.id, schemaFingerprint: row.schemaFingerprint});
+  }
+  return {rows, invalid: false};
+}
+
 export function projectPrivateClaimVerification(
   sessionId: string,
   verification: ClaimVerificationResult | undefined,
 ): ClaimVerificationResult | undefined {
   if (!verification || !['claim_verifier@1', 'claim_verifier@2'].includes(verification.schemaVersion)) return undefined;
+  const nativeRows = (verification.claimResults ?? []).map(claim => projectPrivateNativeRows(sessionId, claim));
   const text = (value: string) => sanitizeCodeAwareText(sessionId, value);
   const references = (values: NonNullable<ClaimVerificationResult['claimResults'][number]['referenceResults']>) =>
     values.map(reference => ({
@@ -395,17 +458,19 @@ export function projectPrivateClaimVerification(
     passed: verification.status === 'passed' && verification.passed === true,
     checkedClaimCount: verification.checkedClaimCount,
     unsupportedClaimCount: verification.unsupportedClaimCount,
-    claimResults: (verification.claimResults ?? []).map(claim => ({
+    claimResults: (verification.claimResults ?? []).map((claim, index) => ({
       claimId: text(claim.claimId), status: privateControl(claim.status,
         ['verified', 'partial', 'inference', 'unsupported', 'not_checked'], 'not_checked'),
       ...(claim.referenceResults ? {referenceResults: references(claim.referenceResults)} : {}),
       ...(claim.referenceCells ? {referenceCells: references(claim.referenceCells)} : {}),
       ...(claim.deterministicProof ? {deterministicProof: {
-        kind: privateControl(claim.deterministicProof.kind, ['numeric_cell', 'interval_overlap', 'comparison_delta', 'none'], 'none'),
+        kind: privateControl(claim.deterministicProof.kind,
+          ['numeric_cell', 'captured_cell', 'source_location', 'interval_overlap', 'comparison_delta', 'none'], 'none'),
         status: privateControl(claim.deterministicProof.status, ['proved', 'candidate', 'rejected', 'not_checked'], 'not_checked'),
         reason: text(claim.deterministicProof.reason),
         anchorIds: claim.deterministicProof.anchorIds.map(text),
         evidenceRefIds: claim.deterministicProof.evidenceRefIds.map(text),
+        ...(nativeRows[index].rows ? {nativeRows: nativeRows[index].rows} : {}),
       }} : {}),
       ...(claim.propositionCoverage ? {propositionCoverage: {
         status: privateControl(claim.propositionCoverage.status, ['complete', 'partial', 'none'], 'none'),
@@ -421,7 +486,10 @@ export function projectPrivateClaimVerification(
     })),
   };
   if (projected.status === 'passed' && !projected.passed) projected.status = 'not_checked';
-  return preserveProjectedFieldOrder(verification, projected);
+  // This boundary also runs before finalization signs its verification binding.
+  // Dropping unsafe identity must therefore invalidate here, not only on a later result diff.
+  return preserveProjectedFieldOrder(verification, nativeRows.some(item => item.invalid)
+    ? invalidatePrivateClaimVerification(projected) : projected);
 }
 
 function invalidatePrivateClaimVerification(verification: ClaimVerificationResult): ClaimVerificationResult {
@@ -557,7 +625,7 @@ export function projectPrivateAnalysisResult(
   result: AnalysisResult,
   language: OutputLanguage,
 ): AnalysisResult {
-  const conclusion = projectPrivateConclusion({sessionId, conclusion: result.conclusion, success: result.success, language});
+  const conclusion = projectPrivateConclusion({sessionId, conclusion: result.conclusion, success: result.success, language, state: result});
   const sourceUseDecision = projectPrivateSourceUseDecision(sessionId, result.sourceUseDecision);
   const sourceReferences = result.sourceReferences ? projectPrivateSourceReferences(sessionId, result.sourceReferences) : undefined;
   const storedContract = projectStoredConclusionSourceMetadata(result.conclusionContract, sourceUseDecision);
@@ -631,8 +699,8 @@ export function projectPrivateAnalysisResult(
     ...(projectPrivateTerminationReason(result.terminationReason)
       ? {terminationReason: projectPrivateTerminationReason(result.terminationReason) as AnalysisResult['terminationReason']}
       : {}),
-    ...(projectPrivateTerminationMessage(result.terminationMessage, language)
-      ? {terminationMessage: projectPrivateTerminationMessage(result.terminationMessage, language)}
+    ...(projectPrivateTerminationMessage(result.terminationMessage, language, result)
+      ? {terminationMessage: projectPrivateTerminationMessage(result.terminationMessage, language, result)}
       : {}),
     ...(result.quickRun ? {quickRun: result.quickRun} : {}),
     ...(conclusionContract ? {conclusionContract} : {}),

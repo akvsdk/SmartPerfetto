@@ -54,6 +54,24 @@ describe('Pi intent transport', () => {
     expect(options).not.toHaveProperty('sessionId');
   });
 
+  it('leaves the same configured model capability to the native SDK when no explicit output cap is supplied', async () => {
+    const {input, model, streamFn} = fixture();
+    delete (input as Partial<PiIntentTransportInput>).maxOutputTokens;
+    model.maxTokens = 65_536;
+    expect(await runPiIntentTransport(input)).toMatchObject({status: 'ok'});
+    expect(streamFn.mock.calls[0][0]).toBe(model);
+    expect(streamFn.mock.calls[0][0].maxTokens).toBe(65_536);
+    expect(streamFn.mock.calls[0][2]).not.toHaveProperty('maxTokens');
+    expect(streamFn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '8192', null])('rejects an explicitly invalid output-token limit %s before dispatch', async value => {
+    const {input, streamFn} = fixture();
+    input.maxOutputTokens = value as number;
+    expect(await runPiIntentTransport(input)).toEqual({status: 'unavailable', reason: 'invalid_configuration'});
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+
   it.each(['error', 'aborted', 'length', 'toolUse', 'deferred', 'pending'] as const)('rejects terminal %s', async stopReason => {
     const {input, result, message} = fixture();
     result.mockResolvedValue({...message, stopReason});

@@ -444,6 +444,7 @@ async function collectSourceEvidence(input: {
   if (!isRecord(search) || search.success !== true) {
     throw new Error('Actual search_codebase handler did not succeed');
   }
+  let indexedPayload: unknown;
   if (input.indexed) {
     const indexed = await input.harness.invoke('lookup_app_source', {
       query: input.groundTruth.marker,
@@ -452,16 +453,17 @@ async function collectSourceEvidence(input: {
     if (!isRecord(indexed) || indexed.success !== true) {
       throw new Error('Actual lookup_app_source handler did not succeed');
     }
+    indexedPayload = indexed.result;
   }
   const exactRead = await input.harness.invoke('read_codebase_file', {
     file_path: path.basename(input.groundTruth.relativeSourcePath),
     start_line: input.groundTruth.lineRange.start,
-    end_line: input.groundTruth.lineRange.end,
+    max_lines: input.groundTruth.lineRange.end - input.groundTruth.lineRange.start + 1,
   });
   const seamRead = await input.harness.invoke('read_codebase_file', {
     file_path: path.basename(input.groundTruth.relativeSourcePath),
     start_line: input.groundTruth.lineRange.start,
-    end_line: input.groundTruth.lineRange.end + 8,
+    max_lines: input.groundTruth.lineRange.end - input.groundTruth.lineRange.start + 9,
   });
   const callSiteSearch = await input.harness.invoke('search_codebase', {
     query: 'onCreate',
@@ -470,7 +472,7 @@ async function collectSourceEvidence(input: {
   const callSiteRead = await input.harness.invoke('read_codebase_file', {
     file_path: path.basename(input.groundTruth.relativeSourcePath),
     start_line: input.groundTruth.lineRange.start + 8,
-    end_line: input.groundTruth.lineRange.end + 16,
+    max_lines: input.groundTruth.lineRange.end - input.groundTruth.lineRange.start + 9,
   });
   const handlerText = JSON.stringify({search, exactRead, seamRead, callSiteSearch, callSiteRead});
   const decision = input.harness.sourceUse.getSourceUseDecision();
@@ -478,13 +480,17 @@ async function collectSourceEvidence(input: {
     throw new Error('Actual source handlers did not produce a corroborated decision');
   }
   const filePath = path.basename(input.groundTruth.relativeSourcePath);
-  const exactReference = decision.references.find(reference =>
+  const returnedReferences = isRecord(exactRead) && Array.isArray(exactRead.sourceReferences)
+    ? exactRead.sourceReferences as SourceReferenceV1[] : [];
+  const exactReference = returnedReferences.find(reference =>
     reference.filePath === filePath &&
     reference.lineRange?.start === input.groundTruth.lineRange.start &&
     reference.lineRange.end === input.groundTruth.lineRange.end &&
     (reference.lookupKind === 'body' || reference.lookupKind === 'indexed'));
   if (!exactReference) throw new Error('Actual source handlers did not return the exact CodeRef');
-  const indexedReference = decision.references.find(reference => reference.lookupKind === 'indexed');
+  const indexedReference = isRecord(indexedPayload) && Array.isArray(indexedPayload.sourceReferences)
+    ? (indexedPayload.sourceReferences as SourceReferenceV1[]).find(reference => reference.lookupKind === 'indexed')
+    : undefined;
   if (input.indexed && !indexedReference) {
     throw new Error('Indexed setup did not produce an indexed CodeRef');
   }
@@ -535,7 +541,6 @@ async function verifyTraceSourceBinding(input: {
         scope: {population: 'cited_rows', subjectRefs: [reference]},
         numeric: {operator: 'eq', value: input.traceFacts.durationNs, unit: 'ns'}},
     }],
-    sourceUseDecision: input.sourceUse,
     sourceReferences: [boundReference],
     sourceClaimBindings: [{
       claimId,

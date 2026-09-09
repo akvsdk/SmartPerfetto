@@ -10,13 +10,10 @@ import {
   SDK_MAX_TURNS_SUBTYPE,
 } from '../../../agentv3/analysisTermination';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, type OutputLanguage } from '../../../agentv3/outputLanguage';
-import { formatToolCallNarration, formatToolResultNarration, type ToolNarrationOptions } from '../../../agentv3/toolNarration';
+import { formatToolCallNarration, formatToolResultNarration, issuePrivateToolResultNarrationReceipt, type ToolNarrationOptions } from '../../../agentv3/toolNarration';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
 import type {CodeAwareStreamingTextProjection} from '../../../services/security/codeAwareOutputRegistry';
-import {
-  appendBoundedText,
-  summarizeExternalToolResult,
-} from '../../runtimeLimits';
+import {summarizeExternalToolResult} from '../../runtimeLimits';
 
 export type UpdateEmitter = (update: StreamingUpdate) => void;
 
@@ -118,7 +115,6 @@ export function createSseBridge(
   /** Accumulated answer text from the final (non-tool) turn — used as fallback
    *  when SDK `result` message is empty (e.g. on timeout). */
   let accumulatedAnswerText = '';
-  let accumulatedAnswerTruncated = false;
   let disposed = false;
   // Buffer window: trade-off between streaming responsiveness and classification
   // accuracy. Shorter = more responsive but higher risk of misclassifying thought
@@ -155,16 +151,8 @@ export function createSseBridge(
 
   function emitAnswerChunk(text: string, timestamp: number): void {
     if (!text || disposed) return;
-    const previousLength = accumulatedAnswerText.length;
-    const bounded = appendBoundedText({
-      current: accumulatedAnswerText,
-      chunk: text,
-      alreadyTruncated: accumulatedAnswerTruncated,
-    });
-    accumulatedAnswerText = bounded.text;
-    accumulatedAnswerTruncated = bounded.truncated;
-    const acceptedText = bounded.text.slice(previousLength);
-    const projected = textProjection?.write(acceptedText) ?? acceptedText;
+    accumulatedAnswerText += text;
+    const projected = textProjection?.write(text) ?? text;
     if (projected) emit({type: 'answer_token', content: {token: projected}, timestamp});
   }
 
@@ -276,7 +264,6 @@ export function createSseBridge(
           // Answer text was misclassified as conclusion — it was actually
           // intermediate reasoning before tool calls. Clear accumulated text.
           accumulatedAnswerText = '';
-          accumulatedAnswerTruncated = false;
           const projectedTail = textProjection?.flush() ?? '';
           if (projectedTail) {
             emit({type: 'thought', content: {thought: projectedTail}, timestamp: now});
@@ -359,12 +346,16 @@ export function createSseBridge(
         // tool's payload with a rejection envelope carrying no success field.
         const failed = isSdkToolResultFailure(rawResult, isError);
         const projected = projectToolResultForExternalSurface(toolName, rawResult);
+        const privateToolResultReceipt = issuePrivateToolResultNarrationReceipt({
+          toolName, result: projected, isError: failed,
+        });
         emit({
           type: 'agent_response',
           content: {
             taskId,
             toolName,
             result: summarizeExternalToolResult(projected),
+            ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
             // Narrate the projected object before truncation can cut its JSON.
             resultNarration: formatToolResultNarration({
               toolName,

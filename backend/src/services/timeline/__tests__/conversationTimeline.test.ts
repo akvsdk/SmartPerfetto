@@ -184,6 +184,14 @@ describe('what the evidence line spends its words on', () => {
     expect(text).toContain('显示配置');
   });
 
+  it('does not print generated SQL row counts as findings or discard meaningful evidence titles', () => {
+    const generic = envelope('SQL Query (1794 rows)', {type: 'sql_result', source: 'execute_sql'});
+    expect(summarize([generic])).toBe('');
+    expect(generic.data.rows).toHaveLength(3);
+    expect(summarize([generic, envelope('主线程阻塞区间', {type: 'sql_result', source: 'execute_sql'})]))
+      .toBe('已获得 主线程阻塞区间');
+  });
+
   it('does not spend the line on row totals or evidence-ID bookkeeping', () => {
     // A reader wants to know what arrived, not how many rows or how many
     // internal identifiers were registered.

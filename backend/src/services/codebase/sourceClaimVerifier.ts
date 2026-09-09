@@ -6,7 +6,6 @@ import {parseClaimSemanticsDeclaration, type ConclusionContract} from '../../age
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
 import {
   sanitizeSourceClaimBindings,
-  sanitizeSourceReference,
   sanitizeSourceReferences,
   sanitizeSourceUseDecision,
   MAX_SOURCE_REFERENCE_COUNT,
@@ -21,6 +20,7 @@ import {
 import {randomUUID} from 'node:crypto';
 import {
   composeCodeAwareTextProjectionReceipts,
+  createCodeAwareStreamingTextProjection,
   isIssuedCodeAwareTextProjectionReceipt,
   projectCodeAwareStructuredText,
   sanitizeCodeAwareStructuredText,
@@ -29,6 +29,8 @@ import {
   type CodeAwareTextProjectionReceipt,
 } from '../security/codeAwareOutputRegistry';
 import {analysisDeliveryFingerprint, type AnalysisDeliveryContext} from '../../types/analysisDelivery';
+import {projectConclusionProtocol, projectConclusionContractForDisplay, issueConclusionProtocolProjection,
+  type IssuedConclusionProtocolProjection} from '../security/conclusionProtocolProjection';
 
 export type SourceClaimVerificationStatus = 'passed' | 'failed' | 'partial' | 'not_checked';
 
@@ -73,13 +75,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sourceReferenceAliases(value: unknown): Map<string, string> {
   const aliases = new Map<string, string>();
-  if (!Array.isArray(value)) return aliases;
-  for (const candidate of value.slice(0, MAX_SOURCE_REFERENCE_COUNT)) {
-    const sanitized = sanitizeSourceReference(candidate);
-    if (!sanitized) continue;
-    aliases.set(sanitized.id, sanitized.id);
-    if (isRecord(candidate) && typeof candidate.id === 'string' && candidate.id.trim()) {
-      aliases.set(candidate.id.trim(), sanitized.id);
+  const references = sanitizeSourceReferences(value);
+  const canonicalIds = new Set(references.map(reference => reference.id));
+  const ambiguous = new Set<string>();
+  for (const reference of references) aliases.set(reference.id, reference.id);
+  for (const reference of references) {
+    for (const alias of [reference.referenceId, reference.chunkId]) {
+      if (!alias || canonicalIds.has(alias) || ambiguous.has(alias)) continue;
+      if (aliases.has(alias) && aliases.get(alias) !== reference.id) {
+        aliases.delete(alias);
+        ambiguous.add(alias);
+      } else {
+        aliases.set(alias, reference.id);
+      }
     }
   }
   return aliases;
@@ -123,7 +131,9 @@ function authoritativeSourceContext(
     rawDecisionReferences,
     contract.sourceReferences,
   );
-  const aliases = sourceReferenceAliases(declaredCandidates);
+  // Only the execution ledger may issue identities or legacy aliases. Model
+  // declarations can describe an invalid reference, but cannot authorize it.
+  const aliases = sourceReferenceAliases(decision.references);
   const declaredById = new Map(
     sanitizeSourceReferences(declaredCandidates).map(reference => [reference.id, reference]),
   );
@@ -153,10 +163,7 @@ export function sanitizeConclusionSourceContract(
     ? options.actualSourceUseDecision
     : contract.sourceUseDecision;
   const rawDecisionReferences = isRecord(rawDecision) ? rawDecision.references : undefined;
-  const aliases = sourceReferenceAliases(boundedSourceReferenceCandidates(
-    rawDecisionReferences,
-    contract.sourceReferences,
-  ));
+  const aliases = sourceReferenceAliases(rawDecisionReferences);
   const decision = sanitizeSourceUseDecision(rawDecision);
   if (!decision) {
     if (!contract.sourceUseDecision && !contract.sourceReferences && !contract.sourceClaimBindings) {
@@ -311,6 +318,11 @@ export function verifySourceClaimBindings(input: {
         code: input.semanticsPolicy === 'declared' ? 'source_claim_semantics_unchecked' : 'source_claim_missing',
         message: 'source binding claimId does not exist in the structured claims',
       });
+      continue;
+    }
+    if (candidate.sourceReferenceIds.length === 0) {
+      issues.push({claimId: candidate.claimId, severity: 'error', code: 'source_reference_not_returned',
+        message: 'source binding requires at least one reference returned by the current run'});
       continue;
     }
     if (input.semanticsPolicy === 'declared') {
@@ -486,6 +498,7 @@ export interface SourceAwareAnalysisProjection {
   result: AnalysisResult;
   conclusionProjection: CodeAwareTextProjectionReceipt;
   deliveryContext?: AnalysisDeliveryContext;
+  protocolProjection?: IssuedConclusionProtocolProjection;
 }
 
 /** Final callers must consume the returned context instead of the pre-projection one. */
@@ -494,6 +507,9 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
   sourceUse: SourceUseDecisionReader | undefined,
   options: {priorProjection?: CodeAwareTextProjectionReceipt; context?: AnalysisDeliveryContext} = {},
 ): SourceAwareAnalysisProjection {
+  const originalDeclaration = {raw: result.conclusion,
+    ...(result.conclusionContract ? {contract: structuredClone(result.conclusionContract)} : {})};
+  const nativeCandidate = options.context?.entry !== 'historical_restore' ? options.context?.acceptedCandidate : undefined;
   const structure = () => ({
     conclusionContract: result.conclusionContract, claimSupport: result.claimSupport,
     claimVerificationResult: result.claimVerificationResult, sourceUseDecision: result.sourceUseDecision,
@@ -505,7 +521,7 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
   const actualDecision = sanitizeSourceUseDecision(sourceUse?.getSourceUseDecision());
   const hasPriorProjection = isIssuedCodeAwareTextProjectionReceipt(options.priorProjection) &&
     options.priorProjection.outputFingerprint === analysisDeliveryFingerprint(result.conclusion);
-  const shouldProject = Boolean(actualDecision || hasPriorProjection);
+  const shouldProject = Boolean(actualDecision || hasPriorProjection || nativeCandidate);
   attachSourceUseToAnalysisResult(
     result,
     actualDecision
@@ -516,7 +532,8 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
   // An archived or provider-authored sidecar cannot establish current source failure.
   const currentSourceVerification = actualDecision ? verifySourceClaimBindingsForResult(result) : undefined;
   const directProjection = shouldProject
-    ? sanitizeCodeAwareStructuredTextWithReceipt(result.sessionId, result.conclusion)
+    ? result.conclusion.length > 0 ? projectConclusionProtocol(result.sessionId, result.conclusion)
+      : createCodeAwareStreamingTextProjection(result.sessionId, 'final-result-empty').projectCompleteWithReceipt('')
     : sanitizeCodeAwareTextWithReceipt(undefined, result.conclusion);
   const conclusionProjection = composeCodeAwareTextProjectionReceipts(options.priorProjection, directProjection);
   result.conclusion = conclusionProjection.text;
@@ -527,7 +544,7 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
       result.terminationMessage = sanitizeCodeAwareStructuredText(result.sessionId, result.terminationMessage);
     }
     if (result.conclusionContract !== undefined) {
-      result.conclusionContract = sanitizeCodeAwareStructuredText(result.sessionId, result.conclusionContract);
+      result.conclusionContract = projectConclusionContractForDisplay(result.sessionId, result.conclusionContract);
     }
     if (result.claimSupport !== undefined) {
       result.claimSupport = sanitizeCodeAwareStructuredText(result.sessionId, result.claimSupport);
@@ -621,5 +638,10 @@ export function finalizeSourceAwareAnalysisResultWithProjection(
       deliveryContext = {...deliveryContext, outputOrigin: 'runtime_fallback'};
     }
   }
-  return {result, conclusionProjection, ...(deliveryContext ? {deliveryContext} : {})};
+  const displayCandidate = deliveryContext?.entry !== 'historical_restore' ? deliveryContext?.acceptedCandidate : undefined;
+  const protocolProjection = nativeCandidate && displayCandidate && !hasPriorProjection &&
+    nativeCandidate.conclusionFingerprint === analysisDeliveryFingerprint(originalDeclaration.raw)
+    ? issueConclusionProtocolProjection({original: originalDeclaration, result, nativeCandidate, displayCandidate}) : undefined;
+  return {result, conclusionProjection, ...(deliveryContext ? {deliveryContext} : {}),
+    ...(protocolProjection ? {protocolProjection} : {})};
 }

@@ -120,7 +120,6 @@ test('macOS packaging preserves and verifies JIT runtime entitlements', () => {
 
 test('portable governance separates code impact from exact-archive release acceptance', () => {
   const agentGuide = readFileSync(join(root, 'AGENTS.md'), 'utf8');
-  const claudeGuide = readFileSync(join(root, 'CLAUDE.md'), 'utf8');
   const productSurface = readFileSync(
     join(root, '.claude/rules/product-surface.md'),
     'utf8',
@@ -128,7 +127,6 @@ test('portable governance separates code impact from exact-archive release accep
   const releaseRules = readFileSync(join(root, '.claude/rules/release.md'), 'utf8');
   const testingRules = readFileSync(join(root, '.claude/rules/testing.md'), 'utf8');
 
-  assert.equal(agentGuide, claudeGuide);
   assert.match(agentGuide, /startup\/readiness[\s\S]*portable-impacting work/);
   assert.match(productSurface, /## Portable Impact Triggers/);
   assert.match(

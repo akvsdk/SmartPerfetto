@@ -34,6 +34,7 @@ import type { RuntimeFactoryInput } from '../runtimeRegistry';
 import type {AnalysisPlanV3} from '../../agentv3/types';
 import {createRuntimeToolResult, readRuntimeToolResultFacts} from '../runtimeToolResult';
 import {McpToolRegistry} from '../../agentv3/mcpToolRegistry';
+import {projectCodeAwareStreamingUpdate} from '../../services/security/codeAwareStreamingUpdateProjection';
 import type { QueryResult, TraceInfo, TraceProcessorService } from '../../services/traceProcessorService';
 import { createTraceProcessorQueryCancelledError } from '../../services/traceProcessorCancellation';
 import {runOpenCodeIntentTransport} from '../engines/opencode/openCodeIntentTransport';
@@ -486,7 +487,12 @@ describe('OpenCode native turn intent and delivery', () => {
     const readView = jest.spyOn(ArtifactStore.prototype, 'createEvidenceReadView');
     let context: ReturnType<typeof finalizationContext.takeFinalizationContext>;
     try {
-      const harness = createNativeIntentHarness({env: {SMARTPERFETTO_OPENCODE_PROMPT_TIMEOUT_MS: '5000'}});
+      const harness = createNativeIntentHarness({env: {
+        SMARTPERFETTO_OPENCODE_PROMPT_TIMEOUT_MS: '5000',
+        SMARTPERFETTO_OPENCODE_MODEL_JSON: JSON.stringify({providerID: 'smartperfetto',
+          modelID: 'main-model', smallModel: 'light-model', name: 'Pinned provider',
+          baseURL: 'http://127.0.0.1:9999/v1', apiKey: 'fixture-api-key'}),
+      }});
       const options = {runId: 'final-run', referenceTraceId: 'trace-reference', analysisContextFingerprint: 'opencode-auth-pin'};
       const result = await harness.runtime.analyze('same scope', 'final-context', 'trace-opencode', options);
       expect(attach).toHaveBeenCalledTimes(1);
@@ -494,6 +500,7 @@ describe('OpenCode native turn intent and delivery', () => {
       expect(finalizationContext.takeFinalizationContext({...result})).toBeUndefined();
       context = finalizationContext.takeFinalizationContext(result);
       expect(context).toBeDefined();
+      expect(context?.sourceScope).toBeUndefined(); // The test's explicit fingerprint cannot authorize the actual MCP selection.
       options.analysisContextFingerprint = 'later-auth-context';
       const providerQuery = context!.getProviderQuery(new AbortController().signal);
       expect(providerQuery).toEqual({text: 'same scope', analysisContextFingerprint: 'opencode-auth-pin'});
@@ -516,6 +523,15 @@ describe('OpenCode native turn intent and delivery', () => {
       expect(mockOpenCodeIntentTransport.mock.calls[1][0].deadlineMs).toBe(context!.deadlineMs);
       expect(harness.configs[2]).toMatchObject({model: 'smartperfetto/main-model', mcp: {}, instructions: [],
         agent: {smartperfetto: {maxSteps: 1}}});
+      for (const config of [harness.configs[1], harness.configs[2]]) {
+        expect(config.provider.smartperfetto).toMatchObject({
+          npm: '@ai-sdk/openai-compatible', name: 'Pinned provider',
+          options: {baseURL: 'http://127.0.0.1:9999/v1', apiKey: 'fixture-api-key'},
+          models: {'main-model': {id: 'main-model', tool_call: true, reasoning: false,
+            temperature: true, modalities: {input: ['text'], output: ['text']}}},
+        });
+        expect(config.provider.smartperfetto.models['main-model']).not.toHaveProperty('limit');
+      }
       expect(harness.prompts[2].body.model).toEqual({providerID: 'smartperfetto', modelID: 'main-model'});
       expect(Object.values(harness.prompts[2].body.tools).every(enabled => enabled === false)).toBe(true);
       expect(harness.serverCloses[2]).toHaveBeenCalledTimes(1);
@@ -531,6 +547,7 @@ describe('OpenCode native turn intent and delivery', () => {
     const context = finalizationContext.takeFinalizationContext(result);
     try {
       expect(context?.deliveryContext).toMatchObject({completion: {runId: 'failed-run', status: 'failed'}});
+      expect(context?.sourceScope).toMatchObject({codeAwareMode: 'metadata_only', selectedCodebaseIds: [], hasCodebaseAccess: false});
       expect(context?.hasSemanticTransport).toBe(false);
       expect(await context?.dispatchText({prompt: 'unused', systemPrompt: '', signal: new AbortController().signal,
         deadlineMs: Date.now() + 5000, outputByteLimit: 8192})).toEqual({status: 'unavailable', reason: 'invalid_configuration'});
@@ -606,14 +623,14 @@ describe('OpenCode native turn intent and delivery', () => {
     }
   }));
 
-  it('checks the native empty answer before privacy suppression can supply text', async () => withBackendDataDir(async () => {
+  it('does not certify a revoked-session replacement of an empty native answer', async () => withBackendDataDir(async () => {
     const sessionId = 'privacy-native-empty';
     revokeCodeAwareOutputGuards(sessionId);
     try {
       const harness = createNativeIntentHarness({answer: ''});
       const result = await harness.runtime.analyze('same scope', sessionId, 'trace-opencode');
-      expect(result).toMatchObject({conclusion: '', success: false, partial: true});
-      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(''));
+      expect(result).toMatchObject({success: false, partial: true, outputOrigin: 'runtime_fallback', completion: {status: 'unknown'}});
+      expect(result.completion?.conclusionFingerprint).toBe(analysisDeliveryFingerprint(result.conclusion));
     } finally {
       clearCodeAwareOutputGuards(sessionId);
     }
@@ -2512,6 +2529,55 @@ describe('experimental OpenCode runtime contract', () => {
     expect(updates.find(update => update.type === 'agent_response')).toMatchObject({content: {isError: true}});
   });
 
+  it.each([false, true])('retains private source outcomes before transport truncation (body=%s)', async includeBody => {
+    const registry = new McpToolRegistry();
+    registry.registerShared({
+      name: 'search_codebase', description: 'Search source', exposure: 'public', inputSchema: {},
+      handler: async () => createRuntimeToolResult({success: true, matches: Array.from({length: 20}, (_, i) => ({
+        referenceId: `source-reference-${i}`, codebaseId: 'codebase-a',
+        filePath: `src/PRIVATE_SOURCE_PATH_${i}.kt`, lineRange: {start: 1, end: 20},
+        ...(includeBody ? {text: 'PRIVATE_SOURCE_BODY'} : {}),
+      }))}),
+    });
+    const updates: any[] = [];
+    await dispatchOpenCodeBridgeRequest(registry.list(), {
+      jsonrpc: '2.0', id: 'source-outcome', method: 'tools/call',
+      params: {name: 'search_codebase', arguments: {}},
+    }, update => updates.push(update));
+    const update = updates.find(item => item.type === 'agent_response')!;
+    expect(() => JSON.parse(update.content.result)).toThrow();
+    expect(update.content.privateToolResultReceipt).toBeDefined();
+    const projected = projectCodeAwareStreamingUpdate('opencode-source-outcome', update, true, 'en');
+    expect(projected).toMatchObject({content: {resultNarration: includeBody
+      ? 'Authorized content was read and is available to check against trace evidence'
+      : 'Candidate source or knowledge locations are available; their content has not been read'}});
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_SOURCE|privateToolResultReceipt/);
+  });
+
+  it.each([false, true])('retains private source failures across both OpenCode response branches (throws=%s)', async throws => {
+    const registry = new McpToolRegistry();
+    registry.registerShared({
+      name: 'read_codebase_file', description: 'Read source', exposure: 'public', inputSchema: {},
+      handler: async () => {
+        if (throws) throw new Error('PRIVATE_SOURCE_FAILURE');
+        return createRuntimeToolResult({success: false, error: 'PRIVATE_SOURCE_FAILURE'});
+      },
+    });
+    const updates: any[] = [];
+    await dispatchOpenCodeBridgeRequest(registry.list(), {
+      jsonrpc: '2.0', id: 'source-failure', method: 'tools/call',
+      params: {name: 'read_codebase_file', arguments: {}},
+    }, update => updates.push(update));
+    const update = updates.find(item => item.type === 'agent_response')!;
+    expect(update.content.privateToolResultReceipt).toBeDefined();
+    expect(JSON.stringify(updates)).not.toContain('PRIVATE_SOURCE_FAILURE');
+    const projected = projectCodeAwareStreamingUpdate('opencode-source-failure', update, true, 'en');
+    expect(projected).toMatchObject({content: {
+      resultNarration: 'This tool call did not complete; collected evidence is retained', isError: true,
+    }});
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_SOURCE|privateToolResultReceipt/);
+  });
+
   it('projects private wiki results before emitting OpenCode responses', async () => {
     const updates: any[] = [];
     await dispatchOpenCodeBridgeRequest([{
@@ -2871,6 +2937,11 @@ describe('experimental OpenCode runtime contract', () => {
         codeAwareMode: 'provider_send',
         codebaseIds: [fixture.codebaseId],
       });
+      const context = finalizationContext.takeFinalizationContext(terminal)!;
+      try {
+        expect(context.getNativeDeclaration(terminal, new AbortController().signal)?.raw).toBe(`## Final Report\n${SOURCE_FINALIZATION_RAW_SOURCE}`);
+        expect(JSON.stringify(terminal)).not.toContain('conclusion_protocol_projection');
+      } finally {context.dispose();}
       mockOpenCodePreparation(runtime, null, 'startup', 'public second run', [], undefined, true);
       const next = await runtime.analyze('public second run', sessionId, 'trace-opencode', {
         analysisMode: 'fast',

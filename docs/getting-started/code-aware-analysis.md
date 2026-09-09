@@ -2,15 +2,17 @@
 
 [English](code-aware-analysis.en.md) | [中文](code-aware-analysis.md)
 
-Code-Aware Analysis 让 SmartPerfetto 在分析 trace 时按需引用本机代码库，把调用栈、native frame 或 kernel symbol 映射到 `CodeRef`。注册只是让代码库成为可选项，不会自动附加到任何 session；用户必须在当前分析中显式选择。注册且仍可访问的路径会立即可用，并可直接使用有界的 `search_codebase` / `read_codebase_file`；不要求先建立 SmartPerfetto 索引。索引是可选的语义/符号检索与 patch 加速层。默认输出只展示 `referenceId` 或 `chunkId`、相对路径、行号和 symbol；源码正文不写入 session、报告或导出。
+Code-Aware Analysis 让 SmartPerfetto 在分析 trace 时按需引用本机代码库，把调用栈、native frame 或 kernel symbol 映射到 `CodeRef`。注册且仍可访问的路径可直接用于有界搜索和读取，不要求先建立索引。Web 的“添加并用于分析”同时完成明确的授权和本次选择；“仅添加”只登记代码库，之后仍需选择。索引是可选的语义/符号检索与 patch 加速层。源码正文不写入 session、报告或导出。
 
 ## 启用方式
 
 1. 启动后端：`./start.sh`。
 2. 在 Perfetto UI 打开 AI Assistant settings，进入 `Codebases`。
-3. 添加代码库时优先点击“选择文件夹”，再运行 preview。显示名称可留空，默认使用文件夹名。
-4. 注册后即可选择并开始分析。SmartPerfetto 的 `reindex` 是可选加速项，仍用于语义/符号检索和 patch 流程；它与可选的外部代码图加速相互独立。
-5. 分析时使用 code-aware 模式，或在 CLI 传入 `--code-aware metadata_only|provider_send` 和 `--codebase-id <id>`。
+3. 点击“选择文件夹”，按需填写额外排除路径；名称默认使用文件夹名。类型、允许访问的路径范围、构建信息等位于高级设置。
+4. 点击“添加并用于分析”，允许分析模型按需接收授权范围内的脱敏片段。当前是仅定位模式时，按钮为“添加并用于定位”，不会改为正文模式。“仅添加”不改变本次选择，也不新增正文授权。
+5. 开始分析，无需构建索引。索引和审计保留在高级设置。CLI 使用 `--code-aware metadata_only|provider_send` 和 `--codebase-id <id>` 显式选择。
+
+关闭源码模式时，“添加并用于分析”只启用新库；已有正文模式时追加新库，已有仅定位模式时保持仅定位。旧的未启用选择或仅定位权限不会因此升级。
 
 CLI 示例：
 
@@ -44,36 +46,40 @@ npm run cli:dev -- run --format json \
 | 本次选择 | 有效行为 |
 |---|---|
 | 不传任何 ID | 普通 trace-only；`fast` 可以保持轻量路径 |
-| 只传 `--codebase-id` | 默认授权 `metadata_only`；普通问题保持源码 dormant，并保留请求的 Fast/Auto/Full 模式 |
-| `--code-aware metadata_only` + codebase ID | 明确问源码时只使用 `CodeRef` 元数据，最多 1 次搜索、2 次读取、6 秒 |
-| `--code-aware provider_send` + codebase ID | 明确问源码且双重授权通过时发送筛选后的片段，仍受 1/2/6 秒预算约束 |
+| 只传 `--codebase-id` | 默认授权 `metadata_only`，保留请求的 Fast/Auto/Full 模式 |
+| `--code-aware metadata_only` + codebase ID | 模型可按需定位源码，只接收 `CodeRef` 元数据 |
+| `--code-aware provider_send` + codebase ID | 可在授权交集内按需搜索、读取有界且脱敏的片段 |
 | `--code-aware off` + codebase ID | 输入无效，直接拒绝，不静默忽略源码配置 |
-| 只传 `--knowledge-source-id` | 使用已授权的私有外部 RAG，完整分析 runtime |
-| codebase ID + knowledge source ID | 外部 RAG 仍使用完整分析 runtime；源码是否启用继续由本轮问题决定 |
+| 只传 `--knowledge-source-id` | 使用已授权的私有外部 RAG，保留请求的分析预算模式 |
+| codebase ID + knowledge source ID | 使用本次选择授权的源码与知识源，并遵守各自访问边界 |
 
 源码 codebase 只要求已注册根目录仍可访问；缺少 active generation 或索引分片不会阻止分析。外部知识源仍是 RAG 数据源，因此仍要求已授权且索引完成。注册路径被移动、卸载或删除时，Web/CLI 会返回 `ANALYSIS_CONTEXT_CODEBASE_ROOT_UNAVAILABLE`，恢复原路径或重新注册即可。
 
-选择源码不再把 `--analysis-mode fast|auto` 强制升级为 `full`。只有 reference trace 与私有 RAG 仍要求完整分析 runtime。`provider_send` 需要两层授权：注册 codebase 时启用 `--send-to-provider`，且本次分析显式选择 `--code-aware provider_send`。
+分析预算和证据权限相互独立：选择源码、对比 Trace 或私有 RAG 不会把请求的 `fast|auto` 自动升级为 `full`。`provider_send` 需要两层授权：注册 codebase 时启用 `--send-to-provider`，且本次分析显式选择 `--code-aware provider_send`。
 
 ## 什么时候使用源码
 
-选中源码只建立授权，不会把源码注入每次分析。所有入口和五种生产 runtime 共用同一份激活策略：
+选中源码会把已授权工具提供给本轮模型，不会把整个代码库注入上下文，也不会根据问题中的关键词决定授权。Web、API、CLI 和五种生产 runtime 共用这一边界：
 
-- 普通 Fast/Auto/Full 问题保持源码 dormant：不注册源码工具，不增加模型轮次，代码库大小不进入主分析关键路径。
-- 明确要求源码文件、函数、实现或调用链时，开放 `list_codebases`、`search_codebase` 和 `read_codebase_file`。源码预算固定为 1 次搜索、2 次读取、6 秒；Full 仍可正常使用 Trace、Skill 和 SQL。
-- 只有显式 Full 且明确要求“深入源码”或“完整审查源码”时，才会在主 Full 结论完成后启动独立深度源码补充。主结论、HTML 报告和 analysis snapshot 已先固化；补充可取消、失败不回写主结论，并单独持久化到 Web 消息或 CLI `source-supplement.json`。
-- 源码激活状态改变时会重置 provider/runtime 上下文，只回放有界、非源码派生的安全文本；UI 历史保留。
+- 模型根据问题和 Trace 锚点决定是否搜索、读取。需要实现解释时，可明确要求“结合已选源码核对实现”；纯量化问题可以由 Trace 回答。
+- 调用遵守当前运行预算、路径过滤、正文授权和结果容量限制。主流程不隐式套用固定的 1 次搜索、2 次读取、6 秒策略。
+- 没有发生调用时，回执不会声称已使用源码。模型先声明不需要源码、后来实际调用时，使用记录仍持续更新。
+- 源码选择或授权变化受会话身份与授权指纹检查约束，不能沿用失效的私有上下文。
 
 每次分析保留 `SourceUseDecisionV1`：
 
 | 字段 | 含义 |
 |---|---|
-| `status` | `pending` / `attempted` 是过程态；查询可形成 `located` / `corroborated`，也可以结束为 `not_needed`、`disallowed`、`no_queryable_anchor`、`ambiguous_candidates`、`not_found_complete`、`search_incomplete` 或 `unverified` |
-| `reasonCode` | 只保留受控的结构化原因码；模型自由文本原因不进入安全输出 |
-| `selectedCodebaseIds` | 本次请求显式选择的代码库 |
-| `queriedCodebaseIds` | 实际发起过检索的代码库 |
-| `usedCodebaseIds` | 实际产生安全 `CodeRef` 的代码库 |
-| `coverageComplete` / `incompleteReasons` | 区分完整无命中与超时、遍历错误等不完整搜索；只有前者才能支持“源码中不存在” |
+| `status` | 记录未调用、已尝试、已定位、可用正文或搜索不完整等状态，不等同于机制核验结果 |
+| `reasonCode` | 受控结构化原因码；模型自由文本理由不进入安全输出 |
+| `selectedCodebaseIds` | 本次显式选择的代码库 |
+| `queriedCodebaseIds` | 实际发起过源码工具调用的代码库 |
+| `usedCodebaseIds` | 实际产生安全 `CodeRef` 的代码库；仅定位也可能出现在这里 |
+| `coverageComplete` / `incompleteReasons` | 检索覆盖是否完整；读取指定窗口不表示搜索不完整，不完整搜索不能证明源码不存在 |
+
+工具返回的 `sourceReferences[].id` 可直接用于 `sourceClaimBindings[].sourceReferenceIds`。引用只能来自本轮实际返回且属于本次选择的代码库；模型自造引用或歧义别名不被接受。达到引用容量时，工具明确返回限制，不会继续交付无法核验的引用。Web 回执区分定位、已提供片段和实际核验结果，不把模型的机制声明当作核验通过。
+
+分析过程展示安全的工具调用和结果摘要，不显示原始查询、源码正文、绝对路径或模型中间文本，也不会用重复的隐私提示替代每一步。
 
 ## 取证顺序与可选代码图
 
@@ -87,11 +93,13 @@ npm run cli:dev -- run --format json \
 
 `code_pinpoint` Skill 可以先从 trace 中产生更稳定的源码候选锚点：`hot_slices` 只把符合保守规则的 App 主线程 Trace label 升级为 source query hint，其他 slice 只作 generic anchor；可选的 `native_symbols` 从 CPU profiling 样本提取 function/module/build-id。两者都只缩小查询范围，不代替当前 trace 证据或后续有界源码核对。
 
-Web 对话的自动源码补充使用更严格的工具面：只开放 `list_codebases`、`search_codebase` 和 `read_codebase_file`，不开放代码图、索引检索、Trace、shell 或 patch 工具。普通 dormant 主分析不会获得任何源码工具，因此代码库大小不会增加主分析的模型轮次。
+索引、代码图和按需读取是不同能力。没有索引时仍可搜索和读取；代码图不可用时仍可根据 Trace 锚点定位源码。只有实际返回并通过核验的引用可用于机制绑定。
 
 `query_code_graph` 和 `inspect_code_symbol` 只返回元数据：`codebaseId`、相对 `CodeRef`、脱敏后的 process/symbol 元数据、`graph.freshness` 与 `graph.verificationRequired`，不返回源码正文或绝对根目录。注册项配置了 `pathFilters` 或 `excludeGlobs` 时，SmartPerfetto 会省略无法证明路径范围的全仓 process 摘要，仍保留已通过授权过滤的相对 `CodeRef`。GitNexus 未安装、不可用、版本不兼容、超时或调用失败时，图工具会返回结构化不可用结果（`success=false` 与 `unsupportedReason`）；索引陈旧时只返回标有 `freshness="stale"` 的导航元数据。AI/策略在这两种情况下都会继续使用现有 `search_codebase` / `read_codebase_file` 路径，注册、选择和 trace 分析不会因此失败。SmartPerfetto 不会安装、打包、再分发 GitNexus，也不会自动创建或刷新它的索引。
 
 GitNexus 是独立的第三方可选工具。其[官方项目](https://github.com/abhigyanpatwari/GitNexus)和 [npm 包](https://www.npmjs.com/package/gitnexus)目前声明使用 [PolyForm Noncommercial 1.0.0](https://github.com/abhigyanpatwari/GitNexus/blob/main/LICENSE)。启用前请自行审阅上游条款并确认你的使用方式符合许可，尤其是商业场景；这不是法律建议。
+
+可选索引达到容量时，本次索引回滚并保留旧索引。界面分别显示索引状态和经过实时根目录检查的按需可用状态；目录被移动、权限失效或不在允许范围时，不会承诺仍可读取。“允许访问的源码范围”同时限制索引和按需访问；排除路径也是正文授权边界的一部分。
 
 ## 支持的代码库
 
@@ -185,3 +193,13 @@ node backend/scripts/run-deepseek-agent-e2e.cjs \
 ```
 
 真实 Claude、OpenAI、Pi、OpenCode 和 Qoder 的结果必须分别报告 `PASSED`、`FAILED` 或 `REAL PROVIDER NOT AVAILABLE`；缺少凭证不是通过。
+
+排查单个失败场景时，可以先运行诊断预检；它不替代五轮矩阵，也不会把未覆盖的建议语义标为已验收：
+
+```bash
+node backend/scripts/run-deepseek-agent-e2e.cjs \
+  --suite code-aware-semantic-delta --runtime openai-agents-sdk \
+  --preflight --query-id explicit-source-location --condition A2
+```
+
+`A0` 不选源码，`A2` 只注册，`A3` 注册并索引。诊断保留实际工具调用、源码引用及完成与核验状态；仅调用成功不算结论通过。主回答的篇幅通过提示词引导，OpenAI 请求默认不添加应用层输出上限，Claude 流式回答也不会因超过累计字符阈值被截断。结构化结论的解析和回退显示会保留全部有效条目，保存历史也不会按固定正文字符数截尾。需要显式设置 `OPENAI_MAX_OUTPUT_TOKENS` 时必须为正整数；服务商自身的限制仍然生效，调整预算不改变验收标准。

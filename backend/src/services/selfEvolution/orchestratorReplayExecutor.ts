@@ -567,18 +567,18 @@ export class OrchestratorReplayExecutor implements ReplayExecutor {
           filePath: trace.filePath,
         });
         registeredTraceIds.push(trace.traceId);
+        // Replay IDs describe offline synthetic isolation, not scoped product
+        // lease-store holders. Provider and evaluation scopes remain pinned below.
         await traceService.ensureProcessorForLease(
           trace.traceId,
           trace.leaseId,
           'isolated',
-          providerScope ?? replay.evalCase.scope,
         );
       }
       const leaseContexts = traces.traces.map(trace => ({
         traceId: trace.traceId,
         leaseId: trace.leaseId,
         mode: 'isolated' as const,
-        leaseScope: providerScope ?? replay.evalCase.scope,
       }));
       return await traceService.runWithLeases(
         leaseContexts,

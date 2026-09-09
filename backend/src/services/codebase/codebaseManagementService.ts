@@ -14,6 +14,8 @@ import {
   type CodebaseScope,
   type IndexCoverage,
 } from './codebaseRegistry';
+import {constants as fsConstants} from 'fs';
+import {access, stat} from 'fs/promises';
 import {CodebaseRegistry} from './codebaseRegistry';
 import {PathSecurityGate} from './pathSecurityGate';
 import {SourceEnumerator, type EnumerationResult} from './sourceEnumerator';
@@ -24,7 +26,7 @@ import {
   type AospManifestProject,
 } from './aospManifest';
 import {RagStore} from '../ragStore';
-import {resolveSourcePathPatterns} from '../rag/sourceFileSelection';
+import {assertCodebaseRootIdentity, resolveSourcePathPatterns} from '../rag/sourceFileSelection';
 
 export type CodebaseManagementErrorCode =
   | 'CODEBASE_AUDIT_FAILED'
@@ -379,7 +381,26 @@ export class CodebaseManagementService {
       );
       await this.cleanupInactiveCodebaseChunks(summary.codebaseId, scope);
     }
-    return this.registry.list(scope).map(projectListItem);
+    return Promise.all(this.registry.list(scope).map(async summary => ({
+      ...projectListItem(summary),
+      rootAvailable: await this.onDemandAvailable(summary.codebaseId, scope),
+    })));
+  }
+
+  /** A live root capability check, independent of optional index state or provider consent. */
+  async onDemandAvailable(id: string, scope: CodebaseScope): Promise<boolean> {
+    try {
+      const ref = this.requireCodebase(id, scope);
+      if (!codebaseRootAvailable(ref)) return false;
+      const root = await this.gate.validateRoot(ref.rootRealpath,
+        ref.rootAuthorization === 'native_picker' ? {additionalAllowlistRoots: [ref.rootRealpath]} : undefined);
+      assertCodebaseRootIdentity(ref.rootRealpath, root);
+      if (!(await stat(root)).isDirectory()) return false;
+      await access(root, fsConstants.R_OK | fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   get(id: string, scope: CodebaseScope): RegisteredCodebase {

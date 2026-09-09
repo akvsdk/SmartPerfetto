@@ -31,6 +31,8 @@ import * as reportRoutes from '../reportRoutes';
 import * as snapshots from '../../services/analysisResultSnapshotPipeline';
 import * as eventStore from '../../services/agentEventStore';
 import {SessionPersistenceService} from '../../services/sessionPersistenceService';
+import {registerAgentReportRoutes} from '../agentReportRoutes';
+import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 
 const sessionId = 'private-route-projection';
 
@@ -71,6 +73,45 @@ function completedSnapshotInputFromRoute(): ts.ObjectLiteralExpression | undefin
 afterEach(() => {clearCodeAwareOutputGuards(sessionId); jest.restoreAllMocks();});
 
 describe('agent route private projections', () => {
+  it.each([false, true])('uses native completion and delivery state consistently in SSE, turn history and report (qualityFailure=%s)', qualityFailure => {
+    const conclusion = 'The original completed candidate remains available.';
+    const result = {sessionId, success: !qualityFailure, conclusion, findings: [], hypotheses: [], confidence: 0.8,
+      rounds: 1, totalDurationMs: 1, terminationMessage: 'PRIVATE_DISCARDED_ATTEMPT_ERROR',
+      ...(qualityFailure ? {partial: true, terminationReason: 'quality_gate_failed' as const} : {}),
+      completion: {schemaVersion: 1 as const, runtimeKind: 'openai-agents-sdk' as const, status: 'completed' as const,
+        runId: 'termination-run', attemptId: 'attempt-original', candidateRef: 'candidate-original',
+        conclusionFingerprint: analysisDeliveryFingerprint(conclusion)}};
+    const session = {sessionId, traceId: 'trace', query: 'original query', status: 'completed', createdAt: 1,
+      tenantId: 'tenant', workspaceId: 'workspace', userId: 'user', codeAwareMode: 'provider_send', codebaseIds: ['app'],
+      outputLanguage: 'en', result, hypotheses: [], dataEnvelopes: [], scenes: [],
+      completedAnalysisFinalArtifacts: {}, logger: {warn: () => {}}, runSequence: 1} as any;
+    const events = agentRoutesPrivacyProjectionTestSeam.ensureCompletedAnalysisSseEvents(session);
+    const completed = events.find(event => event.eventType === 'analysis_completed');
+    expect(completed).toBeDefined();
+    const payload = JSON.parse(completed!.eventData).data;
+    const turn = agentRoutesPrivacyProjectionTestSeam.buildTurnSummary({id: 'turn', turnIndex: 1, timestamp: 1,
+      query: 'original query', completed: true, result: {...result, message: conclusion}} as any, sessionId, 'en');
+    const get = jest.fn();
+    registerAgentReportRoutes({get} as any, {getSession: () => session, recoverResultForSessionIfNeeded: () => result,
+      normalizeNarrativeForClient: text => text, buildClientFindings: () => [], buildSessionResultContract: () => ({})});
+    const response = {json: jest.fn(), status: jest.fn().mockReturnThis()};
+    const handler = get.mock.calls[0][1] as (req: any, res: any) => void;
+    handler({params: {sessionId}, requestContext: {tenantId: 'tenant', workspaceId: 'workspace', userId: 'user'}}, response);
+    const report = (response.json.mock.calls[0][0] as any).report;
+    for (const message of [payload.terminationMessage, turn.terminationMessage, report.summary.terminationMessage]) {
+      if (qualityFailure) expect(message).toContain('have not passed checks');
+      else expect(message).toBeUndefined();
+      expect(message ?? '').not.toContain('did not complete');
+      expect(message ?? '').not.toContain('PRIVATE_DISCARDED_ATTEMPT_ERROR');
+    }
+    for (const body of [payload.conclusion, turn.conclusionPreview, report.summary.conclusion]) {
+      if (qualityFailure) {
+        expect(body).toContain('An answer was generated');
+        expect(body).not.toContain(conclusion);
+      } else expect(body).toBe(conclusion);
+      expect(body).not.toContain('did not complete');
+    }
+  });
   it.each(['live', 'snapshot'] as const)('rejects mismatched %s result run attribution during read recovery', location => {
     const id = `http-read-run-${location}`;
     const stored = {sessionId: id, success: true, conclusion: 'prior result', findings: [], hypotheses: [],
@@ -550,7 +591,7 @@ describe('agent route private projections', () => {
     expect(JSON.stringify(projected)).not.toContain('PRIVATE_REPLAY_CANARY');
     const data = JSON.parse(projected.eventData).data;
     expect(data.conclusion)
-      .toMatch(/未能完成|did not complete/);
+      .toMatch(/未能确认|could not be confirmed/);
     expect(data.resultContract).toBeUndefined();
   });
 

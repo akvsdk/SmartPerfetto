@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Gracker (Chris)
 // This file is part of SmartPerfetto. See LICENSE for details.
+/// <reference lib="es2021.weakref" />
 
 import 'dotenv/config';
 import { installEpipeGuard } from '../utils/epipeGuard';
@@ -10,18 +11,20 @@ import cors from 'cors';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import {createHash, randomUUID} from 'node:crypto';
 import {isDeepStrictEqual} from 'node:util';
 import agentRoutes from '../routes/agentRoutes';
 import ragAdminRoutes from '../routes/ragAdminRoutes';
 import skillRoutes from '../routes/skillRoutes';
 import traceProcessorRoutes from '../routes/traceProcessorRoutes';
-import { getTraceProcessorService, type TraceInfo } from '../services/traceProcessorService';
+import { getTraceProcessorService, type TraceInfo, type TraceProcessorService } from '../services/traceProcessorService';
 import { resolveAgentRuntimeSelection } from '../agentRuntime';
 import { getOpenAIRuntimeDiagnostics, hasOpenAICredentials } from '../agentOpenAI';
 import type {ClaimSemanticsV1, ConclusionContract} from '../agent/core/conclusionContract';
 import type { TraceDataset } from '../agent/core/orchestratorTypes';
 import type {
   SelectionContext,
+  TrackEventSelectionContext,
   TracePairContext,
   TracePairLayout,
   TraceSource,
@@ -34,11 +37,21 @@ import {
 import { writeTraceMetadata } from '../services/traceMetadataStore';
 import {CodeLookupLedger} from '../services/codebase/codeLookupLedger';
 import {hasConcreteCodeReference} from '../services/codebase/codeReferenceContract';
-import type {ClaimVerificationResult} from '../types/claimVerification';
-import type {ClaimSupportV1} from '../types/evidenceContract';
+import {sanitizeSourceUseDecision, type SourceClaimBindingV1, type SourceUseDecisionV1} from '../services/codebase/sourceUseDecision';
+import type {ClaimVerificationResult, ClaimVerificationClaimResult} from '../types/claimVerification';
+import type {ClaimSupportV1, EvidenceAnchorV1} from '../types/evidenceContract';
 import type {AnalysisDeliveryAssurance, AnalysisCompletion} from '../types/analysisDelivery';
 import {analysisDeliveryFingerprint} from '../types/analysisDelivery';
 import type {AnalysisTurnIntent} from '../agentRuntime/analysisTurnIntent';
+import {sanitizeCandidateProtocolDiagnostic, type CandidateProtocolDiagnostic} from '../services/canonicalAnalysisResult';
+import {WorkingTraceProcessor} from '../services/workingTraceProcessor';
+import {analyzeRawSqlDirectProjection} from '../services/evidence/rawSqlDirectProjection';
+import {readRawSqlCaptureFields, resolveRawSqlNativeRowSchema, type RawSqlNativeRowSchema} from '../services/evidence/rawSqlNativeProvenance';
+import {resolveCapabilityTraceProcessorIdentity} from '../services/capabilityManifestRuntimeIdentity';
+import {loadPerfettoSqlDocsAsset} from '../services/perfettoSqlDocs';
+import {prepareAnalysisRunTraceProcessorLeases, type AnalysisRunTraceProcessorLeases,
+  type AnalysisRunTraceProcessorLeaseEntry} from '../services/analysisRunTraceProcessorLease';
+import type {EnterpriseRepositoryScope} from '../services/enterpriseRepository';
 import {
   privateProjectedSourceEventType,
   successfulCodeLookupToolCounts,
@@ -65,6 +78,7 @@ export interface VerifyOptions {
   /** Frontend-style pre-queried trace datasets forwarded as top-level traceContext. */
   traceContext?: TraceDataset[];
   selectionContext?: SelectionContext;
+  sliceSelectionTarget?: SliceSelectionTarget;
   /** Smart action forwarded as options.smartAction. Defaults to analyze for --mode smart CLI runs. */
   smartAction?: SmartAction;
   /** Smart scene selection forwarded as options.smartSelection. */
@@ -146,6 +160,7 @@ export interface VerifyOptions {
 
 export interface SseSummary {
   terminalAnalysis?: TerminalAnalysisEvidence;
+  candidateProtocolDiagnostics?: CandidateProtocolDiagnostic[];
   totalEvents: number;
   terminalEvent?: string;
   /** agentv3 event type counts */
@@ -199,11 +214,13 @@ export interface SseSummary {
   conclusionHasConcreteCodeRefs: boolean;
   analysisCompletedHasConcreteCodeRefs: boolean;
   analysisCompletedSourceUseStatus?: string;
+  analysisCompletedSourceUseDecision?: SourceUseDecisionV1;
   analysisCompletedSourceReferenceCount?: number;
   analysisCompletedSourceBindingCount?: number;
   analysisCompletedSourceClaimVerifierStatus?: string;
   analysisCompletedSourceMechanismStatuses?: string[];
   analysisCompletedSourceReferenceMembershipPassed?: boolean;
+  analysisCompletedVerifiedSourceBindings?: Array<Omit<SourceClaimBindingV1, 'reason'>>;
   analysisCompletedReportUrl?: string;
   analysisCompletedPartial?: boolean;
   analysisCompletedTerminationReason?: string;
@@ -252,7 +269,8 @@ export interface AgentSseExpectedFact {
   unit?: string;
   /** Suite-owned read-only query. Results never enter the model context. */
   oracle?: {sql: string; column: string; unit?: string;
-    anchorMatch?: {startTs?: string; upid?: string}};
+    anchorMatch?: {startTs?: string; upid?: string;
+      nativeRow?: {relation: string; idColumn: string; oracleColumn: string}}};
 }
 
 export interface AgentSseExpectation {
@@ -275,6 +293,270 @@ export interface TerminalAnalysisEvidence {
 }
 
 export type AgentSseOracleRows = Record<string, Array<Record<string, unknown>>>;
+export type AgentSseOracleNativeSchemas = Record<string, Readonly<RawSqlNativeRowSchema & {traceId: string}>>;
+
+/** Independent pre-model oracle pin. It never receives a model proof or issues a capture witness. */
+export async function prepareAgentSseNativeOracle(input: {
+  expectation: AgentSseExpectation;
+  traceId: string;
+  service: Pick<TraceProcessorService, 'getTrace' | 'getRunningNativeProcessorObservation' | 'getRunningCapabilityTraceProcessorInput'>;
+  signal?: AbortSignal;
+  lease?: AnalysisRunTraceProcessorLeaseEntry;
+  assertCurrent?: () => void;
+}, dependencies: {
+  resolveIdentity?: typeof resolveCapabilityTraceProcessorIdentity;
+  loadDocs?: typeof loadPerfettoSqlDocsAsset;
+} = {}): Promise<{schemas: AgentSseOracleNativeSchemas; assertCurrent(): Promise<void>}> {
+  const facts = input.expectation.facts.filter(fact => fact.oracle?.anchorMatch?.nativeRow);
+  const schemas: AgentSseOracleNativeSchemas = Object.create(null);
+  if (!facts.length) return {schemas: Object.freeze(schemas), assertCurrent: async () => undefined};
+  const unavailable = (): never => {throw new Error('Task native row oracle unavailable');};
+  const queryScope = input.lease ? {leaseId: input.lease.lease.id, leaseMode: input.lease.lease.mode,
+    leaseScope: input.lease.context.leaseScope, signal: input.signal} : {signal: input.signal};
+  if (input.lease && (input.lease.context.traceId !== input.traceId || input.lease.lease.traceId !== input.traceId ||
+      input.lease.context.leaseId !== input.lease.lease.id || input.lease.context.mode !== input.lease.lease.mode ||
+      !input.lease.context.holder || !input.lease.context.leaseScope)) return unavailable();
+  const registered = input.service.getTrace(input.traceId);
+  input.signal?.throwIfAborted();
+  input.assertCurrent?.();
+  const initial = input.service.getRunningNativeProcessorObservation(input.traceId, queryScope);
+  if (!registered || registered.id !== input.traceId || registered.status !== 'ready' || !initial) return unavailable();
+  const binarySelection = {...initial.binarySelection};
+  const observeCurrent = () => {
+    input.signal?.throwIfAborted();
+    input.assertCurrent?.();
+    const current = input.service.getRunningNativeProcessorObservation(input.traceId, queryScope);
+    const binary = input.service.getRunningCapabilityTraceProcessorInput(input.traceId, queryScope);
+    if (input.service.getTrace(input.traceId) !== registered || registered.id !== input.traceId || registered.status !== 'ready' ||
+      !current || current.instanceToken !== initial.instanceToken || current.registrationToken !== initial.registrationToken ||
+      current.instanceId !== initial.instanceId || !current.instanceId || current.traceId !== input.traceId ||
+      current.status !== 'trusted' || current.nativeSchemaEligible !== true ||
+      current.analysisRunPrivate !== (input.lease?.privateProcessor ?? false) ||
+      !isDeepStrictEqual(current.binarySelection, binarySelection) || !isDeepStrictEqual(binary, binarySelection)) unavailable();
+  };
+  const resolveIdentity = dependencies.resolveIdentity ?? resolveCapabilityTraceProcessorIdentity;
+  const loadDocs = dependencies.loadDocs ?? loadPerfettoSqlDocsAsset;
+  observeCurrent();
+  const identity = await resolveIdentity(binarySelection);
+  observeCurrent();
+  if (identity.source !== 'bundled') return unavailable();
+  for (const fact of facts) {
+    const tuple = fact.oracle!.anchorMatch!.nativeRow!;
+    const schema = resolveRawSqlNativeRowSchema(identity, loadDocs(), tuple.relation);
+    if (!schema || schema.relation !== tuple.relation || schema.idColumn !== tuple.idColumn) return unavailable();
+    schemas[fact.id] = Object.freeze({...schema, traceId: input.traceId});
+  }
+  const assertCurrent = async () => {
+    observeCurrent();
+    const currentIdentity = await resolveIdentity(binarySelection);
+    observeCurrent();
+    if (!isDeepStrictEqual(currentIdentity, identity)) unavailable();
+    for (const fact of facts) {
+      const schema = resolveRawSqlNativeRowSchema(currentIdentity, loadDocs(), fact.oracle!.anchorMatch!.nativeRow!.relation);
+      if (!schema || !isDeepStrictEqual({...schema, traceId: input.traceId}, schemas[fact.id])) unavailable();
+    }
+  };
+  await assertCurrent();
+  return {schemas: Object.freeze(schemas), assertCurrent};
+}
+
+/** One oracle-owned lease group; its rows and schemas never become model evidence. */
+export async function collectAgentSseOracleEvidence(input: {
+  expectation: AgentSseExpectation;
+  traceId: string;
+  service: TraceProcessorService;
+  scope: EnterpriseRepositoryScope;
+  deadlineMs: number;
+  signal?: AbortSignal;
+}, dependencies: Parameters<typeof prepareAgentSseNativeOracle>[1] & {
+  prepareLeases?: typeof prepareAnalysisRunTraceProcessorLeases;
+} = {}): Promise<{rows: AgentSseOracleRows; schemas: AgentSseOracleNativeSchemas}> {
+  if (!input.expectation.facts.some(fact => fact.oracle?.anchorMatch?.nativeRow)) {
+    return {rows: await collectAgentSseOracleRows(input.expectation, sql => input.service.query(input.traceId, sql)), schemas: {}};
+  }
+  if (!Number.isFinite(input.deadlineMs)) throw new Error('Task native row oracle deadline invalid');
+  const controller = new AbortController();
+  const signal = input.signal ? AbortSignal.any([input.signal, controller.signal]) : controller.signal;
+  const registered = input.service.getTrace(input.traceId);
+  const assertOwner = () => {
+    if (!signal.aborted && Date.now() >= input.deadlineMs) {
+      controller.abort(new DOMException('Task native row oracle deadline exceeded', 'TimeoutError'));
+    }
+    signal.throwIfAborted();
+    if (!registered || input.service.getTrace(input.traceId) !== registered || registered.id !== input.traceId || registered.status !== 'ready') {
+      throw new Error('Task native row oracle registration changed');
+    }
+  };
+  assertOwner();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expire = () => {
+    const remaining = input.deadlineMs - Date.now();
+    if (remaining <= 0) controller.abort(new DOMException('Task native row oracle deadline exceeded', 'TimeoutError'));
+    else timer = setTimeout(expire, Math.min(remaining, 2_147_483_647));
+  };
+  expire();
+  let rejectAbort!: (reason: unknown) => void;
+  const aborted = new Promise<never>((_resolve, reject) => {rejectAbort = reject;});
+  // Ownership may abort before preparation reaches the first race.
+  void aborted.catch(() => undefined);
+  const onAbort = () => rejectAbort(signal.reason);
+  signal.addEventListener('abort', onAbort, {once: true});
+  let group: AnalysisRunTraceProcessorLeases | undefined;
+  try {
+    assertOwner();
+    const preparation = (dependencies.prepareLeases ?? prepareAnalysisRunTraceProcessorLeases)({
+      service: input.service, scope: input.scope, currentTraceId: input.traceId,
+      runId: `verification-oracle-${randomUUID()}`, sessionId: `verification-oracle-${randomUUID()}`,
+      signal, assertCurrent: assertOwner,
+      onInvalidated: error => controller.abort(error),
+    });
+    // A late group still belongs to this cancelled oracle, never a subsequent run.
+    void preparation.then(value => {if (signal.aborted) {try {value.release();} catch { /* Admission owns its own cleanup too. */ }}}, () => undefined);
+    group = await Promise.race([preparation, aborted]);
+    const ownedGroup = group;
+    const result = await Promise.race([ownedGroup.run(async () => {
+      const entries = ownedGroup.entries.filter(entry => entry.side === 'current' && entry.context.traceId === input.traceId);
+      if (entries.length !== 1 || ownedGroup.entries.length !== 1) throw new Error('Task native row oracle lease unavailable');
+      const entry = entries[0];
+      const pin = await prepareAgentSseNativeOracle({expectation: input.expectation, traceId: input.traceId,
+        service: input.service, signal, lease: entry, assertCurrent: () => {assertOwner(); ownedGroup.assertCurrent();}}, dependencies);
+      const rows = await collectAgentSseOracleRows(input.expectation, async sql => {
+        await pin.assertCurrent();
+        const result = await input.service.query(input.traceId, sql, {signal,
+          leaseId: entry.lease.id, leaseMode: entry.lease.mode, leaseScope: entry.context.leaseScope});
+        await pin.assertCurrent();
+        return result;
+      });
+      await pin.assertCurrent();
+      return {rows, schemas: pin.schemas};
+    }), aborted]);
+    assertOwner();
+    return result;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', onAbort);
+    controller.abort();
+    group?.release();
+  }
+}
+
+function nativeOracleAnchorMatches(input: {
+  fact: AgentSseExpectedFact; proof?: ClaimVerificationClaimResult; anchor: EvidenceAnchorV1;
+  oracleRow: Record<string, unknown>; schema?: AgentSseOracleNativeSchemas[string]; traceId: string;
+}): boolean | undefined {
+  const tuple = input.fact.oracle?.anchorMatch?.nativeRow;
+  if (!tuple) return undefined;
+  const {anchor, proof, schema} = input;
+  const rows = proof?.deterministicProof?.nativeRows;
+  if (rows === undefined || Array.isArray(rows) && rows.length === 0) return undefined;
+  if (!Array.isArray(rows)) return false;
+  if (proof?.status !== 'verified' || proof.deterministicProof?.kind !== 'numeric_cell' ||
+    proof.deterministicProof.status !== 'proved' || proof.propositionCoverage?.status !== 'complete' ||
+    proof.propositionCoverage.uncovered.length || rows.length !== 1 || !schema || schema.traceId !== input.traceId ||
+    schema.relation !== tuple.relation || schema.idColumn !== tuple.idColumn) return false;
+  const row = rows[0];
+  if (!row || typeof row !== 'object') return false;
+  return row.anchorId === anchor.anchorId && row.evidenceRefId === anchor.evidenceRefId &&
+    proof.deterministicProof.anchorIds.includes(row.anchorId) && proof.deterministicProof.evidenceRefIds.includes(row.evidenceRefId) &&
+    typeof row.captureId === 'string' && row.captureId.length > 0 && row.captureId === anchor.context.captureId &&
+    row.traceId === input.traceId && row.traceId === anchor.context.traceId && row.traceSide === 'current' &&
+    anchor.context.traceSide === 'current' && row.relation === schema.relation && row.idColumn === schema.idColumn &&
+    row.schemaFingerprint === schema.schemaFingerprint && /^[a-f0-9]{64}$/.test(row.schemaFingerprint) &&
+    Number.isSafeInteger(row.id) && row.id >= 0 && row.id === input.oracleRow[tuple.oracleColumn];
+}
+
+export interface SliceSelectionTarget {
+  processName: string;
+  threadName: string;
+  eventName: string;
+}
+
+type SliceSelectionErrorCode = 'SLICE_SELECTION_INVALID' | 'SLICE_SELECTION_NOT_FOUND' |
+  'SLICE_SELECTION_AMBIGUOUS' | 'SLICE_SELECTION_QUERY_FAILED' | 'SLICE_SELECTION_TIMEOUT' |
+  'SLICE_SELECTION_CANCELLED' | 'SLICE_SELECTION_INVALID_IDENTITY';
+
+export class VerificationSliceSelectionError extends Error {
+  constructor(readonly code: SliceSelectionErrorCode) {
+    super(code);
+    this.name = 'VerificationSliceSelectionError';
+  }
+}
+
+export interface ResolvedVerificationSliceSelection {
+  status: 'resolved';
+  purpose: 'input_scope_not_verified_evidence';
+  selector: SliceSelectionTarget;
+  selectionContext: TrackEventSelectionContext;
+  identity: {traceId: string; table: 'slice'; eventId: number; ts: number; trackId: number; utid: number; upid: number};
+}
+
+export function parseSliceSelectionTarget(value: unknown): SliceSelectionTarget {
+  const record = asRecord(value);
+  const limits = {processName: 256, threadName: 256, eventName: 1024};
+  if (!record || Object.keys(record).length !== 3 || Object.keys(record).some(key => !Object.prototype.hasOwnProperty.call(limits, key)) ||
+      Object.entries(limits).some(([key, limit]) => typeof record[key] !== 'string' ||
+        !record[key].trim() || record[key].length > limit || /[\u0000-\u001f\u007f-\u009f]/.test(record[key]))) {
+    throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID');
+  }
+  return {processName: record.processName as string, threadName: record.threadName as string, eventName: record.eventName as string};
+}
+
+/** Resolve a user scope against this loaded trace; returned rows are never model evidence. */
+export async function resolveVerificationSliceSelection(input: {
+  service: Pick<ReturnType<typeof getTraceProcessorService>, 'queryBounded'>;
+  traceId: string;
+  selector: SliceSelectionTarget;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): Promise<ResolvedVerificationSliceSelection> {
+  const selector = parseSliceSelectionTarget(input.selector);
+  if (!input.traceId || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0) {
+    throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID');
+  }
+  const timeoutMs = Math.min(input.timeoutMs, 10_000);
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
+  const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+  const sql = `SELECT s.id AS event_id, s.ts, s.track_id, tt.utid, t.upid
+    FROM slice s JOIN thread_track tt ON s.track_id = tt.id
+    JOIN thread t ON tt.utid = t.utid JOIN process p ON t.upid = p.upid
+    WHERE p.name = ${quote(selector.processName)} AND t.name = ${quote(selector.threadName)}
+      AND s.name = ${quote(selector.eventName)} ORDER BY s.id LIMIT 2`;
+  let result;
+  try {
+    signal.throwIfAborted();
+    result = await input.service.queryBounded(input.traceId, sql, {
+      timeoutMs, signal, maxRows: 2, maxResponseBytes: 16 * 1024,
+    });
+    signal.throwIfAborted();
+  } catch {
+    throw new VerificationSliceSelectionError(input.signal?.aborted ? 'SLICE_SELECTION_CANCELLED'
+      : timeout.aborted ? 'SLICE_SELECTION_TIMEOUT' : 'SLICE_SELECTION_QUERY_FAILED');
+  }
+  if (result.error) throw new VerificationSliceSelectionError('SLICE_SELECTION_QUERY_FAILED');
+  if (result.rows.length === 0) throw new VerificationSliceSelectionError('SLICE_SELECTION_NOT_FOUND');
+  if (result.rows.length !== 1) throw new VerificationSliceSelectionError('SLICE_SELECTION_AMBIGUOUS');
+  const columns = ['event_id', 'ts', 'track_id', 'utid', 'upid'];
+  if (!isDeepStrictEqual(result.columns, columns) || result.rows[0].length !== columns.length) {
+    throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID_IDENTITY');
+  }
+  const values = result.rows[0].map(value => typeof value === 'number' ? value :
+    typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : NaN);
+  if (values.some((value, index) => !Number.isSafeInteger(value) || (index !== 1 && value < 0))) {
+    throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID_IDENTITY');
+  }
+  const [eventId, ts, trackId, utid, upid] = values;
+  return {status: 'resolved', purpose: 'input_scope_not_verified_evidence', selector,
+    selectionContext: {kind: 'track_event', source: 'track_event_selection', eventId, ts},
+    identity: {traceId: input.traceId, table: 'slice', eventId, ts, trackId, utid, upid}};
+}
+
+interface AgentSseFactVerification {
+  matched: boolean;
+  proposition: 'proved' | 'unknown';
+  matchedClaimIds: string[];
+  matchedAnchorIds: string[];
+}
 
 /** A returned trace ID is not a successful processor readiness probe. */
 export function assertVerificationTraceReady(traceId: string, trace: Pick<TraceInfo, 'status' | 'error'> | undefined): void {
@@ -341,8 +623,12 @@ export function parseAgentSseExpectation(value: unknown): AgentSseExpectation {
       if (!object(oracle) || !keys(oracle, ['sql', 'column', 'unit', 'anchorMatch']) ||
           typeof oracle.sql !== 'string' || !oracle.sql.trim() || typeof oracle.column !== 'string' || !oracle.column.trim() ||
           (oracle.unit !== undefined && (typeof oracle.unit !== 'string' || !oracle.unit.trim())) ||
-          (oracle.anchorMatch !== undefined && (!object(oracle.anchorMatch) || !keys(oracle.anchorMatch, ['startTs', 'upid']) ||
-            !Object.values(oracle.anchorMatch).every(v => typeof v === 'string' && v.trim())))) return fail();
+          (oracle.anchorMatch !== undefined && (!object(oracle.anchorMatch) || !keys(oracle.anchorMatch, ['startTs', 'upid', 'nativeRow']) ||
+            [oracle.anchorMatch.startTs, oracle.anchorMatch.upid].some(v => v !== undefined && (typeof v !== 'string' || !v.trim()))))) return fail();
+      const nativeRow = object(oracle.anchorMatch) ? oracle.anchorMatch.nativeRow : undefined;
+      if (nativeRow !== undefined && (!object(nativeRow) || !keys(nativeRow, ['relation', 'idColumn', 'oracleColumn']) ||
+          !['relation', 'idColumn', 'oracleColumn'].every(key => typeof nativeRow[key] === 'string' &&
+            /^[a-zA-Z_][a-zA-Z0-9_.]{0,159}$/.test(nativeRow[key] as string)))) return fail();
       // The harness accepts SELECTs and module imports, never a mutation script.
       const query = oracle.sql.replace(/^(?:\s*INCLUDE\s+PERFETTO\s+MODULE\s+[\w.]+\s*;)*/i, '').replace(/;\s*$/, '');
       if (!/^\s*(SELECT|WITH)\b/i.test(query) || query.includes(';') ||
@@ -372,7 +658,8 @@ function factValueEquals(actual: unknown, actualUnit: string | undefined, expect
 /** Transport projections do not reissue capture witnesses. v2 proves the retained raw cells. */
 export function evaluateAgentSseExpectation(input: {
   terminal?: TerminalAnalysisEvidence; expectation: AgentSseExpectation; traceId: string; oracleRows?: AgentSseOracleRows;
-}): {checks: Record<string, boolean>; facts: Record<string, {matched: boolean; proposition: 'proved' | 'unknown'}>; uncoveredFacets: string[]} {
+  oracleNativeSchemas?: AgentSseOracleNativeSchemas;
+}): {checks: Record<string, boolean>; facts: Record<string, AgentSseFactVerification>; uncoveredFacets: string[]} {
   const {terminal, expectation, traceId} = input;
   const claims = terminal?.conclusionContract?.claims ?? [];
   const verifier = terminal?.claimVerificationResult;
@@ -396,9 +683,10 @@ export function evaluateAgentSseExpectation(input: {
         (result.status === 'verified' || result.status === 'inference')).length === 1),
   };
   for (const [key, value] of Object.entries(expectation.intent)) checks[`intent:${key}`] = terminal?.turnIntent?.[key as keyof AnalysisTurnIntent] === value;
-  const facts: Record<string, {matched: boolean; proposition: 'proved' | 'unknown'}> = Object.create(null);
+  const facts: Record<string, AgentSseFactVerification> = Object.create(null);
   for (const fact of expectation.facts) {
-    const matches = claims.some(claim => {
+    const matchedAnchorIds = new Set<string>();
+    const matchedClaims = claims.filter(claim => {
       const semantics = claim.semantics;
       if (claim.kind !== fact.kind || !semantics || semantics.polarity !== 'affirmed' || semantics.discourse !== 'asserted' ||
           semantics.modality !== 'certain' || (fact.population && semantics.scope.population !== fact.population)) return false;
@@ -433,17 +721,32 @@ export function evaluateAgentSseExpectation(input: {
             const expected = fact.oracle ? row[fact.oracle.column] : row.value;
             const unit = fact.oracle?.unit ?? fact.unit;
             if (fact.value !== undefined && !factValueEquals(expected, unit, fact.value, fact.unit)) return false;
-            if (fact.oracle?.anchorMatch?.startTs && String(anchor.timeRange?.startTs) !== String(row[fact.oracle.anchorMatch.startTs])) return false;
-            if (fact.oracle?.anchorMatch?.upid && anchor.identity?.upid !== row[fact.oracle.anchorMatch.upid]) return false;
-            return fact.kind === 'numeric'
+            const nativeMatch = nativeOracleAnchorMatches({fact, proof, anchor, oracleRow: row,
+              schema: input.oracleNativeSchemas?.[fact.id], traceId});
+            if (nativeMatch === false) return false;
+            const match = fact.oracle?.anchorMatch;
+            if (nativeMatch === true) {
+              if (match?.startTs && anchor.timeRange?.startTs !== undefined && String(anchor.timeRange.startTs) !== String(row[match.startTs])) return false;
+              if (match?.upid && anchor.identity?.upid !== undefined && anchor.identity.upid !== row[match.upid]) return false;
+            } else {
+              if (match?.nativeRow && (!match.startTs || !match.upid)) return false;
+              if (match?.startTs && String(anchor.timeRange?.startTs) !== String(row[match.startTs])) return false;
+              if (match?.upid && anchor.identity?.upid !== row[match.upid]) return false;
+            }
+            const matches = fact.kind === 'numeric'
               ? factValueEquals(semantics.numeric?.value, semantics.numeric?.unit, expected, unit) &&
                 factValueEquals(cell.actualValue, cell.unit ?? fact.unit, expected, unit)
               : cell.actualValue === expected;
+            if (matches) matchedAnchorIds.add(anchor.anchorId);
+            return matches;
           });
         });
       });
     });
-    facts[fact.id] = {matched: matches, proposition: matches && fact.verification === 'proved' ? 'proved' : 'unknown'};
+    const matches = matchedClaims.length > 0;
+    facts[fact.id] = {matched: matches, proposition: matches && fact.verification === 'proved' ? 'proved' : 'unknown',
+      matchedClaimIds: matchedClaims.flatMap(claim => typeof claim.id === 'string' ? [claim.id] : []),
+      matchedAnchorIds: [...matchedAnchorIds]};
     checks[`fact:${fact.id}`] = matches;
   }
   return {checks, facts, uncoveredFacets: [...(expectation.uncoveredFacets ?? []),
@@ -461,6 +764,14 @@ export async function collectAgentSseOracleRows(expectation: AgentSseExpectation
     if (!result) {result = await query(fact.oracle.sql); queried.set(fact.oracle.sql, result);}
     if (result.error || !result.columns.includes(fact.oracle.column) || !result.rows.length || result.rows.length > 100_000) {
       throw new Error(`Task fact oracle unavailable: ${fact.id}`);
+    }
+    const nativeRow = fact.oracle.anchorMatch?.nativeRow;
+    if (nativeRow) {
+      const idIndex = result.columns.indexOf(nativeRow.oracleColumn);
+      if (idIndex < 0 || result.columns.lastIndexOf(nativeRow.oracleColumn) !== idIndex ||
+          result.rows.some(row => !Number.isSafeInteger(row[idIndex]) || Number(row[idIndex]) < 0)) {
+        throw new Error(`Task fact oracle unavailable: ${fact.id}`);
+      }
     }
     out[fact.id] = result.rows.map(row => Object.fromEntries(result.columns.map((column, index) => [column, row[index]])));
   }
@@ -549,6 +860,7 @@ function printUsage(): void {
   console.log('  --trace-context-json <json|@file> Forward frontend-style traceContext datasets');
   console.log('  --selection-context-json <json|@file>');
   console.log('                                      Forward frontend-style selectionContext');
+  console.log('  --select-slice-json <json|@file>    Resolve exactly one slice by processName, threadName, eventName; mutually exclusive with --selection-context-json');
   console.log('  --smart-action <preview|analyze>  Smart action (default: analyze for --mode/--preset smart)');
   console.log('  --smart-scope <all|scene_types|scene_ids>');
   console.log('                                      Smart selection scope (default: all for analyze)');
@@ -635,6 +947,21 @@ function parseSelectionContextArg(value: string): SelectionContext {
     throw new Error('--selection-context-json must be a JSON object');
   }
   return parsed as SelectionContext;
+}
+
+function parseSliceSelectionTargetArg(value: string): SliceSelectionTarget {
+  try {
+    const filePath = value.startsWith('@') ? path.resolve(process.cwd(), value.slice(1)) : undefined;
+    if (filePath) {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile() || stat.size > 8192) throw new Error('selector_file');
+    }
+    const raw = filePath ? fs.readFileSync(filePath, 'utf8') : value;
+    if (Buffer.byteLength(raw, 'utf8') > 8192) throw new Error('selector_size');
+    return parseSliceSelectionTarget(JSON.parse(raw));
+  } catch {
+    throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID');
+  }
 }
 
 export function parseArgs(argv: string[]): VerifyOptions {
@@ -865,6 +1192,13 @@ export function parseArgs(argv: string[]): VerifyOptions {
         throw new Error('--selection-context-json requires a value');
       }
       options.selectionContext = parseSelectionContextArg(next);
+      i += 1;
+      continue;
+    }
+
+    if (arg === '--select-slice-json') {
+      if (!next || options.sliceSelectionTarget) throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID');
+      options.sliceSelectionTarget = parseSliceSelectionTargetArg(next);
       i += 1;
       continue;
     }
@@ -1190,6 +1524,10 @@ export function parseArgs(argv: string[]): VerifyOptions {
 
   if (options.setupCodebaseMode && !options.setupCodebaseRoot) {
     throw new Error('--setup-codebase-mode requires --setup-codebase-root');
+  }
+
+  if (options.sliceSelectionTarget && options.selectionContext) {
+    throw new VerificationSliceSelectionError('SLICE_SELECTION_INVALID');
   }
 
   return options;
@@ -1595,7 +1933,296 @@ function recordConclusionEvidence(
   summary.analysisCompletedHasConcreteCodeRefs ||= hasConcreteCodeReference(text);
 }
 
-async function collectSseSummary(
+export class VerificationSseTimeoutError extends Error {
+  constructor() {
+    super('SSE verification exceeded its configured timeout');
+    this.name = 'VerificationSseTimeoutError';
+  }
+}
+
+type VerificationDiagnosticRow = Record<string, string | number | boolean>;
+export interface VerificationDiagnosticsSnapshot {
+  schemaVersion: 'verification_observation@1';
+  diagnosticOnly: true;
+  timing: 'elapsed_since_install_not_native_budget';
+  jsonTiming: 'body_read_and_parse_combined';
+  fetch: readonly Readonly<VerificationDiagnosticRow>[];
+  sql: readonly Readonly<VerificationDiagnosticRow>[];
+  fetchDroppedCount: number;
+  sqlDroppedCount: number;
+  observationFailures: number;
+  restoreConflicts: number;
+}
+
+/** Process-local observation only. No hooks are installed when this module is imported. */
+export function installVerificationDiagnostics(input: {
+  phase: () => string;
+  fetchTarget?: object;
+  queryPrototype?: object;
+  now?: () => number;
+}) {
+  const now = input.now ?? Date.now;
+  const startedAt = now();
+  const fetchRows: VerificationDiagnosticRow[] = [];
+  const sqlRows: VerificationDiagnosticRow[] = [];
+  let active = true, fetchDroppedCount = 0, sqlDroppedCount = 0, observationFailures = 0, restoreConflicts = 0;
+  let frozen: VerificationDiagnosticsSnapshot | undefined;
+  const restores: Array<{target: WeakRef<object>; key: string; original?: PropertyDescriptor; wrapper: Function}> = [];
+  const removeListeners: Array<() => void> = [];
+  const processorIds = new WeakMap<object, number>();
+  let nextProcessorId = 0;
+  const bounded = (value: number) => Number.isFinite(value) ? Math.max(0, Math.min(1_000_000_000, Math.floor(value))) : 0;
+  const elapsed = () => bounded(now() - startedAt);
+  const member = (value: unknown, values: readonly string[]) => typeof value === 'string' && values.includes(value) ? value : 'unknown';
+  const phase = () => member(input.phase(), ['context_setup', 'trace_load', 'selection_resolution', 'trace_oracle',
+    'analysis_start', 'analysis_stream', 'analysis_verification', 'follow_up_start', 'follow_up_stream', 'follow_up_verification']);
+  const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+  const safe = (operation: () => void) => {
+    if (!active) return;
+    try {operation();} catch {observationFailures = bounded(observationFailures + 1);}
+  };
+  const data = (value: unknown, key: string): unknown => value !== null && typeof value === 'object'
+    ? Object.getOwnPropertyDescriptor(value, key)?.value : undefined;
+  const observe = (promise: unknown, fulfilled: (value: any) => void, rejected: () => void) => safe(() => {
+    // Both callbacks absorb observer failures. The derived promise is never returned.
+    void Reflect.apply(Promise.prototype.then, promise, [
+      (value: unknown) => {safe(() => fulfilled(value));}, () => {safe(rejected);},
+    ]);
+  });
+  const wrap = (target: object, key: string, factory: (original: Function) => Function) => safe(() => {
+    const original = Object.getOwnPropertyDescriptor(target, key);
+    let descriptor = original, prototype = Object.getPrototypeOf(target), depth = 0;
+    while (!descriptor && prototype && depth++ < 8) {
+      descriptor = Object.getOwnPropertyDescriptor(prototype, key);
+      prototype = Object.getPrototypeOf(prototype);
+    }
+    if (!descriptor || typeof descriptor.value !== 'function') {observationFailures++; return;}
+    const wrapper = factory(descriptor.value);
+    Object.defineProperty(target, key, original ? {...original, value: wrapper}
+      : {value: wrapper, writable: true, configurable: true, enumerable: false});
+    restores.push({target: new WeakRef(target), key, original, wrapper});
+  });
+  const modelHash = (row: VerificationDiagnosticRow, key: string, model: unknown) => {
+    if (typeof model === 'string' && model.length > 0 && model.length <= 256) row[key] = hash(model);
+  };
+  const observeJson = (response: object, row: VerificationDiagnosticRow) => wrap(response, 'json', original => function(this: unknown, ...args: unknown[]) {
+    safe(() => {row.state = 'json_pending'; row.jsonStartedElapsedMs = elapsed();});
+    let promise: unknown;
+    try {promise = Reflect.apply(original, this, args);} catch (error) {
+      safe(() => {row.state = 'json_rejected'; row.jsonSettledElapsedMs = elapsed();});
+      throw error;
+    }
+    observe(promise, value => {
+      row.state = 'json_fulfilled'; row.jsonSettledElapsedMs = elapsed();
+      modelHash(row, 'actualModelHash', data(value, 'model'));
+      row.responseStatus = member(data(value, 'status'), ['completed', 'incomplete', 'failed', 'cancelled']);
+      const choices = data(value, 'choices');
+      if (Array.isArray(choices) && choices.length === 1) {
+        row.finishReason = member(data(choices[0], 'finish_reason'), ['stop', 'length', 'tool_calls', 'function_call', 'content_filter']);
+        const content = data(data(choices[0], 'message'), 'content');
+        if (typeof content === 'string') row.outputChars = bounded(content.length);
+      } else {
+        const output = data(value, 'output');
+        if (Array.isArray(output) && output.length <= 512) {
+          let chars = 0, hasText = false;
+          for (const item of output) {
+            const content = data(item, 'content');
+            if (data(item, 'type') !== 'message' || !Array.isArray(content) || content.length > 512) continue;
+            for (const part of content) {
+              const text = data(part, 'text');
+              if (data(part, 'type') === 'output_text' && typeof text === 'string') {hasText = true; chars = bounded(chars + text.length);}
+            }
+          }
+          if (hasText) row.outputChars = chars;
+        }
+      }
+    }, () => {row.state = 'json_rejected'; row.jsonSettledElapsedMs = elapsed();});
+    return promise;
+  });
+  wrap(input.fetchTarget ?? globalThis, 'fetch', original => function(this: unknown, ...args: unknown[]) {
+    let row: VerificationDiagnosticRow | undefined;
+    safe(() => {
+      const requestObject = args[0] instanceof Request;
+      const address = typeof args[0] === 'string' ? args[0] : args[0] instanceof URL ? args[0].href
+        : requestObject ? (args[0] as Request).url : undefined;
+      if (!address) return;
+      const pathname = new URL(address).pathname;
+      const endpoint = pathname.endsWith('/chat/completions') ? 'chat_completions' : pathname.endsWith('/responses') ? 'responses' : undefined;
+      if (!endpoint) return;
+      if (fetchRows.length >= 32) {fetchDroppedCount = bounded(fetchDroppedCount + 1); return;}
+      row = {sequence: fetchRows.length + 1, phase: phase(), endpoint, startedElapsedMs: elapsed(),
+        state: 'fetch_pending', stream: 'unknown', requestMetadata: 'unavailable'};
+      fetchRows.push(row);
+      const body = requestObject ? undefined : data(args[1], 'body');
+      // Never consume a Request, stream, FormData or other non-string body.
+      if (typeof body === 'string') {
+        row.inputBytes = bounded(Buffer.byteLength(body));
+        if (body.length <= 256 * 1024) {
+          const request: unknown = JSON.parse(body);
+          row.requestMetadata = 'observed';
+          const stream = data(request, 'stream');
+          row.stream = stream === undefined ? false : typeof stream === 'boolean' ? stream : 'unknown';
+          modelHash(row, 'requestedModelHash', data(request, 'model'));
+        }
+      }
+      const signal = data(args[1], 'signal');
+      if (signal instanceof AbortSignal) {
+        const observedRow = row;
+        const aborted = () => safe(() => {observedRow.abortObservedElapsedMs = elapsed();});
+        if (signal.aborted) aborted();
+        else {signal.addEventListener('abort', aborted, {once: true}); removeListeners.push(() => signal.removeEventListener('abort', aborted));}
+      }
+    });
+    let promise: unknown;
+    try {promise = Reflect.apply(original, this, args);} catch (error) {
+      if (row) safe(() => {row!.state = 'fetch_rejected'; row!.settledElapsedMs = elapsed();});
+      throw error;
+    }
+    if (row) {
+      const observedRow = row;
+      observe(promise, response => {
+        observedRow.state = 'headers_received'; observedRow.headersElapsedMs = elapsed();
+        if (Number.isInteger(response?.status) && response.status >= 100 && response.status <= 599) observedRow.httpStatus = response.status;
+        if (response && typeof response === 'object') observeJson(response, observedRow);
+      }, () => {observedRow.state = 'fetch_rejected'; observedRow.settledElapsedMs = elapsed();});
+    }
+    return promise;
+  });
+  const nativeSnapshot = (processor: any, row: VerificationDiagnosticRow, suffix: string) => {
+    const snapshot = processor.getNativeProvenanceSnapshot?.();
+    row[`nativeStatus${suffix}`] = member(snapshot?.status, ['unknown', 'trusted', 'tainted']);
+    row[`nativeSchemaEligible${suffix}`] = typeof snapshot?.nativeSchemaEligible === 'boolean' ? snapshot.nativeSchemaEligible : 'unknown';
+  };
+  for (const method of ['query', 'queryBounded']) wrap(input.queryPrototype ?? WorkingTraceProcessor.prototype, method,
+    original => function(this: unknown, ...args: unknown[]) {
+      let row: VerificationDiagnosticRow | undefined;
+      safe(() => {
+        if (sqlRows.length >= 128) {sqlDroppedCount = bounded(sqlDroppedCount + 1); return;}
+        row = {sequence: sqlRows.length + 1, phase: phase(), method, startedElapsedMs: elapsed(), state: 'pending'};
+        sqlRows.push(row);
+        if (this && typeof this === 'object') {
+          if (!processorIds.has(this)) processorIds.set(this, ++nextProcessorId);
+          row.processorSequence = processorIds.get(this)!;
+          const privateRun = data(this, 'analysisRunPrivate');
+          row.analysisRunPrivate = typeof privateRun === 'boolean' ? privateRun : 'unknown';
+          nativeSnapshot(this, row, 'AtCall');
+        }
+        if (typeof args[0] === 'string') {
+          row.sqlHash = hash(args[0]); row.sqlBytes = bounded(Buffer.byteLength(args[0]));
+          const analysis = analyzeRawSqlDirectProjection(args[0]);
+          row.pureRead = analysis.pureRead;
+          row.parserReason = analysis.reason === undefined ? 'none' : member(analysis.reason,
+            ['sql_unrecognized', 'sql_byte_budget', 'sql_token_budget', 'sql_depth_budget', 'projection_not_direct']);
+          // Syntax candidates do not establish an actual native result mapping.
+          row.directProjection = Boolean(analysis.relation && analysis.projections?.some(projection =>
+            projection.kind === 'column' || projection.kind === 'star'));
+        }
+      });
+      let promise: unknown;
+      try {promise = Reflect.apply(original, this, args);} catch (error) {
+        if (row) safe(() => {row!.state = 'rejected'; row!.settledElapsedMs = elapsed();});
+        throw error;
+      }
+      if (row) {
+        const observedRow = row;
+        observe(promise, result => {
+          observedRow.state = 'fulfilled'; observedRow.settledElapsedMs = elapsed();
+          observedRow.resultError = typeof data(result, 'error') === 'string' && Boolean(data(result, 'error'));
+          nativeSnapshot(this, observedRow, 'AtSettle');
+          const fields = readRawSqlCaptureFields(result);
+          observedRow.captureFieldsPresent = fields !== undefined;
+          observedRow.captureFieldCount = bounded(fields ? Object.keys(fields).length : 0);
+        }, () => {observedRow.state = 'rejected'; observedRow.settledElapsedMs = elapsed();});
+      }
+      return promise;
+    });
+  return {stop(): VerificationDiagnosticsSnapshot {
+    if (frozen) return frozen;
+    active = false;
+    for (const remove of removeListeners.splice(0)) {try {remove();} catch {observationFailures++;}}
+    for (const restore of restores.splice(0).reverse()) {
+      try {
+        const target = restore.target.deref();
+        if (!target) continue;
+        if (Object.getOwnPropertyDescriptor(target, restore.key)?.value !== restore.wrapper) {restoreConflicts++; continue;}
+        if (restore.original) Object.defineProperty(target, restore.key, restore.original);
+        else if (!Reflect.deleteProperty(target, restore.key)) restoreConflicts++;
+      } catch {restoreConflicts++;}
+    }
+    frozen = Object.freeze({schemaVersion: 'verification_observation@1', diagnosticOnly: true,
+      timing: 'elapsed_since_install_not_native_budget', jsonTiming: 'body_read_and_parse_combined',
+      fetch: Object.freeze(fetchRows.map(row => Object.freeze({...row}))), sql: Object.freeze(sqlRows.map(row => Object.freeze({...row}))),
+      fetchDroppedCount, sqlDroppedCount, observationFailures: bounded(observationFailures), restoreConflicts: bounded(restoreConflicts)});
+    return frozen;
+  }};
+}
+
+export function writeVerificationDiagnostics(outputPath: string, snapshot: VerificationDiagnosticsSnapshot): boolean {
+  try {
+    const diagnosticsPath = `${outputPath}.diagnostics.json`;
+    fs.mkdirSync(path.dirname(diagnosticsPath), {recursive: true});
+    fs.writeFileSync(diagnosticsPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+    return true;
+  } catch {
+    try {console.error('diagnostic_write_failed');} catch { /* Diagnostics cannot replace the run's outcome. */ }
+    return false;
+  }
+}
+
+/** Only verifier-issued phase/status fields enter failure artifacts, never error or provider text. */
+export async function recordVerificationFailureAndCancel(input: {
+  baseUrl: string;
+  outputPath: string;
+  phase: string;
+  startedAt: number;
+  timeoutMs: number;
+  sessionId?: string;
+  runId?: string;
+  error: unknown;
+  selectionResolution?: ResolvedVerificationSliceSelection;
+}, request: typeof fetch = fetch): Promise<Record<string, unknown>> {
+  const failure: Record<string, unknown> = {
+    schemaVersion: 'agent_sse_verification_failure@1',
+    timestamp: new Date().toISOString(),
+    phase: input.phase,
+    durationMs: Math.max(0, Date.now() - input.startedAt),
+    timeoutMs: input.timeoutMs,
+    sessionId: input.sessionId || undefined,
+    runId: input.runId || undefined,
+    errorCode: input.error instanceof VerificationSseTimeoutError ? 'SSE_TIMEOUT'
+      : input.error instanceof VerificationSliceSelectionError ? input.error.code : 'VERIFICATION_FAILED',
+    ...(input.selectionResolution ? {selectionResolution: input.selectionResolution} : {}),
+    cancellation: input.sessionId && input.runId ? 'pending' : 'not_owned',
+    passed: false,
+    observedChecksPassed: false,
+    semanticAcceptance: 'INCONCLUSIVE',
+    completeAcceptance: false,
+  };
+  const persist = () => {
+    fs.mkdirSync(path.dirname(input.outputPath), {recursive: true});
+    fs.writeFileSync(input.outputPath, `${JSON.stringify(failure, null, 2)}\n`);
+  };
+  // Persist first: cancellation itself may time out or the child may be killed.
+  persist();
+  if (input.sessionId && input.runId) {
+    try {
+      const response = await request(`${input.baseUrl}/api/agent/v1/${encodeURIComponent(input.sessionId)}/cancel`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({runId: input.runId}), signal: AbortSignal.timeout(10_000),
+      });
+      const payload = asRecord(await response.json());
+      failure.cancellation = response.ok && payload?.success === true &&
+        payload.sessionId === input.sessionId && payload.runId === input.runId ? 'confirmed' : 'rejected';
+      failure.cancellationHttpStatus = response.status;
+    } catch {
+      failure.cancellation = 'failed';
+    }
+    persist();
+  }
+  return failure;
+}
+
+export async function collectSseSummary(
   baseUrl: string,
   sessionId: string,
   timeoutMs: number,
@@ -1603,6 +2230,7 @@ async function collectSseSummary(
   options: { runId?: string } = {},
 ): Promise<SseSummary> {
   const summary: SseSummary = {
+    candidateProtocolDiagnostics: [],
     totalEvents: 0,
     progressCount: 0,
     agentTaskDispatchedCount: 0,
@@ -1650,6 +2278,7 @@ async function collectSseSummary(
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   try {
     const streamPath = options.runId
@@ -1664,7 +2293,7 @@ async function collectSseSummary(
       throw new Error(`SSE stream failed: HTTP ${response.status}`);
     }
 
-    const reader = response.body.getReader();
+    reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let shouldStop = false;
@@ -1714,6 +2343,14 @@ async function collectSseSummary(
           switch (event) {
             case 'progress': {
               summary.progressCount += 1;
+              if (payload?.phase === 'candidate_protocol') {
+                const diagnostic = sanitizeCandidateProtocolDiagnostic(payload.candidateProtocolDiagnostic);
+                const diagnostics = summary.candidateProtocolDiagnostics!;
+                if (diagnostic && diagnostics.length < 4 && !diagnostics.some(previous =>
+                  previous.candidateIndex === diagnostic.candidateIndex && previous.stage === diagnostic.stage)) {
+                  diagnostics.push(diagnostic);
+                }
+              }
               const sourceEventType = privateProjectedSourceEventType(payload);
               if (sourceEventType === 'plan_submitted') {
                 summary.planSubmittedCount += 1;
@@ -1742,6 +2379,11 @@ async function collectSseSummary(
               }
               break;
             }
+            case 'tool_call':
+              if (typeof payload?.toolName === 'string') {
+                recordToolCall(summary, payload.toolName);
+              }
+              break;
             case 'agent_task_dispatched':
               summary.agentTaskDispatchedCount += 1;
               if (typeof payload?.toolName === 'string') {
@@ -1834,6 +2476,10 @@ async function collectSseSummary(
             }
             recordClaimVerifierSummary(summary, payload);
             const conclusionContract = asRecord(payload?.conclusionContract);
+            const actualSourceUseDecision = sanitizeSourceUseDecision(payload?.sourceUseDecision);
+            if (actualSourceUseDecision) {
+              summary.analysisCompletedSourceUseDecision = actualSourceUseDecision;
+            }
             const sourceUseDecision = asRecord(payload?.sourceUseDecision) ?? asRecord(conclusionContract?.sourceUseDecision);
             if (typeof sourceUseDecision?.status === 'string') {
               summary.analysisCompletedSourceUseStatus = sourceUseDecision.status;
@@ -1859,6 +2505,13 @@ async function collectSseSummary(
                   const refs = asRecord(binding)?.sourceReferenceIds;
                   return Array.isArray(refs) && refs.length > 0 && refs.every(ref => returnedReferenceIds.has(ref));
                 });
+              if (sourceClaimVerification.status === 'passed' && summary.analysisCompletedSourceReferenceMembershipPassed) {
+                summary.analysisCompletedVerifiedSourceBindings = sourceClaimVerification.bindings.map(binding => {
+                  const verified = binding as SourceClaimBindingV1;
+                  return {claimId: verified.claimId, mechanismStatus: verified.mechanismStatus,
+                    sourceReferenceIds: verified.sourceReferenceIds, traceEvidenceRefIds: verified.traceEvidenceRefIds};
+                });
+              }
             }
             if (typeof payload?.reportUrl === 'string') {
               summary.analysisCompletedReportUrl = payload.reportUrl;
@@ -1960,9 +2613,12 @@ async function collectSseSummary(
       }
     }
 
-    await reader.cancel();
+  } catch (error) {
+    if (controller.signal.aborted) throw new VerificationSseTimeoutError();
+    throw error;
   } finally {
     clearTimeout(timeout);
+    try { await reader?.cancel(); } catch {}
   }
 
   summary.stageNames = Array.from(stageNameSet);
@@ -2185,30 +2841,50 @@ async function main(): Promise<void> {
     );
   }
 
-  const app = createVerificationApp();
-  const server = app.listen(0);
-
-  const address = server.address();
-  if (!address || typeof address === 'string') {
-    server.close();
-    throw new Error('Failed to bind local verification server');
-  }
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-
   const traceProcessorService = getTraceProcessorService();
+  let server: ReturnType<express.Express['listen']> | undefined;
+  let baseUrl = '';
   let traceId = '';
   let referenceTraceId = '';
   let sessionId = '';
+  let ownedRunId = '';
+  let phase = 'context_setup';
+  let selectionResolution: ResolvedVerificationSliceSelection | undefined;
+  const startedAt = Date.now();
+  const outputPath = options.outputPath ?? path.resolve(process.cwd(), `test-output/verify-agent-sse-scrolling-${startedAt}.json`);
+  const diagnostics = installVerificationDiagnostics({phase: () => phase});
+  let diagnosticsWritten = false;
+  const persistDiagnostics = () => {
+    if (diagnosticsWritten) return;
+    diagnosticsWritten = true;
+    writeVerificationDiagnostics(outputPath, diagnostics.stop());
+  };
 
   try {
+    const app = createVerificationApp();
+    server = app.listen(0);
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Failed to bind local verification server');
+    baseUrl = `http://127.0.0.1:${address.port}`;
     const setup = await setupAnalysisContext(baseUrl, options);
+    phase = 'trace_load';
     await loadVerificationTracePair({service: traceProcessorService, tracePath: options.tracePath,
       referenceTracePath: options.referenceTracePath, onLoaded: (id, side) => {
         if (side === 'current') traceId = id;
         else referenceTraceId = id;
       }});
-    const oracleRows = options.expectation ? await collectAgentSseOracleRows(options.expectation,
-      sql => traceProcessorService.query(traceId, sql)) : undefined;
+    if (options.sliceSelectionTarget) {
+      phase = 'selection_resolution';
+      selectionResolution = await resolveVerificationSliceSelection({service: traceProcessorService,
+        traceId, selector: options.sliceSelectionTarget, timeoutMs: options.timeoutMs});
+      options.selectionContext = selectionResolution.selectionContext;
+    }
+    phase = 'trace_oracle';
+    const oracleEvidence = options.expectation ? await collectAgentSseOracleEvidence({
+      expectation: options.expectation, traceId, service: traceProcessorService, deadlineMs: startedAt + options.timeoutMs,
+      scope: {tenantId: DEFAULT_TENANT_ID, workspaceId: DEFAULT_WORKSPACE_ID, userId: DEFAULT_DEV_USER_ID},
+    }) : undefined;
+    const oracleRows = oracleEvidence?.rows;
     await writeTraceMetadata({
       id: traceId,
       filename: path.basename(options.tracePath),
@@ -2241,6 +2917,7 @@ async function main(): Promise<void> {
       });
     }
 
+    phase = 'analysis_start';
     const startResponse = await fetch(`${baseUrl}/api/agent/v1/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2272,20 +2949,27 @@ async function main(): Promise<void> {
       throw new Error(`Analyze request failed: ${JSON.stringify(startJson)}`);
     }
     sessionId = startJson.sessionId;
+    ownedRunId = typeof startJson.runId === 'string' ? startJson.runId : '';
+    if (!ownedRunId) throw new Error('Analyze request did not identify the owned run');
 
+    phase = 'analysis_stream';
     const sse = await collectSseSummary(baseUrl, sessionId, options.timeoutMs, {
       requiredText: options.requiredText,
       forbiddenText: options.forbiddenText,
-    });
+    }, {runId: ownedRunId});
+    phase = 'analysis_verification';
     const taskVerification = options.expectation ? evaluateAgentSseExpectation({
       terminal: sse.terminalAnalysis, expectation: options.expectation, traceId, oracleRows,
+      oracleNativeSchemas: oracleEvidence?.schemas,
     }) : undefined;
     const auditedLookupCounts = successfulCodeLookupToolCounts(
       CodeLookupLedger.restore(sessionId, 12_000, 2).getEntries(),
     );
     sse.successfulLookupCounts = auditedLookupCounts;
     for (const [toolName, count] of Object.entries(auditedLookupCounts)) {
-      sse.toolCallCounts[toolName] = (sse.toolCallCounts[toolName] ?? 0) + count;
+      // The audit and SSE describe the same calls; the ledger is a lower bound
+      // for older private projections, not another set of executions to add.
+      sse.toolCallCounts[toolName] = Math.max(sse.toolCallCounts[toolName] ?? 0, count);
     }
 
     // Quick-mode analyses skip plan submission. Architecture detection can still
@@ -2457,6 +3141,7 @@ async function main(): Promise<void> {
       && (isQuickMode || Object.values(fullModeChecks).every(Boolean));
     let followUpOutput: Record<string, unknown> | undefined;
     if (options.followUpQuery) {
+      phase = 'follow_up_start';
       const followUpResponse = await fetch(`${baseUrl}/api/agent/v1/sessions/${sessionId}/runs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2486,6 +3171,8 @@ async function main(): Promise<void> {
         throw new Error(`Follow-up analyze request failed: ${JSON.stringify(followUpStartJson)}`);
       }
 
+      ownedRunId = followUpStartJson.runId;
+      phase = 'follow_up_stream';
       const followUpSse = await collectSseSummary(
         baseUrl,
         sessionId,
@@ -2496,6 +3183,7 @@ async function main(): Promise<void> {
         },
         { runId: followUpStartJson.runId },
       );
+      phase = 'follow_up_verification';
       const followUpChecks = buildFollowUpVerificationChecks(followUpSse, options);
       const followUpPassed = Object.values(followUpChecks).every(Boolean);
       passed = passed && followUpPassed;
@@ -2518,6 +3206,7 @@ async function main(): Promise<void> {
       query: options.query,
       preset: options.preset,
       selectionContext: options.selectionContext,
+      selectionResolution,
       analysisContext: {
         codeAwareMode: options.codeAwareMode ?? 'off',
         codebaseIds: options.codebaseIds,
@@ -2531,6 +3220,7 @@ async function main(): Promise<void> {
       checks,
       passed,
       taskVerification,
+      oracleNativeSchemas: oracleEvidence?.schemas,
       passedMeaning: 'observed_transport_and_task_checks_only',
       ...taskAcceptanceStatus(passed, taskVerification?.uncoveredFacets ?? ['task semantics not evaluated']),
       exactTextChecksPurpose: 'transport_or_canary_only_not_semantic_correctness',
@@ -2540,11 +3230,6 @@ async function main(): Promise<void> {
       sessionLogFile,
     };
 
-    const defaultOutputPath = path.resolve(
-      process.cwd(),
-      `test-output/verify-agent-sse-scrolling-${Date.now()}.json`
-    );
-    const outputPath = options.outputPath ?? defaultOutputPath;
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
     fs.writeFileSync(outputPath, `${JSON.stringify(output, null, 2)}\n`);
 
@@ -2554,7 +3239,14 @@ async function main(): Promise<void> {
     if (!passed) {
       process.exitCode = 1;
     }
+  } catch (error) {
+    // Failure cancellation is cleanup too: preserve observations before it waits.
+    persistDiagnostics();
+    const failure = await recordVerificationFailureAndCancel({baseUrl, outputPath, phase,
+      startedAt, timeoutMs: options.timeoutMs, sessionId, runId: ownedRunId, error, selectionResolution});
+    throw new Error(`Verification failed during ${phase}: ${failure.errorCode}; failure artifact recorded`);
   } finally {
+    persistDiagnostics();
     if (sessionId !== '' && !options.keepSession) {
       try {
         await fetch(`${baseUrl}/api/agent/v1/${sessionId}`, { method: 'DELETE' });
@@ -2576,8 +3268,8 @@ async function main(): Promise<void> {
       }
     }
 
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
+    if (server) await new Promise<void>((resolve) => {
+      server!.close(() => resolve());
     });
   }
 }

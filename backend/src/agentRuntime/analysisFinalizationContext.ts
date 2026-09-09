@@ -3,16 +3,18 @@
 // This file is part of SmartPerfetto. See LICENSE for details.
 
 import type {AnalysisResult} from '../agent/core/orchestratorTypes';
-import type {SourceUseDecisionV1} from '../services/codebase/sourceUseDecision';
+import type {SourceExecutionScopeV1, SourceUseDecisionV1} from '../services/codebase/sourceUseDecision';
 import type {ReadonlyStrategyRegistrySnapshot} from '../services/selfEvolution/effectiveRuntimeRegistryContext';
 import type {AnalysisDeliveryContext} from '../types/analysisDelivery';
 import type {DataEnvelope} from '../types/dataContract';
 import type {EvidenceReadRequest, EvidenceReadResolution, EvidenceReadView} from '../services/evidence/evidenceReadView';
 import type {AnalysisTurnIntent} from './analysisTurnIntent';
 import type {IntentTransportInput, IntentTransportResult} from './intentTransport';
-
-/** A finite no-tools review budget; native adapters also respect their model limit. */
-export const FINALIZATION_MAX_OUTPUT_TOKENS = 16_384;
+import {readConclusionProtocolProjection, releaseConclusionProtocolProjection,
+  claimConclusionProtocolProjection,
+  type IssuedConclusionProtocolProjection, type NativeConclusionDeclaration} from '../services/security/conclusionProtocolProjection';
+import {analysisDeliveryFingerprint} from '../types/analysisDelivery';
+import {sanitizeSourceUseDecision} from '../services/codebase/sourceUseDecision';
 
 export interface FinalizationProviderQuery {
   /** The query accepted by this run's provider input authorization boundary. */
@@ -31,6 +33,8 @@ export interface RuntimeFinalizationContextInput {
   deliveryContext: AnalysisDeliveryContext;
   providerQuery?: FinalizationProviderQuery;
   sourceUse?: SourceUseDecisionV1;
+  sourceScope?: SourceExecutionScopeV1;
+  protocolProjection?: IssuedConclusionProtocolProjection;
   /** Captured facts only. Availability is not completeness of capture. */
   capabilityEvidence?: readonly DataEnvelope[];
   evidenceReadView?: EvidenceReadView;
@@ -52,10 +56,12 @@ export interface RuntimeFinalizationContext {
   readonly traceIdentity: Readonly<RuntimeFinalizationContextInput['traceIdentity']>;
   readonly deliveryContext: AnalysisDeliveryContext;
   readonly sourceUse?: SourceUseDecisionV1;
+  readonly sourceScope?: Readonly<SourceExecutionScopeV1>;
   readonly capabilityEvidence?: readonly DataEnvelope[];
   readonly hasSemanticTransport: boolean;
   /** Input-role view, never a general exemption from output privacy projection. */
   getProviderQuery(signal: AbortSignal): Readonly<FinalizationProviderQuery> | undefined;
+  getNativeDeclaration(result: AnalysisResult, signal: AbortSignal): NativeConclusionDeclaration | undefined;
   resolveReferences(requests: readonly EvidenceReadRequest[], signal: AbortSignal): Promise<readonly EvidenceReadResolution[]>;
   dispatchText(input: IntentTransportInput & {signal: AbortSignal}): Promise<IntentTransportResult>;
   /** Cancels in-flight operations and drops closures; does not replace a product run lease. */
@@ -63,6 +69,11 @@ export interface RuntimeFinalizationContext {
 }
 
 const contexts = new WeakMap<AnalysisResult, ContextState>();
+const issuedContexts = new WeakSet<RuntimeFinalizationContext>();
+
+export function isIssuedFinalizationContext(context: RuntimeFinalizationContext): boolean {
+  return issuedContexts.has(context);
+}
 
 function freezeSnapshot<T>(value: T): T {
   const copied = structuredClone(value);
@@ -125,6 +136,14 @@ export function attachFinalizationContext(result: AnalysisResult, input: Runtime
     input.deliveryContext.acceptedCandidate?.runId !== input.runId) {
     throw new Error('finalization_context_identity_mismatch');
   }
+  if (input.protocolProjection) {
+    readConclusionProtocolProjection(input.protocolProjection, {
+      result, candidate: input.deliveryContext.acceptedCandidate, runId: input.runId,
+    });
+    if (analysisDeliveryFingerprint(sanitizeSourceUseDecision(input.sourceUse)) !==
+      analysisDeliveryFingerprint(result.sourceUseDecision)) throw new Error('finalization_source_projection_mismatch');
+    claimConclusionProtocolProjection(input.protocolProjection);
+  }
   contexts.set(result, {controller: new AbortController(), value: {
     ...input,
     turnIntent: freezeSnapshot(input.turnIntent),
@@ -132,6 +151,7 @@ export function attachFinalizationContext(result: AnalysisResult, input: Runtime
     deliveryContext: freezeSnapshot(input.deliveryContext),
     providerQuery: input.providerQuery ? freezeSnapshot(input.providerQuery) : undefined,
     sourceUse: input.sourceUse ? freezeSnapshot(input.sourceUse) : undefined,
+    sourceScope: input.sourceScope ? freezeSnapshot(input.sourceScope) : undefined,
     capabilityEvidence: input.capabilityEvidence ? freezeSnapshot(input.capabilityEvidence) : undefined,
   }});
 }
@@ -150,7 +170,7 @@ export function takeFinalizationContext(result: AnalysisResult): RuntimeFinaliza
     state.controller.signal.throwIfAborted();
     return current();
   };
-  return Object.freeze({
+  const context: RuntimeFinalizationContext = Object.freeze({
     get runId() { return current().runId; },
     get sessionId() { return current().sessionId; },
     get deadlineMs() { return current().deadlineMs; },
@@ -159,9 +179,17 @@ export function takeFinalizationContext(result: AnalysisResult): RuntimeFinaliza
     get traceIdentity() { return current().traceIdentity; },
     get deliveryContext() { return current().deliveryContext; },
     get sourceUse() { return current().sourceUse; },
+    get sourceScope() { return current().sourceScope; },
     get capabilityEvidence() { return current().capabilityEvidence; },
     get hasSemanticTransport() { return Boolean(current().dispatchText); },
     getProviderQuery(signal: AbortSignal) { return active(signal).providerQuery; },
+    getNativeDeclaration(result: AnalysisResult, signal: AbortSignal) {
+      const value = active(signal);
+      return value.protocolProjection ? readConclusionProtocolProjection(value.protocolProjection, {
+        result, candidate: value.deliveryContext.entry === 'historical_restore' ? undefined : value.deliveryContext.acceptedCandidate,
+        runId: value.runId,
+      }) : undefined;
+    },
     async resolveReferences(requests: readonly EvidenceReadRequest[], signal: AbortSignal): Promise<readonly EvidenceReadResolution[]> {
       const value = active(signal);
       const reader = value.evidenceReadView;
@@ -191,8 +219,12 @@ export function takeFinalizationContext(result: AnalysisResult): RuntimeFinaliza
       }
     },
     dispose() {
+      issuedContexts.delete(context);
+      if (state.value?.protocolProjection) releaseConclusionProtocolProjection(state.value.protocolProjection);
       state.controller.abort(new DOMException('Finalization context disposed', 'AbortError'));
       state.value = undefined;
     },
   });
+  issuedContexts.add(context);
+  return context;
 }

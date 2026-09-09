@@ -81,6 +81,23 @@
       "createdAt": "2026-07-29T00:00:00.000Z"
     },
     {
+      "caseId": "synthetic-main-thread-frame-work-v1",
+      "catalogAlias": "main-thread-frame-work",
+      "query": "Analyze window-animation smoothness and continuous main-thread work in the constructed interval from the start of SmartPerfetto::CASE::main-thread-frame-work to the end of SmartPerfetto::END::main-thread-frame-work. Scope the investigation to com.smartperfetto.fixture, com.smartperfetto.unframed, and com.smartperfetto.unlabeled. Identify observed tasks, scheduling states, and task-origin locators inside and outside doFrame; explain what the trace does and does not establish about delayed frames, then give appropriately conditional recommendations.",
+      "analysisMode": "full",
+      "expectedScene": "scrolling",
+      "goldenPoints": [
+        "For com.smartperfetto.fixture, identify ContentLoader$MainHandler: initializeContent as 30 ms between doFrames, with 28 ms Running and 2 ms Runnable; locate the nested parseContentModel 14 ms and inflateContentViews 8 ms without adding child time to parent time or treating labels as proven implementation.",
+        "Identify bindRemainingContent as 40 ms between doFrames, including 30 ms Running and 10 ms D-state waiting; D-state alone does not prove file I/O, Binder, or a named blocker.",
+        "Report three observed doFrames of 22, 24, and 8 ms, with start intervals of 52 and 68 ms; distinguish observed execution spacing from requested deadlines, presentation cadence, refresh rate, and proved missed frames.",
+        "For com.smartperfetto.unframed, identify 40 ms of initializeWithoutFrameMarker work with no doFrame marker; for com.smartperfetto.unlabeled, identify 35 ms of unannotated Running. Missing frame or slice markers do not prove no work or no rendering request.",
+        "Preserve the full marker-bounded window, process/UPID/UTID and task slice/state/time locators, separate Running from Runnable/waits/unknown, and disclose sampling and source-origin limitations without importing unrelated base-trace frame counts.",
+        "Treat concurrent content work as an observed occupancy and candidate interference mechanism, not a proven deadline miss. Recommend moving parsing/computation only after verifying implementation and dependencies; keep required UI work on the main thread and consider splitting, batching, or deferment."
+      ],
+      "split": "validation",
+      "createdAt": "2026-09-09T00:00:00.000Z"
+    },
+    {
       "caseId": "synthetic-media-network-camera-v1",
       "catalogAlias": "media-network-camera",
       "query": "Analyze the media, network, and camera pipeline and identify the evidence-backed bottleneck.",

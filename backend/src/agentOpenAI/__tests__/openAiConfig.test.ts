@@ -189,15 +189,21 @@ describe('createOpenAIEnv', () => {
     expect(diagnostics.baseUrl).toBe('https://example.com/v1');
   });
 
-  it('limits OpenAI model output tokens by default and allows env override', () => {
+  it('leaves the primary generation cap unset by default and respects an explicit cap', () => {
     delete process.env.OPENAI_MAX_OUTPUT_TOKENS;
-    expect(loadOpenAIConfig(null).maxOutputTokens).toBe(2048);
+    expect(loadOpenAIConfig(null).maxOutputTokens).toBeUndefined();
+    expect(getOpenAIRuntimeDiagnostics(null).maxOutputTokens).toBeUndefined();
 
     process.env.OPENAI_MAX_OUTPUT_TOKENS = '2048';
     expect(loadOpenAIConfig(null).maxOutputTokens).toBe(2048);
 
     const diagnostics = getOpenAIRuntimeDiagnostics(null);
     expect(diagnostics.maxOutputTokens).toBe(2048);
+  });
+
+  it.each(['', ' ', '0', '-1', '1.5', '8192suffix', 'Infinity', '9007199254740992'])('rejects malformed explicit output cap %j', value => {
+    process.env.OPENAI_MAX_OUTPUT_TOKENS = value;
+    expect(() => loadOpenAIConfig(null)).toThrow('OPENAI_MAX_OUTPUT_TOKENS must be a positive safe integer');
   });
 
   it('uses shared turn budget config when runtime-specific values are unset', () => {

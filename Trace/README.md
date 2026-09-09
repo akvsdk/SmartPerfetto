@@ -4,15 +4,15 @@
 This directory is the source-controlled trace test and reference corpus.
 
 - [Real trace cases](./real/README.md): 6
-- [Constructed trace cases](./constructed/README.md): 13
+- [Constructed trace cases](./constructed/README.md): 14
 - [Machine-readable catalog](./catalog.json)
 - [Skill and Strategy coverage](./coverage.json)
 
-Evidence tiers: R1=6, R2=0, R3=13.
+Evidence tiers: R1=6, R2=0, R3=14.
 
-Pinned Perfetto SQL source: `add693d8b338ba9599dbcbc3e300b1ab8c000897`. The generated coverage ledger contains 235 Skill SQL source contracts and 2 canonical portable SQL source checks with exact source hashes and upstream module paths.
+Pinned Perfetto SQL source: `add693d8b338ba9599dbcbc3e300b1ab8c000897`. The generated coverage ledger contains 236 Skill SQL source contracts and 2 canonical portable SQL source checks with exact source hashes and upstream module paths.
 
-Skill execution quality: 188 source-column-backed semantic, 4 execution-only composition, 0 expected-empty negative, 11 explicit deferred prerequisite, 32 definition-only.
+Skill execution quality: 193 source-column-backed semantic, 4 execution-only composition, 0 expected-empty negative, 11 explicit deferred prerequisite, 32 definition-only.
 
 ## Commands
 
@@ -59,6 +59,7 @@ Constructed cases keep source scenarios and overlay protobufs in Git; combined t
 | [GPU workload and frequency](./constructed/gpu-workload/) | gpu | Android 16 / API 36 (tested API 35-36) | android-scroll-customer | 11 target(s) |
 | [Input and interaction latency](./constructed/input-interaction-latency/) | interaction | Android 16 / API 36 (tested API 35-36) | android-scroll-customer | 14 target(s) |
 | [Linux and Android system state](./constructed/linux-system-state/) | linux | Android 16 / API 36 (tested API 35-36) | android-startup-light | 5 target(s) |
+| [Main-thread work between animation frames](./constructed/main-thread-frame-work/) | scrolling | Android 16 / API 36 (tested API 35-36) | android-scroll-customer | 1 target(s) |
 | [Media, network, and camera pipeline](./constructed/media-network-camera/) | media | Android 16 / API 36 (tested API 35-36) | android-scroll-customer | 8 target(s) |
 | [Memory and GC pressure](./constructed/memory-gc-pressure/) | memory | Android 16 / API 36 (tested API 35-36) | android-startup-light | 20 target(s) |
 | [Power and thermal throttling](./constructed/power-thermal/) | power | Android 16 / API 36 (tested API 35-36) | android-scroll-customer | 19 target(s) |

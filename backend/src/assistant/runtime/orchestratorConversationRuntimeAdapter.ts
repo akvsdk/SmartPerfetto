@@ -185,7 +185,8 @@ export class OrchestratorConversationRuntimeAdapter implements ConversationRunti
           Boolean(value && typeof value === 'object' && validateDataEnvelope(value).length === 0)));
       }
       this.assertActive(input, state);
-      const projected = narrative.project(projectCodeAwareStreamingUpdate(runtimeSessionId, update, privateKnowledge, outputLanguage));
+      const safeUpdate = projectCodeAwareStreamingUpdate(runtimeSessionId, update, privateKnowledge, outputLanguage);
+      const projected = safeUpdate ? narrative.project(safeUpdate) : null;
       if (projected) input.onUpdate?.(projected);
     };
     this.orchestrator.on('update', onUpdate);

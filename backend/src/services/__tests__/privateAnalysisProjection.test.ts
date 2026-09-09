@@ -10,13 +10,17 @@ import {
 import {
   SOURCE_USE_DECISION_SCHEMA_VERSION,
   sanitizeSourceReference,
+  sanitizeSourceUseDecision,
 } from '../codebase/sourceUseDecision';
 import {
   copyAnalysisResultForSnapshot,
   projectPrivateAnalysisResult,
+  projectPrivateClaimVerification,
+  projectPrivateTerminationMessage,
   projectPrivateSessionStateSnapshot,
 } from '../security/privateAnalysisProjection';
 import type {AnalysisResult} from '../../agent/core/orchestratorTypes';
+import type {DeterministicNativeRowIdentity} from '../../types/claimVerification';
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import {clearCodeAwareOutputGuards, registerCodeAwareCanary} from '../security/codeAwareOutputRegistry';
 
@@ -59,6 +63,62 @@ function deliveredResult(): AnalysisResult {
 }
 
 describe('final delivery private projection', () => {
+  it.each(['absent', 'own_undefined', 'empty', 'valid', 'filtered', 'malformed'] as const)(
+    'keeps source binding shape %s stable without erasing unrelated finite proofs', shape => {
+      const result = deliveredResult();
+      const reference = sanitizeSourceReference({referenceId: 'shape-read', codebaseId: 'shape-app',
+        filePath: 'src/Shape.kt', lineRange: {start: 7, end: 7}, lookupKind: 'body'})!;
+      const decision = sanitizeSourceUseDecision({schemaVersion: SOURCE_USE_DECISION_SCHEMA_VERSION,
+        codeAwareMode: 'provider_send', selectedCodebaseIds: ['shape-app'], status: 'corroborated',
+        attemptedTools: ['read_codebase_file'], queriedCodebaseIds: ['shape-app'], usedCodebaseIds: ['shape-app'],
+        coverageComplete: true, references: [reference]})!;
+      result.sourceUseDecision = decision;
+      result.sourceReferences = decision.references;
+      result.conclusionContract = {schemaVersion: 'conclusion_contract_v1', mode: 'focused_answer',
+        conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], bindingEligibility: 'eligible',
+        claims: [{id: 'claim-1', kind: 'numeric', text: result.conclusion, references: []},
+          {id: 'location', kind: 'categorical', text: 'The returned location is src/Shape.kt:7.', references: []},
+          {id: 'c2', kind: 'categorical', text: 'A separate unexpressed assertion.', references: []}],
+        sourceUseDecision: decision, sourceReferences: decision.references};
+      const binding = {claimId: 'location', sourceReferenceIds: [reference.id],
+        traceEvidenceRefIds: [], mechanismStatus: 'compatible' as const};
+      if (shape === 'own_undefined') result.conclusionContract.sourceClaimBindings = undefined;
+      if (shape === 'empty') result.conclusionContract.sourceClaimBindings = [];
+      if (shape === 'valid') result.conclusionContract.sourceClaimBindings = [binding];
+      if (shape === 'filtered') result.conclusionContract.sourceClaimBindings = [{...binding, sourceReferenceIds: ['not-returned']}];
+      if (shape === 'malformed') result.conclusionContract.sourceClaimBindings = null as any;
+      result.claimSupport = [{claimId: 'claim-1', kind: 'numeric', text: result.conclusion, anchors: [],
+        bindingEligibility: 'eligible', supportLevel: 'partial'}];
+      result.claimVerificationResult = {...result.claimVerificationResult!, status: 'failed', passed: false,
+        checkedClaimCount: 3, unsupportedClaimCount: 1,
+        claimResults: [{...result.claimVerificationResult!.claimResults[0], status: 'partial'},
+          {claimId: 'location', status: 'partial', referenceCells: [],
+            deterministicProof: {kind: 'source_location', status: 'proved', reason: 'source_location_snapshot_proved',
+              anchorIds: [], evidenceRefIds: []},
+            propositionCoverage: {status: 'complete', covered: ['source'], uncovered: [], reason: 'source_location_snapshot_proved'}},
+          {claimId: 'c2', status: 'unsupported'}],
+        issues: [{claimId: 'c2', severity: 'error', code: 'semantic_declaration_not_expressed', message: 'Claim c2: declaration_not_expressed'},
+          {claimId: '', severity: 'error', code: 'semantic_undeclared_claim', message: 'The answer contains an undeclared assertion.'}]};
+      result.deliveryAssurance = {...result.deliveryAssurance!, claims: 'failed', source: 'not_checked', report: 'not_checked'};
+      delete result.reportAssessment;
+      const invalid = shape === 'filtered' || shape === 'malformed';
+      const first = projectPrivateAnalysisResult(result.sessionId, result, 'en');
+      expect(first.conclusion).toBe(result.conclusion);
+      expect(first.claimVerificationResult).toMatchObject({status: 'failed', passed: false, unsupportedClaimCount: 1,
+        issues: result.claimVerificationResult.issues});
+      expect(first.claimVerificationResult!.claimResults[2].status).toBe('unsupported');
+      for (const claim of first.claimVerificationResult!.claimResults.slice(0, 2)) {
+        expect(claim.deterministicProof?.status).toBe(invalid ? 'not_checked' : 'proved');
+        expect(claim.propositionCoverage?.status).toBe(invalid ? 'none' : 'complete');
+      }
+      expect(first.claimSupport![0].bindingEligibility).toBe(invalid ? 'ineligible' : 'eligible');
+      if (shape === 'absent' || shape === 'own_undefined') expect(first.conclusionContract).not.toHaveProperty('sourceClaimBindings');
+      else expect(first.conclusionContract!.sourceClaimBindings).toEqual(shape === 'valid' ? [binding] : []);
+      expect(projectPrivateAnalysisResult(result.sessionId, first, 'en')).toEqual(first);
+      const snapshot = JSON.parse(JSON.stringify(copyAnalysisResultForSnapshot(first)));
+      expect(projectPrivateAnalysisResult(result.sessionId, snapshot, 'en')).toEqual(snapshot);
+    });
+
   it.each(['claimAudit', 'traceEvidence', 'nonEvidenceContext', 'outputs'] as const)(
     'drops an incomplete historical receipt missing %s without changing its answer', field => {
       const result = deliveredResult();
@@ -100,7 +160,7 @@ describe('final delivery private projection', () => {
       expect(projected.claimSupport).toEqual([
         expect.objectContaining({claimId: '[REDACTED_CODE_ECHO]', text: '[REDACTED_CODE_ECHO]',
           supportLevel: 'partial', bindingEligibility: 'ineligible', anchors: [expect.objectContaining({
-            anchorId: 'anchor-[REDACTED_CODE_ECHO]', evidenceRefId: 'evidence-1',
+            anchorId: '[REDACTED_CODE_ECHO]', evidenceRefId: 'evidence-1',
             cells: [{column: 'value', rowIndex: 0, value: 1, actualValue: 1, displayValue: '[REDACTED_CODE_ECHO]'}],
           })]}),
         expect.objectContaining({claimId: 'safe-claim', text: 'Safe public claim', supportLevel: 'partial'}),
@@ -614,5 +674,148 @@ describe('private session snapshot provenance', () => {
     expect(projected.sourceUseDecision).not.toHaveProperty('reasonCode');
     expect(projected.codeLookupSummary?.sourceUseDecision)
       .toEqual(projected.sourceUseDecision);
+  });
+});
+
+describe('native row descriptor private delivery', () => {
+  const nativeRow: DeterministicNativeRowIdentity = {anchorId: 'anchor-1', evidenceRefId: 'evidence-1',
+    captureId: 'capture-1', traceId: 'trace-1', traceSide: 'current', relation: 'slice', idColumn: 'id', id: 7,
+    schemaFingerprint: 'a'.repeat(64)};
+  function withNativeRows(): AnalysisResult {
+    const result = deliveredResult();
+    const claim = result.claimVerificationResult!.claimResults[0];
+    claim.referenceCells![0].anchorId = 'anchor-1';
+    claim.deterministicProof!.nativeRows = [{...nativeRow}];
+    return result;
+  }
+
+  it('preserves closed display descriptors, their key order and verification over repeated result/export projection', () => {
+    const result = withNativeRows();
+    const original = JSON.stringify(result.claimVerificationResult);
+    const verification = projectPrivateClaimVerification(result.sessionId, result.claimVerificationResult)!;
+    expect(JSON.stringify(verification)).toBe(original);
+    const first = projectPrivateAnalysisResult(result.sessionId, result, 'en');
+    const replayed = projectPrivateAnalysisResult(result.sessionId, first, 'en');
+    const exported = JSON.parse(JSON.stringify(copyAnalysisResultForSnapshot(replayed)));
+    expect(exported.claimVerificationResult.claimResults[0].deterministicProof.nativeRows).toEqual([nativeRow]);
+    expect(first.deliveryAssurance?.claims).toBe('passed');
+    expect(replayed).toEqual(first);
+    expect(result.claimVerificationResult).toEqual(verification);
+  });
+
+  it.each([
+    {name: 'path', changes: {traceId: '/private/project/trace'}},
+    {name: 'unknown field', changes: {rawPayload: 'PRIVATE_NATIVE_ROW'}},
+    {name: 'unsafe integer', changes: {id: Number.MAX_SAFE_INTEGER + 1}},
+    {name: 'negative ID', changes: {id: -1}},
+    {name: 'fractional ID', changes: {id: 1.5}},
+    {name: 'invalid side', changes: {traceSide: 'other'}},
+    {name: 'invalid fingerprint', changes: {schemaFingerprint: 'a'.repeat(63)}},
+    {name: 'wrong anchor', changes: {anchorId: 'another-anchor'}},
+    {name: 'wrong evidence', changes: {evidenceRefId: 'another-evidence'}},
+    {name: 'whitespace', changes: {captureId: ' capture-1'}},
+    {name: 'oversize identifier', changes: {traceId: 't'.repeat(161)}},
+  ])('invalidates proof immediately for a $name descriptor before any outer finalizer binding', ({changes}) => {
+    const result = withNativeRows();
+    result.claimVerificationResult!.claimResults[0].deterministicProof!.nativeRows = [{...nativeRow, ...changes} as DeterministicNativeRowIdentity];
+    const projected = projectPrivateClaimVerification(result.sessionId, result.claimVerificationResult)!;
+    expect(projected).toMatchObject({passed: false, status: 'not_checked', claimResults: [{status: 'not_checked',
+      deterministicProof: {status: 'not_checked'}}]});
+    expect(projected.claimResults[0].deterministicProof?.nativeRows).toBeUndefined();
+    const final = projectPrivateAnalysisResult(result.sessionId, result, 'en');
+    expect(final.deliveryAssurance?.claims).not.toBe('passed');
+    expect(JSON.stringify(final)).not.toContain('PRIVATE_NATIVE_ROW');
+  });
+
+  it.each(['duplicate', 'missing', 'not-array', 'wrong-pair', 'canary'] as const)('rejects %s rows without retaining positive verification', failure => {
+    const result = withNativeRows();
+    const claim = result.claimVerificationResult!.claimResults[0];
+    const proof = claim.deterministicProof!;
+    if (failure === 'duplicate') proof.nativeRows!.push({...nativeRow, id: 8});
+    if (failure === 'missing') delete (proof.nativeRows![0] as Partial<DeterministicNativeRowIdentity>).captureId;
+    if (failure === 'not-array') proof.nativeRows = {} as DeterministicNativeRowIdentity[];
+    if (failure === 'wrong-pair') {
+      proof.evidenceRefIds.push('evidence-2');
+      proof.nativeRows![0].evidenceRefId = 'evidence-2';
+    }
+    if (failure === 'canary') registerCodeAwareCanary(result.sessionId, 'capture-1');
+    try {
+      const projected = projectPrivateClaimVerification(result.sessionId, result.claimVerificationResult)!;
+      expect(projected.passed).toBe(false);
+      expect(projected.claimResults[0].status).not.toBe('verified');
+      expect(projected.claimResults[0].deterministicProof?.status).not.toBe('proved');
+      expect(projected.claimResults[0].deterministicProof?.nativeRows).toBeUndefined();
+      expect(projectPrivateClaimVerification(result.sessionId, projected)).toEqual(projected);
+    } finally {clearCodeAwareOutputGuards(result.sessionId);}
+  });
+
+  it('keeps rejected/unsupported verdicts negative when a malformed row is removed', () => {
+    const result = withNativeRows();
+    const verification = result.claimVerificationResult!;
+    verification.status = 'failed'; verification.passed = false;
+    verification.claimResults[0].status = 'unsupported';
+    verification.claimResults[0].deterministicProof!.status = 'rejected';
+    verification.claimResults[0].deterministicProof!.nativeRows![0].id = -1;
+    const projected = projectPrivateClaimVerification(result.sessionId, verification)!;
+    expect(projected).toMatchObject({status: 'failed', passed: false, claimResults: [{status: 'unsupported', deterministicProof: {status: 'rejected'}}]});
+    expect(projected.claimResults[0].deterministicProof?.nativeRows).toBeUndefined();
+  });
+});
+
+describe('private termination state', () => {
+  const diagnostic = 'PRIVATE_RECOVERY_DIAGNOSTIC';
+  it('omits a discarded-attempt diagnostic from a completed current result', () => {
+    const result = {...deliveredResult(), terminationMessage: diagnostic};
+    expect(projectPrivateTerminationMessage(diagnostic, 'en', result)).toBeUndefined();
+    expect(projectPrivateAnalysisResult(result.sessionId, result, 'en').terminationMessage).toBeUndefined();
+  });
+  it.each(['failed', 'cancelled', 'incomplete'] as const)('keeps actual native %s ahead of a success flag', status => {
+    const result = deliveredResult();
+    result.completion = {...result.completion!, status};
+    expect(projectPrivateTerminationMessage(diagnostic, 'en', result)).toContain('did not complete');
+  });
+  it.each(['quality_gate_failed', 'plan_incomplete', undefined] as const)('describes completed delivery failure without claiming native failure (%s)', terminationReason => {
+    const result = {...deliveredResult(), success: false, terminationReason};
+    const message = projectPrivateTerminationMessage(diagnostic, 'en', result)!;
+    expect(message).toContain('have not passed checks');
+    expect(message).not.toContain('did not complete');
+    expect(message).not.toContain(diagnostic);
+  });
+  it.each(['quality_gate_failed', 'plan_incomplete'] as const)('keeps a safe failed-delivery placeholder stable through the complete projector (%s)', terminationReason => {
+    const result = {...deliveredResult(), success: false, partial: true, terminationReason,
+      conclusion: 'PRIVATE_FAILED_ANSWER_CANARY', terminationMessage: diagnostic};
+    registerCodeAwareCanary(result.sessionId, result.conclusion);
+    try {
+      const first = projectPrivateAnalysisResult(result.sessionId, result, 'en');
+      expect(first.conclusion).toContain('An answer was generated');
+      expect(first.conclusion).not.toContain('did not complete');
+      expect(first.terminationMessage).toContain('have not passed checks');
+      expect(first).toMatchObject({success: false, partial: true, terminationReason});
+      expect(first.claimVerificationResult?.passed).toBe(false);
+      expect(first.deliveryAssurance?.claims).not.toBe('passed');
+      expect(JSON.stringify(first)).not.toContain(result.conclusion);
+      expect(JSON.stringify(first)).not.toContain(diagnostic);
+      expect(projectPrivateAnalysisResult(result.sessionId, first, 'en')).toEqual(first);
+      const restored = JSON.parse(JSON.stringify(copyAnalysisResultForSnapshot(first))) as AnalysisResult;
+      expect(projectPrivateAnalysisResult(result.sessionId, restored, 'en').conclusion).toBe(first.conclusion);
+    } finally {clearCodeAwareOutputGuards(result.sessionId);}
+  });
+  it('never publishes a failed answer using only a serialized completed flag and uses neutral historical fallback', () => {
+    const result = {...deliveredResult(), success: false, conclusion: 'PRIVATE_UNGUARDED_FAILED_BODY'};
+    expect(projectPrivateAnalysisResult(result.sessionId, result, 'en').conclusion).toContain('An answer was generated');
+    expect(projectPrivateAnalysisResult(result.sessionId, result, 'en').conclusion).not.toContain(result.conclusion);
+    const unknown = {...result, completion: undefined};
+    expect(projectPrivateAnalysisResult(result.sessionId, unknown, 'en').conclusion).toContain('could not be confirmed');
+    for (const status of ['failed', 'cancelled', 'incomplete'] as const) {
+      expect(projectPrivateAnalysisResult(result.sessionId, {...result,
+        completion: {...result.completion!, status}, terminationReason: 'quality_gate_failed'}, 'en').conclusion)
+        .toContain('did not complete');
+    }
+  });
+  it('keeps completed partial and unknown historical diagnostics distinct', () => {
+    expect(projectPrivateTerminationMessage(diagnostic, 'en', {...deliveredResult(), partial: true})).toContain('remain incomplete');
+    expect(projectPrivateTerminationMessage(diagnostic, 'en')).toBe('Detailed analysis diagnostics are hidden by the privacy policy.');
+    expect(projectPrivateTerminationMessage(undefined, 'en')).toBeUndefined();
+    expect(projectPrivateTerminationMessage(diagnostic, 'en', {success: false})).toContain('did not complete');
   });
 });

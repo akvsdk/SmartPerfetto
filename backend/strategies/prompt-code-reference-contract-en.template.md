@@ -3,6 +3,8 @@
 
 ### CodeRef Location Contract
 
-When `search_codebase`, `read_codebase_file`, or `lookup_*_source` successfully returns source CodeRefs, preserve at least one actual location, preferably `relative/path/File.kt:L10-L20`; a filename alone is insufficient. Without `lineRange`, state that line numbers are unavailable and keep `referenceId`/`chunkId` plus `filePath`; never invent lines.
+Copy bindable `id` from tool `sourceReferences` (indexed: `result.sourceReferences`), never from history or calculation. Preserve actual `filePath:L10-L20`; without `lineRange`, retain `referenceId`/`chunkId` + `filePath` and state line numbers unavailable.
 
-Trace evidence proves occurrence; source evidence explains implementation mechanism. Source claims cite returned CodeRefs; occurrence claims also cite current Trace/Skill/SQL evidence. Source location alone remains candidate/compatible/unverified, not a confirmed root cause.
+Source-backed claims except pure `source.location` add `sourceClaimBindings: [{"claimId":"declared claim id","mechanismStatus":"compatible","sourceReferenceIds":["returned id"],"traceEvidenceRefIds":[]}]`. Trace IDs belong to that claim's current evidence; leave empty when absent. Trace evidence proves occurrence; source explains candidate mechanisms. `metadata_only` is locate-only; execution supplies `sourceUseDecision`. Incomplete search cannot prove absence; read `truncated` means later lines exist. No extra lookup is required.
+
+Source IDs never enter `references[].sourceRef` (a Trace alias). Source-only claims use empty `references`. Position facts use `source.location` with exact returned `semantics.source`; no duplicate binding required. If supplied, its binding must be unique, same-ID, without Trace IDs. Locations cannot prove contents, behavior, call chains or Trace mappings; never guess lines or change propositions for verification.

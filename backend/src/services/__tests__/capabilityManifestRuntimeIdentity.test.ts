@@ -49,8 +49,9 @@ function pinText(
   return [
     '# exact trace processor identity',
     `PERFETTO_VERSION=${revision}`,
+    'PERFETTO_ARTIFACT_VERSION=v58.2',
     'PERFETTO_LUCI_URL_BASE=https://example.invalid/perfetto',
-    `${key}=${binarySha}`,
+    ...Object.values(SHA_KEYS).map(shaKey => `${shaKey}=${shaKey === key ? binarySha : '0'.repeat(64)}`),
     '',
   ].join('\n');
 }

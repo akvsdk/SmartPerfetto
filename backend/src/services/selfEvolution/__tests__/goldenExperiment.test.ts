@@ -205,7 +205,7 @@ describe('golden experiment manifest compiler', () => {
       profiles: [],
       createdAt: '2026-08-22T00:00:00.000Z',
     });
-    expect(manifest.cells).toHaveLength(13);
+    expect(manifest.cells).toHaveLength(14);
     expect(manifest.cells.every(cell =>
       cell.execution === 'deterministic_contract'
       && cell.profileId === null
@@ -239,8 +239,8 @@ describe('golden experiment manifest compiler', () => {
     const second = compileGoldenExperimentManifest(input);
     expect(first).toEqual(second);
     expect(first.cases.every(item => item.split !== 'holdout')).toBe(true);
-    expect(first.cases).toHaveLength(9);
-    expect(first.cells).toHaveLength(9 * 2 * 3);
+    expect(first.cases).toHaveLength(10);
+    expect(first.cells).toHaveLength(10 * 2 * 3);
     expect(new Set(first.cells.map(cell => cell.cellId)).size)
       .toBe(first.cells.length);
     expect(first.policy).toMatchObject({concurrency: 1, repeats: 3});

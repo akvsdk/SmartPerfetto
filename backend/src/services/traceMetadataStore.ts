@@ -230,6 +230,7 @@ function ensureEnterpriseTraceOwner(
   tenantId: string,
   workspaceId: string,
   userId: string | undefined,
+  preserveExistingUser = false,
 ): void {
   const now = Date.now();
   db.prepare(`
@@ -242,6 +243,14 @@ function ensureEnterpriseTraceOwner(
   `).run(workspaceId, tenantId, workspaceId, now, now);
 
   if (!userId) return;
+  if (preserveExistingUser) {
+    const existing = db.prepare('SELECT tenant_id FROM users WHERE id = ?').get(userId) as
+      {tenant_id: string} | undefined;
+    if (existing) {
+      if (existing.tenant_id !== tenantId) throw new Error('Trace owner already exists outside the repository scope');
+      return;
+    }
+  }
   db.prepare(`
     INSERT INTO users (id, tenant_id, email, display_name, idp_subject, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -283,7 +292,7 @@ function enterpriseLocalPathForMetadata(metadata: TraceMetadata): string {
   return fallbackPath;
 }
 
-function writeEnterpriseTraceMetadata(metadata: TraceMetadata): void {
+function writeEnterpriseTraceMetadata(metadata: TraceMetadata, backingOnly = false): void {
   if (!metadata.tenantId || !metadata.workspaceId) {
     throw new Error('Enterprise trace metadata requires tenantId and workspaceId');
   }
@@ -295,30 +304,50 @@ function writeEnterpriseTraceMetadata(metadata: TraceMetadata): void {
   const createdAt = metadataDateMs(metadata.uploadedAt);
 
   withEnterpriseTraceDb((db) => {
-    ensureEnterpriseTraceOwner(db, tenantId, workspaceId, ownerUserId ?? undefined);
-    const expiresAt = resolveEnterpriseRetentionExpiresAt(
-      db,
-      { tenantId, workspaceId, ...(ownerUserId ? { userId: ownerUserId } : {}) },
-      'trace',
-      createdAt,
-    );
-    const repo = createEnterpriseWorkspaceRepository<TraceAssetRow>(db, 'trace_assets');
-    const changes = repo.upsertById(
-      { tenantId, workspaceId, ...(ownerUserId ? { userId: ownerUserId } : {}) },
-      metadata.id,
-      {
-        owner_user_id: ownerUserId,
-        local_path: enterpriseLocalPathForMetadata(metadata),
-        size_bytes: metadata.size,
-        status: metadata.status,
-        metadata_json: metadataJsonForRow(metadata),
-        created_at: createdAt,
-        expires_at: expiresAt,
-      },
-    );
-    if (changes === 0) {
-      throw new Error('Trace metadata id already exists outside the repository scope');
-    }
+    const write = () => {
+      const scope = {tenantId, workspaceId, ...(ownerUserId ? {userId: ownerUserId} : {})};
+      const repo = createEnterpriseWorkspaceRepository<TraceAssetRow>(db, 'trace_assets');
+      const localPath = enterpriseLocalPathForMetadata(metadata);
+      const existing = backingOnly ? repo.getById(scope, metadata.id) : null;
+      if (existing) {
+        const extra = parseMetadataJson(existing.metadata_json);
+        const externalRpc = metadata.externalRpc === true;
+        const sameIdentity = (extra.externalRpc === true) === externalRpc &&
+          existing.size_bytes === metadata.size && (externalRpc
+            ? extra.port === metadata.port && existing.local_path === localPath
+            : path.resolve(existing.local_path) === path.resolve(localPath));
+        if (!sameIdentity) {
+          throw Object.assign(new Error('Trace processor lease backing identity conflicts with the registered Trace'),
+            {code: 'TRACE_PROCESSOR_LEASE_BACKING_CONFLICT'});
+        }
+        return;
+      }
+      ensureEnterpriseTraceOwner(db, tenantId, workspaceId, ownerUserId ?? undefined, backingOnly);
+      const expiresAt = resolveEnterpriseRetentionExpiresAt(
+        db,
+        { tenantId, workspaceId, ...(ownerUserId ? { userId: ownerUserId } : {}) },
+        'trace',
+        createdAt,
+      );
+      const changes = repo.upsertById(
+        { tenantId, workspaceId, ...(ownerUserId ? { userId: ownerUserId } : {}) },
+        metadata.id,
+        {
+          owner_user_id: ownerUserId,
+          local_path: localPath,
+          size_bytes: metadata.size,
+          status: metadata.status,
+          metadata_json: metadataJsonForRow(metadata),
+          created_at: createdAt,
+          expires_at: expiresAt,
+        },
+      );
+      if (changes === 0) {
+        throw new Error('Trace metadata id already exists outside the repository scope');
+      }
+    };
+    if (backingOnly) db.transaction(write)();
+    else write();
   });
 }
 
@@ -352,7 +381,7 @@ export function ensureTraceProcessorLeaseBackingMetadata(
     tenantId: scope.tenantId,
     workspaceId: scope.workspaceId,
     ...(scope.userId ? {userId: scope.userId} : {}),
-  });
+  }, true);
 }
 
 export function deleteTraceProcessorLeaseBackingMetadata(

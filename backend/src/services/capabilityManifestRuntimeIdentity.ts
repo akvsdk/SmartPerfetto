@@ -36,6 +36,7 @@ const PLATFORM_SHA_KEYS = new Map<string, string>([
 
 const KNOWN_PIN_KEYS = new Set([
   'PERFETTO_VERSION',
+  'PERFETTO_ARTIFACT_VERSION',
   'PERFETTO_LUCI_URL_BASE',
   ...PLATFORM_SHA_KEYS.values(),
 ]);

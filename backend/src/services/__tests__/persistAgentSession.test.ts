@@ -736,3 +736,50 @@ describe('persistAgentTurn', () => {
     expect(savedCall[1]).toEqual(expect.objectContaining({ lineage }));
   });
 });
+
+describe('complete assistant message persistence', () => {
+  it.each([{privateMode: false, partial: false}, {privateMode: false, partial: true},
+    {privateMode: true, partial: false}, {privateMode: true, partial: true}])(
+    'saves and reloads the complete safe tail through SQLite (private=$privateMode partial=$partial)', ({privateMode, partial}) => {
+      const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-complete-message-'));
+      const previousDb = process.env.SMARTPERFETTO_ENTERPRISE_DB_PATH;
+      const sessionId = 'complete-long-message'; const traceId = 'complete-long-trace';
+      const canary = 'PRIVATE_COMPLETE_MESSAGE_CANARY';
+      process.env.SMARTPERFETTO_ENTERPRISE_DB_PATH = path.join(temporaryRoot, 'sessions.sqlite');
+      SessionPersistenceService.resetForTests();
+      const conclusion = `${'A useful safe finding. '.repeat(600)}${privateMode ? canary : 'public detail'}\nSAFE_COMPLETE_ANSWER_TAIL`;
+      const result: AnalysisResult = {sessionId, success: true, findings: [], hypotheses: [], conclusion,
+        rounds: 1, confidence: 0.8, totalDurationMs: 10, partial,
+        ...(partial ? {terminationReason: 'quality_gate_failed', terminationMessage: 'Checks remain incomplete.'} : {}),
+        completion: {schemaVersion: 1, runtimeKind: 'openai-agents-sdk', status: 'completed', runId: 'message-run',
+          attemptId: 'attempt', candidateRef: 'candidate', conclusionFingerprint: analysisDeliveryFingerprint(conclusion)}};
+      try {
+        if (privateMode) registerCodeAwareCanary(sessionId, canary);
+        sessionContextManager.set(sessionId, traceId, new EnhancedSessionContext(sessionId, traceId));
+        persistAgentTurn({sessionId, traceId, query: 'Explain the result', result,
+          session: {sessionId, traceId, createdAt: 1, result, outputLanguage: 'en',
+            ...(privateMode ? {codeAwareMode: 'provider_send', codebaseIds: ['private-codebase']} : {}),
+            orchestrator: {takeSnapshot: (_id: string, _trace: string, fields: Record<string, unknown>) => ({
+              version: 1, sessionId, traceId, snapshotTimestamp: 1, ...fields,
+              analysisNotes: [], analysisPlan: null, planHistory: [], uncertaintyFlags: [],
+            })}} as any});
+        SessionPersistenceService.resetForTests();
+        const stored = SessionPersistenceService.getInstance().getSession(sessionId);
+        const assistant = stored?.messages.find(message => message.role === 'assistant');
+        expect(assistant?.content.length).toBeGreaterThan(10_000);
+        expect(assistant?.content.endsWith('SAFE_COMPLETE_ANSWER_TAIL')).toBe(true);
+        if (partial) expect(assistant?.content).toContain('结果完整性提示');
+        else expect(assistant?.content).not.toContain('结果完整性提示');
+        if (privateMode) expect(JSON.stringify(stored)).not.toContain(canary);
+        else expect(assistant?.content).toContain(conclusion);
+      } finally {
+        SessionPersistenceService.resetForTests();
+        sessionContextManager.remove(sessionId);
+        clearCodeAwareOutputGuards(sessionId);
+        if (previousDb === undefined) delete process.env.SMARTPERFETTO_ENTERPRISE_DB_PATH;
+        else process.env.SMARTPERFETTO_ENTERPRISE_DB_PATH = previousDb;
+        fs.rmSync(temporaryRoot, {recursive: true, force: true});
+      }
+    },
+  );
+});

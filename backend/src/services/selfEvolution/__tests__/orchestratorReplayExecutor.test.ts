@@ -247,13 +247,17 @@ describe('OrchestratorReplayExecutor', () => {
       registerStoredTrace: () => {
         traceServiceCalls.registered += 1;
       },
-      ensureProcessorForLease: async () => {
+      ensureProcessorForLease: async (...args: unknown[]) => {
+        expect(args).toHaveLength(3); // Synthetic isolation does not claim a product lease-store scope.
         traceServiceCalls.ensured += 1;
       },
       runWithLeases: async (
-        _leases: unknown,
+        leases: Array<Record<string, unknown>>,
         callback: () => Promise<unknown>,
-      ) => callback(),
+      ) => {
+        expect(leases.every(lease => !Object.prototype.hasOwnProperty.call(lease, 'leaseScope'))).toBe(true);
+        return callback();
+      },
       cleanupLeaseProcessor: () => {
         traceServiceCalls.cleaned += 1;
       },

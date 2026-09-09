@@ -269,7 +269,8 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
     expect(JSON.stringify(report)).not.toContain('/Users/chris');
   });
 
-  it('projects the canonical current-run source decision and claim bindings into report data', () => {
+  it.each(['absent', 'empty', 'unknown-claim'] as const)(
+    'does not promote %s source verification bindings into report data', verificationCase => {
     const reference = sanitizeSourceReference({
       referenceId: 'lookup-1',
       codebaseId: 'safe-app',
@@ -332,6 +333,13 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
       result: {
         ...baseResult('source-report-session'),
         sourceUseDecision,
+        ...(verificationCase !== 'absent' ? {sourceClaimVerificationResult: {
+          schemaVersion: 'source_claim_verifier@1' as const, status: 'passed' as const, issues: [],
+          bindings: [{claimId: verificationCase === 'unknown-claim' ? 'unknown-claim' : 'claim-1',
+            mechanismStatus: 'compatible' as const,
+            sourceReferenceIds: verificationCase === 'empty' ? [] : [reference.id],
+            traceEvidenceRefIds: ['trace-evidence-1']}],
+        }} : {}),
         conclusionContract: {
           schemaVersion: 'conclusion_contract_v1',
           mode: 'focused_answer',
@@ -358,12 +366,7 @@ describe('buildAgentDrivenReportData private knowledge projection', () => {
         status: 'corroborated',
         coverageComplete: true,
       }),
-      sourceClaimBindings: [{
-        claimId: 'claim-1',
-        mechanismStatus: 'unverified',
-        sourceReferenceIds: [reference.id],
-        traceEvidenceRefIds: ['trace-evidence-1'],
-      }],
+      sourceClaimBindings: [],
     }));
     expect(JSON.stringify(report.sourceContext)).not.toContain('/Users/chris');
     expect(JSON.stringify(report.sourceContext)).not.toContain('SECRET_');

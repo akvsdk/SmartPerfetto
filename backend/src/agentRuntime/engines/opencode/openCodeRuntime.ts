@@ -46,7 +46,7 @@ import {
 import { extractFindingsFromText } from '../../../agentv3/claudeFindingExtractor';
 import { detectFocusApps, focusAppTimeRangeFromSelection } from '../../../agentv3/focusAppDetector';
 import { localize, parseOutputLanguage, type OutputLanguage } from '../../../agentv3/outputLanguage';
-import { formatToolCallNarration, formatToolResultNarration, toolResultIsFailure } from '../../../agentv3/toolNarration';
+import { formatToolCallNarration, formatToolResultNarration, issuePrivateToolResultNarrationReceipt, toolResultIsFailure } from '../../../agentv3/toolNarration';
 import { estimateAnalysisConfidence } from '../../../agentv3/analysisTermination';
 import {planPhaseUpdatedContent} from '../../../agentv3/planPhaseEvents';
 import { type SceneType } from '../../../agentv3/sceneClassifier';
@@ -87,7 +87,6 @@ import {
 import {analysisContextUsesPrivateKnowledge} from '../../../services/resolvedAnalysisContext';
 import { verifyConclusion } from '../claude/claudeVerifier';
 import { getExtendedKnowledgeBase } from '../../../services/sqlKnowledgeBase';
-import {sanitizeCodeAwareTextWithReceipt} from '../../../services/security/codeAwareOutputRegistry';
 import {projectToolResultForExternalSurface} from '../../../services/rag/toolResultProjectionFilter';
 import {extractSourceLookupCodeReferences} from '../../../services/codebase/sourceLookupTools';
 import {finalizeSourceAwareAnalysisResultWithProjection} from '../../../services/codebase/sourceClaimVerifier';
@@ -891,6 +890,9 @@ export async function dispatchOpenCodeBridgeRequest(
       // from the raw result first.
       const resultIsFailure = toolResultIsFailure({toolName: definition.name, result});
       const projectedResult = projectToolResultForExternalSurface(definition.name, result);
+      const privateToolResultReceipt = issuePrivateToolResultNarrationReceipt({
+        toolName: definition.name, result: projectedResult, isError: resultIsFailure,
+      });
       const resultText = summarizeOpenCodeToolResult(projectedResult);
       const codeReferences = extractSourceLookupCodeReferences(definition.name, result);
       recordPlanOrPrePlanToolCall(options.analysisPlan, {
@@ -914,6 +916,7 @@ export async function dispatchOpenCodeBridgeRequest(
           taskId,
           toolName: definition.name,
           result: resultText,
+          ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
           // Narrate the projected object; resultText is byte-truncated.
           resultNarration: formatToolResultNarration({
             toolName: definition.name,
@@ -939,16 +942,23 @@ export async function dispatchOpenCodeBridgeRequest(
         throw openCodeBridgeAbortError('OpenCode SmartPerfetto MCP bridge request was aborted');
       }
       const failureMessage = err instanceof Error ? err.message : String(err);
+      const projectedFailure = projectToolResultForExternalSurface(definition.name, {
+        success: false, error: failureMessage,
+      });
+      const privateToolResultReceipt = issuePrivateToolResultNarrationReceipt({
+        toolName: definition.name, result: projectedFailure, isError: true,
+      });
       emitOpenCodeBridgeUpdateIfDeliverable(emitUpdate, options, {
         type: 'agent_response',
         content: {
           taskId,
           toolName: definition.name,
-          result: `ERROR: ${failureMessage}`,
+          result: summarizeOpenCodeToolResult(projectedFailure),
+          ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
           resultNarration: formatToolResultNarration({
             toolName: definition.name,
             args,
-            result: {success: false, error: failureMessage},
+            result: projectedFailure,
             isError: true,
             language: openCodeOutputLanguage(options),
           }),
@@ -1565,7 +1575,6 @@ function createOpenCodeProviderConfig(
           tool_call: true,
           reasoning: false,
           temperature: true,
-          limit: { context: 128_000, output: 16_384 },
           cost: { input: 0, output: 0 },
           modalities: { input: ['text'], output: ['text'] },
           status: 'active',
@@ -2852,10 +2861,8 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
       entry: 'runtime_draft', acceptedCandidate: completion, completion,
       turnIntent, outputOrigin: result.outputOrigin,
     };
-    const priorProjection = sanitizeCodeAwareTextWithReceipt(sessionId, result.conclusion);
-    result.conclusion = priorProjection.text;
-    const {deliveryContext} = finalizeSourceAwareAnalysisResultWithProjection(result, prep.sourceUse, {
-      priorProjection, context: nativeDeliveryContext,
+    const {deliveryContext, protocolProjection} = finalizeSourceAwareAnalysisResultWithProjection(result, prep.sourceUse, {
+      context: nativeDeliveryContext,
     });
     executionLease.throwIfAborted();
     const verificationPhase = runtimePerformance.startPhase('verification');
@@ -2937,8 +2944,9 @@ export class OpenCodeRuntime extends EventEmitter implements IOrchestrator {
     attachFinalizationContext(result, {
       runId, sessionId, deadlineMs, turnIntent, strategyRegistry: resolver.strategyRegistry,
       traceIdentity: {currentTraceId: traceId, referenceTraceId: options.referenceTraceId},
-      deliveryContext,
+      deliveryContext, protocolProjection,
       sourceUse: prep.sourceUse?.getSourceUseDecision(),
+      sourceScope: prep.sourceUse?.getSourceExecutionScope?.(),
       ...(artifactStore ? {evidenceReadView: artifactStore.createEvidenceReadView({
         allowedTraces: [
           {traceId, traceSide: 'current'},

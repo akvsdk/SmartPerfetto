@@ -38,8 +38,11 @@ import {
   sanitizeCodeAwareTextWithReceipt,
 } from '../security/codeAwareOutputRegistry';
 import {projectCodeAwareStreamingUpdate} from '../security/codeAwareStreamingUpdateProjection';
+import {issuePrivateToolResultNarrationReceipt} from '../../agentv3/toolNarration';
 import {LLMEchoOutputStream, type CodeRef} from '../security/llmEchoOutputFilter';
 import {ExternalKnowledgeSourceRegistry} from '../externalKnowledgeSourceRegistry';
+import {parseConclusionContractSidecar, renderConclusionContractSidecar} from '../../agent/core/conclusionContract';
+import {projectConclusionProtocol, projectConclusionContractForDisplay} from '../security/conclusionProtocolProjection';
 
 let tmpDir: string;
 const CODEBASE_SCOPE = {
@@ -47,6 +50,87 @@ const CODEBASE_SCOPE = {
   workspaceId: 'workspace-test',
   userId: 'tester',
 };
+
+describe('conclusion protocol privacy roles', () => {
+  const sessionId = 'protocol-safety';
+  const declaration = () => ({schemaVersion: 'conclusion_contract_v1' as const, mode: 'focused_answer' as const,
+    conclusions: [], clusters: [], evidenceChain: [], uncertainties: [], nextSteps: [], claims: [{
+      id: 'claim', kind: 'identity' as const, text: 'The marker was located.', references: [{
+        evidenceRefId: 'data:marker', rowIndex: 0, column: 'name', value: 'synthetic_source_marker_long_name',
+      }],
+    }]});
+  const raw = () => `A useful conclusion.\n${renderConclusionContractSidecar(declaration())}`;
+
+  it.each(['canary', 'private_query'] as const)('does not exempt a %s matching a fixed protocol literal', kind => {
+    const marker = 'conclusion_contract_v1';
+    if (kind === 'canary') registerCodeAwareCanary(sessionId, marker);
+    else registerPrivateAnalysisQueryForEcho(sessionId, marker);
+    const projected = projectConclusionProtocol(sessionId, raw());
+    expect(projected.text).not.toContain(marker);
+    expect(parseConclusionContractSidecar(projected.text).status).toBe('invalid');
+  });
+
+  it('keeps revoked and overflowed guards stronger than protocol projection', () => {
+    revokeCodeAwareOutputGuards(sessionId);
+    expect(projectConclusionProtocol(sessionId, raw()).disposition).toBe('replaced');
+    const overflow = 'protocol-overflow';
+    for (let index = 0; index < 201; index++) registerCodeAwareCanary(overflow, `private-canary-${index}`);
+    expect(projectConclusionProtocol(overflow, raw()).disposition).toBe('replaced');
+  });
+
+  it('does not retain arbitrary private fields from an invalid native declaration', () => {
+    const marker = 'UNREGISTERED_PRIVATE_ROOT';
+    const malformed = '<!-- smartperfetto:conclusion-contract@1\n```json\n' +
+      JSON.stringify({...declaration(), verified: true, rootPath: `/private/${marker}`, query: marker}) + '\n```\n-->';
+    const projected = projectConclusionProtocol(sessionId, `A safe answer.\n${malformed}`);
+    expect(projected.text).not.toContain(marker);
+    expect(parseConclusionContractSidecar(projected.text).status).toBe('invalid');
+  });
+
+  it('removes private fields and guards all public strings and dynamic selector keys', () => {
+    const marker = 'PRIVATE_PROTOCOL_CANARY';
+    registerCodeAwareCanary(sessionId, marker);
+    const contract = {...declaration(), rootPath: `/private/${marker}`, query: marker,
+      metadata: {sceneId: marker, unknown: marker},
+      conclusions: [{rank: 1, statement: marker, rawBody: marker}],
+      claims: [{...declaration().claims[0], text: marker, references: [{evidenceRefId: 'data:marker',
+        rowSelector: {[marker]: marker}, column: marker, value: marker}]}],
+    };
+    const projected = projectConclusionProtocol(sessionId, `${marker}\n${renderConclusionContractSidecar(contract)}`);
+    expect(projected.text).not.toContain(marker);
+    expect(projected.text).not.toContain('rootPath');
+    expect(projected.text).not.toContain('unknown');
+    expect(JSON.stringify(projectConclusionContractForDisplay(sessionId, contract))).not.toContain(marker);
+  });
+
+  it('is idempotent for quoted CodeRefs on sidecar, typed JSON and stored declarations', () => {
+    registerOnDemandSourceLookupForEcho(sessionId, [{referenceId: 'lookup', codebaseId: 'app',
+      filePath: 'src/Probe"Data.kt', lineRange: {start: 1, end: 1},
+      text: 'const marker = "synthetic_source_marker_long_name";'}]);
+    for (const input of [raw(), JSON.stringify({...declaration(), relationProposals: []}),
+      `\`\`\`json\n${JSON.stringify({...declaration(), relationProposals: []})}\n\`\`\``]) {
+      const first = projectConclusionProtocol(sessionId, input).text;
+      expect(first).not.toContain('synthetic_source_marker_long_name');
+      expect(projectConclusionProtocol(sessionId, first).text).toBe(first);
+    }
+    const projected = projectConclusionContractForDisplay(sessionId, declaration());
+    expect(projectConclusionContractForDisplay(sessionId, projected)).toEqual(projected);
+  });
+
+  it.each(['captured.cell', 'source.location', 'numeric.cell'])('preserves the registered proof predicate %s through source matching', predicate => {
+    registerOnDemandSourceLookupForEcho(sessionId, [{referenceId: 'lookup', codebaseId: 'app', filePath: 'src/Probe.kt',
+      text: predicate}]);
+    const contract = declaration();
+    const withSemantics = {...contract, claims: [{...contract.claims[0], semantics: {
+      schemaVersion: 'claim_semantics@1' as const, predicate, polarity: 'affirmed' as const,
+      discourse: 'asserted' as const, quantifier: 'one' as const, modality: 'certain' as const,
+      scope: {population: 'cited_rows' as const},
+    }}]};
+    expect(projectConclusionContractForDisplay(sessionId, withSemantics)?.claims?.[0].semantics?.predicate).toBe(predicate);
+    registerCodeAwareCanary(sessionId, predicate);
+    expect(JSON.stringify(projectConclusionContractForDisplay(sessionId, withSemantics))).not.toContain(predicate);
+  });
+});
 
 describe('structured projection across execution realms', () => {
   it('preserves ordinary foreign JSON data without inventing a privacy change', () => {
@@ -428,6 +512,23 @@ describe('CodeLookupLedger', () => {
 });
 
 describe('filterRagLookup', () => {
+  it('admits only authorized redacted source bodies before granting patch context or spending tokens', async () => {
+    const {registry, codebaseId, sourceGeneration} = makeRegistry(true);
+    const ledger = new CodeLookupLedger('admission', 100, 2, path.join(tmpDir, 'admission.jsonl'));
+    const seen: string[] = [];
+    const source = makeChunk({codebaseId, sourceGeneration, snippet: 'class PRIVATE_ADMISSION_BODY { val api_key = "1234567890" }'});
+    const filtered = await filterRagLookup(makeRawResult(source), {toolName: 'lookup_app_source', turn: 0,
+      codebaseRegistry: registry, knowledgeScope: CODEBASE_SCOPE, ledger, sessionId: 'admission',
+      admitSourceHit: hit => {seen.push(hit.snippet ?? ''); return false;}});
+    await ledger.flush();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toContain('1234567890');
+    expect(filtered.hits).toEqual([]);
+    expect(ledger.hasPriorLookupOf(source.chunkId)).toBe(false);
+    expect(ledger.remainingTokens()).toBe(100);
+    expect(sanitizeCodeAwareText('admission', 'PRIVATE_ADMISSION_BODY')).toBe('PRIVATE_ADMISSION_BODY');
+  });
+
   it('redacts secrets and records successful user codebase lookups when consent allows provider send', async () => {
     const {registry, codebaseId, sourceGeneration} = makeRegistry(true);
     const ledger = new CodeLookupLedger('session-b', 1000, 1, path.join(tmpDir, 'ledger-b.jsonl'));
@@ -1131,7 +1232,107 @@ describe('tool result projection and session registry', () => {
 describe('code-aware streaming application boundary', () => {
   const timestamp = 1714600000000;
 
-  it('suppresses live answer tokens and replaces reasoning with localized progress', () => {
+  it('distinguishes real SQL, source search and source read calls without copying their arguments', () => {
+    const calls = ['execute_sql', 'search_codebase', 'read_codebase_file'].map(toolName =>
+      projectCodeAwareStreamingUpdate('session-stream', {
+        type: 'agent_task_dispatched', timestamp,
+        content: {toolName, args: {query: 'PRIVATE_QUERY', file_path: '/PRIVATE_ROOT/Main.kt'},
+          message: 'PRIVATE_MODEL_PROSE', privateSafe: true},
+      }, true, 'zh-CN'));
+    expect(calls.every(call => call?.type === 'tool_call')).toBe(true);
+    expect(new Set(calls.map(call => call?.content.message)).size).toBe(3);
+    expect(calls[0]?.content.message).toContain('SQL');
+    expect(calls[1]?.content.message).toContain('搜索源码');
+    expect(calls[2]?.content.message).toContain('读取源码');
+    expect(JSON.stringify(calls)).not.toContain('PRIVATE_');
+    expect(JSON.stringify(calls)).not.toContain('隐私策略隐藏');
+  });
+
+  it('reports source body availability from projected execution results only', () => {
+    const raw = {success: true, codebaseId: 'cb-app', reference: {
+      referenceId: 'source-visible', codebaseId: 'cb-app', filePath: 'src/Main.kt',
+      lineRange: {start: 1, end: 2}, text: 'PRIVATE_SOURCE_BODY',
+    }};
+    const projectedResult = projectToolResultForExternalSurface('read_codebase_file', raw);
+    const update = projectCodeAwareStreamingUpdate('session-stream', {
+      type: 'agent_response', timestamp, content: {
+        toolName: 'read_codebase_file', result: projectedResult,
+        resultNarration: 'PRIVATE_FORGED_NARRATION', isError: false,
+      },
+    }, true, 'zh-CN');
+    expect(update?.content.resultNarration).toContain('已读取授权内容');
+    expect(JSON.stringify(update)).not.toContain('PRIVATE_');
+    expect(JSON.stringify(update)).not.toContain('Main.kt');
+    expect(projectCodeAwareStreamingUpdate('session-stream', {
+      type: 'agent_response', timestamp, content: {
+        toolName: 'read_codebase_file', result: '{truncated',
+        resultNarration: 'PRIVATE_FORGED_NARRATION', privateSafe: true,
+      },
+    }, true, 'zh-CN')).toBeNull();
+  });
+
+  it('retains automatic phase outcomes without private phase titles or IDs', () => {
+    const update = projectCodeAwareStreamingUpdate('session-stream', {
+      type: 'plan_phase_updated', timestamp,
+      content: {origin: 'auto', status: 'completed', phaseId: 'PRIVATE_ID', summary: 'PRIVATE_SUMMARY'},
+    }, true, 'zh-CN');
+    expect(update?.content.message).toBe('当前分析阶段已完成');
+    expect(JSON.stringify(update)).not.toContain('PRIVATE_');
+  });
+
+  it('retains only bounded protocol diagnostics without private text or message narration', () => {
+    const diagnostic = {
+      schemaVersion: 'candidate_protocol_diagnostic@1', stage: 'native', candidateIndex: 1,
+      status: 'invalid', sidecarStatus: 'invalid', typedJsonStatus: 'not_checked',
+      issueCodes: ['invalid_reference'], issueCount: 1, rawChars: 210, canonicalChars: 80,
+      projectionKind: 'protocol_projection',
+    };
+    const event = {type: 'progress' as const, timestamp, content: {
+      phase: 'candidate_protocol', candidateProtocolDiagnostic: diagnostic,
+      message: 'PRIVATE_MODEL_BODY', path: '/PRIVATE_ROOT/App.kt',
+    }};
+    const projected = projectCodeAwareStreamingUpdate('session-stream', event, true, 'zh-CN');
+    expect(projected?.content).toEqual({
+      phase: 'candidate_protocol', candidateProtocolDiagnostic: diagnostic,
+    });
+    expect(JSON.stringify(projected)).not.toContain('PRIVATE_');
+    expect(projected?.content).not.toHaveProperty('message');
+    for (const invalid of [
+      {...diagnostic, raw: 'PRIVATE_MODEL_BODY'},
+      {...diagnostic, path: '/PRIVATE_ROOT/App.kt'},
+      {...diagnostic, issueCodes: ['PRIVATE_MODEL_BODY']},
+      {...diagnostic, rawChars: 'PRIVATE_MODEL_BODY'},
+      {...diagnostic, candidateIndex: 3},
+    ]) {
+      expect(projectCodeAwareStreamingUpdate('session-stream', {
+        ...event, content: {...event.content, candidateProtocolDiagnostic: invalid},
+      }, true, 'zh-CN')).toBeNull();
+    }
+  });
+
+  it('preserves intact source outcomes after transport truncation only with a locally issued receipt', () => {
+    const result = projectToolResultForExternalSurface('search_codebase', {
+      success: true, codebaseId: 'cb-app', matches: Array.from({length: 20}, (_,index) => ({
+        referenceId: `source-${index}`, codebaseId: 'cb-app', filePath: `src/PRIVATE_FILE_${index}.kt`,
+        lineRange: {start: 1, end: 3}, text: 'PRIVATE_SOURCE_BODY',
+      })),
+    });
+    const wire = JSON.stringify(result).slice(0, 2000);
+    expect(() => JSON.parse(wire)).toThrow();
+    const receipt = issuePrivateToolResultNarrationReceipt({toolName: 'search_codebase', result});
+    const event = {type: 'agent_response' as const, timestamp, content: {
+      toolName: 'search_codebase', result: wire, privateToolResultReceipt: receipt,
+    }};
+    const projected = projectCodeAwareStreamingUpdate('session-stream', event, true, 'zh-CN');
+    expect(projected?.content.resultNarration).toContain('已读取授权内容');
+    expect(JSON.stringify(projected)).not.toContain('PRIVATE_');
+    expect(projected?.content).not.toHaveProperty('privateToolResultReceipt');
+    expect(projectCodeAwareStreamingUpdate('session-stream', JSON.parse(JSON.stringify(event)), true, 'zh-CN')).toBeNull();
+    expect(projectCodeAwareStreamingUpdate('session-stream', {...event, content: {...event.content,
+      toolName: 'read_codebase_file'}}, true, 'zh-CN')).toBeNull();
+  });
+
+  it('suppresses live answer tokens and omits private reasoning without filler', () => {
     const answer = projectCodeAwareStreamingUpdate(
       'session-stream',
       {type: 'answer_token', content: {token: 'PRIVATE_TOKEN_CANARY'}, timestamp},
@@ -1145,13 +1346,9 @@ describe('code-aware streaming application boundary', () => {
       'zh-CN',
     );
 
-    expect(answer.content).toEqual({suppressed: true});
+    expect(answer?.content).toEqual({suppressed: true});
     expect(JSON.stringify(answer)).not.toContain('PRIVATE_TOKEN_CANARY');
-    expect(thought.type).toBe('progress');
-    expect(thought.content).toEqual(expect.objectContaining({
-      phase: 'thought',
-      privateModelTextSuppressed: true,
-    }));
+    expect(thought).toBeNull();
     expect(JSON.stringify(thought)).not.toContain('PRIVATE_REASONING_CANARY');
   });
 
@@ -1186,11 +1383,7 @@ describe('code-aware streaming application boundary', () => {
       'en',
     );
 
-    expect(projected.type).toBe('progress');
-    expect(projected.content).toEqual(expect.objectContaining({
-      privateModelTextSuppressed: true,
-      sourceEventType: type,
-    }));
+    expect(projected).toBeNull();
     expect(JSON.stringify(projected)).not.toContain('PRIVATE_');
   });
 
@@ -1205,7 +1398,7 @@ describe('code-aware streaming application boundary', () => {
       true,
       'en',
     );
-    expect(projected.type).toBe('progress');
+    expect(projected).toBeNull();
     expect(JSON.stringify(projected)).not.toContain('PRIVATE_INVALID_DATA_CANARY');
   });
 
@@ -1236,13 +1429,13 @@ describe('code-aware streaming application boundary', () => {
       'en',
     );
 
-    expect(projected.type).toBe('data');
+    expect(projected?.type).toBe('data');
     expect(JSON.stringify(projected)).not.toContain(canary);
-    expect(projected.content).not.toHaveProperty('sql');
-    expect(projected.content.meta).not.toHaveProperty('queryReview');
-    expect(projected.content.meta).not.toHaveProperty('intent');
-    expect(projected.content.data.rows[0][0]).toBe(42);
-    expect(projected.content.data).not.toHaveProperty('executableSql');
+    expect(projected?.content).not.toHaveProperty('sql');
+    expect(projected?.content.meta).not.toHaveProperty('queryReview');
+    expect(projected?.content.meta).not.toHaveProperty('intent');
+    expect(projected?.content.data.rows[0][0]).toBe(42);
+    expect(projected?.content.data).not.toHaveProperty('executableSql');
   });
 
   it('replaces private error and progress payloads with localized control messages', () => {
@@ -1262,7 +1455,8 @@ describe('code-aware streaming application boundary', () => {
         'en',
       );
       expect(JSON.stringify(projected)).not.toContain('PRIVATE_');
-      expect(projected.content.privateModelTextSuppressed).toBe(true);
+      if (type === 'error') expect(projected?.content.privateModelTextSuppressed).toBe(true);
+      else expect(projected).toBeNull();
     }
   });
 
@@ -1282,8 +1476,8 @@ describe('code-aware streaming application boundary', () => {
       'en',
     );
 
-    expect(projected.type).toBe('progress');
-    expect(projected.content).toMatchObject({
+    expect(projected?.type).toBe('progress');
+    expect(projected?.content).toMatchObject({
       sourceEventType: 'degraded',
       degradedFallback: 'verification_failed',
       degradedIssueType: 'unresolved_hypothesis',
@@ -1304,8 +1498,7 @@ describe('code-aware streaming application boundary', () => {
       true,
       'en',
     );
-    expect(unsafe.content).not.toHaveProperty('degradedFallback');
-    expect(unsafe.content).not.toHaveProperty('degradedIssueType');
+    expect(unsafe).toBeNull();
   });
 
   it('keeps ordinary sessions byte-preserving and sanitizes source-aware conclusions', () => {
@@ -1328,10 +1521,10 @@ describe('code-aware streaming application boundary', () => {
       true,
       'en',
     );
-    expect(conclusion.content.conclusion).not.toContain('CONCLUSION_PRIVATE_CANARY');
-    expect(conclusion.content).not.toHaveProperty('rawAnswer');
-    expect(conclusion.content).not.toHaveProperty('findings');
-    expect(conclusion.content.confidence).toBe(0.8);
+    expect(conclusion?.content.conclusion).not.toContain('CONCLUSION_PRIVATE_CANARY');
+    expect(conclusion?.content).not.toHaveProperty('rawAnswer');
+    expect(conclusion?.content).not.toHaveProperty('findings');
+    expect(conclusion?.content.confidence).toBe(0.8);
   });
 
   it('allows only sanitized source supplement text and numeric metrics', () => {
@@ -1351,14 +1544,14 @@ describe('code-aware streaming application boundary', () => {
       'en',
     );
 
-    expect(projected.type).toBe('analysis_source_enrichment_completed');
-    expect(projected.content.message).not.toContain('SOURCE_SUPPLEMENT_PRIVATE_CANARY');
-    expect(projected.content.metrics).toEqual({
+    expect(projected?.type).toBe('analysis_source_enrichment_completed');
+    expect(projected?.content.message).not.toContain('SOURCE_SUPPLEMENT_PRIVATE_CANARY');
+    expect(projected?.content.metrics).toEqual({
       searchCalls: 3,
       readCalls: 7,
       durationMs: 9000,
     });
-    expect(projected.content).not.toHaveProperty('rawToolPayload');
+    expect(projected?.content).not.toHaveProperty('rawToolPayload');
   });
 
   it('fails closed when one long-lived session exceeds the guard pattern budget', () => {
@@ -1509,5 +1702,142 @@ describe('LLMEchoOutputStream', () => {
       splitStream.flush();
     expect(split).not.toContain('PRIVATE_BOUNDARY_SECRET');
     expect(split).toContain('[Code: boundarySecret @ src/Boundary.kt]');
+  });
+});
+
+describe('source echo text units', () => {
+  const ref: CodeRef = {chunkId: 'source-one', codebaseId: 'app', filePath: 'StartupHooks.kt', lineRange: {start: 1, end: 24}};
+  const label = '[Code: source-one @ StartupHooks.kt:1-24]';
+  const source = fs.readFileSync(path.resolve(__dirname, '../../../tests/e2e/context-fixtures/app/StartupHooks.kt'), 'utf8');
+  function project(text: string, cuts: number[] = [], register?: (stream: LLMEchoOutputStream) => void, bytes = false) {
+    const stream = new LLMEchoOutputStream(64);
+    if (register) register(stream); else stream.registerSnippet(source, ref);
+    const input = bytes ? Buffer.from(text) : text;
+    let output = ''; let start = 0;
+    for (const end of [...cuts, input.length]) {output += stream.write(input.slice(start, end)); start = end;}
+    output += stream.flush();
+    return {output, stats: stream.stats()};
+  }
+
+  it('replaces the actual A2 broken-word source quotes as complete units at every split', () => {
+    const text = '方法 `fun initializeOnMainThread() { ... }`；策略 “avoid synchronous disk I/O before first frame”。';
+    const expected = `方法 ${label}；策略 ${label}。`;
+    expect(project(text).output).toBe(expected);
+    for (let cut = 0; cut <= text.length; cut++) expect(project(text, [cut]).output).toBe(expected);
+    expect(project(text, Array.from({length: text.length}, (_, index) => index)).output).toBe(expected);
+  });
+
+  it('expands unquoted qualified identifiers instead of leaving prefix or suffix fragments', () => {
+    const text = 'Call StartupHooks.initializeOnMainThread before first frame.';
+    const value = project(text).output;
+    expect(value).toBe(`Call ${label} before first frame.`);
+    expect(value).not.toMatch(/in\[Code|\]ore/);
+  });
+
+  it('respects escaped and nested quote/code delimiters', () => {
+    const text = 'Outer “text `fun initializeOnMainThread() { ... }` and \\"quoted\\" text” tail.';
+    const expected = `Outer ${label} tail.`;
+    for (let cut = 0; cut <= text.length; cut++) expect(project(text, [cut]).output).toBe(expected);
+    const fenced = 'Before\n```kotlin\nfun initializeOnMainThread() {\n}\n```\nAfter';
+    expect(project(fenced).output).toBe(`Before\n${label}\nAfter`);
+  });
+
+  it('keeps source origin collisions neutral and hard private policies stronger than a source ref', () => {
+    const snippet = 'privateSharedIdentifierCall()';
+    const bothSources = (stream: LLMEchoOutputStream) => {
+      stream.registerSnippet(snippet, ref);
+      stream.registerSnippet(snippet, {...ref, chunkId: 'source-two', filePath: 'Other.kt'});
+    };
+    expect(project(snippet, [], bothSources).output).toBe('[Code: multiple source references]');
+    for (const order of [false, true]) {
+      const register = (stream: LLMEchoOutputStream) => {
+        if (order) stream.registerPrivateSnippet(snippet, '[PRIVATE_QUERY_REFERENCE]');
+        stream.registerSnippet(snippet, ref);
+        if (!order) stream.registerPrivateSnippet(snippet, '[PRIVATE_QUERY_REFERENCE]');
+      };
+      expect(project(snippet, [], register).output).toBe('[PRIVATE_QUERY_REFERENCE]');
+      expect(project(snippet, [], stream => {register(stream); stream.registerCanary(snippet);} ).output).toBe('[REDACTED_CODE_ECHO]');
+    }
+  });
+
+  it('is idempotent only for exact registered CodeRefs and still filters hard secrets inside them', () => {
+    const local: CodeRef = {...ref, symbol: 'privateSharedIdentifierCall'};
+    const register = (stream: LLMEchoOutputStream) => stream.registerSnippet('privateSharedIdentifierCall()', local);
+    const first = project('privateSharedIdentifierCall()', [], register).output;
+    expect(project(first, [], register).output).toBe(first);
+    expect(project('[Code: privateSharedIdentifierCall() @ unregistered.kt]', [], register).output).not.toContain('privateSharedIdentifierCall()');
+    expect(project(first, [], stream => {register(stream); stream.registerCanary('privateSharedIdentifierCall');}).output)
+      .not.toContain('privateSharedIdentifierCall');
+    const guarded = project('privateSharedIdentifierCall()', [], stream => {register(stream); stream.registerCanary('privateSharedIdentifierCall');});
+    expect(JSON.stringify(guarded.stats)).not.toContain('privateSharedIdentifierCall');
+  });
+
+  it('decodes all UTF-8 byte splits consistently around a secret and source text', () => {
+    const text = '中文😀 before `fun initializeOnMainThread() { ... }` after 🚀';
+    const expected = project(text).output;
+    for (let cut = 0; cut <= Buffer.byteLength(text); cut++) expect(project(text, [cut], undefined, true).output).toBe(expected);
+    expect(project(text, Array.from({length: Buffer.byteLength(text)}, (_, index) => index), undefined, true).output).toBe(expected);
+  });
+
+  it('counts string chunks as the complete UTF-8 input even when a surrogate pair spans writes', () => {
+    const text = '中文😀 before `fun initializeOnMainThread() { ... }` after 🚀';
+    const expected = project(text);
+    for (let cut = 0; cut <= text.length; cut++) {
+      const split = project(text, [cut]);
+      expect(split.output).toBe(expected.output);
+      expect(split.stats.bytesProcessed).toBe(Buffer.byteLength(text));
+      expect(split.stats.redactedBytes).toBe(expected.stats.redactedBytes);
+    }
+    const everyCharacter = project(text, Array.from({length: text.length}, (_, index) => index));
+    expect(everyCharacter.stats.bytesProcessed).toBe(Buffer.byteLength(text));
+    const orphan = new LLMEchoOutputStream();
+    orphan.write('\uD83D');
+    orphan.flush();
+    expect(orphan.stats().bytesProcessed).toBe(3);
+    orphan.flush();
+    expect(orphan.stats().bytesProcessed).toBe(3);
+  });
+
+  it('counts oversized discarded units correctly across string surrogate boundaries', () => {
+    const unit = `"${'safe '.repeat(1300)}😀 end"`;
+    const text = `Before ${unit} After`;
+    const expected = project(text);
+    expect(expected.output).toBe('Before [PRIVATE_OUTPUT_SUPPRESSED] After');
+    expect(expected.stats.redactedBytes).toBe(Buffer.byteLength(unit));
+    const emoji = text.indexOf('😀');
+    for (const cut of [6143, 6144, 6145, emoji, emoji + 1, emoji + 2, text.length]) {
+      const split = project(text, [cut]);
+      expect(split.output).toBe(expected.output);
+      expect(split.stats.bytesProcessed).toBe(Buffer.byteLength(text));
+      expect(split.stats.redactedBytes).toBe(Buffer.byteLength(unit));
+    }
+    const everyCharacter = project(text, Array.from({length: text.length}, (_, index) => index));
+    expect(everyCharacter.stats.bytesProcessed).toBe(Buffer.byteLength(text));
+    expect(everyCharacter.stats.redactedBytes).toBe(Buffer.byteLength(unit));
+    const unclosed = `Before "${'safe '.repeat(1300)}\uD83D`;
+    expect(project(unclosed).stats.redactedBytes).toBe(Buffer.byteLength(unclosed.slice(7)));
+  });
+
+  it('never leaves a split Unicode scalar when a derived source window starts inside an emoji', () => {
+    const snippet = `${'a'.repeat(11)}😀${'中文'.repeat(25)}`;
+    const text = `prefix ${snippet.slice(11, 41)} suffix`;
+    const register = (stream: LLMEchoOutputStream) => stream.registerSnippet(snippet, ref);
+    const complete = project(text, [], register).output;
+    expect(Buffer.from(complete, 'utf8').toString('utf8')).toBe(complete);
+    for (let cut = 0; cut <= Buffer.byteLength(text); cut++) expect(project(text, [cut], register, true).output).toBe(complete);
+  });
+
+  it('suppresses only an over-budget or unclosed unit and resumes following text without a whole-answer cap', () => {
+    const long = 'safe '.repeat(700);
+    for (const quote of ['"', '`', '```']) {
+      const text = `Before ${quote}${long}${quote} After\n${'ordinary text. '.repeat(1000)}`;
+      const expected = project(text).output;
+      expect(expected).toContain('Before [PRIVATE_OUTPUT_SUPPRESSED] After');
+      expect(expected).toContain('ordinary text. '.repeat(1000));
+      for (const cut of [1, 63, 2047, 2048, 2049, 4095, text.length - 2]) expect(project(text, [cut]).output).toBe(expected);
+      expect(project(text, Array.from({length: text.length}, (_, index) => index)).output).toBe(expected);
+    }
+    expect(project('Before `unfinished code').output).toBe('Before [PRIVATE_OUTPUT_SUPPRESSED]');
+    expect(project('Before “unfinished quote').output).toBe('Before [PRIVATE_OUTPUT_SUPPRESSED]');
   });
 });

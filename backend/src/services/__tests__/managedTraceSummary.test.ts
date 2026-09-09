@@ -16,7 +16,9 @@ import {TraceProcessorService} from '../traceProcessorService';
 
 describe('managedTraceSummary', () => {
   it('passes the active path, port, and exact running binary selection to the executor', async () => {
+    const invalidate = jest.fn();
     const source: ManagedTraceSummarySource = {
+      invalidateNativeProvenance: invalidate,
       getRunningTraceSummaryInput: (_traceId, options) => {
         expect(options).toEqual({leaseId: 'lease-a', leaseMode: 'shared'});
         return {
@@ -30,6 +32,7 @@ describe('managedTraceSummary', () => {
       },
     };
     const executor: ManagedTraceSummaryExecutor = async (input, dependencies) => {
+      expect(invalidate).toHaveBeenCalledWith('trace-a', {leaseId: 'lease-a', leaseMode: 'shared'});
       expect(input).toEqual({
         tracePath: '/private/trace.pftrace', traceSide: 'reference', remotePort: 9876,
       });
@@ -49,6 +52,7 @@ describe('managedTraceSummary', () => {
       {leaseId: 'lease-a', leaseMode: 'shared'},
     );
     expect(result.status).toBe('unavailable');
+    expect(invalidate).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(result)).not.toContain('/private/');
   });
 

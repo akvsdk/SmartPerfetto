@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "clock": {
+    "anchor": "trace-middle",
+    "duration_ns": "500000000"
+  },
+  "actors": {
+    "processes": [
+      {
+        "id": "app",
+        "name": "com.smartperfetto.fixture",
+        "uid": 10999
+      },
+      {
+        "id": "unframed",
+        "name": "com.smartperfetto.unframed",
+        "uid": 11000
+      },
+      {
+        "id": "unlabeled",
+        "name": "com.smartperfetto.unlabeled",
+        "uid": 11001
+      }
+    ],
+    "threads": [
+      {
+        "id": "app-main",
+        "process": "app",
+        "name": "main",
+        "is_main": true
+      },
+      {
+        "id": "unframed-main",
+        "process": "unframed",
+        "name": "main",
+        "is_main": true
+      },
+      {
+        "id": "unlabeled-main",
+        "process": "unlabeled",
+        "name": "main",
+        "is_main": true
+      }
+    ]
+  },
+  "signals": [
+    {
+      "type": "atrace-slice",
+      "at_ns": "1000000",
+      "duration_ns": "1000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "SmartPerfetto::CASE::main-thread-frame-work",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "10000000",
+      "duration_ns": "22000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "Choreographer#doFrame 1001",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "32000000",
+      "duration_ns": "30000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "ContentLoader$MainHandler: initializeContent",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "34000000",
+      "duration_ns": "25000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "ContentRepository.initialize",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "36000000",
+      "duration_ns": "14000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "parseContentModel",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "50000000",
+      "duration_ns": "8000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "inflateContentViews",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "62000000",
+      "duration_ns": "24000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "Choreographer#doFrame 1002",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "90000000",
+      "duration_ns": "40000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "ContentLoader$MainHandler: bindRemainingContent",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "130000000",
+      "duration_ns": "8000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "Choreographer#doFrame 1003",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "150000000",
+      "duration_ns": "40000000",
+      "process": "unframed",
+      "thread": "unframed-main",
+      "name": "ContentRepository.initializeWithoutFrameMarker",
+      "cpu": 31
+    },
+    {
+      "type": "atrace-slice",
+      "at_ns": "399000000",
+      "duration_ns": "1000000",
+      "process": "app",
+      "thread": "app-main",
+      "name": "SmartPerfetto::END::main-thread-frame-work",
+      "cpu": 31
+    },
+    {
+      "type": "sched-running",
+      "at_ns": "10000000",
+      "duration_ns": "45000000",
+      "thread": "app-main",
+      "cpu": 31,
+      "end_state": "R"
+    },
+    {
+      "type": "sched-running",
+      "at_ns": "57000000",
+      "duration_ns": "29000000",
+      "thread": "app-main",
+      "cpu": 31,
+      "end_state": "S"
+    },
+    {
+      "type": "sched-running",
+      "at_ns": "90000000",
+      "duration_ns": "20000000",
+      "thread": "app-main",
+      "cpu": 31,
+      "end_state": "D"
+    },
+    {
+      "type": "sched-running",
+      "at_ns": "120000000",
+      "duration_ns": "19000000",
+      "thread": "app-main",
+      "cpu": 31,
+      "end_state": "S"
+    },
+    {
+      "type": "sched-running",
+      "at_ns": "150000000",
+      "duration_ns": "40000000",
+      "thread": "unframed-main",
+      "cpu": 30,
+      "end_state": "S"
+    },
+    {
+      "type": "sched-running",
+      "at_ns": "210000000",
+      "duration_ns": "35000000",
+      "thread": "unlabeled-main",
+      "cpu": 29,
+      "end_state": "S"
+    }
+  ]
+}

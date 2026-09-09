@@ -19,6 +19,7 @@ import type {
 } from './traceSummarySpecRegistry';
 
 export interface ManagedTraceSummarySource {
+  invalidateNativeProvenance?: (traceId: string, options?: TraceProcessorServiceQueryOptions) => void;
   getRunningTraceSummaryInput?: (
     traceId: string,
     options?: TraceProcessorServiceQueryOptions,
@@ -95,6 +96,7 @@ export async function executeManagedTraceSummaryV1(
   if (managed.source === 'external_rpc') {
     return unavailableTraceSummaryV1('external_rpc_unsupported');
   }
+  source.invalidateNativeProvenance?.(traceId, options);
   return (dependencies.executor ?? executeTraceSummaryV1)({
     tracePath: managed.tracePath,
     traceSide,

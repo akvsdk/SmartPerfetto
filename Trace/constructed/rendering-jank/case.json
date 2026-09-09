@@ -464,7 +464,7 @@
           "total_gaps",
           "ui_no_frame_count",
           "rt_no_drawframe_count",
-          "sf_backpressure_count",
+          "drawframe_observed_count",
           "max_gap_ms"
         ],
         "required_marker": "SmartPerfetto::CASE::rendering-jank"
@@ -1036,6 +1036,10 @@
           "input_event_backlog_threshold": 3
         },
         "required_steps": [
+          "main_thread_work_summary",
+          "main_thread_work_tasks",
+          "main_thread_work_sources",
+          "main_thread_work_cadence",
           "init_cpu_topology",
           "frame_timeline_check",
           "vsync_config",
@@ -1061,6 +1065,10 @@
           "fallback_no_frame_timeline"
         ],
         "required_sql_steps": [
+          "main_thread_work_summary",
+          "main_thread_work_tasks",
+          "main_thread_work_sources",
+          "main_thread_work_cadence",
           "frame_timeline_check",
           "vsync_config",
           "buffer_tx_coverage_probe",
@@ -1608,7 +1616,7 @@
         "id": "strategy-game",
         "type": "strategy",
         "target": "game",
-        "query": "游戏",
+        "query": "\u6e38\u620f",
         "expected_strategy": "game",
         "source_file": "backend/strategies/game.strategy.md",
         "required_marker": "SmartPerfetto::CASE::rendering-jank"
@@ -1617,7 +1625,7 @@
         "id": "strategy-scroll_response",
         "type": "strategy",
         "target": "scroll_response",
-        "query": "滑动响应",
+        "query": "\u6ed1\u52a8\u54cd\u5e94",
         "expected_strategy": "scroll_response",
         "source_file": "backend/strategies/scroll-response.strategy.md",
         "required_marker": "SmartPerfetto::CASE::rendering-jank"
@@ -1626,7 +1634,7 @@
         "id": "strategy-scrolling",
         "type": "strategy",
         "target": "scrolling",
-        "query": "滑动",
+        "query": "\u6ed1\u52a8",
         "expected_strategy": "scrolling",
         "source_file": "backend/strategies/scrolling.strategy.md",
         "required_marker": "SmartPerfetto::CASE::rendering-jank"

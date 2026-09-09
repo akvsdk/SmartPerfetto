@@ -14,6 +14,9 @@ import {
   encodeQueryResult,
 } from './traceProcessorProtobuf';
 import { executeTraceProcessorHttpRpcSql } from './traceProcessorHttpRpcClient';
+import {createRawSqlNativeProvenance, initializeRawSqlNativeProvenance, invalidateRawSqlNativeProvenance, revalidateRawSqlNativeProvenance,
+  readRawSqlNativeProvenanceSnapshot, type RawSqlNativeProvenanceSnapshot,
+  type RawSqlBootstrapCapability, type RawSqlNativeProvenance} from './evidence/rawSqlNativeProvenance';
 import { getPortPool } from './portPool';
 import { traceProcessorConfig } from '../config';
 import logger, {diagnosticLogIdentity} from '../utils/logger';
@@ -165,6 +168,18 @@ const CRITICAL_STDLIB_MODULES = [
   'android.startup.startups',   // 16 skills, 32 TS refs — startup analysis foundation
   'android.binder',             // 22 skills,  6 TS refs — IPC/blocking analysis foundation
 ];
+// A client can remember a disclosed port after its original processor exits.
+// This set is deliberately independent of processor lifetime and pool reuse.
+const exposedNativePorts = new Set<number>();
+
+export function normalizeTraceProcessorRpcPort(value: unknown): number {
+  const port = typeof value === 'number' ? value
+    : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value.trim()) : NaN;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    throw new Error('Invalid trace processor RPC port');
+  }
+  return port;
+}
 
 export function isFatalTraceProcessorListenFailure(text: string): boolean {
   if (!(text.includes('Failed to listen') || text.includes('Address already in use'))) {
@@ -480,6 +495,8 @@ export interface TraceProcessorCreateOptions {
   processorKey?: string;
   leaseId?: string;
   leaseMode?: 'shared' | 'isolated' | string;
+  /** Derived by the service from a scoped server-owned analysis lease. */
+  analysisRunPrivate?: boolean;
 }
 
 function probeOk(startTime: number, detail?: string): TraceProcessorHealthProbeResult {
@@ -557,6 +574,8 @@ async function probeDedicatedHealthQuery(
  * 4. Properly cleans up the process on destroy
  */
 export class WorkingTraceProcessor extends EventEmitter implements TraceProcessor {
+  private readonly nativeProvenance: RawSqlNativeProvenance;
+  private readonly nativeBootstrapCapability: RawSqlBootstrapCapability;
   public id: string;
   public traceId: string;
   public status: 'initializing' | 'ready' | 'busy' | 'error' = 'initializing';
@@ -566,6 +585,7 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
   private readonly processorKey: string;
   private readonly leaseId?: string;
   private readonly leaseMode: 'shared' | 'isolated' | string;
+  public readonly analysisRunPrivate: boolean;
   private runtimeBinarySelection?: Readonly<{
     source: 'local_binary';
     selectedPath: string;
@@ -606,6 +626,10 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
       throw new Error('Trace processor binary selection is unavailable before initialization');
     }
     return {...this.runtimeBinarySelection};
+  }
+
+  public getNativeProvenanceSnapshot(): RawSqlNativeProvenanceSnapshot {
+    return readRawSqlNativeProvenanceSnapshot(this.nativeProvenance);
   }
 
   public getRuntimeStats(): TraceProcessorRuntimeStats {
@@ -657,14 +681,21 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
     this.processorKey = options.processorKey ?? traceId;
     this.leaseId = options.leaseId;
     this.leaseMode = options.leaseMode ?? 'shared';
+    this.analysisRunPrivate = this.leaseMode === 'isolated' && options.analysisRunPrivate === true;
+    const native = createRawSqlNativeProvenance(this.id,
+      CRITICAL_STDLIB_MODULES.map(module => `INCLUDE PERFETTO MODULE ${module};`), this.traceId);
+    this.nativeProvenance = native.provenance;
+    this.nativeBootstrapCapability = native.bootstrapCapability;
 
     // Allocate port from pool
     this._httpPort = getPortPool().allocate(this.processorKey);
+    if (exposedNativePorts.has(this._httpPort)) this.invalidateNativeProvenance();
     this.sqlWorker = new TraceProcessorSqlWorker({
       processorId: this.id,
       traceId: this.traceId,
       processorKey: this.processorKey,
       port: this._httpPort,
+      nativeProvenance: this.nativeProvenance,
     });
   }
 
@@ -698,6 +729,8 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
 
     // Start trace_processor_shell in HTTP mode
     try {
+      await initializeRawSqlNativeProvenance(this.nativeProvenance, binarySelection);
+      if (this.isDestroyed) throw new Error('Processor destroyed during initialization');
       await this.startHttpServer(binarySelection);
 
       // Verify server is working with a test query
@@ -707,6 +740,8 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
       if (testResult.error) {
         throw new Error(`Server verification failed: ${testResult.error}`);
       }
+      await revalidateRawSqlNativeProvenance(this.nativeProvenance, binarySelection);
+      if (this.isDestroyed) throw new Error('Processor destroyed during initialization');
       this.sampleRss();
 
       this.status = 'ready';
@@ -976,10 +1011,11 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
     }
   }
 
-  private async enqueueHttpQuery(sql: string, options: TraceProcessorQueryOptions): Promise<QueryResult> {
+  private async enqueueHttpQuery(sql: string, options: TraceProcessorQueryOptions,
+    bootstrapCapability?: RawSqlBootstrapCapability): Promise<QueryResult> {
     this._activeQueries++;
     try {
-      return await this.executeHttpQuery(sql, options);
+      return await this.executeHttpQuery(sql, options, bootstrapCapability);
     } finally {
       this._activeQueries--;
     }
@@ -998,7 +1034,7 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
     try {
       for (const m of CRITICAL_STDLIB_MODULES) {
         if (this.isDestroyed) break;
-        const result = await this.enqueueHttpQuery(`INCLUDE PERFETTO MODULE ${m};`, { priority: 'p1' });
+        const result = await this.enqueueHttpQuery(`INCLUDE PERFETTO MODULE ${m};`, { priority: 'p1' }, this.nativeBootstrapCapability);
         if (result.error) {
           failed++;
           if (!result.error.includes('not found') && !result.error.includes('no such')) {
@@ -1032,11 +1068,15 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
   private async executeHttpQuery(
     sql: string,
     options: TraceProcessorQueryOptions = {},
+    bootstrapCapability?: RawSqlBootstrapCapability,
   ): Promise<QueryResult> {
-    const result = await this.sqlWorker.query(sql, {
+    const queryOptions = {
       ...options,
       timeoutMs: options.timeoutMs ?? traceProcessorConfig.queryTimeoutMs,
-    });
+    };
+    const result = bootstrapCapability
+      ? await this.sqlWorker.queryBootstrap(sql, bootstrapCapability, queryOptions)
+      : await this.sqlWorker.query(sql, queryOptions);
     if (result.error === 'Query timeout') {
       logger.warn(
         'TraceProcessor',
@@ -1055,6 +1095,7 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
   private async preloadModules(
     modules: string[],
     label: string,
+    bootstrapCapability?: RawSqlBootstrapCapability,
   ): Promise<{ loaded: string[]; failed: string[] }> {
     const loaded: string[] = [];
     const failed: string[] = [];
@@ -1084,7 +1125,7 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
     for (const moduleName of modules) {
       let result: { status: 'fulfilled' | 'rejected'; value?: string; reason?: Error };
       try {
-        const queryResult = await this.executeHttpQuery(`INCLUDE PERFETTO MODULE ${moduleName};`, { priority: 'p2' });
+        const queryResult = await this.executeHttpQuery(`INCLUDE PERFETTO MODULE ${moduleName};`, { priority: 'p2' }, bootstrapCapability);
         if (queryResult.error) {
           result = { status: 'rejected', reason: new Error(queryResult.error) };
         } else {
@@ -1123,7 +1164,7 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
    * Preload critical modules used by frequently hit analysis paths.
    */
   async preloadCriticalPerfettoModules(): Promise<{ loaded: string[]; failed: string[] }> {
-    return this.preloadModules(CRITICAL_STDLIB_MODULES, 'critical');
+    return this.preloadModules(CRITICAL_STDLIB_MODULES, 'critical', this.nativeBootstrapCapability);
   }
 
   /**
@@ -1133,7 +1174,12 @@ export class WorkingTraceProcessor extends EventEmitter implements TraceProcesso
     return this.preloadModules(getPerfettoStdlibModules(), 'all');
   }
 
+  invalidateNativeProvenance(): void {
+    invalidateRawSqlNativeProvenance(this.nativeProvenance);
+  }
+
   destroy(): void {
+    this.invalidateNativeProvenance();
     if (!IS_TEST_ENV) {
       console.log(`[TraceProcessor] Destroying processor ${this.id} for trace ${this.traceId}`);
     }
@@ -1212,6 +1258,18 @@ export function isTraceProcessorEvictionCandidate(
 }
 
 export class TraceProcessorFactory {
+  static exposeNativePort(port: number): void {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+    exposedNativePorts.add(port);
+    for (const processor of new Set(this.processors.values())) {
+      if (processor instanceof WorkingTraceProcessor && processor.httpPort === port) processor.invalidateNativeProvenance();
+    }
+  }
+
+  static isPrivateAnalysisPort(port: number): boolean {
+    return [...this.processors.values()].some(processor => processor instanceof WorkingTraceProcessor &&
+      processor.analysisRunPrivate && processor.httpPort === port);
+  }
   private static processors: Map<string, ManagedTraceProcessor> = new Map();
   private static externalProcessorsByPort: Map<number, ExternalRpcProcessor> = new Map();
   private static maxProcessors = 5;
@@ -1375,6 +1433,9 @@ export class TraceProcessorFactory {
    * We don't start a new process, we just create a wrapper that queries the existing one.
    */
   static async createFromExternalRpc(traceId: string, port: number): Promise<ExternalRpcProcessor> {
+    port = normalizeTraceProcessorRpcPort(port);
+    if (this.isPrivateAnalysisPort(port)) throw new Error('Private analysis processor cannot accept external connections');
+    this.exposeNativePort(port);
     const current = this.processors.get(traceId);
     if (current instanceof ExternalRpcProcessor && current.httpPort === port && current.status === 'ready') {
       console.log(`[TraceProcessorFactory] Reusing external RPC processor for trace ${traceId} on port ${port}`);

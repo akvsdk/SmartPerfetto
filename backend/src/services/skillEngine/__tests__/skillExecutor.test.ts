@@ -38,6 +38,11 @@ import {
 import { validateDataEnvelope } from '../../../types/dataContract';
 import { isTraceProcessorQueryCancelledError } from '../../traceProcessorCancellation';
 import {capturedEvidenceTable, evidenceTableFor} from '../../evidence/evidenceCapture';
+import fs from 'node:fs';
+import path from 'node:path';
+import yaml from 'js-yaml';
+import {ArtifactStore} from '../../../agentv3/artifactStore';
+import Database from 'better-sqlite3';
 
 // =============================================================================
 // Mock Setup
@@ -4496,5 +4501,126 @@ describe('SkillExecutor - authored deep and empty/error semantics', () => {
       executionStatus: 'optional_error',
       executionError: 'missing optional table',
     });
+  });
+});
+
+describe('scrolling main-thread task delivery', () => {
+  it('keeps task identity and execution/wait evidence when every existing summary is populated', async () => {
+    const source = yaml.load(fs.readFileSync(path.join(process.cwd(),
+      'skills/composite/scrolling_analysis.skill.yaml'), 'utf8')) as SkillDefinition;
+    const taskStep = source.steps!.find(step => step.id === 'main_thread_work_tasks') as any;
+    expect(taskStep).toBeDefined();
+    const task = {
+      task_name: 'ContentLoader: initializeContent', phase: 'between_doFrames',
+      outside_doframe_ms: 30, wall_ms: 30, running_ms: 28, runnable_ms: 2,
+      unknown_state_ms: 0, slice_id: 42, upid: 7, utid: 8,
+      start_ts: '9007199254740993', end_ts: '9007199284740993', dur: '30000000',
+      hotspot_name: 'parseContentModel', hotspot_slice_id: 43, hotspot_arg_set_id: 5,
+      hotspot_exclusive_wall_ms: 14, eligible_task_count: 80, returned_task_count: 20,
+    };
+    const sourceRow = {source_kind: 'hotspot', root_slice_id: 42, upid: 7, utid: 8,
+      source_slice_id: 43, parent_id: 42, arg_set_id: 5,
+      source_name: 'parseContentModel', start_ts: '9007199256740993', end_ts: '9007199270740993'};
+    // Use the actual production ordering, display and synthesis contracts. SQL
+    // behavior is tested separately against the maintained CTEs. Every existing
+    // synthesis source is populated here so the summary's caps are exercised.
+    const steps = source.steps!.filter(step => (step as any).synthesize || step.id === 'main_thread_work_sources').map(step => ({
+      ...step, type: 'atomic', condition: undefined, sql_fragments: undefined,
+      sql: `SELECT '${step.id}' AS delivery_source`,
+    })) as SkillStep[];
+    const mock = createMockTraceProcessorService();
+    mock.query.mockImplementation(async (_traceId: string, sql: string) => {
+      const step = steps.find(value => sql.includes(`'${value.id}'`)) as any;
+      const row: Record<string, unknown> = step?.id === taskStep.id ? task
+        : step?.id === 'main_thread_work_sources' ? sourceRow : {};
+      if (step?.id !== taskStep.id && step?.id !== 'main_thread_work_sources') {
+        for (const field of step?.synthesize?.fields ?? []) row[field.key] = 123;
+        for (const group of step?.synthesize?.groupBy ?? []) row[group.field] = 'populated';
+        Object.assign(row, {upid: 7, utid: 8, observed_doframe_count: 40,
+          unknown_state_ms: 0, eligible_task_count: 80});
+      }
+      return {columns: Object.keys(row), rows: [Object.values(row)]};
+    });
+    const executor = createSkillExecutor(mock as any);
+    executor.registerSkill(JSON.parse(JSON.stringify({...source, identity: undefined, prerequisites: undefined, steps})));
+    const result = await executor.execute('scrolling_analysis', 'delivery-trace');
+    expect(result.error).toBeUndefined();
+    expect(result.success).toBe(true);
+    const summary = JSON.stringify(result.displayResults.find(item => item.stepId === '__synthesize_summary__')?.data);
+    expect(summary).toContain(task.task_name);
+    expect(summary).toContain('Running');
+    expect(summary).toContain('28');
+    const display = result.displayResults.find(item => item.stepId === taskStep.id)!;
+    expect(display).toBeDefined();
+    const data = display.data as {columns: string[]; rows: unknown[][]};
+    for (const key of ['task_name', 'slice_id', 'upid', 'utid', 'start_ts', 'end_ts', 'running_ms', 'runnable_ms']) {
+      expect(data.rows[0][data.columns.indexOf(key)]).toBe(task[key as keyof typeof task]);
+    }
+    expect(result.synthesizeData?.find(item => item.stepId === taskStep.id)?.data).toEqual([task]);
+    const store = new ArtifactStore();
+    const artifact = store.store({skillId: source.name, stepId: taskStep.id,
+      title: display.title, data});
+    const restored = ArtifactStore.fromSnapshot(JSON.parse(JSON.stringify(store.serialize())));
+    const fetched = JSON.stringify(restored.fetch(artifact, 'rows'));
+    expect(fetched).toContain(task.task_name);
+    expect(fetched).toContain(task.start_ts);
+    expect(fetched).toContain('runnable_ms');
+    const sourceDisplay = result.displayResults.find(item => item.stepId === 'main_thread_work_sources')!;
+    const sourceId = store.store({skillId: source.name, stepId: sourceDisplay.stepId, data: sourceDisplay.data});
+    const sourceFetch = ArtifactStore.fromSnapshot(JSON.parse(JSON.stringify(store.serialize()))).fetch(sourceId, 'rows');
+    for (const [key, value] of Object.entries(sourceRow)) {
+      expect(sourceFetch.rows[0][sourceFetch.columns.indexOf(key)]).toBe(value);
+    }
+  });
+});
+
+describe('main-thread production SQL substitution', () => {
+  it('executes current fragments with omitted bounds and an apostrophe in the package', async () => {
+    const source = yaml.load(fs.readFileSync(path.join(process.cwd(),
+      'skills/composite/main_thread_frame_work.skill.yaml'), 'utf8')) as SkillDefinition;
+    const db = new Database(':memory:');
+    try {
+      db.exec(`CREATE TABLE trace_bounds(start_ts INTEGER, end_ts INTEGER);
+        INSERT INTO trace_bounds VALUES(0,30000000);
+        CREATE TABLE process(upid INTEGER,pid INTEGER,name TEXT,start_ts INTEGER,end_ts INTEGER);
+        CREATE TABLE thread(utid INTEGER,tid INTEGER,upid INTEGER,name TEXT,start_ts INTEGER,end_ts INTEGER);
+        INSERT INTO thread VALUES(1,10,1,'main',NULL,NULL);
+        CREATE TABLE thread_track(id INTEGER,utid INTEGER);
+        INSERT INTO thread_track VALUES(1,1);
+        CREATE TABLE slice(id INTEGER,name TEXT,parent_id INTEGER,arg_set_id INTEGER,
+          track_id INTEGER,ts INTEGER,dur INTEGER);
+        INSERT INTO slice VALUES(42,'initializeContent',NULL,5,1,0,30000000);
+        CREATE TABLE thread_state(id INTEGER,utid INTEGER,ts INTEGER,dur INTEGER,state TEXT,
+          blocked_function TEXT,io_wait INTEGER);
+        INSERT INTO thread_state VALUES(1,1,0,30000000,'Running',NULL,NULL);`);
+      db.prepare('INSERT INTO process VALUES(1,10,?,NULL,NULL)').run("com.example.o'reilly");
+      const mock = createMockTraceProcessorService();
+      mock.query.mockImplementation(async (_traceId: string, sql: string) => {
+        const statement = db.prepare(sql);
+        return {columns: statement.columns().map(column => column.name), rows: statement.raw().all()};
+      });
+      const executor = createSkillExecutor(mock as any);
+      const fragments = new Map<string, string>();
+      for (const step of source.steps! as any[]) for (const file of step.sql_fragments ?? []) {
+        fragments.set(file, fs.readFileSync(path.join(process.cwd(), 'skills', file), 'utf8'));
+      }
+      executor.setFragmentRegistry(fragments);
+      // Identity resolution has its own real-processor gates. This test exercises
+      // the production fragment injection and parameter escaping with real SQL.
+      const definition = JSON.parse(JSON.stringify(source));
+      delete definition.identity;
+      executor.registerSkill(definition);
+      const result = await executor.execute(source.name, 'substitution-trace', {package:"com.example.o'reilly"});
+      expect(result.error).toBeUndefined();
+      expect(result.success).toBe(true);
+      const tasks = result.rawResults?.main_thread_work_tasks.data as any[];
+      expect(tasks).toEqual([expect.objectContaining({task_name:'initializeContent',
+        phase:'no_doFrame',outside_doframe_ms:30,running_ms:30,start_ts:'0',end_ts:'30000000'})]);
+      const sourceDisplay = result.displayResults.find(value => value.stepId === 'main_thread_work_sources')!;
+      const store = new ArtifactStore();
+      const artifactId = store.store({skillId:source.name,stepId:sourceDisplay.stepId,data:sourceDisplay.data});
+      const fetched = store.fetch(artifactId,'rows');
+      expect(fetched.rows[0][fetched.columns.indexOf('source_slice_id')]).toBe(42);
+    } finally { db.close(); }
   });
 });

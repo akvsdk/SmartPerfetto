@@ -3,7 +3,12 @@
 
 import {ArtifactStore} from '../../../agentv3/artifactStore';
 import {buildTraceProcessorQueryProvenance} from '../../traceProcessorConnectionModel';
-import {captureEvidenceTable, evidenceTableFor, getCapturedAnchorFacts, type CapturedFieldSemantics} from '../evidenceCapture';
+import {captureEvidenceTable, captureRawSqlEvidence, evidenceTableFor, getCapturedAnchorFacts, type CapturedFieldSemantics} from '../evidenceCapture';
+import * as runtimeIdentity from '../../capabilityManifestRuntimeIdentity';
+import * as sqlDocs from '../../perfettoSqlDocs';
+import {beginRawSqlNativeQuery, createRawSqlNativeProvenance, initializeRawSqlNativeProvenance,
+  sealRawSqlNativeQuery, readRawSqlCaptureFields} from '../rawSqlNativeProvenance';
+import {runDeterministicClaimVerifier} from '../../verifier/deterministicClaimVerifier';
 import {SkillExecutor} from '../../skillEngine/skillExecutor';
 import {prepareClaimEvidence, preparedClaimEvidenceSnapshot, preparedEvidenceMatchesInput, evidenceReferenceKey,
   preparedIdentityResolutions, type PreparedClaimEvidence} from '../claimEvidencePreparation';
@@ -398,5 +403,147 @@ describe('prepared captured identity projection', () => {
     expect(request).toEqual({key: expect.stringMatching(/^identity:/), reference: {evidenceRefId: 'data:first'}, requiredColumns: [], metadataOnly: true});
     expect(Object.isFrozen(request)).toBe(true);
     expect(Object.isFrozen(request.reference)).toBe(true);
+  });
+});
+
+
+describe('native row companions in prepared evidence', () => {
+  const revision = 'b'.repeat(40);
+  beforeEach(() => {
+    jest.spyOn(runtimeIdentity, 'resolveCapabilityTraceProcessorIdentity').mockResolvedValue({source: 'bundled', gitRevision: revision, stdlibRevision: revision});
+    jest.spyOn(sqlDocs, 'loadPerfettoSqlDocsAsset').mockReturnValue({version: 1, generatedFrom: revision, modules: [], symbolToModule: {},
+      entries: [{id: 'slice', name: 'slice', type: 'view', category: 'prelude', module: 'prelude.views', package: 'prelude', description: '',
+        columns: [{name: 'id', type: 'ID'}, {name: 'dur', type: 'DURATION'}]}]});
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  async function rawFixture(mode: 'raw' | 'generic' | 'copy' | 'wrong-trace' = 'raw') {
+    const native = createRawSqlNativeProvenance('actual-instance', [], 'trace');
+    await initializeRawSqlNativeProvenance(native.provenance, {source: 'local_binary', selectedPath: '/pinned/tp', selectionOrigin: 'default'});
+    const data = {columns: ['event_id', 'dur'], rows: [[7, 42_000_000], [8, 42_000_000]]};
+    sealRawSqlNativeQuery(beginRawSqlNativeQuery(native.provenance, 'SELECT id AS event_id, dur FROM slice'), data);
+    const witness = mode === 'generic' ? captureEvidenceTable({...data, nativeRows: [{id: 7}]}, readRawSqlCaptureFields(data)) :
+      captureRawSqlEvidence(mode === 'copy' ? JSON.parse(JSON.stringify(data)) : data,
+        {traceId: mode === 'wrong-trace' ? 'other' : 'trace', traceSide: 'current'});
+    const store = new ArtifactStore();
+    const id = store.store({skillId: 'execute_sql', data, traceProvenance: buildTraceProcessorQueryProvenance({traceId: 'trace', traceSide: 'current'}),
+      sourceToolCallId: 'native-invocation'});
+    store.registerEvidenceCapture(id, witness, {evidenceRefId: 'native-result'});
+    const ref = {evidenceRefId: 'native-result', rowIndex: 0, column: 'dur', value: 42_000_000};
+    const declaration = contract(ref);
+    declaration.claims![0].semantics!.numeric = {operator: 'eq', value: 42, unit: 'ms'};
+    return {store, witness, ref, declaration};
+  }
+
+  it('retains the directly projected ID for a dur-only operand and binds the original capture', async () => {
+    const {store, witness, ref, declaration} = await rawFixture();
+    const view = store.createEvidenceReadView(readOptions);
+    expect(await read(view, ref)).toMatchObject([{status: 'resolved', row: {event_id: 7, dur: 42_000_000}}]);
+    const preparedEvidence = await prepareClaimEvidence({conclusionContract: declaration, evidenceReadView: view});
+    const result = runClaimVerification({conclusionContract: declaration, preparedEvidence});
+    const anchor = result.claimSupport[0].anchors[0];
+    const proof = result.claimVerificationResult.claimResults[0].deterministicProof!;
+    expect(proof).toMatchObject({kind: 'numeric_cell', status: 'proved', nativeRows: [{anchorId: anchor.anchorId,
+      evidenceRefId: anchor.evidenceRefId, captureId: witness.captureId, traceId: 'trace', traceSide: 'current', relation: 'slice',
+      idColumn: 'id', id: 7, schemaFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/)}]});
+    expect(anchor.context.captureId).toBe(witness.captureId);
+    expect(anchor.cells).toHaveLength(1);
+    expect(anchor.cells![0].column).toBe('dur');
+    expect(getCapturedAnchorFacts(anchor)?.fields.dur).not.toHaveProperty('clock');
+    expect(result.claimVerificationResult.passed).toBe(false);
+    const copied = JSON.parse(JSON.stringify(result.claimSupport));
+    expect(runDeterministicClaimVerifier({claimSupport: copied}).claimResults[0].deterministicProof.nativeRows).toBeUndefined();
+  });
+
+  it('charges ID cells, bytes and deadlines, while metadata-only reads have no row witness', async () => {
+    const {store, ref} = await rawFixture();
+    expect(await read(store.createEvidenceReadView({...readOptions, budget: {maxCells: 1}}), ref))
+      .toMatchObject([{status: 'incomplete', reason: 'cell_read_budget_exhausted'}]);
+    expect(await read(store.createEvidenceReadView({...readOptions, budget: {maxCells: 2}}), ref))
+      .toMatchObject([{status: 'resolved'}]);
+    for (const budget of [{maxBytes: 1}, {maxElapsedMs: 0}]) {
+      expect(await read(store.createEvidenceReadView({...readOptions, budget}), ref)).toMatchObject([{status: 'incomplete'}]);
+    }
+    const [metadata] = await store.createEvidenceReadView({...readOptions, budget: {maxCells: 0}}).resolveReferences([
+      {key: 'native-metadata', reference: {evidenceRefId: ref.evidenceRefId}, requiredColumns: [], metadataOnly: true},
+    ]);
+    const anchor = {context: {traceId: 'trace', traceSide: 'current'}};
+    bindReadResolutionToAnchor(anchor, metadata);
+    expect(metadata).toMatchObject({status: 'resolved'});
+    expect(getCapturedAnchorFacts(anchor)).toBeUndefined();
+    expect(anchor.context).not.toHaveProperty('captureId');
+  });
+
+  it.each(['generic', 'copy', 'wrong-trace'] as const)('does not sign native identity from %s captures', async mode => {
+    const {store, declaration} = await rawFixture(mode);
+    const preparedEvidence = await prepareClaimEvidence({conclusionContract: declaration,
+      evidenceReadView: store.createEvidenceReadView(readOptions)});
+    const proof = runClaimVerification({conclusionContract: declaration, preparedEvidence})
+      .claimVerificationResult.claimResults[0].deterministicProof!;
+    expect(proof.nativeRows).toBeUndefined();
+    if (mode === 'copy') expect(proof.reason).toBe('unit_authority_unknown');
+    if (mode === 'wrong-trace') expect(proof.reason).toBe('reference_cells_unresolved');
+  });
+
+  it('rejects a valid raw witness relabeled as another Trace after capture', async () => {
+    const {witness} = await rawFixture();
+    const store = new ArtifactStore();
+    const id = store.store({skillId: 'execute_sql', data: {columns: ['event_id', 'dur'], rows: [[7, 42_000_000]]},
+      traceProvenance: buildTraceProcessorQueryProvenance({traceId: 'other', traceSide: 'reference'}), sourceToolCallId: 'relabel'});
+    store.registerEvidenceCapture(id, witness, {evidenceRefId: 'relabel'});
+    const result = await read(store.createEvidenceReadView({ownerKey: 'other-run',
+      allowedTraces: [{traceId: 'other', traceSide: 'reference'}]}), {evidenceRefId: 'relabel', rowIndex: 0, column: 'dur'});
+    expect(result).toMatchObject([{status: 'denied', reason: 'trace_capture_mismatch'}]);
+  });
+
+  it.each(['wrong-trace', 'invalid-side', 'unsigned-custom'] as const)(
+    'preserves captured.cell provenance through %s raw capture and artifact registration', async mode => {
+      const native = createRawSqlNativeProvenance('cell-instance', [], 'trace-a');
+      await initializeRawSqlNativeProvenance(native.provenance,
+        {source: 'local_binary', selectedPath: '/pinned/tp', selectionOrigin: 'default'});
+      const data = {columns: ['id', 'label'], rows: [[7, 'observed']]};
+      if (mode !== 'unsigned-custom') {
+        sealRawSqlNativeQuery(beginRawSqlNativeQuery(native.provenance, "SELECT id, 'observed' AS label FROM slice"), data);
+      }
+      const traceId = mode === 'wrong-trace' ? 'trace-b' : 'trace-a';
+      const witness = captureRawSqlEvidence(data, {traceId,
+        traceSide: (mode === 'invalid-side' ? 'invalid' : 'current') as 'current'});
+      const store = new ArtifactStore();
+      const id = store.store({skillId: 'execute_sql', data,
+        traceProvenance: buildTraceProcessorQueryProvenance({traceId, traceSide: 'current'}), sourceToolCallId: 'cell-invocation'});
+      store.registerEvidenceCapture(id, witness, {evidenceRefId: 'cell-result'});
+      const ref = {evidenceRefId: 'cell-result', rowIndex: 0, column: 'label', value: 'observed'};
+      const declaration = contract(ref);
+      declaration.claims![0].kind = 'categorical';
+      declaration.claims![0].semantics = {...declaration.claims![0].semantics!, predicate: 'captured.cell', numeric: undefined};
+      const view = store.createEvidenceReadView({ownerKey: 'cell-run', allowedTraces: [{traceId, traceSide: 'current'}]});
+      const preparedEvidence = await prepareClaimEvidence({conclusionContract: declaration, evidenceReadView: view});
+      const result = runClaimVerification({conclusionContract: declaration, preparedEvidence});
+      const proof = result.claimVerificationResult.claimResults[0].deterministicProof!;
+      if (mode === 'unsigned-custom') {
+        expect(proof).toMatchObject({kind: 'captured_cell', status: 'proved'});
+        expect(proof.nativeRows).toBeUndefined();
+      } else {
+        expect(proof.status).not.toBe('proved');
+        expect(proof.nativeRows).toBeUndefined();
+        expect(await read(view, ref)).toMatchObject([{status: 'missing', reason: 'trace_capture_mismatch'}]);
+        expect(result.claimSupport[0].anchors.every(anchor => getCapturedAnchorFacts(anchor) === undefined)).toBe(true);
+      }
+    },
+  );
+
+  it('includes only actual proof operands even when another referenced row has the target ID', async () => {
+    const {store, declaration, ref} = await rawFixture();
+    const other = {...ref, rowIndex: 1};
+    declaration.claims![0].references!.push(other);
+    declaration.claims![0].semantics!.scope.subjectRefs = [other];
+    const preparedEvidence = await prepareClaimEvidence({conclusionContract: declaration,
+      evidenceReadView: store.createEvidenceReadView(readOptions)});
+    const result = runClaimVerification({conclusionContract: declaration, preparedEvidence});
+    expect(result.claimSupport[0].anchors).toHaveLength(2);
+    const proof = result.claimVerificationResult.claimResults[0].deterministicProof!;
+    expect(proof.status).toBe('proved');
+    expect(proof.nativeRows?.map(row => row.id)).toEqual([8]);
+    expect(proof.nativeRows?.[0].anchorId).toBe(result.claimSupport[0].anchors[1].anchorId);
   });
 });

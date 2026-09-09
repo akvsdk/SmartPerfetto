@@ -174,12 +174,12 @@ jest.mock('../../../../services/security/codeAwareOutputRegistry', () => {
   );
   return {
     ...actual,
-    createCodeAwareStreamingTextProjection: jest.fn<any>().mockImplementation(() => ({
+    createCodeAwareStreamingTextProjection: jest.fn<any>().mockImplementation((sessionId: string, channel: string) => channel === 'qoder-answer' ? ({
       write: mockProjectionWrite,
       flush: mockProjectionFlush,
       projectComplete: (text: string) => text,
       projectCompleteWithReceipt: mockProjectionProjectComplete,
-    })),
+    }) : actual.createCodeAwareStreamingTextProjection(sessionId, channel)),
   };
 });
 
@@ -220,6 +220,7 @@ import type {ClaudeSdkToolLike} from '../../../runtimeToolSpec';
 import type {RuntimeToolInvocationEvent, RuntimeToolObserver} from '../../../runtimeToolObserver';
 import {createRuntimeToolResult} from '../../../runtimeToolResult';
 import {getSourceLookupCodeReferences} from '../../../../services/codebase/sourceLookupTools';
+import {projectCodeAwareStreamingUpdate} from '../../../../services/security/codeAwareStreamingUpdateProjection';
 
 function createRuntime(
   env: Record<string, string | undefined> = {},
@@ -450,6 +451,43 @@ describe('QoderRuntime', () => {
         expect.objectContaining({content: expect.objectContaining({taskId: 'failed', isError: true})}),
       ]);
       expect(tracker.prePlanToolCallLog).toHaveLength(toolName === 'execute_sql' ? 6 : 0);
+    });
+
+    it.each([false, true])('retains private source outcomes before transport truncation (body=%s)', async includeBody => {
+      let descriptor!: ClaudeSdkToolLike;
+      mockCreateClaudeMcpServer.mockImplementationOnce((options: any) => {
+        const registry = new McpToolRegistry({toolObserver: options.toolObserver});
+        registry.registerShared({
+          name: 'search_codebase', description: 'Search source', exposure: 'public', inputSchema: {},
+          handler: async () => createRuntimeToolResult({success: true, matches: Array.from({length: 20}, (_, i) => ({
+            referenceId: `source-reference-${i}`, codebaseId: 'codebase-a',
+            filePath: `src/PRIVATE_SOURCE_PATH_${i}.kt`, lineRange: {start: 1, end: 20},
+            ...(includeBody ? {text: 'PRIVATE_SOURCE_BODY'} : {}),
+          }))}),
+        });
+        descriptor = registry.list()[0].tool as ClaudeSdkToolLike;
+        return {server: registry.buildSdkServer(), allowedTools: registry.buildAllowedTools(), toolDefinitions: registry.list()};
+      });
+      mockQuery.mockReturnValue({
+        async *[Symbol.asyncIterator]() {
+          await descriptor.handler({}, {toolCallId: 'source-outcome'});
+          yield {type: 'result', subtype: 'success', is_error: false, result: '## Final Report\ndone'};
+        },
+        interrupt: mockInterrupt, close: mockClose,
+      });
+      const updates: any[] = [];
+      const runtime = createRuntime();
+      runtime.on('update', update => updates.push(update));
+      await expect(runtime.analyze('test query', 'qoder-source-outcome', 'trace-1', {analysisMode: 'full'}))
+        .resolves.toMatchObject({success: true});
+      const update = updates.find(item => item.type === 'agent_response')!;
+      expect(() => JSON.parse(update.content.result)).toThrow();
+      expect(update.content.privateToolResultReceipt).toBeDefined();
+      const projected = projectCodeAwareStreamingUpdate('qoder-source-outcome', update, true, 'en');
+      expect(projected).toMatchObject({content: {resultNarration: includeBody
+        ? 'Authorized content was read and is available to check against trace evidence'
+        : 'Candidate source or knowledge locations are available; their content has not been read'}});
+      expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_SOURCE|privateToolResultReceipt/);
     });
 
     it('keeps source references ephemeral while projecting both public result and narration', async () => {
@@ -1106,6 +1144,7 @@ describe('QoderRuntime', () => {
         .analyze('any request', 'final-context', 'trace-1', options);
       const context = takeFinalizationContext(result)!;
       expect(context).toBeDefined();
+      expect(context.sourceScope).toBeUndefined(); // The default mock has no source scope accessor.
       options.analysisContextFingerprint = 'later-auth-context';
       const providerQuery = context.getProviderQuery(new AbortController().signal);
       expect(providerQuery).toEqual({text: 'any request', analysisContextFingerprint: 'qoder-auth-pin'});
@@ -1180,7 +1219,11 @@ describe('QoderRuntime', () => {
       context.dispose();
     });
 
-    it('keeps cancellation context when intent and the main deadline were established', async () => {
+    it.each([true, false])('keeps cancellation context and current source execution scope: current=%s', async current => {
+      const scope = {codeAwareMode: 'off' as const, selectedCodebaseIds: [], hasCodebaseAccess: false,
+        analysisContextFingerprint: 'qoder-source-scope'};
+      mockCreateClaudeMcpServer.mockReturnValue({server: {name: 'smartperfetto'}, allowedTools: [], toolDefinitions: [],
+        sourceUse: {getSourceUseDecision: () => undefined, getSourceExecutionScope: () => current ? scope : undefined}});
       const late = createDeferred<void>();
       mockQuery.mockReturnValue({async *[Symbol.asyncIterator]() {await late.promise;}, interrupt: mockInterrupt, close: mockClose});
       const runtime = createRuntime({QODER_MODEL: 'main-model'});
@@ -1190,6 +1233,7 @@ describe('QoderRuntime', () => {
       const result = await analysis;
       const context = takeFinalizationContext(result)!;
       expect(context.hasSemanticTransport).toBe(false);
+      expect(context.sourceScope).toEqual(current ? scope : undefined);
       expect(context.deliveryContext).toMatchObject({completion: {status: 'cancelled'}});
       late.resolve();
       context.dispose();
@@ -1416,6 +1460,11 @@ describe('QoderRuntime', () => {
           codeAwareMode: 'provider_send',
           codebaseIds: [fixture.codebaseId],
         });
+        const context = takeFinalizationContext(terminal)!;
+        try {
+          expect(context.getNativeDeclaration(terminal, new AbortController().signal)?.raw).toBe(SOURCE_FINALIZATION_RAW_SOURCE);
+          expect(JSON.stringify(terminal)).not.toContain('conclusion_protocol_projection');
+        } finally {context.dispose();}
         const next = await runtime.analyze('public run', 'session-1', 'trace-1', {
           codeAwareMode: 'off',
         });
@@ -1511,15 +1560,14 @@ describe('QoderRuntime', () => {
       ]));
     });
 
-    it('writes assistant chunks incrementally and sanitizes the complete final answer exactly once', async () => {
+    it('projects assistant chunks incrementally and independently projects the native final answer', async () => {
       const chunks = ['## Final', ' Report\nfirst ', 'second'];
       const finalText = chunks.join('');
       mockProjectionWrite.mockImplementation(text => `<${text}>`);
       mockProjectionFlush.mockReturnValue('<tail>');
       const api = privacyProjectionApi();
-      api.registerPrivateAnalysisQueryForEcho('qoder-redacted-fixture', 'second');
-      const receipt = api.sanitizeCodeAwareTextWithReceipt('qoder-redacted-fixture', finalText);
-      mockProjectionProjectComplete.mockReturnValue(receipt);
+      api.registerPrivateAnalysisQueryForEcho('session-qoder-linear-projection', 'second');
+      const receipt = api.sanitizeCodeAwareTextWithReceipt('session-qoder-linear-projection', finalText);
       mockQuery.mockReturnValue(createMockSdkStream([
         ...chunks.map(text => ({
           type: 'assistant',
@@ -1534,8 +1582,7 @@ describe('QoderRuntime', () => {
       const result = await runtime.analyze('test', 'session-qoder-linear-projection', 'trace-1');
 
       expect(mockProjectionWrite.mock.calls.map(call => call[0])).toEqual(chunks);
-      expect(mockProjectionProjectComplete).toHaveBeenCalledTimes(1);
-      expect(mockProjectionProjectComplete).toHaveBeenCalledWith(finalText);
+      expect(mockProjectionProjectComplete).not.toHaveBeenCalled();
       expect(mockProjectionFlush).toHaveBeenCalledTimes(1);
       expect(mockClose).toHaveBeenCalledTimes(1);
       expect(updates
@@ -1545,7 +1592,7 @@ describe('QoderRuntime', () => {
       expect(result.conclusion).toBe(receipt.text);
       expect(result.completion).toMatchObject({status: 'completed',
         conclusionFingerprint: analysisDeliveryFingerprint(receipt.text)});
-      api.clearCodeAwareOutputGuards('qoder-redacted-fixture');
+      api.clearCodeAwareOutputGuards('session-qoder-linear-projection');
     });
 
     it('closes once and discards the projection tail after an iterator error', async () => {
@@ -1771,7 +1818,7 @@ describe('QoderRuntime', () => {
       ]));
       const result = await createRuntime({QODER_MODEL: 'main-model'})
         .analyze('any request', 'empty-preserved-native', 'trace-1');
-      expect(mockProjectionProjectComplete).toHaveBeenCalledWith(body);
+      expect(mockProjectionProjectComplete).not.toHaveBeenCalled();
       expect(result).toMatchObject({success: false, partial: true, confidence: 0,
         conclusion: body, outputOrigin: 'sdk_final', completion: {status: 'unknown', sdkFinishReason: 'end_turn'}});
       const context = takeFinalizationContext(result)!;
@@ -1782,37 +1829,43 @@ describe('QoderRuntime', () => {
 
     it('does not certify a runtime privacy replacement created from an empty SDK answer', async () => {
       const receipt = issuedReplacementReceipt('');
-      mockProjectionProjectComplete.mockReturnValue(receipt);
+      const api = privacyProjectionApi();
+      api.revokeCodeAwareOutputGuards('empty-native-body');
       mockQuery.mockReturnValue(createMockSdkStream([
         {type: 'result', subtype: 'success', is_error: false, stop_reason: null, result: '', num_turns: 1},
       ]));
-      const result = await createRuntime().analyze('any request', 'empty-native-body', 'trace-1');
-      expect(mockProjectionProjectComplete).toHaveBeenCalledWith('');
-      expect(result).toMatchObject({success: false, partial: true, confidence: 0,
-        conclusion: receipt.text, outputOrigin: 'runtime_fallback',
-        completion: {status: 'unknown'}});
+      try {
+        const result = await createRuntime().analyze('any request', 'empty-native-body', 'trace-1');
+        expect(mockProjectionProjectComplete).not.toHaveBeenCalled();
+        expect(result).toMatchObject({success: false, partial: true, confidence: 0,
+          conclusion: receipt.text, outputOrigin: 'runtime_fallback',
+          completion: {status: 'unknown'}});
+      } finally {api.clearCodeAwareOutputGuards('empty-native-body');}
     });
 
     it.each(['有证据支持的原始回答', 'Original answer with supporting evidence'])
       ('uses the issued replaced disposition for a nonempty native answer: %s', async nativeBody => {
         const receipt = issuedReplacementReceipt(nativeBody);
         expect(receipt.disposition).toBe('replaced');
-        mockProjectionProjectComplete.mockReturnValue(receipt);
+        const api = privacyProjectionApi();
+        api.revokeCodeAwareOutputGuards('whole-replacement');
         mockQuery.mockReturnValue(createMockSdkStream([
           {type: 'result', subtype: 'success', is_error: false, stop_reason: null, result: nativeBody, num_turns: 1},
         ]));
-        const result = await createRuntime().analyze('any request', 'whole-replacement', 'trace-1', {runId: 'replacement-run'});
-        expect(result).toMatchObject({success: false, partial: true, confidence: 0,
-          conclusion: receipt.text, outputOrigin: 'runtime_fallback', completion: {
-            status: 'unknown', runId: 'replacement-run', conclusionFingerprint: receipt.outputFingerprint,
-          }});
-        expect(result.completion?.candidateRef).not.toBe('replacement-run:qoder:main');
-        const verifier = jest.requireMock('../../claude/claudeVerifier') as {verifyConclusion: jest.Mock};
-        const context = (verifier.verifyConclusion.mock.calls[0][2] as any).deliveryContext;
-        expect(context.outputOrigin).toBe('runtime_fallback');
-        expect(context.completion).toEqual(result.completion);
-        expect(context.acceptedCandidate.conclusionFingerprint).toBe(receipt.outputFingerprint);
-        expect(JSON.stringify(result)).not.toContain(receipt.inputFingerprint);
+        try {
+          const result = await createRuntime().analyze('any request', 'whole-replacement', 'trace-1', {runId: 'replacement-run'});
+          expect(result).toMatchObject({success: false, partial: true, confidence: 0,
+            conclusion: receipt.text, outputOrigin: 'runtime_fallback', completion: {
+              status: 'unknown', runId: 'replacement-run', conclusionFingerprint: receipt.outputFingerprint,
+            }});
+          expect(result.completion?.candidateRef).not.toBe('replacement-run:qoder:main');
+          const verifier = jest.requireMock('../../claude/claudeVerifier') as {verifyConclusion: jest.Mock};
+          const context = (verifier.verifyConclusion.mock.calls[0][2] as any).deliveryContext;
+          expect(context.outputOrigin).toBe('runtime_fallback');
+          expect(context.completion).toEqual(result.completion);
+          expect(context.acceptedCandidate.conclusionFingerprint).toBe(receipt.outputFingerprint);
+          expect(JSON.stringify(result)).not.toContain(receipt.inputFingerprint);
+        } finally {api.clearCodeAwareOutputGuards('whole-replacement');}
       });
 
     it.each(['A normal answer', '正常模型回答', '[PRIVATE_OUTPUT_SUPPRESSED]'])
@@ -1828,10 +1881,9 @@ describe('QoderRuntime', () => {
     it('transfers completion only through the issued redaction chain and uses the returned candidate', async () => {
       const api = privacyProjectionApi();
       const nativeBody = 'The observation remains valid. Private implementation detail is removed.';
-      api.registerPrivateAnalysisQueryForEcho('qoder-redaction', 'Private implementation detail');
-      const receipt = api.sanitizeCodeAwareTextWithReceipt('qoder-redaction', nativeBody);
+      api.registerPrivateAnalysisQueryForEcho('redaction-run', 'Private implementation detail');
+      const receipt = api.sanitizeCodeAwareTextWithReceipt('redaction-run', nativeBody);
       expect(receipt.disposition).toBe('redacted');
-      mockProjectionProjectComplete.mockReturnValue(receipt);
       mockQuery.mockReturnValue(createMockSdkStream([
         {type: 'result', subtype: 'success', is_error: false, stop_reason: null, result: nativeBody, num_turns: 1},
       ]));
@@ -1843,7 +1895,7 @@ describe('QoderRuntime', () => {
       const context = (verifier.verifyConclusion.mock.calls[0][2] as any).deliveryContext;
       expect(context.completion).toEqual(result.completion);
       expect(context.acceptedCandidate.conclusionFingerprint).toBe(receipt.outputFingerprint);
-      api.clearCodeAwareOutputGuards('qoder-redaction');
+      api.clearCodeAwareOutputGuards('redaction-run');
     });
 
     it('keeps failed setup provenance through an issued redaction instead of rebinding the raw error', async () => {

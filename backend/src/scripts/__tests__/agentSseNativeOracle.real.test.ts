@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2024-2026 Gracker (Chris)
+// This file is part of SmartPerfetto. See LICENSE for details.
+
+import {describe, expect, it, jest} from '@jest/globals';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import {once} from 'events';
+import {collectAgentSseOracleEvidence, parseAgentSseExpectation} from '../verifyAgentSseScrolling';
+import {TraceProcessorService} from '../../services/traceProcessorService';
+import {TraceProcessorFactory} from '../../services/workingTraceProcessor';
+import {prepareAnalysisRunTraceProcessorLeases, type AnalysisRunTraceProcessorLeases} from '../../services/analysisRunTraceProcessorLease';
+import {getTraceProcessorLeaseStore, setTraceProcessorLeaseStoreForTests} from '../../services/traceProcessorLeaseStore';
+import {getPortPool} from '../../services/portPool';
+import {resolveCapabilityTraceProcessorIdentity} from '../../services/capabilityManifestRuntimeIdentity';
+import {DEFAULT_DEV_USER_ID, DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID} from '../../middleware/auth';
+import {ENTERPRISE_FEATURE_FLAG_ENV} from '../../config';
+
+jest.setTimeout(120_000);
+const scope = {tenantId: DEFAULT_TENANT_ID, workspaceId: DEFAULT_WORKSPACE_ID, userId: DEFAULT_DEV_USER_ID};
+const wrapper = require(path.resolve(__dirname, '../../../scripts/run-deepseek-agent-e2e.cjs'));
+
+function expectation() {
+  const query = wrapper.semanticDeltaQueries().find((item: {kind: string}) => item.kind === 'quantitative-only');
+  const args: string[] = wrapper.semanticConditionArgs(query, 'A0', 'unused-oracle-report.json', 60_000);
+  return parseAgentSseExpectation(JSON.parse(args[args.indexOf('--expectation-json') + 1]));
+}
+
+async function withLoadedTrace(operation: (service: TraceProcessorService, traceId: string) => Promise<void>) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-native-oracle-'));
+  const changes = {[ENTERPRISE_FEATURE_FLAG_ENV]: 'false', SMARTPERFETTO_ENTERPRISE_DB_PATH: path.join(root, 'enterprise.sqlite'),
+    SMARTPERFETTO_DATA_DIR: path.join(root, 'data'), UPLOAD_DIR: path.join(root, 'uploads')};
+  const previous = new Map(Object.keys(changes).map(key => [key, process.env[key]]));
+  let service: TraceProcessorService | undefined;
+  try {
+    Object.assign(process.env, changes);
+    service = new TraceProcessorService(path.join(root, 'uploads', 'traces'));
+    const traceId = await service.loadTraceFromFilePath(path.resolve(process.cwd(),
+      '../Trace/.generated/constructed/source-analysis-semantic/trace.pftrace'));
+    expect(service.getTrace(traceId)?.status).toBe('ready');
+    // This state follows actual loading/metadata SQL, without seeding a policy or witness.
+    expect(service.getRunningNativeProcessorObservation(traceId)).toMatchObject({status: 'tainted', nativeSchemaEligible: true, analysisRunPrivate: false});
+    await operation(service, traceId);
+  } finally {
+    jest.restoreAllMocks();
+    if (service) service.cleanupProcessorsForTraces(service.getAllTraces().map(trace => trace.id));
+    getTraceProcessorLeaseStore().close();
+    setTraceProcessorLeaseStoreForTests(null);
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await fs.rm(root, {recursive: true, force: true});
+  }
+}
+
+function expectReleased(group: AnalysisRunTraceProcessorLeases) {
+  expect(group.entries).toHaveLength(1);
+  const entry = group.entries[0];
+  const key = `${entry.context.traceId}:lease:${entry.lease.id}`;
+  expect(getTraceProcessorLeaseStore().getLeaseById(scope, entry.lease.id)).toMatchObject({state: 'released', holderCount: 0});
+  expect(TraceProcessorFactory.get(key)).toBeUndefined();
+  expect(getPortPool().getStats().allocations.some(allocation => allocation.traceId === key)).toBe(false);
+}
+
+describe('real native oracle lease lifecycle', () => {
+  it('loads a tainted shared instance, uses one real isolated group for the original JOIN, and releases it', async () => {
+    await withLoadedTrace(async (service, traceId) => {
+      const shared = service.getRunningNativeProcessorObservation(traceId)!;
+      let owned: AnalysisRunTraceProcessorLeases | undefined;
+      let released: Promise<unknown> | undefined;
+      const prepare = jest.fn(async (input: Parameters<typeof prepareAnalysisRunTraceProcessorLeases>[0]) => {
+        owned = await prepareAnalysisRunTraceProcessorLeases(input);
+        expect(owned.entries[0]).toMatchObject({privateProcessor: true, context: {mode: 'isolated'}});
+        released = once(getPortPool(), 'released', {signal: AbortSignal.timeout(10_000)});
+        return owned;
+      });
+      const query = jest.spyOn(service, 'query');
+      const expected = expectation();
+      const result = await collectAgentSseOracleEvidence({service, traceId, expectation: expected, scope, deadlineMs: Date.now() + 90_000},
+        {prepareLeases: prepare});
+      await released;
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(query.mock.calls[0][1]).toBe(expected.facts[0].oracle!.sql);
+      expect(result.rows.source_marker_duration).toEqual([expect.objectContaining({duration_ns: 42_000_000, row_id: expect.any(Number)})]);
+      expect(result.schemas.source_marker_duration).toMatchObject({traceId, relation: 'slice', idColumn: 'id', schemaFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/)});
+      expectReleased(owned!);
+      expect(service.getRunningNativeProcessorObservation(traceId)?.instanceToken).toBe(shared.instanceToken);
+      expect(service.getRunningNativeProcessorObservation(traceId)?.status).toBe('tainted');
+    });
+  });
+
+  it('cancels and releases the real private group when the post-query pin check exceeds the original deadline', async () => {
+    await withLoadedTrace(async (service, traceId) => {
+      let owned: AnalysisRunTraceProcessorLeases | undefined;
+      let released: Promise<unknown> | undefined;
+      let queryCompleted = false;
+      let completeLateIdentity: (() => void) | undefined;
+      const originalQuery = service.query;
+      const query = jest.spyOn(service, 'query').mockImplementation(function(this: TraceProcessorService, ...args) {
+        const promise = Reflect.apply(originalQuery, this, args) as ReturnType<TraceProcessorService['query']>;
+        void promise.then(() => {queryCompleted = true;}, () => undefined);
+        return promise;
+      });
+      const prepare = jest.fn(async (input: Parameters<typeof prepareAnalysisRunTraceProcessorLeases>[0]) => {
+        owned = await prepareAnalysisRunTraceProcessorLeases(input);
+        released = once(getPortPool(), 'released', {signal: AbortSignal.timeout(30_000)});
+        return owned;
+      });
+      try {
+        await expect(collectAgentSseOracleEvidence({service, traceId, expectation: expectation(), scope, deadlineMs: Date.now() + 20_000}, {
+          prepareLeases: prepare,
+          resolveIdentity: async input => {
+            const actual = await resolveCapabilityTraceProcessorIdentity(input);
+            if (!queryCompleted) return actual;
+            return new Promise(resolve => {completeLateIdentity = () => resolve(actual);});
+          },
+        })).rejects.toMatchObject({name: 'TimeoutError'});
+        completeLateIdentity?.();
+        await released;
+        expect(queryCompleted).toBe(true);
+        expect(query).toHaveBeenCalledTimes(1);
+        expect(prepare).toHaveBeenCalledTimes(1);
+        expectReleased(owned!);
+      } finally {completeLateIdentity?.(); owned?.release();}
+    });
+  });
+});

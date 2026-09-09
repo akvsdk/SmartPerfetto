@@ -6,7 +6,7 @@ import { EventEmitter } from 'events';
 import { createHash, randomUUID } from 'crypto';
 import {resolveAgentRuntimeBudgetConfig} from '../../../config';
 import {analysisDeliveryFingerprint, type AnalysisCompletion, type AnalysisCandidateIdentity, type AnalysisDeliveryContext} from '../../../types/analysisDelivery';
-import {attachFinalizationContext, FINALIZATION_MAX_OUTPUT_TOKENS} from '../../analysisFinalizationContext';
+import {attachFinalizationContext} from '../../analysisFinalizationContext';
 import {createAnalysisTurnIntentResolver, type AnalysisTurnIntent} from '../../analysisTurnIntent';
 import {resolveRuntimeTurnPolicy, type RuntimeTurnPolicy} from '../../runtimeTurnPolicy';
 import {runIntentTransport, type IntentTransportInput} from '../../intentTransport';
@@ -29,8 +29,9 @@ import {
 } from '../../../services/selfEvolution/evaluationRuntimeHooks';
 import type { TraceProcessorService } from '../../../services/traceProcessorService';
 import { getExtendedKnowledgeBase } from '../../../services/sqlKnowledgeBase';
-import {analysisContextUsesPrivateKnowledge} from '../../../services/resolvedAnalysisContext';
-import {sanitizeCodeAwareStructuredTextWithReceipt} from '../../../services/security/codeAwareOutputRegistry';
+import {analysisContextUsesPrivateKnowledge, assertCurrentAnalysisContextAuthorization, buildAnalysisContextAuthorizationFingerprint} from '../../../services/resolvedAnalysisContext';
+import {resolveKnowledgeScope} from '../../../services/scopedKnowledgeStore';
+import {inspectCandidateProtocol, buildCandidateProtocolDiagnostic} from '../../../services/canonicalAnalysisResult';
 import {
   isSensitiveRagToolName,
   projectToolResultForExternalSurface,
@@ -64,7 +65,7 @@ import {
 import { probeTraceCompleteness } from '../../../agentv3/traceCompletenessProber';
 import type {SceneType} from '../../../agentv3/sceneClassifier';
 import { DEFAULT_OUTPUT_LANGUAGE, localize, parseOutputLanguage, type OutputLanguage } from '../../../agentv3/outputLanguage';
-import { formatToolCallNarration, formatToolResultNarration, toolResultIsFailure } from '../../../agentv3/toolNarration';
+import { formatToolCallNarration, formatToolResultNarration, issuePrivateToolResultNarrationReceipt, toolResultIsFailure } from '../../../agentv3/toolNarration';
 import { estimateAnalysisConfidence } from '../../../agentv3/analysisTermination';
 import { planPhaseUpdatedContent } from '../../../agentv3/planPhaseEvents';
 import type {
@@ -101,6 +102,7 @@ import type {
 import {
   createJsonSchemaFromZodRawShape,
   normalizeRuntimeToolArgs,
+  stringifyRuntimeToolResult,
 } from '../../runtimeToolSpec';
 import type { RuntimeSelection } from '../../runtimeSelection';
 import type { RuntimeEngineDefinition, RuntimeFactoryInput } from '../../runtimeRegistry';
@@ -137,7 +139,6 @@ import {isRuntimeCandidateAdmitted} from '../../runtimeCandidateAdmission';
 import {countCompletedQuickConversationTurns} from '../../quickDirectResult';
 import {getLruCacheEntry, setLruCacheEntry} from '../../runtimeCache';
 import {
-  DEFAULT_EXTERNAL_TOOL_RESULT_MAX_CHARS,
   DEFAULT_FULL_REQUEST_TIMEOUT_MS,
   DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
   summarizeExternalToolResult,
@@ -176,7 +177,6 @@ export const PI_AGENT_CORE_ABORT_JOIN_TIMEOUT_MS_ENV = 'SMARTPERFETTO_PI_AGENT_C
 
 const AGENT_FULL_REQUEST_TIMEOUT_MS_ENV = 'AGENT_FULL_REQUEST_TIMEOUT_MS';
 const AGENT_STREAM_IDLE_TIMEOUT_MS_ENV = 'AGENT_STREAM_IDLE_TIMEOUT_MS';
-const PI_AGENT_CORE_PROVIDER_TEXT_MAX_CHARS = DEFAULT_EXTERNAL_TOOL_RESULT_MAX_CHARS;
 const PI_AGENT_CORE_DEFAULT_ABORT_JOIN_TIMEOUT_MS = 5_000;
 
 function normalizeOptionalString(value: unknown): string | undefined {
@@ -388,10 +388,7 @@ function projectPiAnalysisResult(
     result.partial = true;
     result.terminationReason ??= 'quality_gate_failed';
   }
-  const receipt = sanitizeCodeAwareStructuredTextWithReceipt(result.sessionId, result.conclusion);
-  result.conclusion = receipt.text;
   return finalizeSourceAwareAnalysisResultWithProjection(result, sourceUse, {
-    priorProjection: receipt,
     context,
   });
 }
@@ -881,6 +878,9 @@ export function projectPiAgentCoreEventToStreamingUpdate(
         isError: event.isError === true,
       });
       const projected = projectToolResultForExternalSurface(toolName, event.result);
+      const privateToolResultReceipt = issuePrivateToolResultNarrationReceipt({
+        toolName, result: projected, isError: resultIsFailure,
+      });
       const result = summarizePiToolResult(projected);
       // Narrate the projected object; `result` is byte-truncated for transport.
       const resultNarration = formatToolResultNarration({
@@ -898,6 +898,7 @@ export function projectPiAgentCoreEventToStreamingUpdate(
               toolCallId: event.toolCallId,
               result,
               resultNarration,
+              ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
               isError: true,
               recoverable: true,
             },
@@ -910,6 +911,7 @@ export function projectPiAgentCoreEventToStreamingUpdate(
               toolName,
               result,
               resultNarration,
+              ...(privateToolResultReceipt ? {privateToolResultReceipt} : {}),
               isError: resultIsFailure,
             },
             timestamp,
@@ -923,19 +925,7 @@ export function projectPiAgentCoreEventToStreamingUpdate(
 }
 
 function stringifyPiToolResult(result: RuntimeToolResult): Array<{ type: 'text'; text: string }> {
-  const content = (result as { content?: Array<Record<string, unknown>> }).content;
-  const providerFacingValue = Array.isArray(content)
-    ? content.map((block) => (
-      typeof block.text === 'string' ? block.text : block
-    )).join('\n')
-    : typeof result === 'string' ? result : result;
-  return [{
-    type: 'text',
-    text: summarizeExternalToolResult(
-      providerFacingValue,
-      PI_AGENT_CORE_PROVIDER_TEXT_MAX_CHARS,
-    ),
-  }];
+  return [{type: 'text', text: stringifyRuntimeToolResult(result)}];
 }
 
 export type PiAgentCoreNativeToolExecutionMode = 'sequential' | 'parallel';
@@ -1383,7 +1373,9 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
             runId: executionLease.key.runId!, sessionId, deadlineMs: startedAt + requestTimeoutMs,
             turnIntent, strategyRegistry,
             traceIdentity: {currentTraceId: traceId || undefined, referenceTraceId: options.referenceTraceId},
-            deliveryContext: projected.deliveryContext, sourceUse: sourceUse?.getSourceUseDecision(),
+            deliveryContext: projected.deliveryContext, protocolProjection: projected.protocolProjection,
+            sourceUse: sourceUse?.getSourceUseDecision(),
+            sourceScope: sourceUse?.getSourceExecutionScope?.(),
             evidenceReadView: createPiEvidenceReadView(currentArtifactStore, executionLease.key.runId!, sessionId, traceId, options),
           });
         }
@@ -1675,6 +1667,9 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
     onSourceUseReady(prep.sourceUse, prep.artifactStore);
     executionLease.throwIfAborted();
     const privateAnalysisContext = analysisContextUsesPrivateKnowledge(options);
+    const authorizationScope = resolveKnowledgeScope(options);
+    const authorizationFingerprint = options.analysisContextFingerprint ??
+      buildAnalysisContextAuthorizationFingerprint(options, authorizationScope);
     if (privateAnalysisContext) this.sessionOpaqueStates.delete(sessionId);
 
     const quickBudget = resolveQuickTurnBudget({env: this.env, enforcement: 'turn_cap'});
@@ -1777,6 +1772,19 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
             outputOrigin: completionFor(assistant, text, attemptId, limited).status === 'completed'
               ? 'sdk_final' : 'assistant_stream'},
         });
+        const nativeProtocol = inspectCandidateProtocol(text);
+        if (assistant) this.emit('update', {type: 'progress', content: {phase: 'candidate_protocol',
+          candidateProtocolDiagnostic: buildCandidateProtocolDiagnostic(nativeProtocol, 'native', attemptId === '1' ? 1 : 2)}, timestamp: Date.now()});
+        if (completionFor(assistant, text, attemptId, limited).status === 'completed' &&
+            (nativeProtocol.status === 'invalid' || !nativeProtocol.canonicalBody.trim())) {
+          value.heuristicIssues.push({type: 'missing_check', severity: 'error', recoveryKind: 'continue_output',
+            message: nativeProtocol.status === 'invalid'
+              ? localize(outputLanguage, '当前候选的结论声明格式无效，需要按本轮协议重新输出。',
+                'The candidate has invalid conclusion declarations and needs to follow this turn\'s protocol.')
+              : localize(outputLanguage, '当前候选没有可交付的正文，需要补全完整答案。',
+                'The candidate has no deliverable body and needs a complete answer.')});
+          value.passed = false;
+        }
         executionLease.throwIfAborted();
         phase.end('ok');
         return value;
@@ -1817,11 +1825,17 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
         correctionInProgress = true;
         try {
           agent.state.tools = [];
-          agent.state.systemPrompt = loadPiFinalReportCorrectionSystemPrompt(outputLanguage);
-          const candidate = await runProviderPrompt(generateCorrectionPrompt(actionable, acceptedText, outputLanguage, turnIntent.sceneId));
+          agent.state.systemPrompt = `${originalSystemPrompt}\n\n${loadPiFinalReportCorrectionSystemPrompt(outputLanguage)}`;
+          assertCurrentAnalysisContextAuthorization(options, authorizationScope, authorizationFingerprint);
+          const correctionDiagnostic = buildCandidateProtocolDiagnostic(inspectCandidateProtocol(acceptedText), 'native', 1);
+          const candidate = await runProviderPrompt(`${generateCorrectionPrompt(actionable, acceptedText, outputLanguage, turnIntent.sceneId)}\n\n${JSON.stringify({candidateProtocolDiagnostic: correctionDiagnostic})}`);
           if (candidate && completionFor(candidate.assistant, candidate.text, candidate.attemptId, candidate.turnLimitReached).status === 'completed') {
             const checked = await verifyCandidate(candidate.text, candidate.assistant, candidate.attemptId, candidate.turnLimitReached);
-            if (![...checked.heuristicIssues, ...(checked.llmIssues ?? [])].some(issue => issue.severity === 'error' &&
+            const originalProtocol = inspectCandidateProtocol(acceptedText);
+            const correctedProtocol = inspectCandidateProtocol(candidate.text);
+            if (correctedProtocol.canonicalBody.trim() && correctedProtocol.status !== 'invalid' &&
+                !(originalProtocol.status !== 'absent' && correctedProtocol.status === 'absent') &&
+                ![...checked.heuristicIssues, ...(checked.llmIssues ?? [])].some(issue => issue.severity === 'error' &&
               issue.type !== 'plan_deviation' && issue.type !== 'unresolved_hypothesis')) {
               acceptedAssistant = candidate.assistant;
               acceptedText = candidate.text;
@@ -1885,6 +1899,9 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       outputOrigin: nativeResult.outputOrigin, turnIntent,
     });
     const result = projected.result;
+    this.emit('update', {type: 'progress', content: {phase: 'candidate_protocol',
+      candidateProtocolDiagnostic: buildCandidateProtocolDiagnostic(inspectCandidateProtocol(result.conclusion), 'runtime_projected',
+        acceptedAttemptId === '1' ? 1 : 2, projected.conclusionProjection.disposition)}, timestamp: Date.now()});
     applyFinalResultQualityGate({result, query, sceneType: turnIntent.sceneId,
       context: projected.deliveryContext,
       comparisonIdentity: prep.comparisonIdentity, deferFocusedEvidenceFinalization: true});
@@ -1903,14 +1920,15 @@ export class PiAgentCoreRuntime extends EventEmitter implements IOrchestrator {
       attachFinalizationContext(result, {
         runId, sessionId, deadlineMs, turnIntent, strategyRegistry: intentResolver.strategyRegistry,
         traceIdentity: {currentTraceId: traceId || undefined, referenceTraceId: options.referenceTraceId},
-        deliveryContext: projected.deliveryContext, sourceUse: prep.sourceUse.getSourceUseDecision(),
+        deliveryContext: projected.deliveryContext, protocolProjection: projected.protocolProjection,
+        sourceUse: prep.sourceUse.getSourceUseDecision(),
+        sourceScope: prep.sourceUse.getSourceExecutionScope?.(),
         evidenceReadView: createPiEvidenceReadView(prep.artifactStore, runId, sessionId, traceId, options),
         ...(result.completion?.status === 'completed' && result.success && result.conclusion
           && result.outputOrigin !== 'runtime_fallback' ? {
             providerQuery: {text: prep.analysisRunSpec.query.text, analysisContextFingerprint: options.analysisContextFingerprint},
             dispatchText: (input: IntentTransportInput) => runPiIntentTransport({
               ...input, deadlineMs: Math.min(deadlineMs, input.deadlineMs), providerRuntime,
-              maxOutputTokens: FINALIZATION_MAX_OUTPUT_TOKENS,
             }),
           } : {}),
       });

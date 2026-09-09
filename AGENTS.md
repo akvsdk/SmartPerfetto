@@ -1,16 +1,85 @@
 # SmartPerfetto Agent Guide
 
-Project-scoped entry guide for AI coding agents. Keep this file short: durable
-details belong in `.claude/rules/` and product docs, not in root agent adapters.
+This is the canonical project-scoped guide for AI coding agents. Maintain
+shared rules here and durable area-specific contracts in `.claude/rules/`
+and product docs. `CLAUDE.md` imports this file as a compatibility entrypoint;
+other agent adapters should point here without duplicating the rules.
 
-Claude Code reads `CLAUDE.md`. Codex, OpenCode, Windsurf, Cline, and other
-agents commonly read `AGENTS.md`. Keep these two files in sync. Cursor,
-Copilot, and Gemini adapters should stay short and point back here plus the
-relevant `.claude/rules/` files.
+## Communication
+
+- Default to Simplified Chinese for user-facing communication; keep code,
+  commands, and technical identifiers in English. Honor an explicit language request.
+- Lead with the outcome and impact, then explain actions, unresolved decisions,
+  and evidence where useful. Use concise, connected paragraphs; use lists only
+  for parallel items, comparisons, or steps.
+- Use concrete words. Avoid filler, jargon without a purpose, repeated
+  summaries, and unrequested contrasts. Include technical details when they
+  help the user understand the result, judge risk, or reproduce it.
+- Disagree with a suggestion when evidence shows it would undermine the goal;
+  explain why and recommend a workable alternative.
+
+## Authority and Context
+
+- Follow system, platform, and safety constraints. The user's current explicit
+  instructions take precedence over project defaults, Skills, memory, and
+  personal preferences. This guide applies only within this repository;
+  more specific directory rules refine the relevant scope.
+- Before editing, inspect the live worktree, this guide, relevant rules, source,
+  and existing tests. Scripts, configuration, probes, and current runtime
+  evidence establish project facts; documentation records intended contracts.
+  Resolve discrepancies explicitly rather than treating old reports as live proof.
+- For non-trivial or history-dependent work, search available memory/history
+  first. If memory MCP is unavailable or unhelpful, use read-only local Codex
+  summaries, then thread records and their rollouts. Reuse relevant prior work
+  after checking current truth; clarify whether to extend or re-review only
+  when the current request leaves that choice unresolved.
+- Read Skills and detailed rules relevant to the task. If a rule or Skill causes
+  a pause, cite the exact file and instruction and explain the unresolved need;
+  distinguish an explicit requirement from your interpretation. Do not use the
+  `brainstorming` Skill.
+
+## Execution
+
+- For an implementation request, continue through the authorized work,
+  verification, and necessary fixes until the intended result is complete or
+  a concrete blocker requires user input. A plan or passing test alone is not
+  completion. Keep explanation, review, and diagnosis requests read-only unless
+  the user also asks for a change.
+- Make routine, reversible decisions within the agreed scope. Before asking
+  for approval, finish independent authorized work that makes the decision
+  concrete and reviewable. Do not repeatedly request existing authorization
+  or add approval steps for hypothetical risks; actual scope and permission
+  boundaries still apply.
+- Clarify unresolved material goals, design choices, scope, or acceptance
+  criteria using the required `grilling` flow: establish facts yourself, ask
+  one decision at a time with a recommendation, then confirm the agreed scope.
+  Honor an explicit request to skip it. Settled requirements, status queries,
+  and small self-contained edits do not need another clarification round.
+- For non-trivial changes, state the touched files, change order, dependencies,
+  and risks; apply the independent review gate below, then Execute -> Verify ->
+  Revise. Review architecture and affected contracts, not just the local diff.
+- Use the smallest applicable verification tier in `.claude/rules/testing.md`.
+  Report what changed, what was actually verified, and any material gap;
+  distinguish local edits from commits, pushes, and releases.
+- Remove only this task's disposable temporary artifacts. Preserve user data,
+  unrelated changes, and evidence needed for review or release.
+
+## Tools and Delegation
+
+- Prefer `rg` and `rg --files` for text and file search; use GitNexus for symbol
+  relationships and impact as required by `.claude/rules/git.md`. Refresh its
+  index with `--index-only` so analysis does not rewrite agent entrypoints.
+- Batch independent reads and queries. Keep shared state, dependent decisions,
+  and conflicting operations serial. Prefer an available CLI/API; use the
+  user's authenticated browser when the task requires a web console.
+- Delegate only a bounded, independent workstream or an independent review
+  that saves time or improves quality. State inputs, ownership, outputs, and
+  completion criteria. Keep simple tasks and shared decisions with the primary
+  agent, which inspects and validates the combined result. Follow
+  `.claude/rules/agent-orchestration.md` when delegating.
 
 ## Basics
 
-- Reply to maintainers in the language they use.
 - SmartPerfetto is an AGPL-licensed, AI-assisted Android Perfetto analysis
   platform: pre-built Perfetto UI, Express backend, AI runtimes, YAML Skills,
   Markdown strategies, and a `trace_processor_shell` pool.
@@ -49,33 +118,18 @@ cd backend && npm run build
   verification, identity resolution, reports, snapshots, CLI output, and
   frontend chat projection are separate surfaces. Keep chat readable without
   deleting report/snapshot provenance.
-- Accuracy guards are mostly pattern matchers, and that is where they break:
-  a token budget, a whitespace-sensitive regex, or a placeholder written inside
-  a comment has silently disabled routing, identity admission, and scene
-  guidance. Before widening a rule, check the detector's boundary conditions
-  against real inputs, and prefer giving the model the missing context over
-  adding another prohibition.
-- A detector that must decide *who wrote* a piece of text cannot do it from the
-  text. This product analyses traces, so `ECONNRESET` and `Connection error` are
-  its subject matter, and a matcher for provider failures flagged five of six
-  ordinary short answers about them. Authorship lives in the run — what it
-  dispatched, collected, and streamed — so make that state a required argument
-  rather than an optional hint a caller can forget.
-- A user-facing narration layer must cover both halves of an event. Tool
-  *calls* went through a shared narrator while tool *results* fell back to
-  `summarizeExternalToolResult` — a byte truncator whose name says summary — so
-  a third of the analysis process view was truncated JSON. When adding a
-  runtime event that reaches a user surface, give it a sentence in the shared
-  narration layer; if it cannot be described honestly, emit nothing rather than
-  a serialized payload.
-- Read a structured fact from a payload before it is truncated for transport.
-  `summarizeExternalToolResult` caps tool results at 2000 characters, and the
-  fields appended last — `planPhaseId`, `success` — are the ones that vanish,
-  degrading plan attribution and tool-success evidence without any error.
-- A user-facing line earns its place only when it says something the line above
-  it could not. Reporting a tool result's shape — row counts, column counts,
-  how many evidence IDs were registered — answers the system's question, not the
-  reader's; report the outcome, or nothing.
+- Before widening a detector, check real inputs at token-budget, whitespace,
+  and placeholder/comment boundaries. Supply missing context where possible.
+- Determine authorship from required run state: what was dispatched, collected,
+  and streamed. Provider-error wording can also be ordinary trace-analysis
+  content; it cannot establish who wrote an answer.
+- Narrate both tool calls and results through the shared narration layer.
+  Describe the outcome, or emit nothing when it cannot be stated honestly;
+  serialized payloads and row/column/evidence counts are not user-facing findings.
+- Extract structured facts before transport truncation, including `planPhaseId`
+  and `success` before `summarizeExternalToolResult`. Preserve plan attribution
+  and success evidence even when the transported result is shortened.
+- Each user-facing line should add information beyond the preceding line.
 - `frontend/` is consumed by Docker, `./start.sh`, and portable packages. After
   AI Assistant plugin UI changes, verify in dev mode and run
   `./scripts/update-frontend.sh`.
@@ -112,11 +166,8 @@ logic, use Plan -> independent read-only review -> Revise -> Execute.
   Codex read-only review.
 - If the primary agent is Codex, do not call Codex to review itself. Prefer a
   read-only reviewer sub-agent/tool.
-- In ZCode/OpenCode, invoke the `codex` MCP tool for this gate. It exposes
-  `codex` (start a read-only review session; pass a review prompt with
-  `sandbox: "read-only"` and `approval-policy: "never"`) and `codex-reply`
-  (continue a session by `threadId`). Registered as `mcp.codex` in
-  `~/.zcode/v2/config.json`, backed by `codex mcp-server`.
+- Use review tools actually available in the current environment; do not assume
+  a particular model, plugin, machine path, or tool schema.
 - If no stable reviewer is available, or the reviewer times out twice, use a
   structured self-review plus post-diff review, note the fallback, and rely on
   the relevant verification tier from `.claude/rules/testing.md`.

@@ -1,5 +1,27 @@
 # Testing Rules
 
+## Proportionate Verification
+
+- Choose the smallest applicable tier below and complete its required checks.
+  Use commands defined by this repository's rules, scripts, or documentation
+  that the current environment can execute. Record missing entrypoints as
+  `NOT CONFIGURED` and unavailable prerequisites as `NOT AVAILABLE`.
+- Do not add tests for reversible, low-impact changes merely to restate the
+  implementation. Add or update tests when they protect an observable behavior,
+  regression boundary, or maintained contract; an existing contract test must
+  still match an intentionally changed contract.
+- After applicable checks pass, repeat or broaden them only for new changes,
+  failures, unresolved doubts, or a required PR/release gate. Reuse evidence only
+  when the relevant files, dependencies, configuration, and execution environment
+  are unchanged. The PR and exact-archive release gates below still apply.
+- Before committing code, simplify only task-owned changes without changing
+  behavior: use an available `/simplify`, then a project-defined executable
+  simplification script, then `code-simplifier` on PATH. If none is available,
+  perform a manual simplification review plus `git diff --check`; record the
+  unavailable tool without treating it as a blocker.
+- Preserve evidence needed for acceptance. Remove only disposable temporary
+  files created by this task; do not clean unrelated work or shared caches.
+
 ## Default PR Gate
 
 Before opening or landing a PR, run from the repository root:
@@ -70,6 +92,7 @@ contain at least one test".
 | Contract/type-only change | `cd backend && npx tsc --noEmit` plus relevant contract tests |
 | CRUD-only service, no agent/runtime path | That service's `__tests__/<name>.test.ts` |
 | MCP, memory, report, provider, session, or agent runtime | `cd backend && npm run test:scene-trace-regression` |
+| Raw SQL capture units or native processor provenance | `npm --prefix backend run test:raw-sql-provenance` plus affected parser, worker lifecycle, RPC and capture tests; this gate ensures the pinned binary and materializes the Trace fixture |
 | Skill YAML | `cd backend && npm run validate:skills` plus scene trace regression |
 | Strategy/template Markdown | `cd backend && npm run validate:strategies` plus scene trace regression |
 | Trace corpus, Skill/Strategy coverage, or generator | `npm run trace:regression`; it includes `npm run trace:tooling:test` plus generated-corpus build and SQL execution |
@@ -498,7 +521,9 @@ verification request ignores active Provider Manager profiles, and pins:
 - `OPENAI_AGENTS_PROTOCOL=chat_completions`
 - `OPENAI_MODEL=deepseek-v4-pro`
 - `OPENAI_LIGHT_MODEL=deepseek-v4-flash`
-- `OPENAI_MAX_OUTPUT_TOKENS=8192`
+- No implicit OpenAI main-answer output cap; an explicit
+  `OPENAI_MAX_OUTPUT_TOKENS` must be a positive safe integer. Prompt guidance
+  controls normal answer length; provider limits remain authoritative.
 
 Keep API keys out of committed files. Pass `DEEPSEEK_API_KEY` or
 `OPENAI_API_KEY` through the shell environment or a local untracked env file

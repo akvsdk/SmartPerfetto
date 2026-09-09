@@ -116,6 +116,7 @@ export interface AnalysisVerificationBinding {
 export interface AnalysisSourceVerificationBinding extends AnalysisVerificationBinding {
   conclusionContractFingerprint: string;
   sourceUseFingerprint: string;
+  sourceScopeFingerprint?: string;
 }
 
 interface CurrentAnalysisDeliveryContext {
@@ -129,6 +130,7 @@ interface CurrentAnalysisDeliveryContext {
   claimVerificationBinding?: AnalysisVerificationBinding;
   sourceVerificationBinding?: AnalysisSourceVerificationBinding;
   sourceUseFingerprint?: string;
+  sourceScopeFingerprint?: string;
   reportRequirements?: PinnedAnalysisReportRequirements;
   reportAssessment?: FinalReportAssessment;
   caseRetrieval?: AnalysisCaseRetrievalState;
@@ -140,6 +142,8 @@ export type AnalysisDeliveryContext =
   | (CurrentAnalysisDeliveryContext & {
       entry: 'new_finalization';
       acceptedCandidate: AnalysisCandidateIdentity;
+      /** Issued only from current source-free declarations and the actual run ledger. */
+      sourceApplicability?: 'not_applicable';
     });
 
 export interface AnalysisDeliveryAssurance {

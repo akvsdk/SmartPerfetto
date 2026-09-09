@@ -234,16 +234,25 @@ exact runtime result + private RuntimeFinalizationContext
 
 产品必须在复制结果前从 exact result 取出 context。context 固定 provider、原始绝对
 deadline、trace identity 和证据读取范围；产品 owner 在 await 前后检查当前 run、取消和
-授权。语义审核最多一次、无工具，独立上限为 60 秒，并受原始 deadline 和用户取消约束。
+授权。语义审核最多一次、无工具，沿用原始绝对 deadline；开始审核或重复读取结果不会
+重置或延长预算。用户取消或释放 context 会中止审核。
 审核超时记录为 unavailable，保留原正文及 native completion，不重写正文或把因果命题降成数值
 命题。审核未知不单独使简短回答失败；完整报告仍需要满足其报告审核契约。
 正文、真实 native completion 和原始 claim 是不同输入；合法 JSON 和模型审核
 一致都不能单独成为证明。
 
+语义审核不另加应用层输出 token 上限。OpenAI 只发送本次运行冻结的显式
+`maxOutputTokens`；Claude 保留原 SDK 环境；Pi 未显式传入上限时使用已固定模型的
+原生 SDK 能力。分类请求仍保留各自的小协议预算。服务商与 SDK 的输出限制仍然有效，
+审核也仍校验完整结束状态和已完成 JSON 的 64 KiB 大小边界。
+OpenCode 的共享模型配置不伪造 context/output 容量：未提供容量时依赖 SDK 默认值，
+未知 context 不触发容量阈值驱动的预压缩，真实 context overflow 仍走原生被动压缩。
+这不保证长会话行为与已知容量模型相同，也不增加模型 JSON 的容量配置入口。
+
 `final_report_contract` 仍来自固定 registry 的 strategy frontmatter。`claudeVerifier`
 只提供结构化交付诊断，不再运行独立语义 LLM 或按误诊词匹配正文。有限证明目录以
-`SUPPORTED_DETERMINISTIC_CLAIM_RULES` 为准：当前为 `numeric.cell`、`interval.overlap`、
-`comparison.delta`。缺失原始 witness、受信单位/字段语义或覆盖时保留候选/未知状态；
+`SUPPORTED_DETERMINISTIC_CLAIM_RULES` 为准。每项规则仅证明其明确覆盖的命题；缺失原始
+witness、受信单位/字段语义或覆盖时保留候选/未知状态；
 一般因果关系不能由相等数值或端点推导。完整 claim 状态由捕获证据与当前命题的语义审核
 联合决定。报告、CLI 和 snapshot 保留 provenance；chat 分开投影正文、machine sidecar
 和结构化 runtime appendix，不能机械删改自然语言结论。

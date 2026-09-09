@@ -39,12 +39,15 @@ SmartPerfetto 在 Perfetto Trace 之上增加 AI 分析层。加载 Trace、用�
 
 - 分析 Android Perfetto Trace 中的滑动卡顿、启动、ANR、交互延迟、内存、游戏和
   渲染流程问题。
+- 沿滑动和窗口动画期间的主线程连续时间线，追查 doFrame 之间的任务、执行/等待
+  和来源线索；FrameTimeline 用于核对出帧结果，缺少帧数据仍可分析主线程工作。
 - 保留 Perfetto 时间线和 SQL 工作流，并通过 AI Assistant 提供证据化结论、连续追问、
   对比和报告。
 - 使用确定性的 YAML Skill 与 Markdown 策略，将事实证据、模型解释和报告来源分开。
 - 按每次请求显式选择已注册的本机源码，无需索引也能有界按需检索，并在
   Web、报告、CLI、snapshot 和 API 的安全来源中区分 trace 发生证据与
-  `CodeRef` 机制证据。
+  `CodeRef` 机制证据。通过“选择文件夹 → 添加并用于分析”即可开始，排除路径和
+  可选索引设置见[源码分析指南](docs/getting-started/code-aware-analysis.md)。
 - UI 选区只传身份与时间边界；名称等描述性事实由后端重新查询，`/anr` 与 `/jank`
   也进入同一套证据和验证管线。
 - 支持浏览器 UI、`smp` CLI 和 HTTP/SSE 接入；完整范围见
@@ -96,6 +99,8 @@ Web UI 启动后，打开 **AI Assistant 设置 → Providers**，添加一个 P
 2. 加载 `.pftrace` 或 `.perfetto-trace` 文件。
 3. 打开 AI Assistant 面板。
 4. 输入 `分析滑动卡顿`、`为什么启动慢？` 或 `分析这个 Trace 中的 ANR` 等问题。
+
+每一轮先展示本轮分析过程和步骤，最后展示本轮结论；下一轮问题接在该结论之后。
 
 CLI 用法：
 

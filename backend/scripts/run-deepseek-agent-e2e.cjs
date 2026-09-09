@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { isDeepStrictEqual } = require('node:util');
 
 const backendRoot = path.resolve(__dirname, '..');
 const verifierPath = path.join(backendRoot, 'src/scripts/verifyAgentSseScrolling.ts');
@@ -43,16 +44,12 @@ const SEMANTIC_DELTA_QUERIES = [
     text: '指出本次启动标记对应的源码位置、调用链和最小可操作修改点。',
   },
 ];
-const SEMANTIC_DELTA_MARKER =
-  'StartupHooks.initializeOnMainThread#before-first-frame-sync-policy';
 const SEMANTIC_DELTA_TRACE =
   '../Trace/.generated/constructed/source-analysis-semantic/trace.pftrace';
 const SEMANTIC_DELTA_SOURCE_ROOT = 'tests/e2e/context-fixtures/app';
 const SEMANTIC_DELTA_RELATIVE_SOURCE_PATH =
   'backend/tests/e2e/context-fixtures/app/StartupHooks.kt';
 const SEMANTIC_DELTA_SOURCE_FILE = 'StartupHooks.kt';
-const SEMANTIC_DELTA_SOURCE_SYMBOL = 'StartupHooks.initializeOnMainThread';
-const SEMANTIC_DELTA_CALLER = 'Application.onCreate';
 const PRIVATE_SOURCE_CANARY = 'SEMANTIC_DELTA_PRIVATE_SOURCE_CANARY_NEVER_EMIT';
 
 // Independent FrameTimeline population oracle for these E2E suites:
@@ -83,10 +80,11 @@ function sourceFactExpectation(query) {
     ...(query.kind === 'quantitative-only' ? {taskKind: 'fact', scope: 'bounded_question', deliverable: 'answer'} : {})},
     facts: [{id: 'source_marker_duration', kind: 'numeric', columns: ['dur', 'dur_ns'], verification: 'proved',
       value: facts.durationNs, unit: 'ns', oracle: {
-        sql: `SELECT s.dur AS duration_ns, s.ts AS start_ts, t.upid FROM slice s
+        sql: `SELECT s.id AS row_id, s.dur AS duration_ns, s.ts AS start_ts, t.upid FROM slice s
           JOIN thread_track tt ON s.track_id = tt.id JOIN thread t USING(utid) JOIN process p USING(upid)
           WHERE s.name = '${marker}' AND t.name = '${facts.thread}' AND p.name = '${facts.process}'`,
-        column: 'duration_ns', unit: 'ns', anchorMatch: {startTs: 'start_ts', upid: 'upid'},
+        column: 'duration_ns', unit: 'ns', anchorMatch: {startTs: 'start_ts', upid: 'upid',
+          nativeRow: {relation: 'slice', idColumn: 'id', oracleColumn: 'row_id'}},
       }}], uncoveredFacets: query.kind === 'quantitative-only' ? undefined : ['source recommendation action semantics']};
 }
 
@@ -289,6 +287,11 @@ function main() {
   assertFile(verifierPath, 'Agent SSE verifier');
 
   if (options.suite === SEMANTIC_DELTA_SUITE) {
+    if (options.preflight) {
+      const result = runSemanticPreflight(options);
+      if (!result.preflightPassed) process.exitCode = 1;
+      return;
+    }
     const aggregate = runCodeAwareSemanticDeltaSuite(options);
     if (aggregate.attemptFailureCount > 0) process.exitCode = 1;
     return;
@@ -325,6 +328,9 @@ function parseArgs(argv) {
   let runtime = DEFAULT_RUNTIME;
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   let repeat = 1;
+  let preflight = false;
+  let queryId;
+  let condition;
   let outputDir = path.resolve(
     backendRoot,
     'test-output/code-aware-semantic-delta/real-provider',
@@ -369,6 +375,17 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (arg === '--preflight') {
+      preflight = true;
+      continue;
+    }
+    if (arg === '--query-id' || arg === '--condition') {
+      const value = argv[++i];
+      if (!value) throw new Error(`${arg} requires a value`);
+      if (arg === '--query-id') queryId = value;
+      else condition = value;
+      continue;
+    }
     if (arg === '--output-dir') {
       const value = argv[i + 1];
       if (!value) throw new Error('--output-dir requires a value');
@@ -383,11 +400,18 @@ function parseArgs(argv) {
     throw new Error(`Unknown option: ${arg}`);
   }
 
-  if (suite === SEMANTIC_DELTA_SUITE && repeat !== 5) {
+  if (preflight) {
+    if (suite !== SEMANTIC_DELTA_SUITE || repeat !== 1 || resolveSemanticRuntimeKinds(runtime).length !== 1 ||
+        !SEMANTIC_DELTA_QUERIES.some(query => query.id === queryId) || !['A0', 'A2', 'A3'].includes(condition)) {
+      throw new Error('--preflight requires the code-aware-semantic-delta suite, one runtime, an existing --query-id, one --condition A0|A2|A3, and no repeats');
+    }
+  } else if (queryId !== undefined || condition !== undefined) {
+    throw new Error('--query-id and --condition are only available with --preflight');
+  } else if (suite === SEMANTIC_DELTA_SUITE && repeat !== 5) {
     throw new Error(`${SEMANTIC_DELTA_SUITE} requires --repeat 5`);
   }
 
-  return { suite, runtime, timeoutMs, repeat, outputDir, help: false };
+  return { suite, runtime, timeoutMs, repeat, outputDir, preflight, queryId, condition, help: false };
 }
 
 function parseSuite(value) {
@@ -431,11 +455,12 @@ function printUsage() {
   console.log('Runs SmartPerfetto Agent SSE E2E with Deepseek-backed SmartPerfetto runtimes.');
   console.log('');
   console.log('Credential precedence: DEEPSEEK_API_KEY, then OPENAI_API_KEY.');
-  console.log('OpenAI receives OPENAI_* pins; Pi/OpenCode receive generated Deepseek model JSON unless env already overrides it.');
+  console.log('OpenAI receives explicit OPENAI_* pins; Pi reads the installed SDK model catalog, and OpenCode receives Deepseek model JSON unless env already overrides it.');
   console.log('Qoder receives DeepSeek through resolveModel BYOK and still requires QODER_PERSONAL_ACCESS_TOKEN or qodercli login.');
   console.log('BYOK does not replace Qoder authentication.');
   console.log(`Each real SSE scenario has a ${DEFAULT_TIMEOUT_MS}ms default timeout; use --timeout-ms to override it.`);
   console.log('The code-aware semantic-delta suite requires --repeat 5 and writes paired-run plus aggregate JSON artifacts.');
+  console.log('For one diagnostic scenario, use --preflight --query-id autonomous-diagnosis|quantitative-only|explicit-source-location --condition A0|A2|A3 with one runtime. Preflight never counts as complete acceptance.');
 }
 
 function resolveSemanticRuntimeKinds(value) {
@@ -547,18 +572,44 @@ function semanticDeltaQueries() {
   return SEMANTIC_DELTA_QUERIES.map(query => ({...query}));
 }
 
+function scenarioSliceSelector(caseId, scenario) {
+  const targets = (scenario?.signals || []).filter(signal => signal.type === 'atrace-slice' &&
+    signal.name !== `SmartPerfetto::CASE::${caseId}`);
+  if (targets.length !== 1) throw new Error('Source scenario must identify exactly one target slice');
+  const [target] = targets;
+  const threads = (scenario.actors?.threads || []).filter(thread =>
+    thread.id === target.thread && thread.process === target.process);
+  const processes = (scenario.actors?.processes || []).filter(process => process.id === target.process);
+  if (threads.length !== 1 || processes.length !== 1 ||
+      [target.name, threads[0]?.name, processes[0]?.name].some(name => typeof name !== 'string' || !name.trim())) {
+    throw new Error('Source scenario target process and thread identities are missing or ambiguous');
+  }
+  return {processName: processes[0].name, threadName: threads[0].name, eventName: target.name};
+}
+
+function sourceScenarioSliceSelector() {
+  const caseRoot = path.resolve(backendRoot, '../Trace/constructed/source-analysis-semantic');
+  const caseMetadata = JSON.parse(fs.readFileSync(path.join(caseRoot, 'case.json'), 'utf8'));
+  const scenarioFile = caseMetadata.construction?.scenario_file;
+  if (typeof scenarioFile !== 'string' || path.basename(scenarioFile) !== scenarioFile) {
+    throw new Error('Source scenario metadata must name a local scenario file');
+  }
+  return scenarioSliceSelector(caseMetadata.id,
+    JSON.parse(fs.readFileSync(path.join(caseRoot, scenarioFile), 'utf8')));
+}
+
 function semanticConditionArgs(query, condition, outputPath, timeoutMs) {
   const args = [
     '--mode', 'full',
     '--provider-id', 'env',
     '--trace', SEMANTIC_DELTA_TRACE,
     '--query', query.text,
+    '--select-slice-json', JSON.stringify(sourceScenarioSliceSelector()),
     '--output', outputPath,
     '--timeout-ms', String(timeoutMs),
     '--require-non-partial',
     '--require-claim-verifier-ok',
     '--expectation-json', JSON.stringify(sourceFactExpectation(query)),
-    '--require-text', SEMANTIC_DELTA_MARKER,
     '--forbid-text', PRIVATE_SOURCE_CANARY,
   ];
   if (condition === 'A0') {
@@ -566,8 +617,6 @@ function semanticConditionArgs(query, condition, outputPath, timeoutMs) {
       '--code-aware', 'off',
       '--forbid-text', SEMANTIC_DELTA_RELATIVE_SOURCE_PATH,
       '--forbid-text', SEMANTIC_DELTA_SOURCE_FILE,
-      '--forbid-text', SEMANTIC_DELTA_SOURCE_SYMBOL,
-      '--forbid-text', SEMANTIC_DELTA_CALLER,
       '--forbid-text', '[Code:',
     );
     return args;
@@ -578,12 +627,7 @@ function semanticConditionArgs(query, condition, outputPath, timeoutMs) {
     '--code-aware', 'provider_send',
   );
   if (query.kind !== 'quantitative-only') {
-    args.push(
-      '--require-code-ref',
-      '--require-text', SEMANTIC_DELTA_SOURCE_FILE,
-      '--require-text', SEMANTIC_DELTA_SOURCE_SYMBOL,
-      '--require-text', SEMANTIC_DELTA_CALLER,
-    );
+    args.push('--require-code-ref');
   }
   return args;
 }
@@ -606,11 +650,80 @@ function sanitizeDiagnostic(value) {
     .trim();
 }
 
+function nativeOccurrenceForAnchor(anchor, verification) {
+  const proof = verification?.deterministicProof;
+  const rows = proof?.nativeRows;
+  if (rows === undefined || Array.isArray(rows) && rows.length === 0) return {status: 'absent'};
+  if (!Array.isArray(rows) || verification?.status !== 'verified' || proof.status !== 'proved' ||
+      !['numeric_cell', 'captured_cell', 'interval_overlap', 'comparison_delta'].includes(proof.kind) ||
+      verification.propositionCoverage?.status !== 'complete' || verification.propositionCoverage.uncovered?.length !== 0 ||
+      !proof.anchorIds?.includes(anchor.anchorId) || !proof.evidenceRefIds?.includes(anchor.evidenceRefId)) return {status: 'invalid'};
+  const candidates = rows.filter(row => row?.anchorId === anchor.anchorId && row?.evidenceRefId === anchor.evidenceRefId);
+  if (candidates.length !== 1) return {status: 'invalid'};
+  const row = candidates[0];
+  if (!anchor.context?.captureId || row.captureId !== anchor.context.captureId ||
+      row.traceId !== anchor.context.traceId || row.traceSide !== 'current' || anchor.context.traceSide !== 'current' ||
+      typeof row.relation !== 'string' || !/^[a-z_][a-z0-9_]*$/.test(row.relation) ||
+      typeof row.idColumn !== 'string' || !/^[a-z_][a-z0-9_]*$/.test(row.idColumn) ||
+      !Number.isSafeInteger(row.id) || row.id < 0 || !/^[a-f0-9]{64}$/.test(row.schemaFingerprint) ||
+      !verification.referenceCells?.some(cell => cell.anchorId === anchor.anchorId &&
+        cell.evidenceRefId === anchor.evidenceRefId && cell.status === 'matched')) return {status: 'invalid'};
+  return {status: 'valid', row};
+}
+
+function sameTraceOccurrence(anchor, oracle, anchorVerification, oracleVerification) {
+  if (anchor.missing || oracle.missing || !anchor.context?.traceId || anchor.context.traceId !== oracle.context?.traceId ||
+      anchor.context.traceSide !== 'current' || oracle.context?.traceSide !== 'current') return false;
+  for (const key of ['upid', 'utid', 'pid', 'tid', 'packageName', 'processName', 'threadName']) {
+    if (anchor.identity?.[key] !== undefined && oracle.identity?.[key] !== undefined &&
+        anchor.identity[key] !== oracle.identity[key]) return false;
+  }
+  for (const key of ['startTs', 'endTs', 'unit']) {
+    if (anchor.timeRange?.[key] !== undefined && oracle.timeRange?.[key] !== undefined &&
+        String(anchor.timeRange[key]) !== String(oracle.timeRange[key])) return false;
+  }
+  const sameCapture = Boolean(anchor.evidenceRefId) && anchor.evidenceRefId === oracle.evidenceRefId;
+  const cells = anchor.cells || [];
+  const oracleCells = oracle.cells || [];
+  const rowConflict = cells.some(cell => oracleCells.some(other =>
+    (sameCapture && Number.isInteger(cell.rowIndex) && Number.isInteger(other.rowIndex) && cell.rowIndex !== other.rowIndex) ||
+    Object.entries(cell.rowSelector || {}).some(([key, value]) =>
+      Object.hasOwn(other.rowSelector || {}, key) && !isDeepStrictEqual(value, other.rowSelector[key]))));
+  if (rowConflict) return false;
+  const native = nativeOccurrenceForAnchor(anchor, anchorVerification);
+  const nativeOracle = nativeOccurrenceForAnchor(oracle, oracleVerification);
+  if (native.status === 'invalid' || nativeOracle.status === 'invalid') return false;
+  if (native.status === 'valid' && nativeOracle.status === 'valid') {
+    return ['traceId', 'traceSide', 'relation', 'idColumn', 'id', 'schemaFingerprint']
+      .every(key => native.row[key] === nativeOracle.row[key]);
+  }
+  if (sameCapture) {
+    // An evidence id identifies a result set. Cross-claim reuse must identify its
+    // actual row, not merely a coincident time or a different row in that set.
+    if (cells.some(cell => oracleCells.some(other =>
+      Number.isInteger(cell.rowIndex) && cell.rowIndex >= 0 && cell.rowIndex === other.rowIndex ||
+      Object.keys(cell.rowSelector || {}).length > 0 && isDeepStrictEqual(cell.rowSelector, other.rowSelector)))) return true;
+    return Boolean(anchor.anchorId) && anchor.anchorId === oracle.anchorId;
+  }
+  // Across independent captures, require the entire physical interval and the
+  // same trace-scoped thread and process. Shared row selectors may not conflict.
+  const validRange = range => range?.unit === 'ns' && /^\d+$/.test(String(range.startTs)) &&
+    /^\d+$/.test(String(range.endTs)) && BigInt(range.endTs) > BigInt(range.startTs);
+  return validRange(anchor.timeRange) && validRange(oracle.timeRange) &&
+    ['upid', 'utid'].every(key => Number.isInteger(anchor.identity?.[key]) && anchor.identity[key] >= 0 &&
+      anchor.identity[key] === oracle.identity?.[key]);
+}
+
 function evaluateSemanticConditionReport(input) {
   const {report, query, condition, sourceRoot} = input;
   const summary = report?.summary;
-  const serialized = report ? JSON.stringify(report) : '';
+  // Canary names appear in the verifier's boolean check keys by design. Scan
+  // delivered content, and check those diagnostic booleans separately.
+  const {checks: _checks, summary: _summary, ...reportContent} = report || {};
+  const {requiredTextMatches: _required, forbiddenTextMatches: forbidden, ...summaryContent} = summary || {};
+  const serialized = JSON.stringify({...reportContent, summary: summaryContent});
   const privacyPassed = Boolean(report) &&
+    forbidden?.[PRIVATE_SOURCE_CANARY] !== true &&
     !serialized.includes(sourceRoot) &&
     !serialized.includes(PRIVATE_SOURCE_CANARY) &&
     !serialized.includes('val startupPolicy =');
@@ -632,9 +745,44 @@ function evaluateSemanticConditionReport(input) {
         typeof setup?.activeGeneration === 'string' &&
         setup?.pendingGeneration === false;
   const task = report?.taskVerification;
-  const traceFactPassed = task?.facts?.source_marker_duration?.proposition === 'proved' &&
-    task?.facts?.source_marker_duration?.matched === true &&
-    Object.keys(task?.checks || {}).length > 0 && Object.values(task.checks).every(value => value === true);
+  const overallTaskChecksPassed = Object.keys(task?.checks || {}).length > 0 &&
+    Object.values(task.checks).every(value => value === true);
+  const fact = task?.facts?.source_marker_duration;
+  const claims = summary?.terminalAnalysis?.conclusionContract?.claims || [];
+  const supports = summary?.terminalAnalysis?.claimSupport || [];
+  const claimResults = summary?.terminalAnalysis?.claimVerificationResult?.claimResults || [];
+  const claimVerification = claimId => {
+    const matches = claimResults.filter(result => result.claimId === claimId);
+    return matches.length === 1 ? matches[0] : undefined;
+  };
+  const uniqueIds = ids => Array.isArray(ids) && ids.length > 0 &&
+    ids.every(id => typeof id === 'string' && id.length > 0) && new Set(ids).size === ids.length;
+  const oracleClaimIds = new Set(Array.isArray(fact?.matchedClaimIds) ? fact.matchedClaimIds : []);
+  const oracleAnchorIds = new Set(Array.isArray(fact?.matchedAnchorIds) ? fact.matchedAnchorIds : []);
+  // The verifier already matched the independent oracle. Retain that result only
+  // while its exact claim/proof/anchor association is present in this terminal.
+  const oracleAnchors = [...oracleClaimIds].flatMap(claimId => {
+    const declared = claims.filter(claim => claim.id === claimId);
+    const supported = supports.filter(support => support.claimId === claimId);
+    const verification = claimVerification(claimId);
+    const proof = verification?.deterministicProof;
+    if (declared.length !== 1 || declared[0].kind !== 'numeric' || supported.length !== 1 ||
+        verification?.status !== 'verified' || proof?.kind !== 'numeric_cell' || proof.status !== 'proved' ||
+        verification.propositionCoverage?.status !== 'complete' || verification.propositionCoverage.uncovered?.length !== 0) return [];
+    return (supported[0].anchors || []).filter(anchor => oracleAnchorIds.has(anchor.anchorId) &&
+      supported[0].anchors.filter(other => other.anchorId === anchor.anchorId).length === 1 &&
+      !anchor.missing && typeof report?.traceId === 'string' && anchor.context?.traceId === report.traceId &&
+      anchor.context.traceSide === 'current' && proof.anchorIds?.includes(anchor.anchorId) &&
+      proof.evidenceRefIds?.includes(anchor.evidenceRefId) && verification.referenceCells?.some(cell =>
+        cell.anchorId === anchor.anchorId && cell.evidenceRefId === anchor.evidenceRefId && cell.status === 'matched'))
+      .map(anchor => ({claimId, anchor, verification}));
+  });
+  const traceFactPassed = fact?.proposition === 'proved' && fact.matched === true &&
+    task?.checks?.['fact:source_marker_duration'] === true &&
+    summary?.terminalAnalysis?.claimVerificationResult?.schemaVersion === 'claim_verifier@2' &&
+    uniqueIds(fact.matchedClaimIds) && uniqueIds(fact.matchedAnchorIds) &&
+    [...oracleClaimIds].every(claimId => oracleAnchors.some(item => item.claimId === claimId)) &&
+    [...oracleAnchorIds].every(anchorId => oracleAnchors.some(item => item.anchor.anchorId === anchorId));
   const sourceToolCount = ['search_codebase', 'read_codebase_file', 'lookup_app_source']
     .reduce((count, tool) => count + (summary?.toolCallCounts?.[tool] || 0), 0);
   const forbiddenMatches = summary?.forbiddenTextMatches || {};
@@ -642,8 +790,6 @@ function evaluateSemanticConditionReport(input) {
     [
       SEMANTIC_DELTA_RELATIVE_SOURCE_PATH,
       SEMANTIC_DELTA_SOURCE_FILE,
-      SEMANTIC_DELTA_SOURCE_SYMBOL,
-      SEMANTIC_DELTA_CALLER,
       '[Code:',
     ].every(text => forbiddenMatches[text] !== true) &&
     summary?.conclusionHasConcreteCodeRefs !== true &&
@@ -659,13 +805,37 @@ function evaluateSemanticConditionReport(input) {
     summary?.analysisCompletedSourceClaimVerifierStatus === 'passed' &&
     summary?.analysisCompletedSourceReferenceMembershipPassed === true &&
     mechanismStatuses.length > 0 &&
-    mechanismStatuses.every(status => status === 'corroborated' || status === 'compatible');
-  const references = summary?.terminalAnalysis?.conclusionContract?.sourceUseDecision?.references || [];
-  const sourceIdentityPassed = references.some(reference =>
-    typeof reference.filePath === 'string' && path.posix.basename(reference.filePath) === SEMANTIC_DELTA_SOURCE_FILE &&
-    reference.symbol === SEMANTIC_DELTA_SOURCE_SYMBOL && Number.isInteger(reference.lineRange?.start) &&
-    reference.lineRange.start > 0 && reference.lineRange.end >= reference.lineRange.start);
-  const claims = summary?.terminalAnalysis?.conclusionContract?.claims || [];
+    // A valid source-only location can retain an unverified mechanism. The
+    // oracle-linked binding must independently meet sourceIdentityPassed below.
+    mechanismStatuses.every(status => ['corroborated', 'compatible', 'unverified'].includes(status));
+  const sourceUseDecision = summary?.analysisCompletedSourceUseDecision ??
+    summary?.terminalAnalysis?.conclusionContract?.sourceUseDecision;
+  const references = sourceUseDecision?.references || [];
+  const selectedCodebases = new Set(report?.analysisContext?.codebaseIds || []);
+  const sourceGroundTruth = JSON.parse(fs.readFileSync(path.resolve(backendRoot,
+    '../Trace/constructed/source-analysis-semantic/analysis/expected.json'), 'utf8')).source_trace_ground_truth;
+  const matchingReferences = references.filter(reference =>
+    typeof reference.id === 'string' && reference.id.startsWith('source-ref-v1-') &&
+    selectedCodebases.has(reference.codebaseId) && reference.filePath === SEMANTIC_DELTA_SOURCE_FILE &&
+    (reference.lookupKind === 'body' || reference.lookupKind === 'indexed') &&
+    Number.isInteger(reference.lineRange?.start) && Number.isInteger(reference.lineRange?.end) &&
+    reference.lineRange.start > 0 && reference.lineRange.start <= sourceGroundTruth.lineRange.start &&
+    reference.lineRange.end >= sourceGroundTruth.lineRange.end);
+  const matchingReferenceIds = new Set(matchingReferences.map(reference => reference.id));
+  const verifiedBindings = summary?.analysisCompletedVerifiedSourceBindings || [];
+  const sourceIdentityPassed = sourceBindingPassed && verifiedBindings.some(binding => {
+    if (!['corroborated', 'compatible'].includes(binding.mechanismStatus) ||
+        !binding.sourceReferenceIds?.some(id => matchingReferenceIds.has(id))) return false;
+    const boundAnchors = supports.filter(support => support.claimId === binding.claimId)
+      .flatMap(support => support.anchors || [])
+      .filter(anchor => binding.traceEvidenceRefIds?.includes(anchor.evidenceRefId));
+    return boundAnchors.some(anchor => oracleAnchors.some(oracle => sameTraceOccurrence(anchor, oracle.anchor,
+      claimVerification(binding.claimId), oracle.verification)));
+  });
+  const canaryLine = fs.readFileSync(path.join(sourceRoot, SEMANTIC_DELTA_SOURCE_FILE), 'utf8')
+    .split(/\r?\n/).findIndex(line => line.includes(PRIVATE_SOURCE_CANARY)) + 1;
+  const privacyCanaryCovered = canaryLine > 0 && matchingReferences.some(reference =>
+    reference.lineRange.start <= canaryLine && reference.lineRange.end >= canaryLine);
   const quantitativeOutputPassed = traceFactPassed && claims.length > 0 && claims.every(claim =>
     ['numeric', 'time_range', 'comparison'].includes(claim.kind) && claim.semantics?.scope?.population !== 'codebase');
   const sourceSemanticPassed = query?.kind === 'quantitative-only'
@@ -678,9 +848,11 @@ function evaluateSemanticConditionReport(input) {
     privacyPassed,
     provenancePassed,
     traceFactPassed,
+    overallTaskChecksPassed,
     sourceLeakFree,
     sourceBindingPassed,
     sourceIdentityPassed,
+    privacyCanaryCovered,
     sourceSemanticPassed,
     uncoveredFacets: [...new Set([...(task?.uncoveredFacets || []),
       ...(query?.kind === 'quantitative-only' ? [] : ['source recommendation action semantics'])])],
@@ -718,7 +890,10 @@ function runSemanticCondition(input) {
       privacyPassed: evaluation.privacyPassed,
       provenancePassed: evaluation.provenancePassed,
       traceFactPassed: evaluation.traceFactPassed,
+      overallTaskChecksPassed: evaluation.overallTaskChecksPassed,
       sourceLeakFree: evaluation.sourceLeakFree,
+      ...(input.condition !== 'A0' && input.query.kind !== 'quantitative-only'
+        ? {privacyCanaryCovered: evaluation.privacyCanaryCovered} : {}),
     },
     sourceBindingPassed: evaluation.sourceBindingPassed,
     sourceSemanticPassed: evaluation.sourceSemanticPassed,
@@ -727,6 +902,36 @@ function runSemanticCondition(input) {
       ? undefined
       : sanitizeDiagnostic(result.stderr || result.stdout || result.error?.message),
   };
+}
+
+function runSemanticPreflight(options) {
+  const [runtimeKind] = resolveSemanticRuntimeKinds(options.runtime);
+  const query = semanticDeltaQueries().find(candidate => candidate.id === options.queryId);
+  const availability = realProviderAvailability(runtimeKind);
+  const attemptDir = path.join(options.outputDir, runtimeKind, 'preflight');
+  const outputPath = path.join(attemptDir, query.id, `${options.condition}.preflight.json`);
+  const base = {schemaVersion: 'code_aware_semantic_delta_preflight@1', runtime: runtimeKind,
+    queryId: query.id, condition: options.condition, completeAcceptance: false,
+    passedMeaning: 'single_scenario_diagnostic_only_not_repeated_provider_acceptance'};
+  let output;
+  if (!availability.available) {
+    output = {...base, preflightPassed: false, status: 'REAL PROVIDER NOT AVAILABLE', reason: availability.reason};
+  } else {
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'smartperfetto-semantic-preflight-'));
+    try {
+      const record = runSemanticCondition({runtimeKind, query, condition: options.condition, availability,
+        timeoutMs: options.timeoutMs, outputDir: options.outputDir, attemptDir, isolatedRoot});
+      const preflightPassed = record.passed && Object.values(record.hardAssertions).every(Boolean) &&
+        (options.condition === 'A0' && query.kind !== 'quantitative-only' || record.sourceSemanticPassed);
+      output = {...base, preflightPassed, status: preflightPassed ? 'PREFLIGHT PASSED' : 'PREFLIGHT FAILED', record};
+    } finally {
+      fs.rmSync(isolatedRoot, {recursive: true, force: true});
+    }
+  }
+  writeJson(outputPath, output);
+  console.log(JSON.stringify(output, null, 2));
+  console.log(`Preflight artifact written to: ${outputPath}`);
+  return output;
 }
 
 function runSemanticPairedAttempt(input) {
@@ -929,6 +1134,12 @@ function getOutputPathFromArgs(args) {
 }
 
 function buildChildEnv(apiKey, runtimeKind, isolatedRoot) {
+  const configuredOutputTokens = process.env.OPENAI_MAX_OUTPUT_TOKENS;
+  const outputTokens = configuredOutputTokens === undefined ? undefined : Number(configuredOutputTokens.trim());
+  if (configuredOutputTokens !== undefined &&
+      (!/^\d+$/.test(configuredOutputTokens.trim()) || !Number.isSafeInteger(outputTokens) || outputTokens <= 0)) {
+    throw new Error('OPENAI_MAX_OUTPUT_TOKENS must be a positive safe integer');
+  }
   const deepseekBaseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
   const deepseekModel = process.env.DEEPSEEK_MODEL || 'deepseek-v4-pro';
   const deepseekLightModel = process.env.DEEPSEEK_LIGHT_MODEL || 'deepseek-v4-flash';
@@ -939,7 +1150,7 @@ function buildChildEnv(apiKey, runtimeKind, isolatedRoot) {
     OPENAI_BASE_URL: deepseekBaseUrl,
     OPENAI_MODEL: deepseekModel,
     OPENAI_LIGHT_MODEL: deepseekLightModel,
-    OPENAI_MAX_OUTPUT_TOKENS: '8192',
+    ...(outputTokens !== undefined ? {OPENAI_MAX_OUTPUT_TOKENS: String(outputTokens)} : {}),
     DOTENV_CONFIG_QUIET: 'true',
     SMARTPERFETTO_BACKEND_DATA_DIR: path.join(isolatedRoot, 'data'),
     SMARTPERFETTO_BACKEND_LOG_DIR: path.join(isolatedRoot, 'logs'),
@@ -1000,20 +1211,34 @@ function buildChildEnv(apiKey, runtimeKind, isolatedRoot) {
 }
 
 function createPiAgentCoreDeepseekModelJson({ model, baseUrl }) {
-  return JSON.stringify({
-    id: model,
-    name: model,
-    api: 'openai-completions',
-    provider: 'deepseek',
-    baseUrl,
-    reasoning: false,
-    input: ['text'],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 8192,
-    apiKeyEnv: 'DEEPSEEK_API_KEY',
-    thinkingLevel: 'off',
+  // The SDK public provider entrypoint is import-only. An offline ESM child
+  // preserves this synchronous CLI without reading SDK-private JSON layouts or
+  // inventing model capabilities. getModels does not refresh or contact a provider.
+  const result = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+    import {deepseekProvider} from '@earendil-works/pi-ai/providers/deepseek';
+    const model = deepseekProvider().getModels().find(candidate => candidate.id === process.argv[1]);
+    if (!model) process.exitCode = 2;
+    else process.stdout.write(JSON.stringify(model));
+  `, '--', model], {
+    cwd: backendRoot,
+    encoding: 'utf8',
+    timeout: 10_000,
+    maxBuffer: 256 * 1024,
   });
+  if (result.status === 2) {
+    throw new Error('Unknown DeepSeek model in the installed Pi SDK; set SMARTPERFETTO_PI_AGENT_CORE_MODEL_JSON explicitly');
+  }
+  if (result.error || result.status !== 0) {
+    throw new Error('Unable to read the installed Pi SDK model catalog; set SMARTPERFETTO_PI_AGENT_CORE_MODEL_JSON explicitly');
+  }
+  let catalogModel;
+  try { catalogModel = JSON.parse(result.stdout); } catch {}
+  if (catalogModel?.id !== model || catalogModel.provider !== 'deepseek' ||
+      !Number.isSafeInteger(catalogModel.contextWindow) || catalogModel.contextWindow <= 0 ||
+      !Number.isSafeInteger(catalogModel.maxTokens) || catalogModel.maxTokens <= 0) {
+    throw new Error('Invalid model metadata from the installed Pi SDK');
+  }
+  return JSON.stringify({...catalogModel, baseUrl, apiKeyEnv: 'DEEPSEEK_API_KEY'});
 }
 
 function assertFile(filePath, label) {
@@ -1032,4 +1257,8 @@ module.exports = {
   realProviderAvailability,
   semanticConditionArgs,
   semanticDeltaQueries,
+  runSemanticPreflight,
+  runSemanticPairedAttempt,
+  sameTraceOccurrence,
+  scenarioSliceSelector,
 };

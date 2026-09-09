@@ -106,8 +106,11 @@ The plugin talks to `/api/agent/v1/*`.
 ## Analysis Process View
 
 The `streaming_flow` message is the analysis process view (`### 🧭 分析过程`).
-It renders below the answer within a round — see `message_order.ts` — so the
-answer stays next to the question and the process reads as reference below it.
+It renders above the answer within each round — see `message_order.ts` — so
+the final conclusion is the last content in that round. Sort within round
+boundaries: an earlier round's process and conclusion must stay before the
+next round's separator and question. Mark final answers with `answer_stream`
+even when no answer tokens were streamed.
 
 - Keep steps structured (`StreamingFlowState.conversationSteps`) all the way to
   render. Pre-formatting each step into a string destroys the phase grouping
@@ -118,8 +121,7 @@ answer stays next to the question and the process reads as reference below it.
   a flat list: private-knowledge runs suppress `plan_phase_updated`, and quick
   mode has no plan at all.
 - Do not mirror answer text into the process view. The answer streams in its
-  own bubble; snapshots there printed the same text twice once the process view
-  moved below the answer. Start and completion markers are fine.
+  own bubble. Start and completion markers are fine.
 - The stop control has two forms: plain stop, and stop-and-redirect, which
   focuses the composer only after the backend confirms the matching `runId`
   reached a terminal state. Cancellation can still be waiting on run identity,

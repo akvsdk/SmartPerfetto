@@ -16,7 +16,8 @@ import {
   type RequestContext,
   type RequestContextAuthType,
 } from '../middleware/auth';
-import { getTraceProcessorService } from '../services/traceProcessorService';
+import { getTraceProcessorService, isPrivateAnalysisLease } from '../services/traceProcessorService';
+import {traceProcessorProcessorKey} from '../services/traceProcessorConnectionModel';
 import {
   getTraceProcessorLeaseStore,
   type FrontendHolderVisibility,
@@ -292,6 +293,10 @@ async function resolveProxyTargetForContext(
   if (!lease) {
     throw new TraceProcessorProxyError(404, 'Trace processor lease not found');
   }
+  if (isPrivateAnalysisLease(lease) || getTraceProcessorService().isPrivateAnalysisProcessorKey(
+    traceProcessorProcessorKey(lease.traceId, lease.id, lease.mode))) {
+    throw new TraceProcessorProxyError(403, 'Private analysis processor cannot accept frontend connections');
+  }
   if (CONFLICT_STATES.has(lease.state)) {
     throw new TraceProcessorProxyError(409, `Trace processor lease is ${lease.state}`);
   }
@@ -426,6 +431,10 @@ async function heartbeatLease(req: Request, res: Response): Promise<void> {
   let lease = store.getLeaseById(scope, leaseId);
   if (!lease) {
     throw new TraceProcessorProxyError(404, 'Trace processor lease not found');
+  }
+  if (isPrivateAnalysisLease(lease) || getTraceProcessorService().isPrivateAnalysisProcessorKey(
+    traceProcessorProcessorKey(lease.traceId, lease.id, lease.mode))) {
+    throw new TraceProcessorProxyError(403, 'Private analysis processor cannot accept frontend connections');
   }
   if (CONFLICT_STATES.has(lease.state)) {
     throw new TraceProcessorProxyError(409, `Trace processor lease is ${lease.state}`);
@@ -655,6 +664,7 @@ async function proxyWebSocket(
   const target = await resolveProxyTargetForContext(context, leaseId, {
     websocketConnectedAt: Date.now(),
   });
+  getTraceProcessorService().exposeNativePort(target.port);
   const upstream = net.connect({
     host: '127.0.0.1',
     port: target.port,

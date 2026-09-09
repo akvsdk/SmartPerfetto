@@ -9,6 +9,7 @@ import type {
 import {localize, type OutputLanguage} from '../agentv3/outputLanguage';
 import {assessFinalReportContract, type FinalReportContractAssessmentResult} from './finalReportContractGate';
 import {verifySourceClaimBindingsForResult} from './codebase/sourceClaimVerifier';
+import {isUnusedSourceDecision} from './codebase/sourceUseDecision';
 import {assessScrollingJankClaimBoundary} from './scrollingJankClaimBoundary';
 import type {IdentityResolutionV1} from '../types/identityContract';
 import {
@@ -1366,10 +1367,20 @@ export function assessFinalResultQualityAssessment(
       recoveryKind: 'correct_evidence',
     });
   }
+  if (context.entry === 'new_finalization' && context.sourceApplicability === 'not_applicable' &&
+    currentTypedVerification && sourceVerificationCurrent && sourceClaimVerification?.status === 'not_checked' &&
+    Boolean(context.sourceScopeFingerprint) && sourceBinding?.sourceScopeFingerprint === context.sourceScopeFingerprint &&
+    sourceClaimVerification.bindings.length === 0 && sourceClaimVerification.issues.length === 0 &&
+    isUnusedSourceDecision(result.sourceUseDecision) &&
+    (result.sourceReferences === undefined || Array.isArray(result.sourceReferences) && result.sourceReferences.length === 0)) {
+    assurance.source = 'not_applicable';
+  }
   const claimVerification = result.claimVerificationResult;
   if (claimVerification) {
+    const sourceProofCurrent = !claimVerification.claimResults.some(claim =>
+      claim.deterministicProof?.kind === 'source_location') || sourceVerificationCurrent;
     assurance.claims = claimVerification.status === 'partial' ? 'coverage_incomplete' :
-      claimVerification.status === 'passed' ? claimVerificationCurrent ? 'passed' : 'not_checked' :
+      claimVerification.status === 'passed' ? claimVerificationCurrent && sourceProofCurrent ? 'passed' : 'not_checked' :
       claimVerification.status === 'failed' ? 'failed' : 'not_checked';
     if (claimVerification.status === 'failed' || claimVerification.unsupportedClaimCount > 0 ||
       claimVerification.claimResults.some(claim => claim.status === 'unsupported')) {

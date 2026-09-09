@@ -103,7 +103,9 @@ import {
   evaluateTenantMutationPolicy,
   sendTenantMutationDeniedPayload,
 } from '../services/enterpriseTenantLifecycleService';
-import { estimateTraceProcessorRssBytes } from '../services/traceProcessorRamBudget';
+import { estimateTraceProcessorRssBytes, TraceProcessorAdmissionError } from '../services/traceProcessorRamBudget';
+import {prepareAnalysisRunTraceProcessorLeases, analysisRunTraceProcessorFailureSide,
+  type AnalysisRunTraceProcessorLeases} from '../services/analysisRunTraceProcessorLease';
 import { TraceProcessorFactory } from '../services/workingTraceProcessor';
 import { registerAgentLogsRoutes } from './agentLogsRoutes';
 import { registerAgentQuickSceneRoutes } from './agentQuickSceneRoutes';
@@ -612,8 +614,13 @@ interface HttpFinalizationRun {
 }
 
 const httpFinalizationRuns = new WeakMap<AnalysisSession, Map<string, HttpFinalizationRun>>();
+// Root lease ownership outlives smart -> deep-dive finalization controller handoffs.
+const httpAnalysisRunLeaseControllers = new WeakMap<AnalysisSession, Map<string, AbortController>>();
 
 function abortHttpFinalizationRuns(session: AnalysisSession, runId?: string): void {
+  for (const [id, controller] of httpAnalysisRunLeaseControllers.get(session) ?? []) {
+    if (!runId || id === runId) controller.abort(new DOMException('Analysis cancelled', 'AbortError'));
+  }
   for (const [id, run] of httpFinalizationRuns.get(session) ?? []) {
     if (!runId || id === runId) run.controller.abort(new DOMException('Analysis cancelled', 'AbortError'));
   }
@@ -635,6 +642,7 @@ function createHttpFinalizationRun(
     runId, signal: controller.signal,
     ...(dispatchedFingerprint !== undefined ? {analysisContextFingerprint: dispatchedFingerprint} : {}),
     isCurrent: () => assistantAppService.getSession(session.sessionId) === session &&
+      !httpAnalysisRunLeaseControllers.get(session)?.get(runId)?.signal.aborted &&
       isCurrentRunOwner(session, runId) && !isSessionRunCancelled(session, runId),
     assertAuthorized: () => assertCurrentAnalysisContextAuthorization(selection, scope, fingerprint),
   };
@@ -2223,6 +2231,7 @@ function buildTurnSummary(
         conclusion: displayResult.message,
         success: displayResult.success !== false,
         language: outputLanguage,
+        state: displayResult,
       })
     : displayResult?.message;
   const confidence = typeof displayResult?.confidence === 'number' ? displayResult.confidence : undefined;
@@ -2249,7 +2258,7 @@ function buildTurnSummary(
       ? projectPrivateTerminationReason(displayResult?.terminationReason)
       : displayResult?.terminationReason,
     terminationMessage: privateSessionId
-      ? projectPrivateTerminationMessage(displayResult?.terminationMessage, outputLanguage)
+      ? projectPrivateTerminationMessage(displayResult?.terminationMessage, outputLanguage, displayResult)
       : displayResult?.terminationMessage,
     confidence,
     findingCount: Array.isArray(turn.findings) ? turn.findings.length : 0,
@@ -2598,6 +2607,8 @@ async function handleAnalyzeRequest(
   let executionRunId: string | undefined;
   let executionRunManifestLifecycle: RunManifestLifecycle | undefined;
   let executionHandedOff = false;
+  let runTraceProcessorLeases: AnalysisRunTraceProcessorLeases | undefined;
+  let releaseLeaseOwner = () => {};
   try {
     const requestId = getRequestId(req);
     const requestContext = requireRequestContext(req);
@@ -3007,10 +3018,63 @@ async function handleAnalyzeRequest(
     );
     executionRunManifestLifecycle = runManifestLifecycle;
 
+    const leaseController = new AbortController();
+    const leaseControllers = httpAnalysisRunLeaseControllers.get(sessionForRun) ?? new Map<string, AbortController>();
+    httpAnalysisRunLeaseControllers.set(sessionForRun, leaseControllers);
+    leaseControllers.set(runContext.runId, leaseController);
+    releaseLeaseOwner = () => {
+      runTraceProcessorLeases?.release();
+      if (leaseControllers.get(runContext.runId) === leaseController) leaseControllers.delete(runContext.runId);
+    };
+    try {
+      runTraceProcessorLeases = await prepareAnalysisRunTraceProcessorLeases({
+        service: traceProcessorService, scope: leaseScopeFromRequestContext(requestContext),
+        runId: runContext.runId, sessionId, currentTraceId: traceId, referenceTraceId: effectiveReferenceTraceId,
+        signal: leaseController.signal,
+        assertCurrent: () => {
+          if (assistantAppService.getSession(sessionId) !== sessionForRun ||
+            isSessionRunCancelled(sessionForRun, runContext.runId) || isStaleRun(sessionForRun, runContext.runId)) {
+            throw new DOMException('Analysis run is no longer current', 'AbortError');
+          }
+        },
+        onInvalidated: () => abortHttpFinalizationRuns(sessionForRun, runContext.runId),
+        metadata: {requestId: runContext.requestId, runSequence: runContext.sequence},
+        ...(enterpriseLeasesEnabled() ? {decideMode: (selectedTrace: {id: string; size: number}) =>
+          buildLeaseModeDecisionForTrace(leaseScopeFromRequestContext(requestContext), selectedTrace.id, 'agent_run', {
+            analysisMode: options.analysisMode, traceSizeBytes: selectedTrace.size,
+          })} : {}),
+      });
+    } catch (leaseError: any) {
+      if (leaseController.signal.aborted || isSessionRunCancelled(sessionForRun, runContext.runId) ||
+        isStaleRun(sessionForRun, runContext.runId)) {
+        res.json({success: false, status: 'cancelled', sessionId, runId: runContext.runId});
+        return;
+      }
+      sessionForRun.status = 'failed';
+      sessionForRun.error = leaseError.message;
+      markSessionRunStatus(sessionForRun, 'failed', leaseError.message, runContext.runId);
+      const admission = leaseError instanceof TraceProcessorAdmissionError;
+      res.status(admission ? 503 : 409).json({success: false,
+        code: admission ? 'TRACE_PROCESSOR_RAM_BUDGET_EXCEEDED' : leaseError.code ??
+          (analysisRunTraceProcessorFailureSide(leaseError) === 'reference'
+            ? 'REFERENCE_TRACE_PROCESSOR_LEASE_UNAVAILABLE' : 'TRACE_PROCESSOR_LEASE_UNAVAILABLE'),
+        error: leaseError.message, ...(admission ? {details: leaseError.decision} : {}),
+      });
+      return;
+    }
+    const leases = runTraceProcessorLeases;
+    // Keep legacy enterprise response metadata; personal private processor identities stay internal.
+    const currentLeaseEntry = enterpriseLeasesEnabled() ? leases.entries.find(entry => entry.side === 'current') : undefined;
+    const referenceLeaseEntry = enterpriseLeasesEnabled() ? leases.entries.find(entry => entry.side === 'reference') : undefined;
+    const agentRunLease = currentLeaseEntry?.lease;
+    const referenceAgentRunLease = referenceLeaseEntry?.lease;
+    const agentRunLeaseDecision = currentLeaseEntry?.decision;
+    const referenceAgentRunLeaseDecision = referenceLeaseEntry?.decision;
+
     if (options.preset === 'smart') {
       const smartAnalysisPromise = withRunManifestLifecycle(
         runManifestLifecycle,
-        () => runSmartAnalysis(sessionId, query, traceId, {
+        () => leases.run(() => runSmartAnalysis(sessionId, query, traceId, {
           runContext,
           traceProcessorService,
           smartAction: options.smartAction ?? 'preview',
@@ -3026,7 +3090,7 @@ async function handleAnalyzeRequest(
           codebaseIds: options.codebaseIds,
           knowledgeSourceIds: options.knowledgeSourceIds,
           runManifestAttributionSink: runManifestLifecycle.builder,
-        }),
+        })),
       )
         .then(() => {
           sealCompletedHttpRunManifest(
@@ -3071,6 +3135,7 @@ async function handleAnalyzeRequest(
         });
       executionHandedOff = true;
       void smartAnalysisPromise.finally(() => {
+        releaseLeaseOwner();
         finalizeHttpRunManifestLifecycle(
           sessionForRun,
           runManifestLifecycle,
@@ -3098,140 +3163,6 @@ async function handleAnalyzeRequest(
       return;
     }
 
-    let agentRunLease: TraceProcessorLeaseRecord | null = null;
-    let referenceAgentRunLease: TraceProcessorLeaseRecord | null = null;
-    let agentRunLeaseDecision: TraceProcessorLeaseModeDecision | null = null;
-    let referenceAgentRunLeaseDecision: TraceProcessorLeaseModeDecision | null = null;
-    if (enterpriseLeasesEnabled()) {
-      try {
-        const scope = leaseScopeFromRequestContext(requestContext);
-        agentRunLeaseDecision = buildLeaseModeDecisionForTrace(scope, traceId, 'agent_run', {
-          analysisMode: options.analysisMode,
-          traceSizeBytes: trace.size,
-        });
-        agentRunLease = getTraceProcessorLeaseStore().acquireHolder(
-          scope,
-          traceId,
-          {
-            holderType: 'agent_run',
-            holderRef: runContext.runId,
-            runId: runContext.runId,
-            sessionId,
-            metadata: {
-              requestId: runContext.requestId,
-              runSequence: runContext.sequence,
-              leaseModeReason: agentRunLeaseDecision.reason,
-              leaseModeSignals: agentRunLeaseDecision.signals,
-            },
-          },
-          { mode: agentRunLeaseDecision.mode },
-        );
-        agentRunLease = markLeaseReadyIfNew(agentRunLease, scope);
-        await traceProcessorService.ensureProcessorForLease(traceId, agentRunLease.id, agentRunLease.mode, scope);
-      } catch (leaseError: any) {
-        if (agentRunLease) {
-          try {
-            getTraceProcessorLeaseStore().markFailed(leaseScopeFromRequestContext(requestContext), agentRunLease.id);
-          } catch (markFailedError: any) {
-            console.warn(
-              `[AgentRoutes] Failed to mark agent_run lease ${agentRunLease.id} failed: ${markFailedError.message}`,
-            );
-          }
-        }
-        if (!isSessionRunCancelled(sessionForRun, runContext.runId) && !isStaleRun(sessionForRun, runContext.runId)) {
-          sessionForRun.status = 'failed';
-          sessionForRun.error = leaseError.message;
-          markSessionRunStatus(sessionForRun, 'failed', leaseError.message, runContext.runId);
-        }
-        res.status(409).json({
-          success: false,
-          code: 'TRACE_PROCESSOR_LEASE_UNAVAILABLE',
-          error: leaseError.message,
-        });
-        return;
-      }
-
-      const currentLeaseRunIsActive =
-        !isSessionRunCancelled(sessionForRun, runContext.runId) && !isStaleRun(sessionForRun, runContext.runId);
-      if (effectiveReferenceTraceId && currentLeaseRunIsActive) {
-        try {
-          const scope = leaseScopeFromRequestContext(requestContext);
-          referenceAgentRunLeaseDecision = buildLeaseModeDecisionForTrace(
-            scope,
-            effectiveReferenceTraceId,
-            'agent_run',
-            {
-              analysisMode: options.analysisMode,
-              traceSizeBytes: effectiveReferenceTrace?.size,
-            },
-          );
-          referenceAgentRunLease = getTraceProcessorLeaseStore().acquireHolder(
-            scope,
-            effectiveReferenceTraceId,
-            {
-              holderType: 'agent_run',
-              holderRef: `${runContext.runId}:reference`,
-              runId: runContext.runId,
-              sessionId,
-              metadata: {
-                requestId: runContext.requestId,
-                runSequence: runContext.sequence,
-                traceSide: 'reference',
-                leaseModeReason: referenceAgentRunLeaseDecision.reason,
-                leaseModeSignals: referenceAgentRunLeaseDecision.signals,
-              },
-            },
-            { mode: referenceAgentRunLeaseDecision.mode },
-          );
-          referenceAgentRunLease = markLeaseReadyIfNew(referenceAgentRunLease, scope);
-          await traceProcessorService.ensureProcessorForLease(
-            effectiveReferenceTraceId,
-            referenceAgentRunLease.id,
-            referenceAgentRunLease.mode,
-            scope,
-          );
-        } catch (leaseError: any) {
-          if (referenceAgentRunLease) {
-            try {
-              getTraceProcessorLeaseStore().markFailed(
-                leaseScopeFromRequestContext(requestContext),
-                referenceAgentRunLease.id,
-              );
-            } catch (markFailedError: any) {
-              console.warn(
-                `[AgentRoutes] Failed to mark reference agent_run lease ${referenceAgentRunLease.id} failed: ${markFailedError.message}`,
-              );
-            }
-          }
-          if (agentRunLease) {
-            try {
-              getTraceProcessorLeaseStore().releaseHolder(
-                leaseScopeFromRequestContext(requestContext),
-                agentRunLease.id,
-                'agent_run',
-                runContext.runId,
-              );
-            } catch (releaseError: any) {
-              console.warn(
-                `[AgentRoutes] Failed to release current agent_run lease after reference lease failure ${agentRunLease.id}: ${releaseError.message}`,
-              );
-            }
-          }
-          if (!isSessionRunCancelled(sessionForRun, runContext.runId) && !isStaleRun(sessionForRun, runContext.runId)) {
-            sessionForRun.status = 'failed';
-            sessionForRun.error = leaseError.message;
-            markSessionRunStatus(sessionForRun, 'failed', leaseError.message, runContext.runId);
-          }
-          res.status(409).json({
-            success: false,
-            code: 'REFERENCE_TRACE_PROCESSOR_LEASE_UNAVAILABLE',
-            error: leaseError.message,
-          });
-          return;
-        }
-      }
-    }
-
     // Validate traceContext — must be array of objects with columns/rows
     const traceContext = Array.isArray(rawTraceContext)
       ? rawTraceContext.filter(
@@ -3251,7 +3182,7 @@ async function handleAnalyzeRequest(
     if (!sessionRunIsInactive) {
       analysisPromise = withRunManifestLifecycle(
         runManifestLifecycle,
-        () => runAgentDrivenAnalysis(sessionId, query, traceId, {
+        () => leases.run(() => runAgentDrivenAnalysis(sessionId, query, traceId, {
           ...options,
           selectionContext,
           blockedStrategyIds,
@@ -3262,24 +3193,7 @@ async function handleAnalyzeRequest(
           providerId: sessionForRun.providerId !== undefined ? sessionForRun.providerId : providerId,
           knowledgeScope: knowledgeScopeFromRequestContext(requestContext),
           runManifestAttributionSink: runManifestLifecycle.builder,
-          traceProcessorLease: agentRunLease
-            ? {
-                traceId,
-                leaseId: agentRunLease.id,
-                mode: agentRunLease.mode,
-                leaseScope: leaseScopeFromRequestContext(requestContext),
-              }
-            : undefined,
-          referenceTraceProcessorLease:
-            referenceAgentRunLease && effectiveReferenceTraceId
-              ? {
-                  traceId: effectiveReferenceTraceId,
-                  leaseId: referenceAgentRunLease.id,
-                  mode: referenceAgentRunLease.mode,
-                  leaseScope: leaseScopeFromRequestContext(requestContext),
-                }
-              : undefined,
-        }),
+        })),
       )
         .then(() => {
           sealCompletedHttpRunManifest(
@@ -3331,32 +3245,7 @@ async function handleAnalyzeRequest(
     });
     executionHandedOff = true;
     void analysisPromise.finally(() => {
-      if (agentRunLease) {
-        try {
-          getTraceProcessorLeaseStore().releaseHolder(
-            leaseScopeFromRequestContext(requestContext),
-            agentRunLease.id,
-            'agent_run',
-            runContext.runId,
-          );
-        } catch (releaseError: any) {
-          console.warn(`[AgentRoutes] Failed to release agent_run lease ${agentRunLease.id}: ${releaseError.message}`);
-        }
-      }
-      if (referenceAgentRunLease) {
-        try {
-          getTraceProcessorLeaseStore().releaseHolder(
-            leaseScopeFromRequestContext(requestContext),
-            referenceAgentRunLease.id,
-            'agent_run',
-            `${runContext.runId}:reference`,
-          );
-        } catch (releaseError: any) {
-          console.warn(
-            `[AgentRoutes] Failed to release reference agent_run lease ${referenceAgentRunLease.id}: ${releaseError.message}`,
-          );
-        }
-      }
+      releaseLeaseOwner();
       settleSessionRunExecution(sessionForRun, runContext.runId);
     });
 
@@ -3376,7 +3265,7 @@ async function handleAnalyzeRequest(
       leaseState: agentRunLease?.state,
       leaseMode: agentRunLease?.mode,
       leaseModeReason: agentRunLeaseDecision?.reason,
-      leaseQueueLength: agentRunLeaseDecision?.signals.sharedQueueLength,
+      leaseQueueLength: agentRunLeaseDecision?.signals?.sharedQueueLength,
       referenceLeaseId: referenceAgentRunLease?.id,
       referenceLeaseState: referenceAgentRunLease?.state,
       referenceLeaseMode: referenceAgentRunLease?.mode,
@@ -3399,6 +3288,7 @@ async function handleAnalyzeRequest(
       error: error.message || 'Agent analysis failed',
     });
   } finally {
+    if (!executionHandedOff) releaseLeaseOwner();
     if (!executionHandedOff && executionSession && executionRunId) {
       if (executionRunManifestLifecycle) {
         finalizeHttpRunManifestLifecycle(
@@ -3714,7 +3604,7 @@ router.get('/:sessionId/status', (req, res) => {
           ? projectPrivateTerminationReason(result.terminationReason)
           : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage)
+          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
           : result.terminationMessage,
         reportUrl: finalArtifacts?.reportUrl,
         reportError: privateKnowledge ? undefined : finalArtifacts?.reportError,
@@ -5868,6 +5758,7 @@ async function runAgentDrivenAnalysis(sessionId: string, query: string, traceId:
       sourceAware,
       outputLanguage,
     );
+    if (!projectedUpdate) return;
     // Token events are both extremely high volume and may contain model text in
     // non-private runs. They are already represented by aggregate runtime
     // telemetry, so never duplicate them into console/session logs.
@@ -8220,7 +8111,7 @@ function ensureCompletedAnalysisFinalArtifacts(
           ? projectPrivateTerminationReason(result.terminationReason)
           : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage)
+          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
           : result.terminationMessage,
         dataEnvelopes: session.dataEnvelopes,
         analysisReceipt: privateKnowledge
@@ -8483,7 +8374,7 @@ function ensureCompletedAnalysisSseEvents(session: AnalysisSession, runId?: stri
             ? projectPrivateTerminationReason(result.terminationReason)
             : result.terminationReason,
           terminationMessage: privateKnowledge
-            ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage)
+            ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
             : result.terminationMessage,
           quickRun,
           analysisReceipt: privateKnowledge

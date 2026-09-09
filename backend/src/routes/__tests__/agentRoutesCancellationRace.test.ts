@@ -115,6 +115,63 @@ afterEach(() => {
 });
 
 describe('agent analyze cancellation races', () => {
+  it.each(['ordinary', 'smart'] as const)('uses a private run lease for personal %s analysis without enabling enterprise', async preset => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'smartperfetto-personal-analysis-lease-'));
+    let sessionId: string | undefined;
+    try {
+      const traceId = `personal-${preset}`;
+      const tracePath = path.join(tmpDir, `${traceId}.trace`);
+      await fs.writeFile(tracePath, 'synthetic fixture bytes');
+      delete process.env.SMARTPERFETTO_API_KEY;
+      process.env.SMARTPERFETTO_SSO_TRUSTED_HEADERS = 'true';
+      process.env[ENTERPRISE_FEATURE_FLAG_ENV] = 'false';
+      process.env[ENTERPRISE_DB_PATH_ENV] = path.join(tmpDir, 'enterprise.sqlite');
+      process.env[ENTERPRISE_DATA_DIR_ENV] = path.join(tmpDir, 'data');
+      process.env.UPLOAD_DIR = path.join(tmpDir, 'uploads');
+      process.env.SMARTPERFETTO_AGENT_RUNTIME = 'claude-agent-sdk';
+      process.env.SMARTPERFETTO_AI_ENABLED = 'true';
+      const service = new TraceProcessorService(process.env.UPLOAD_DIR);
+      const trace = service.registerStoredTrace({id: traceId, filename: `${traceId}.trace`, size: 23, filePath: tracePath});
+      await writeTraceMetadata({id: traceId, filename: trace.filename, size: trace.size,
+        uploadedAt: new Date().toISOString(), status: 'ready', path: tracePath,
+        tenantId: 'tenant-a', workspaceId: 'workspace-a', userId: 'analyst-user'});
+      jest.spyOn(service, 'getOrLoadTrace').mockResolvedValue(trace);
+      jest.spyOn(service, 'getAnalysisRunProcessorPolicy').mockImplementation((_id, lease) => ({sourceKind: 'local_file',
+        requiresIsolation: !lease?.leaseId, reason: lease?.leaseId ? 'trusted' : 'shared_tainted'}));
+      const ensure = jest.spyOn(service, 'ensureProcessorForLease').mockImplementation(async (id, leaseId, mode, scope) => {
+        expect(mode).toBe('isolated');
+        expect(scope).toBeDefined();
+        const lease = getTraceProcessorLeaseStore().getLeaseById(scope!, leaseId)!;
+        expect(lease.holders[0].metadata?.analysisRunPrivate).toBe(true);
+        return readyProcessor(id);
+      });
+      const group = jest.spyOn(service, 'runWithLeases').mockImplementation(async contexts => {
+        expect(contexts).toEqual([expect.objectContaining({traceId, mode: 'isolated', leaseScope: expect.any(Object)})]);
+        // Stop before either engine: this route test must never invoke a provider or native Trace.
+        throw new Error('mocked run boundary reached');
+      });
+      const cleanup = jest.spyOn(service, 'cleanupLeaseProcessor').mockReturnValue(true);
+      jest.spyOn(ClaudeRuntime.prototype, 'cleanupSession').mockImplementation(() => undefined);
+      setTraceProcessorServiceForTests(service);
+      const response = await analystHeaders(request(makeApp()).post('/api/agent/v1/analyze')).send({
+        traceId, query: 'Analyze this Trace', ...(preset === 'smart' ? {options: {preset: 'smart'}} : {}),
+      });
+      expect(response.status).toBe(200);
+      sessionId = response.body.sessionId;
+      expect(response.body.leaseId).toBeUndefined();
+      for (let i = 0; i < 10 && cleanup.mock.calls.length === 0; i++) await new Promise(resolve => setImmediate(resolve));
+      expect(ensure).toHaveBeenCalledTimes(1);
+      expect(group).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(process.env[ENTERPRISE_FEATURE_FLAG_ENV]).toBe('false');
+    } finally {
+      if (sessionId) agentRoutesCancellationTestSeam.deleteSession(sessionId);
+      getTraceProcessorLeaseStore().close();
+      setTraceProcessorLeaseStoreForTests(null);
+      await fs.rm(tmpDir, {recursive: true, force: true});
+    }
+  });
+
   it('cancels detached source enrichment without changing the completed primary run', async () => {
     const sessionId = 'session-source-enrichment-cancel';
     const runId = `${sessionId}:1`;
@@ -209,14 +266,8 @@ describe('agent analyze cancellation races', () => {
       });
 
       const traceProcessorService = new TraceProcessorService(process.env.UPLOAD_DIR);
-      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockResolvedValue({
-        id: traceId,
-        filename: `${traceId}.trace`,
-        size: 11,
-        filePath: tracePath,
-        uploadTime: new Date(),
-        status: 'ready',
-      });
+      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockResolvedValue(
+        traceProcessorService.registerStoredTrace({id: traceId, filename: `${traceId}.trace`, size: 11, filePath: tracePath}));
       jest.spyOn(traceProcessorService, 'ensureProcessorForLease')
         .mockResolvedValue(readyProcessor(traceId));
       jest.spyOn(traceProcessorService, 'runWithLease')
@@ -323,14 +374,8 @@ describe('agent analyze cancellation races', () => {
       });
 
       const traceProcessorService = new TraceProcessorService(process.env.UPLOAD_DIR);
-      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockResolvedValue({
-        id: traceId,
-        filename: `${traceId}.trace`,
-        size: 11,
-        filePath: tracePath,
-        uploadTime: new Date(),
-        status: 'ready',
-      });
+      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockResolvedValue(
+        traceProcessorService.registerStoredTrace({id: traceId, filename: `${traceId}.trace`, size: 11, filePath: tracePath}));
       jest.spyOn(traceProcessorService, 'ensureProcessorForLease').mockImplementation(() => {
         if (!signalLeaseEntered) throw new Error('lease entry signal is unavailable');
         signalLeaseEntered();
@@ -547,14 +592,8 @@ describe('agent analyze cancellation races', () => {
       }
 
       const traceProcessorService = new TraceProcessorService(process.env.UPLOAD_DIR);
-      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockImplementation(async (id) => ({
-        id,
-        filename: `${id}.trace`,
-        size: 11,
-        filePath: path.join(tmpDir, `${id}.trace`),
-        uploadTime: new Date(),
-        status: 'ready',
-      }));
+      jest.spyOn(traceProcessorService, 'getOrLoadTrace').mockImplementation(async id =>
+        traceProcessorService.registerStoredTrace({id, filename: `${id}.trace`, size: 11, filePath: path.join(tmpDir, `${id}.trace`)}));
       jest.spyOn(traceProcessorService, 'ensureProcessorForLease').mockImplementation(async (id) => readyProcessor(id));
       const runWithLeaseSpy = jest
         .spyOn(traceProcessorService, 'runWithLease')

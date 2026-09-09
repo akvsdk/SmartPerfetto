@@ -12,7 +12,7 @@ import {buildStrategyRegistrySnapshotFromDefinitions} from '../../agentv3/strate
 import {analysisDeliveryFingerprint, type AnalysisDeliveryContext} from '../../types/analysisDelivery';
 import {createDataEnvelope, type DataEnvelope} from '../../types/dataContract';
 import { buildQuickRunReceipt, resolveQuickTurnBudget } from '../../agentRuntime/quickBudget';
-import type {SourceUseDecisionV1} from '../codebase/sourceUseDecision';
+import {sanitizeSourceReference, type SourceUseDecisionV1} from '../codebase/sourceUseDecision';
 import {captureEvidenceTable, type CapturedFieldSemantics} from '../evidence/evidenceCapture';
 import {prepareClaimEvidence} from '../evidence/claimEvidencePreparation';
 import type {EvidenceReadView} from '../evidence/evidenceReadView';
@@ -3155,13 +3155,12 @@ describe('final result quality gate', () => {
   });
 
   it('surfaces source-binding downgrades without deleting verified trace conclusions', async () => {
-    const sourceReference = {
-      id: 'source-ref-v1-aaaaaaaaaaaaaaaaaaaaaaaa',
+    const sourceReference = sanitizeSourceReference({
       referenceId: 'lookup-1',
       codebaseId: 'app-source',
       filePath: 'src/main/Foo.kt',
       lookupKind: 'metadata' as const,
-    };
+    })!;
     const sourceUse: SourceUseDecisionV1 = {
       schemaVersion: 'source_use_decision@1',
       codeAwareMode: 'metadata_only',

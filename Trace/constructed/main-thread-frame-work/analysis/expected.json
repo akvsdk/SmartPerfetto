@@ -1,0 +1,457 @@
+{
+  "schema_version": 1,
+  "case_id": "main-thread-frame-work",
+  "marker": "SmartPerfetto::CASE::main-thread-frame-work",
+  "expectations": [
+    {
+      "id": "interframe-task-execution-and-source",
+      "type": "skill",
+      "target": "main_thread_frame_work",
+      "mode": "semantic",
+      "source_file": "backend/skills/composite/main_thread_frame_work.skill.yaml",
+      "parameters": {
+        "package": "com.smartperfetto.fixture",
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "required_sql_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "main_thread_work_tasks",
+      "required_columns": [
+        "task_name",
+        "phase",
+        "outside_doframe_ms",
+        "wall_ms",
+        "running_ms",
+        "hotspot_name",
+        "hotspot_exclusive_wall_ms",
+        "start_ts",
+        "dur",
+        "slice_id",
+        "hotspot_slice_id",
+        "arg_set_id",
+        "ancestor_path",
+        "attribution",
+        "is_incomplete",
+        "eligible_task_count",
+        "returned_task_count",
+        "upid",
+        "utid",
+        "track_id",
+        "parent_id",
+        "end_ts",
+        "raw_ts",
+        "raw_dur",
+        "runnable_ms",
+        "runnable_preempted_ms",
+        "sleep_ms",
+        "idle_state_ms",
+        "uninterruptible_ms",
+        "io_wait_ms",
+        "unknown_io_wait_ms",
+        "unknown_state_ms",
+        "inside_doframe_ms",
+        "between_doframes_ms",
+        "before_first_doframe_ms",
+        "after_last_doframe_ms",
+        "no_doframe_ms",
+        "ambiguous_annotation_wall_ms",
+        "hotspot_arg_set_id",
+        "hotspot_parent_id",
+        "hotspot_exclusive_outside_doframe_ms",
+        "top_wait_state_id",
+        "top_wait_state",
+        "top_wait_blocked_function",
+        "top_wait_io_wait",
+        "top_wait_start_ts",
+        "top_wait_end_ts",
+        "top_wait_overlap_ms",
+        "selection_scope"
+      ],
+      "assertions": [
+        {
+          "column": "task_name",
+          "operator": "eq",
+          "value": "ContentLoader$MainHandler: initializeContent"
+        },
+        {
+          "column": "phase",
+          "operator": "eq",
+          "value": "between_doFrames"
+        },
+        {
+          "column": "outside_doframe_ms",
+          "operator": "eq",
+          "value": 30
+        },
+        {
+          "column": "running_ms",
+          "operator": "eq",
+          "value": 28
+        },
+        {
+          "column": "runnable_ms",
+          "operator": "eq",
+          "value": 2
+        },
+        {
+          "column": "slice_id",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "hotspot_name",
+          "operator": "eq",
+          "value": "parseContentModel"
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::main-thread-frame-work"
+    },
+    {
+      "id": "observed-cadence-without-frametimeline",
+      "type": "skill",
+      "target": "main_thread_frame_work",
+      "mode": "semantic",
+      "source_file": "backend/skills/composite/main_thread_frame_work.skill.yaml",
+      "parameters": {
+        "package": "com.smartperfetto.fixture",
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "required_sql_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "main_thread_work_cadence",
+      "required_columns": [
+        "observed_start_interval_ms",
+        "between_execution_ms",
+        "observation",
+        "start_ts",
+        "dur",
+        "previous_slice_id",
+        "slice_id",
+        "eligible_interval_count",
+        "returned_interval_count",
+        "upid",
+        "utid",
+        "next_start_ts",
+        "marker_count",
+        "previous_marker_count",
+        "is_incomplete",
+        "previous_is_incomplete",
+        "execution_overlap_ms",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "observed_start_interval_ms",
+          "operator": "eq",
+          "value": 52
+        },
+        {
+          "column": "between_execution_ms",
+          "operator": "eq",
+          "value": 30
+        },
+        {
+          "column": "previous_slice_id",
+          "operator": "gt",
+          "value": 0
+        },
+        {
+          "column": "slice_id",
+          "operator": "gt",
+          "value": 0
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::main-thread-frame-work"
+    },
+    {
+      "id": "whole-window-work-coverage",
+      "type": "skill",
+      "target": "main_thread_frame_work",
+      "mode": "semantic",
+      "source_file": "backend/skills/composite/main_thread_frame_work.skill.yaml",
+      "parameters": {
+        "package": "com.smartperfetto.fixture",
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "required_sql_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "main_thread_work_summary",
+      "required_columns": [
+        "phase",
+        "wall_ms",
+        "annotated_wall_ms",
+        "running_ms",
+        "runnable_ms",
+        "runnable_preempted_ms",
+        "sleep_ms",
+        "idle_state_ms",
+        "uninterruptible_ms",
+        "uninterruptible_wakekill_ms",
+        "io_wait_ms",
+        "unknown_state_ms",
+        "unannotated_running_ms",
+        "ambiguous_annotation_wall_ms",
+        "incomplete_slice_count",
+        "upid",
+        "utid",
+        "window_start_ts",
+        "window_end_ts",
+        "unannotated_wall_ms",
+        "known_state_ms",
+        "conflicting_state_ms",
+        "other_state_ms",
+        "unknown_io_wait_ms",
+        "eligible_task_count",
+        "observed_doframe_count",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "phase",
+          "operator": "eq",
+          "value": "window"
+        },
+        {
+          "column": "observed_doframe_count",
+          "operator": "eq",
+          "value": 3
+        },
+        {
+          "column": "wall_ms",
+          "operator": "eq",
+          "value": 399
+        },
+        {
+          "column": "running_ms",
+          "operator": "eq",
+          "value": 113
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::main-thread-frame-work"
+    },
+    {
+      "id": "business-task-with-no-doframe",
+      "type": "skill",
+      "target": "main_thread_frame_work",
+      "mode": "semantic",
+      "source_file": "backend/skills/composite/main_thread_frame_work.skill.yaml",
+      "parameters": {
+        "package": "com.smartperfetto.unframed",
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "required_sql_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "main_thread_work_tasks",
+      "required_columns": [
+        "task_name",
+        "phase",
+        "outside_doframe_ms",
+        "wall_ms",
+        "running_ms",
+        "hotspot_name",
+        "hotspot_exclusive_wall_ms",
+        "start_ts",
+        "dur",
+        "slice_id",
+        "hotspot_slice_id",
+        "arg_set_id",
+        "ancestor_path",
+        "attribution",
+        "is_incomplete",
+        "eligible_task_count",
+        "returned_task_count",
+        "upid",
+        "utid",
+        "track_id",
+        "parent_id",
+        "end_ts",
+        "raw_ts",
+        "raw_dur",
+        "runnable_ms",
+        "runnable_preempted_ms",
+        "sleep_ms",
+        "idle_state_ms",
+        "uninterruptible_ms",
+        "io_wait_ms",
+        "unknown_io_wait_ms",
+        "unknown_state_ms",
+        "inside_doframe_ms",
+        "between_doframes_ms",
+        "before_first_doframe_ms",
+        "after_last_doframe_ms",
+        "no_doframe_ms",
+        "ambiguous_annotation_wall_ms",
+        "hotspot_arg_set_id",
+        "hotspot_parent_id",
+        "hotspot_exclusive_outside_doframe_ms",
+        "top_wait_state_id",
+        "top_wait_state",
+        "top_wait_blocked_function",
+        "top_wait_io_wait",
+        "top_wait_start_ts",
+        "top_wait_end_ts",
+        "top_wait_overlap_ms",
+        "selection_scope"
+      ],
+      "assertions": [
+        {
+          "column": "task_name",
+          "operator": "eq",
+          "value": "ContentRepository.initializeWithoutFrameMarker"
+        },
+        {
+          "column": "phase",
+          "operator": "eq",
+          "value": "no_doFrame"
+        },
+        {
+          "column": "outside_doframe_ms",
+          "operator": "eq",
+          "value": 40
+        },
+        {
+          "column": "running_ms",
+          "operator": "eq",
+          "value": 40
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::main-thread-frame-work"
+    },
+    {
+      "id": "unlabeled-running-with-no-doframe",
+      "type": "skill",
+      "target": "main_thread_frame_work",
+      "mode": "semantic",
+      "source_file": "backend/skills/composite/main_thread_frame_work.skill.yaml",
+      "parameters": {
+        "package": "com.smartperfetto.unlabeled",
+        "start_ts": "${fixture_start}",
+        "end_ts": "${fixture_end}"
+      },
+      "required_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "required_sql_steps": [
+        "main_thread_work_summary",
+        "main_thread_work_tasks",
+        "main_thread_work_sources",
+        "main_thread_work_cadence"
+      ],
+      "forced_sql_steps": [],
+      "isolated_sql_probes": [],
+      "expected_condition_skips": [],
+      "semantic_step": "main_thread_work_summary",
+      "required_columns": [
+        "phase",
+        "wall_ms",
+        "annotated_wall_ms",
+        "running_ms",
+        "runnable_ms",
+        "runnable_preempted_ms",
+        "sleep_ms",
+        "idle_state_ms",
+        "uninterruptible_ms",
+        "uninterruptible_wakekill_ms",
+        "io_wait_ms",
+        "unknown_state_ms",
+        "unannotated_running_ms",
+        "ambiguous_annotation_wall_ms",
+        "incomplete_slice_count",
+        "upid",
+        "utid",
+        "window_start_ts",
+        "window_end_ts",
+        "unannotated_wall_ms",
+        "known_state_ms",
+        "conflicting_state_ms",
+        "other_state_ms",
+        "unknown_io_wait_ms",
+        "eligible_task_count",
+        "observed_doframe_count",
+        "evidence_scope"
+      ],
+      "assertions": [
+        {
+          "column": "phase",
+          "operator": "eq",
+          "value": "window"
+        },
+        {
+          "column": "observed_doframe_count",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "annotated_wall_ms",
+          "operator": "eq",
+          "value": 0
+        },
+        {
+          "column": "unannotated_running_ms",
+          "operator": "eq",
+          "value": 35
+        }
+      ],
+      "required_marker": "SmartPerfetto::CASE::main-thread-frame-work"
+    }
+  ]
+}

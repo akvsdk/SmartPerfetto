@@ -1012,6 +1012,71 @@ describe('typed turn prompt assembly', () => {
     return segment ? JSON.parse(segment.content).data : undefined;
   };
 
+  function investigationFixture(overrides: Partial<AnalysisTurnIntent> = {}): ClaudeAnalysisContext {
+    const context = fixture({taskKind: 'investigation', ...overrides});
+    context.strategyRegistry!.getStrategy('scrolling')!.investigationRequirements = [
+      'Explain observed main-thread tasks and states within the requested scope.',
+      'A doFrame interval alone does not prove a missed deadline.',
+    ];
+    return context;
+  }
+
+  it.each([
+    ['bounded_question', 'answer', 'quick'], ['bounded_question', 'answer', 'full'],
+    ['bounded_question', 'report', 'quick'], ['scene_wide', 'answer', 'quick'],
+    ['scene_wide', 'answer', 'full'], ['scene_wide', 'report', 'full'],
+  ] as const)('supplies pinned investigation obligations for %s/%s/%s without legacy recipes', (scope, deliverable, recommendedComplexity) => {
+    const context = investigationFixture({scope, deliverable, recommendedComplexity});
+    const parts = buildSystemPromptParts(context);
+    expect(segmentData(parts, 'investigation_requirements')).toEqual({
+      sceneId: 'scrolling', registryFingerprint: 'pin-one',
+      requirements: context.strategyRegistry!.getStrategy('scrolling')!.investigationRequirements,
+    });
+    expect(parts.segments.find(segment => segment.label === 'investigation_requirements'))
+      .toMatchObject({tier: 3, droppable: false, truncatable: false});
+    expect(parts.segments.some(segment => segment.label === 'scene_strategy_core')).toBe(false);
+    expect(buildQuickSystemPrompt(context)).toBe(parts.fullPrompt);
+    expect(segmentData(buildSystemPromptParts({...context, onDemandContext: true}), 'investigation_requirements'))
+      .toEqual(segmentData(parts, 'investigation_requirements'));
+  });
+
+  it.each(['fact', 'acknowledgement', 'comparison'] as const)('does not attach investigation obligations to a %s turn', taskKind => {
+    const context = investigationFixture({taskKind, evidenceAccess: 'existing_only'});
+    expect(segmentData(buildSystemPromptParts(context), 'investigation_requirements')).toBeUndefined();
+  });
+
+  it('does not invent investigation obligations for unavailable decisions or old strategy snapshots', () => {
+    expect(segmentData(buildSystemPromptParts(investigationFixture({status: 'unavailable'})),
+      'investigation_requirements')).toBeUndefined();
+    expect(segmentData(buildSystemPromptParts(fixture({taskKind: 'investigation'})),
+      'investigation_requirements')).toBeUndefined();
+  });
+
+  it('keeps investigation evidence, selection and authorization intact under prompt pressure', () => {
+    const context: ClaudeAnalysisContext = {
+      ...investigationFixture({scope: 'bounded_question', evidenceAccess: 'existing_only'}),
+      onDemandContext: true, codeAwareMode: 'provider_send', codebaseIds: ['selected-source'],
+      selectionContext: {kind: 'area', startNs: 10, endNs: 20, tracks: [{uri: 'track-1', upid: 42, utid: 43}]},
+      conversationSummary: 'Incomplete prior history. '.repeat(20000),
+      knowledgeBaseContext: 'Optional lookup context. '.repeat(20000),
+    };
+    const parts = buildSystemPromptParts(context, 2_000);
+    expect(estimatePromptTokens(parts.fullPrompt)).toBeLessThanOrEqual(2_000);
+    expect(segmentData(parts, 'turn_policy')).toMatchObject({scope: 'bounded_question',
+      evidenceAccess: 'existing_only', onDemandContext: true});
+    expect(segmentData(parts, 'source_authorization')).toEqual({mode: 'provider_send',
+      codebaseIds: ['selected-source'], evidenceAccess: 'existing_only'});
+    expect(segmentData(parts, 'selection_context')).toEqual(context.selectionContext);
+    expect(segmentData(parts, 'investigation_requirements').requirements)
+      .toEqual(context.strategyRegistry!.getStrategy('scrolling')!.investigationRequirements);
+    expect(parts.segments.some(segment => segment.label === 'source_use_decision')).toBe(false);
+    expect(parts.droppedLabels).toContain('knowledge_base');
+    expect(parts.truncatedLabels).toContain('conversation_context');
+    expect(parts.truncatedLabels).not.toContain('investigation_requirements');
+    expect(parts.droppedLabels).not.toContain('investigation_requirements');
+    expect(() => buildSystemPromptParts(context, 1)).toThrow('hard budget');
+  });
+
   it('injects shared framing and the actual proof catalog after removing authoring comments', () => {
     const parts = buildSystemPromptParts(fixture());
     const segment = parts.segments.find(item => item.label === 'conclusion_declaration')!;

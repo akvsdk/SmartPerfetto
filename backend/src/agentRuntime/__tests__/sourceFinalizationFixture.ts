@@ -136,13 +136,15 @@ export function createRuntimeSourceFinalizationFixture(input: {
       const readResult = await invoke('read_codebase_file', {
         file_path: SOURCE_FINALIZATION_FILE_PATH,
         start_line: 1,
-        end_line: 1,
+        max_lines: 1,
       });
       if (!readResult || (readResult as {success?: boolean}).success !== true) {
         throw new Error('Task 7 real read_codebase_file handler did not succeed');
       }
       const decision = mcp.sourceUse.getSourceUseDecision();
-      const reference = decision?.references.find(candidate => candidate.lookupKind === 'body');
+      // Build the model's declaration exclusively from the delivered tool body.
+      const reference = (readResult as {sourceReferences?: SourceReferenceV1[]}).sourceReferences
+        ?.find(candidate => candidate.lookupKind === 'body');
       if (!decision || !reference) {
         throw new Error('Task 7 real source handler did not produce body provenance');
       }

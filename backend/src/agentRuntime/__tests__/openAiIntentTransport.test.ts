@@ -73,6 +73,25 @@ describe('OpenAI native intent transport', () => {
     expect(body).not.toHaveProperty('conversation');
   });
 
+  it.each(['responses', 'chat_completions'] as const)('omits the provider output-token field for %s when no explicit cap is supplied', async protocol => {
+    const {input, fetchImpl} = fixture(protocol);
+    delete (input as Partial<OpenAiIntentTransportInput>).maxOutputTokens;
+    expect(await runOpenAiIntentTransport(input)).toMatchObject({status: 'ok'});
+    const body = JSON.parse(fetchImpl.mock.calls[0][1]!.body as string);
+    expect(body).not.toHaveProperty('max_tokens');
+    expect(body).not.toHaveProperty('max_completion_tokens');
+    expect(body).not.toHaveProperty('max_output_tokens');
+    expect(body.model).toBe(input.config.lightModel);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '8192', null])('rejects an explicitly invalid output-token limit %s before dispatch', async value => {
+    const {input, fetchImpl} = fixture('chat_completions');
+    input.maxOutputTokens = value as number;
+    expect(await runOpenAiIntentTransport(input)).toEqual({status: 'unavailable', reason: 'invalid_configuration'});
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('uses the existing Chat Completions token compatibility for a gateway model', async () => {
     const {input, fetchImpl} = fixture('chat_completions');
     input.config.lightModel = 'deepseek-chat';

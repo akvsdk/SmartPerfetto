@@ -16,7 +16,7 @@ import {
 
 export interface OpenAiIntentTransportInput extends IntentTransportInput {
   config: Pick<OpenAIAgentConfig, 'baseURL' | 'apiKey' | 'lightModel' | 'protocol'>;
-  maxOutputTokens: number;
+  maxOutputTokens?: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -90,7 +90,8 @@ export function runOpenAiIntentTransport(input: OpenAiIntentTransportInput) {
   return runIntentTransport(input, async scope => {
     const {config} = input;
     if (!config.baseURL || !config.lightModel?.trim()
-      || !Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens <= 0
+      || (input.maxOutputTokens !== undefined
+        && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens <= 0))
       || (config.protocol !== 'chat_completions' && config.protocol !== 'responses')) {
       return {status: 'unavailable', reason: 'invalid_configuration'};
     }
@@ -101,12 +102,13 @@ export function runOpenAiIntentTransport(input: OpenAiIntentTransportInput) {
       instructions: input.systemPrompt,
       input: [{role: 'user', content: input.prompt}],
       tools: [], store: false,
-      max_output_tokens: input.maxOutputTokens,
+      ...(input.maxOutputTokens !== undefined ? {max_output_tokens: input.maxOutputTokens} : {}),
     } : {
       model: config.lightModel,
       messages: [{role: 'system', content: input.systemPrompt}, {role: 'user', content: input.prompt}],
       temperature: 0,
-      ...buildOpenAIChatCompletionsTokenLimit(config.lightModel, input.maxOutputTokens),
+      ...(input.maxOutputTokens !== undefined
+        ? buildOpenAIChatCompletionsTokenLimit(config.lightModel, input.maxOutputTokens) : {}),
     };
     const response = await (input.fetchImpl ?? fetch)(url, {
       method: 'POST', signal: scope.signal,

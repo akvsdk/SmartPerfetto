@@ -123,7 +123,7 @@ export function registerAgentReportRoutes(
           ? projectPrivateTerminationReason(result.terminationReason)
           : result.terminationReason,
         terminationMessage: privateKnowledge
-          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage)
+          ? projectPrivateTerminationMessage(result.terminationMessage, outputLanguage, result)
           : result.terminationMessage,
       },
       reportUrl: completedPayload?.finalArtifacts?.reportUrl,

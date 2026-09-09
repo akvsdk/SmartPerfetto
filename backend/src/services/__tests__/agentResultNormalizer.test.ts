@@ -20,6 +20,7 @@ import { runPreparedAnalysisClaimVerification } from '../evidence/analysisRelati
 import {analysisDeliveryFingerprint} from '../../types/analysisDelivery';
 import {captureEvidenceTable} from '../evidence/evidenceCapture';
 import {prepareClaimEvidence} from '../evidence/claimEvidencePreparation';
+import {projectSafeSourceProvenance, verifySourceClaimBindings} from '../codebase/sourceClaimVerifier';
 
 function makeResult(overrides: Partial<AnalysisResult> = {}): AnalysisResult {
   return {
@@ -741,7 +742,8 @@ describe('normalizeResultForReport', () => {
     expect(out.conclusionContract).toBe(contract);
   });
 
-  test('canonicalizes source provenance without putting it into the chat narrative', () => {
+  test.each(['lookup-1', 'model-controlled-id'] as const)(
+    'canonicalizes source provenance and safely handles binding ID %s', bindingId => {
     const r = makeResult({
       conclusion: 'compact chat narrative',
       conclusionContract: {
@@ -783,7 +785,7 @@ describe('normalizeResultForReport', () => {
         sourceClaimBindings: [{
           claimId: 'claim-1',
           mechanismStatus: 'compatible',
-          sourceReferenceIds: ['model-controlled-id'],
+          sourceReferenceIds: [bindingId],
           traceEvidenceRefIds: ['data:trace-1'],
           reason: 'raw-source-canary',
         }],
@@ -798,8 +800,27 @@ describe('normalizeResultForReport', () => {
 
     expect(out.conclusion).toBe('compact chat narrative');
     expect(out.conclusionContract?.sourceReferences?.[0]?.id).toMatch(/^source-ref-v1-/);
-    expect(JSON.stringify(out.conclusionContract)).not.toContain('model-controlled-id');
     expect(JSON.stringify(out.conclusionContract)).not.toContain('raw-source-canary');
+    const verified = verifySourceClaimBindings({conclusionContract: out.conclusionContract,
+      actualSourceUseDecision: out.sourceUseDecision,
+      matchedTraceEvidenceRefIdsByClaimId: {'claim-1': ['data:trace-1']}});
+    const safe = projectSafeSourceProvenance({conclusionContract: out.conclusionContract,
+      actualSourceUseDecision: out.sourceUseDecision});
+    expect(JSON.stringify(safe)).not.toContain('model-controlled-id');
+    expect(JSON.stringify(safe)).not.toContain('raw-source-canary');
+    if (bindingId === 'lookup-1') {
+      expect(JSON.stringify(out.conclusionContract)).not.toContain('model-controlled-id');
+      expect(verified.status).toBe('passed');
+      expect(safe?.sourceClaimBindings[0]?.sourceReferenceIds).toEqual([safe?.sourceUseDecision.references[0].id]);
+    } else {
+      // Keep the invalid declaration until verification can diagnose it; never
+      // resolve a model-created alias or publish it as accepted provenance.
+      expect(out.conclusionContract?.sourceClaimBindings?.[0]?.sourceReferenceIds).toEqual([bindingId]);
+      expect(verified.status).toBe('failed');
+      expect(verified.issues).toContainEqual(expect.objectContaining({code: 'source_reference_not_returned'}));
+      expect(verified.bindings).toEqual([]);
+      expect(safe?.sourceClaimBindings).toEqual([]);
+    }
   });
 
   test('derives claim provenance from unsanitized narrative while returning sanitized display text', () => {

@@ -1580,8 +1580,8 @@ describe('scrolling_analysis skill schema', () => {
     expect(strategy).toContain('不能用“仅 N 帧真实/可感知”排除其余呈现间隔异常');
     expect(strategy).toContain('已有 `scrolling_analysis:vsync_config` artifact 时直接复用');
     expect(strategy).toContain('不要在 `expectedCalls` 中无条件预占 standalone `vsync_config`');
-    expect(strategy).toContain('`fallback_no_frame_timeline` 只有数据不可用提示而没有可用替代源');
-    expect(strategy).toContain('立即停止自动追加帧/架构 Skill 与探索 SQL');
+    expect(strategy).toContain('目标存在但 FrameTimeline/BufferTX 不可用时，只停止依赖帧源的统计和深钻');
+    expect(strategy).toContain('继续读取主线程工作证据');
     expect(strategy).toContain('`vsync_source = default_60hz_no_trace_timing` 只是内部默认预算');
     expect(strategy).toContain('不得把 60Hz 当作设备或本次场景事实交付');
     expect(strategy).toContain('`frame_timeline_unattributed`');
@@ -1982,5 +1982,457 @@ describe('single-frame exact UPID SQL semantics', () => {
         global_context: ['frame_budget_ms', 'primary_cause', 'secondary_info'], peer_context: ['deep_reason'],
       });
     } finally {db.close();}
+  });
+});
+
+// Main-thread causes are evaluated from the continuous execution window, even
+// when FrameTimeline and input/scroll session tables do not exist.
+describe('main_thread_frame_work continuous-window SQL behavior', () => {
+  const definition = yaml.load(fs.readFileSync(path.join(process.cwd(),
+    'skills/composite/main_thread_frame_work.skill.yaml'), 'utf8')) as any;
+  it('keeps all standalone evidence projections first and identical in scrolling analysis', () => {
+    const scrolling = yaml.load(fs.readFileSync(path.join(process.cwd(),
+      'skills/composite/scrolling_analysis.skill.yaml'), 'utf8')) as any;
+    expect(scrolling.steps.slice(0, definition.steps.length)).toEqual(definition.steps);
+  });
+
+  const step = (id: string) => definition.steps.find((candidate: any) => candidate.id === id);
+  const sql = (id: string, options: {
+    upid?: number | null; packageName?: string; start?: number; end?: number; topK?: number;
+    projection?: string;
+  } = {}) => {
+    const selected = step(id);
+    const fragments = selected.sql_fragments.map((file: string) =>
+      fs.readFileSync(path.join(process.cwd(), 'skills', file), 'utf8')).join('\n,\n');
+    return `WITH ${fragments}\n${options.projection || selected.sql}`
+      .split('${__process_scope.upid}').join(String(options.upid ?? 'NULL'))
+      .split('${package}').join(options.packageName ?? 'com.example.app')
+      .split('${start_ts}').join(String(options.start ?? 'NULL'))
+      .split('${end_ts}').join(String(options.end ?? 'NULL'))
+      .split('${main_thread_top_k|20}').join(String(options.topK ?? 20));
+  };
+  const fixture = () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE trace_bounds(start_ts INTEGER, end_ts INTEGER);
+      INSERT INTO trace_bounds VALUES (0, 100000000);
+      CREATE TABLE process(upid INTEGER PRIMARY KEY, pid INTEGER, name TEXT, start_ts INTEGER, end_ts INTEGER);
+      CREATE TABLE thread(utid INTEGER PRIMARY KEY, upid INTEGER, tid INTEGER, name TEXT, start_ts INTEGER, end_ts INTEGER);
+      CREATE TABLE thread_track(id INTEGER PRIMARY KEY, utid INTEGER);
+      CREATE TABLE slice(id INTEGER PRIMARY KEY, track_id INTEGER, ts INTEGER, dur INTEGER,
+        name TEXT, parent_id INTEGER, arg_set_id INTEGER);
+      CREATE INDEX slice_track_ts ON slice(track_id, ts);
+      CREATE INDEX slice_parent ON slice(parent_id);
+      CREATE TABLE thread_state(utid INTEGER, ts INTEGER, dur INTEGER, state TEXT, io_wait INTEGER,
+        id INTEGER PRIMARY KEY, blocked_function TEXT);
+      CREATE INDEX thread_state_utid_ts ON thread_state(utid, ts);
+      INSERT INTO process VALUES (42, 100, 'com.example.app', NULL, NULL);
+      INSERT INTO thread VALUES (1, 42, 100, 'main', NULL, NULL);
+      INSERT INTO thread_track VALUES (10, 1);
+    `);
+    return db;
+  };
+  const rows = (db: Database.Database, id: string, options: Parameters<typeof sql>[1] = {}) =>
+    db.prepare(sql(id, options)).all() as Record<string, any>[];
+  const windowRow = (db: Database.Database, options: Parameters<typeof sql>[1] = {}) =>
+    rows(db, 'main_thread_work_summary', options).find(row => row.phase === 'window')!;
+
+  it('finds a 30ms initialization task between 22ms and 24ms doFrames without FrameTimeline', () => {
+    const db = fixture();
+    try {
+      db.exec(`
+        INSERT INTO slice VALUES
+          (1,10,0,22000000,'Choreographer#doFrame 1',NULL,11),
+          (2,10,22000000,30000000,'ContentLoader.initialize',NULL,12),
+          (3,10,52000000,24000000,'Choreographer#doFrame 2',NULL,13),
+          (4,10,23000000,25000000,'ContentRepository.initialize',2,14),
+          (5,10,24000000,14000000,'parseContent',4,15),
+          (6,10,38000000,8000000,'inflateContent',4,16);
+        INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES
+          (1,0,30000000,'Running',NULL), (1,30000000,2000000,'R',NULL),
+          (1,32000000,68000000,'Running',NULL);
+      `);
+      const summary = rows(db, 'main_thread_work_summary');
+      expect(windowRow(db)).toMatchObject({wall_ms: 100, annotated_wall_ms: 76,
+        unannotated_wall_ms: 24, observed_doframe_count: 2, eligible_task_count: 3,
+        running_ms: 98, runnable_ms: 2, unannotated_running_ms: 24});
+      expect(summary.find(row => row.phase === 'between_doFrames')).toMatchObject({
+        wall_ms: 30, annotated_wall_ms: 30, running_ms: 28, runnable_ms: 2,
+      });
+      const tasks = rows(db, 'main_thread_work_tasks');
+      expect(tasks[0]).toMatchObject({task_name: 'ContentLoader.initialize', phase: 'between_doFrames',
+        wall_ms: 30, outside_doframe_ms: 30, inside_doframe_ms: 0, running_ms: 28, runnable_ms: 2,
+        slice_id: 2, arg_set_id: 12, hotspot_name: 'parseContent', hotspot_slice_id: 5,
+        hotspot_parent_id: 4, hotspot_arg_set_id: 15, hotspot_exclusive_wall_ms: 14,
+        eligible_task_count: 3, returned_task_count: 3});
+      expect(tasks[0].ancestor_path).toBe('ContentLoader.initialize > ContentRepository.initialize > parseContent');
+      expect(rows(db, 'main_thread_work_cadence')).toEqual([
+        expect.objectContaining({observed_start_interval_ms: 52, between_execution_ms: 30,
+          previous_slice_id: 1, slice_id: 3, eligible_interval_count: 1, returned_interval_count: 1}),
+      ]);
+    } finally {db.close();}
+  });
+
+  it('preserves every phase of one outer task and computes exclusive wall with a running child union', () => {
+    const db = fixture();
+    try {
+      db.exec(`
+        INSERT INTO slice VALUES
+          (1,10,0,100000000,'outerDispatch',NULL,1),
+          (2,10,10000000,20000000,'Choreographer#doFrame 1',1,2),
+          (3,10,60000000,20000000,'Choreographer#doFrame 2',1,3),
+          (4,10,30000000,30000000,'initialize',1,4),
+          (5,10,32000000,18000000,'longChild',4,5),
+          (6,10,34000000,2000000,'overlappingChild',4,6),
+          (7,10,46000000,6000000,'tailChild',4,7);
+        INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES (1,0,100000000,'Running',NULL);
+      `);
+      const task = rows(db, 'main_thread_work_tasks')[0];
+      expect(task).toMatchObject({task_name: 'outerDispatch', phase: 'mixed', wall_ms: 100,
+        inside_doframe_ms: 40, between_doframes_ms: 30, before_first_doframe_ms: 10,
+        after_last_doframe_ms: 20, outside_doframe_ms: 60, running_ms: 100});
+      const hotspots = rows(db, 'main_thread_work_tasks', {
+        projection: 'SELECT slice_id, exclusive_wall_ns FROM mtw_hotspots ORDER BY slice_id',
+      });
+      expect(hotspots.find(row => row.slice_id === 1)?.exclusive_wall_ns).toBe(30000000);
+      // Children cover [32,52), not 18+2+6=26ms and not a LAG(end) overcount.
+      expect(hotspots.find(row => row.slice_id === 4)?.exclusive_wall_ns).toBe(10000000);
+      const summary = rows(db, 'main_thread_work_summary');
+      expect(windowRow(db).annotated_wall_ms).toBe(100);
+      expect(summary.filter(row => row.phase !== 'window').reduce((sum, row) => sum + row.wall_ms, 0)).toBe(100);
+      expect(summary.filter(row => row.phase !== 'window').reduce((sum, row) => sum + row.running_ms, 0)).toBe(100);
+    } finally {db.close();}
+  });
+
+  it('clips open and boundary slices, keeps incomplete status, and never turns unknown scheduling into zero CPU', () => {
+    const db = fixture();
+    try {
+      db.exec(`
+        INSERT INTO slice VALUES
+          (1,10,20000000,-1,'unfinishedInitialization',NULL,1),
+          (2,10,10000000,20000000,'endsAtWindowStart',NULL,2),
+          (3,10,70000000,10000000,'startsAtWindowEnd',NULL,3),
+          (4,10,35000000,-1,'unfinishedChild',1,4);
+      `);
+      const options = {start: 30000000, end: 70000000};
+      expect(windowRow(db, options)).toMatchObject({wall_ms: 40, annotated_wall_ms: 40,
+        incomplete_slice_count: 2, eligible_task_count: 1, observed_doframe_count: 0,
+        running_ms: null, runnable_ms: null, known_state_ms: 0, unknown_state_ms: 40,
+        unannotated_running_ms: null});
+      expect(rows(db, 'main_thread_work_tasks', options)).toEqual([
+        expect.objectContaining({task_name: 'unfinishedInitialization', raw_ts: '20000000',
+          raw_dur: '-1', start_ts: '30000000', end_ts: '70000000', dur: '40000000',
+          phase: 'no_doFrame', is_incomplete: 1, hotspot_is_incomplete: 1,
+          running_ms: null, unknown_state_ms: 40}),
+      ]);
+      expect(rows(db, 'main_thread_work_cadence', options)).toEqual([]);
+    } finally {db.close();}
+  });
+
+  it('keeps exact UPID lifetimes and conserves union time across overlapping annotation tracks', () => {
+    const db = fixture();
+    try {
+      db.exec(`
+        UPDATE process SET end_ts=50000000 WHERE upid=42;
+        UPDATE thread SET end_ts=50000000 WHERE utid=1;
+        INSERT INTO process VALUES (43,100,'com.example.app',50000000,NULL),
+          (44,101,'com.example.app:worker',NULL,NULL),(45,102,'com.example.app2',NULL,NULL);
+        INSERT INTO thread VALUES (2,43,100,'main',50000000,NULL),
+          (3,44,101,'main',NULL,NULL),(4,45,102,'main',NULL,NULL);
+        INSERT INTO thread_track VALUES (11,1),(20,2),(30,3),(40,4);
+        INSERT INTO slice VALUES
+          (1,10,10000000,30000000,'trackOne',NULL,1),
+          (2,11,20000000,30000000,'trackTwo',NULL,2),
+          (3,20,50000000,50000000,'restartedProcess',NULL,3),
+          (4,30,0,100000000,'childProcess',NULL,4),
+          (5,40,0,100000000,'similarPrefix',NULL,5);
+        INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES (1,0,100000000,'Running',NULL),
+          (2,0,100000000,'Running',NULL),(3,0,100000000,'Running',NULL);
+      `);
+      expect(windowRow(db, {upid: 42})).toMatchObject({upid: 42, window_end_ts: '50000000',
+        wall_ms: 50, annotated_wall_ms: 40, running_ms: 50, ambiguous_annotation_wall_ms: 20,
+        annotation_track_count: 2, eligible_task_count: 2});
+      const tasks = rows(db, 'main_thread_work_tasks', {upid: 42});
+      expect(tasks).toHaveLength(2);
+      expect(tasks.every(row => row.upid === 42 && row.attribution === 'overlapping_roots_nonadditive')).toBe(true);
+      expect(tasks.reduce((sum, row) => sum + row.wall_ms, 0)).toBe(60);
+      expect(windowRow(db, {upid: 43})).toMatchObject({upid: 43, window_start_ts: '50000000', wall_ms: 50});
+      expect(rows(db, 'main_thread_work_summary').filter(row => row.phase === 'window')
+        .map(row => row.upid)).toEqual([42, 43, 44]);
+      // A trusted identity binding takes precedence over a stale display name.
+      expect(windowRow(db, {upid: 42, packageName: 'stale.name'}).upid).toBe(42);
+    } finally {db.close();}
+  });
+
+  it('reports unannotated CPU, actual waits and uncovered state without inferring idle or IO causes', () => {
+    const db = fixture();
+    try {
+      db.exec(`INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES
+        (1,0,10000000,'Running',NULL),(1,10000000,10000000,'R',NULL),
+        (1,20000000,10000000,'R+',NULL),(1,30000000,10000000,'S',NULL),
+        (1,40000000,10000000,'I',NULL),(1,50000000,10000000,'D',0),
+        (1,60000000,10000000,'D',1),(1,70000000,5000000,'DK',NULL),
+        (1,75000000,5000000,'T',NULL);`);
+      expect(windowRow(db)).toMatchObject({wall_ms: 100, annotated_wall_ms: 0,
+        unannotated_wall_ms: 100, unannotated_running_ms: 10, running_ms: 10,
+        runnable_ms: 10, runnable_preempted_ms: 10, sleep_ms: 10, idle_state_ms: 10,
+        uninterruptible_ms: 20, uninterruptible_wakekill_ms: 5,
+        io_wait_ms: 10, unknown_io_wait_ms: 5, other_state_ms: 5,
+        known_state_ms: 80, unknown_state_ms: 20});
+      expect(rows(db, 'main_thread_work_tasks')).toEqual([]);
+      expect(rows(db, 'main_thread_work_cadence')).toEqual([]);
+      db.exec("INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES (1,0,5000000,'S',NULL)");
+      expect(windowRow(db)).toMatchObject({running_ms: 5, unknown_state_ms: 25, conflicting_state_ms: 5});
+    } finally {db.close();}
+  });
+
+  it('keeps complete many-short-task totals before TopK and excludes resynced annotation from doFrame cadence', () => {
+    const db = fixture();
+    try {
+      const insert = db.prepare('INSERT INTO slice VALUES (?,10,?,1000000,?,NULL,?)');
+      db.transaction(() => {
+        for (let index = 0; index < 60; index++) {
+          insert.run(index + 1, index * 1000000, 'ContentLoader.smallInitialization', index + 1);
+        }
+      })();
+      db.exec(`INSERT INTO slice VALUES (100,10,80000000,1000000,'Choreographer#doFrame resynced',NULL,100);
+        INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES (1,0,100000000,'Running',NULL);`);
+      const options = {topK: 2};
+      expect(windowRow(db, options)).toMatchObject({annotated_wall_ms: 61,
+        eligible_task_count: 61, observed_doframe_count: 0, running_ms: 100});
+      const tasks = rows(db, 'main_thread_work_tasks', options);
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0]).toMatchObject({task_name: 'ContentLoader.smallInitialization',
+        eligible_task_count: 61, returned_task_count: 2, phase: 'no_doFrame'});
+      expect(rows(db, 'main_thread_work_cadence', options)).toEqual([]);
+      expect(rows(db, 'main_thread_work_tasks', {topK: 1000000})).toHaveLength(61);
+    } finally {db.close();}
+  });
+
+  it('marks duplicate-track and incomplete doFrame observations instead of inventing execution gaps', () => {
+    const db = fixture();
+    try {
+      db.exec(`
+        INSERT INTO thread_track VALUES (11,1);
+        INSERT INTO slice VALUES
+          (1,10,0,10000000,'Choreographer#doFrame 1',NULL,1),
+          (2,11,0,10000000,'Choreographer#doFrame 1',NULL,2),
+          (3,10,20000000,-1,'Choreographer#doFrame 2',NULL,3),
+          (4,11,50000000,10000000,'Choreographer#doFrame 3',NULL,4);
+      `);
+      const intervals = rows(db, 'main_thread_work_cadence');
+      expect(intervals).toHaveLength(2);
+      expect(intervals.find(row => row.start_ts === '0')).toMatchObject({
+        observed_start_interval_ms: 20, previous_slice_id: null,
+        observation: 'ambiguous_duplicate_markers', between_execution_ms: null,
+      });
+      expect(intervals.find(row => row.start_ts === '20000000')).toMatchObject({
+        observed_start_interval_ms: 30, observation: 'incomplete_previous_execution',
+        between_execution_ms: null,
+      });
+      expect(rows(db, 'main_thread_work_cadence', {topK: 1})[0]).toMatchObject({
+        eligible_interval_count: 2, returned_interval_count: 1,
+      });
+    } finally {db.close();}
+  });
+
+  it('scopes many irrelevant slices before sweeping and bounds only detail expansion', () => {
+    const db = fixture();
+    try {
+      db.exec(`INSERT INTO process VALUES (99,999,'unrelated',NULL,NULL);
+        INSERT INTO thread VALUES (99,99,999,'main',NULL,NULL);
+        INSERT INTO thread_track VALUES (99,99);
+        UPDATE trace_bounds SET end_ts=10000000000;`);
+      const insert = db.prepare('INSERT INTO slice VALUES (?,?,?,?,?,NULL,0)');
+      db.transaction(() => {
+        for (let index = 0; index < 10000; index++) {
+          insert.run(index + 1, 99, index * 1000000, 1000000, 'irrelevant');
+          insert.run(index + 20000, 10, index * 1000000, 1000000, 'smallInitialization');
+        }
+      })();
+      const options = {upid: 42, start: 100000000, end: 200000000, topK: 3};
+      expect(windowRow(db, options)).toMatchObject({eligible_task_count: 100,
+        annotated_wall_ms: 100, wall_ms: 100, observed_slice_count: 100});
+      expect(rows(db, 'main_thread_work_tasks', options)).toHaveLength(3);
+      expect(rows(db, 'main_thread_work_tasks', options)[0]).toMatchObject({
+        eligible_task_count: 100, returned_task_count: 3,
+      });
+      // The full-window path still accounts for every root before bounding
+      // detailed descendants, rather than doing a root x endpoint expansion.
+      expect(windowRow(db, {upid: 42, topK: 3})).toMatchObject({
+        eligible_task_count: 10000, annotated_wall_ms: 10000,
+      });
+      expect(rows(db, 'main_thread_work_tasks', {upid: 42, topK: 3})[0]).toMatchObject({
+        eligible_task_count: 10000, returned_task_count: 3,
+      });
+    } finally {db.close();}
+  });
+
+  it('prioritizes inter-frame work ahead of arbitrarily many slower doFrames and removes nested duplicate markers', () => {
+    const db = fixture();
+    try {
+      db.exec('UPDATE trace_bounds SET end_ts = 2000000000');
+      const insert = db.prepare('INSERT INTO slice VALUES (?,10,?,30000000,?,NULL,0)');
+      db.transaction(() => {
+        for (let index = 0; index < 30; index++) {
+          insert.run(index + 1, index * 50000000, `Choreographer#doFrame ${index}`);
+        }
+      })();
+      db.exec(`INSERT INTO slice VALUES
+        (100,10,30000000,20000000,'initializeContent',NULL,100),
+        (101,10,1000000,10000000,'Choreographer#doFrame nested',1,101);`);
+      expect(windowRow(db, {topK: 1})).toMatchObject({observed_doframe_count: 30, eligible_task_count: 31});
+      expect(rows(db, 'main_thread_work_tasks', {topK: 1})).toEqual([
+        expect.objectContaining({task_name: 'initializeContent', phase: 'between_doFrames',
+          outside_doframe_ms: 20, eligible_task_count: 31, returned_task_count: 1}),
+      ]);
+      expect(rows(db, 'main_thread_work_cadence')[0]).toMatchObject({eligible_interval_count: 29,
+        observed_start_interval_ms: 50});
+    } finally {db.close();}
+  });
+
+  it('retains bounded non-frame exclusive hotspots and scheduler blocking provenance for mixed outer tasks', () => {
+    const db = fixture();
+    try {
+      db.exec(`INSERT INTO slice VALUES
+        (1,10,0,100000000,'Looper.dispatch',NULL,1),
+        (2,10,0,35000000,'Choreographer#doFrame 1',1,2),
+        (3,10,55000000,45000000,'Choreographer#doFrame 2',1,3),
+        (4,10,35000000,20000000,'initializeContent',1,4),
+        (5,10,0,34000000,'drawFirstFrame',2,5),
+        (6,10,55000000,44000000,'drawSecondFrame',3,6);
+        INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES
+          (1,0,35000000,'Running',NULL),(1,35000000,10000000,'D',1),
+          (1,45000000,5000000,'S',NULL),(1,50000000,50000000,'Running',NULL);
+        UPDATE thread_state SET blocked_function='filemap_fault' WHERE state='D';
+        UPDATE thread_state SET blocked_function='futex_wait_queue' WHERE state='S';`);
+      const task = rows(db, 'main_thread_work_tasks')[0];
+      expect(task).toMatchObject({phase: 'mixed', outside_doframe_ms: 20,
+        hotspot_name: 'initializeContent', hotspot_exclusive_wall_ms: 20,
+        hotspot_exclusive_outside_doframe_ms: 20, running_ms: 85,
+        uninterruptible_ms: 10, io_wait_ms: 10, sleep_ms: 5,
+        top_wait_state: 'D', top_wait_state_id: 2, top_wait_blocked_function: 'filemap_fault',
+        top_wait_io_wait: 1, top_wait_start_ts: '35000000', top_wait_end_ts: '45000000',
+        top_wait_overlap_ms: 10});
+      const hotspots = JSON.parse(task.hotspot_evidence);
+      expect(hotspots).toHaveLength(3);
+      expect(hotspots[0]).toMatchObject({name: 'initializeContent', slice_id: 4,
+        arg_set_id: 4, in_doframe_tree: 0, start_ts: '35000000',
+        exclusive_outside_doframe_ms: 20, ancestor_path: 'Looper.dispatch > initializeContent'});
+      expect(hotspots.some((row: any) => row.in_doframe_tree === 1)).toBe(true);
+      expect(JSON.parse(task.wait_evidence)).toEqual([
+        expect.objectContaining({thread_state_id: 2, state: 'D', io_wait: 1,
+          blocked_function: 'filemap_fault', overlap_ms: 10, start_ts: '35000000', end_ts: '45000000'}),
+        expect.objectContaining({thread_state_id: 3, state: 'S', io_wait: null,
+          blocked_function: 'futex_wait_queue', overlap_ms: 5}),
+      ]);
+    } finally {db.close();}
+  });
+
+  it('preserves nanosecond precision beyond the JavaScript integer range on every output surface', () => {
+    const db = fixture();
+    try {
+      db.exec(`UPDATE trace_bounds SET start_ts=9007199254740993, end_ts=9007199354740993;
+        INSERT INTO slice VALUES
+        (1,10,9007199254740993,20000000,'Choreographer#doFrame 1',NULL,1),
+        (2,10,9007199274740993,30000000,'initialize',NULL,2),
+        (3,10,9007199304740993,20000000,'Choreographer#doFrame 2',NULL,3);`);
+      expect(windowRow(db)).toMatchObject({window_start_ts: '9007199254740993',
+        window_end_ts: '9007199354740993'});
+      expect(rows(db, 'main_thread_work_tasks')[0]).toMatchObject({
+        raw_ts: '9007199274740993', raw_dur: '30000000', start_ts: '9007199274740993',
+        end_ts: '9007199304740993', dur: '30000000',
+      });
+      expect(rows(db, 'main_thread_work_cadence')[0]).toMatchObject({
+        start_ts: '9007199254740993', next_start_ts: '9007199304740993', dur: '50000000',
+      });
+    } finally {db.close();}
+  });
+
+  it('exports the top three hotspots and waits as scalar source rows independent of JSON truncation', () => {
+    const db = fixture();
+    try {
+      const longName = 'initializeContent_' + 'longBusinessAnnotation'.repeat(8);
+      db.exec(`INSERT INTO slice VALUES (1,10,0,100000000,'dispatch',NULL,1),
+        (2,10,0,20000000,'childOne',1,2), (3,10,20000000,20000000,'childTwo',1,3),
+        (4,10,40000000,20000000,'childThree',1,4), (5,10,60000000,20000000,'childFour',1,5);
+        INSERT INTO thread_state(utid,ts,dur,state,io_wait) VALUES
+          (1,0,30000000,'D',1),(1,30000000,25000000,'S',NULL),
+          (1,55000000,20000000,'R',NULL),(1,75000000,15000000,'R+',NULL),
+          (1,90000000,10000000,'Running',NULL);
+        UPDATE thread_state SET blocked_function='filemap_fault' WHERE state='D';`);
+      db.prepare('UPDATE slice SET name=? WHERE id=2').run(longName);
+      const sources = rows(db, 'main_thread_work_sources', {topK: 1});
+      expect(sources).toHaveLength(6);
+      expect(sources.filter(row => row.source_kind === 'hotspot')).toHaveLength(3);
+      expect(sources.filter(row => row.source_kind === 'wait')).toHaveLength(3);
+      expect(sources.find(row => row.source_slice_id === 2)).toMatchObject({
+        root_slice_id: 1, source_name: longName, source_rank: 2,
+        source_slice_id: 2, parent_id: 1, arg_set_id: 2, upid: 42, utid: 1,
+        track_id: 10, start_ts: '0', end_ts: '20000000', dur: '20000000',
+        exclusive_wall_ms: 20, exclusive_outside_doframe_ms: 20,
+      });
+      expect(sources.find(row => row.thread_state_id === 1)).toMatchObject({
+        source_kind: 'wait', source_rank: 1, root_slice_id: 1,
+        state: 'D', blocked_function: 'filemap_fault', io_wait: 1,
+        start_ts: '0', end_ts: '30000000', wait_overlap_ms: 30,
+        source_slice_id: null, exclusive_wall_ms: null,
+      });
+      const columns = step('main_thread_work_sources').display.columns.map((column: any) => column.name);
+      expect(columns).toEqual(expect.arrayContaining(['source_slice_id', 'thread_state_id',
+        'parent_id', 'arg_set_id', 'blocked_function', 'start_ts', 'end_ts', 'source_rank']));
+      expect(step('main_thread_work_tasks').display.columns.map((column: any) => column.name))
+        .not.toContain('hotspot_evidence');
+    } finally {db.close();}
+  });
+});
+
+describe('FrameTimeline gap observation boundary', () => {
+  it('keeps process/layer identity and counts crossing markers without inferring backpressure', () => {
+    const skill = yaml.load(fs.readFileSync(path.join(process.cwd(),
+      'skills/atomic/frame_production_gap.skill.yaml'), 'utf8')) as any;
+    const db = new Database(':memory:');
+    try {
+      db.function('PERCENTILE', {varargs: true}, () => 16666667);
+      db.exec(`CREATE TABLE process(upid INTEGER, pid INTEGER, name TEXT);
+        INSERT INTO process VALUES(1,10,'com.example.app'),(2,20,'com.example.app:remote');
+        CREATE TABLE thread(utid INTEGER, tid INTEGER, upid INTEGER, name TEXT);
+        INSERT INTO thread VALUES(1,10,1,'main'),(2,20,2,'main'),
+          (3,11,1,'RenderThread'),(4,21,2,'RenderThread');
+        CREATE TABLE thread_track(id INTEGER, utid INTEGER);
+        INSERT INTO thread_track SELECT utid,utid FROM thread;
+        CREATE TABLE counter(ts INTEGER, track_id INTEGER);
+        CREATE TABLE counter_track(id INTEGER, name TEXT);
+        CREATE TABLE actual_frame_timeline_slice(ts INTEGER,dur INTEGER,upid INTEGER,
+          layer_name TEXT,display_frame_token INTEGER,surface_frame_token INTEGER);
+        INSERT INTO actual_frame_timeline_slice VALUES(0,10000000,1,'same',1,1),
+          (50000000,10000000,1,'same',2,2),(40000000,1000000,2,'same',3,3);
+        CREATE TABLE slice(id INTEGER,track_id INTEGER,ts INTEGER,dur INTEGER,name TEXT);
+        INSERT INTO slice VALUES(1,1,5000000,25000000,'Choreographer#doFrame 1'),
+          (2,4,20000000,5000000,'DrawFrame 1');`);
+      const query = (id: string) => {
+        const values: Record<string, string> = {process_name:'com.example.app',
+          '__process_scope.upid':'1',start_ts:'NULL',end_ts:'NULL',min_gap_vsync:'1.5'};
+        return db.prepare(skill.steps.find((step: any) => step.id === id).sql.replace(
+          /\$\{([^}]+)\}/g, (_: string, key: string) => {
+            if (!(key in values)) throw new Error(`Unexpected gap parameter ${key}`);
+            return values[key];
+          })).all() as any[];
+      };
+      expect(query('gap_list')).toEqual([expect.objectContaining({upid:1,gap_ms:40,
+        doframe_count:1,drawframe_count:0,gap_type:'rt_no_drawframe'})]);
+      db.exec("INSERT INTO slice VALUES(3,3,20000000,5000000,'DrawFrame 2')");
+      expect(query('gap_list')[0]).toMatchObject({gap_type:'drawframe_observed',
+        evidence_scope:'observed_marker_coverage_only'});
+      expect(query('gap_summary')[0]).toMatchObject({total_frames:2,total_gaps:1,
+        drawframe_observed_count:1});
+      expect(query('gap_summary')[0]).not.toHaveProperty('sf_backpressure_count');
+      db.exec(`DELETE FROM actual_frame_timeline_slice;
+        INSERT INTO actual_frame_timeline_slice VALUES(0,100000000,1,'same',10,10),
+          (30000000,10000000,1,'same',11,11),(80000000,10000000,1,'same',12,12);`);
+      expect(query('gap_list')).toEqual([]);
+      db.exec("INSERT INTO actual_frame_timeline_slice VALUES(140000000,20000000,1,'same',13,13)");
+      expect(query('gap_list')).toEqual([expect.objectContaining({gap_ms:40,before_frame_id:'10',after_frame_id:'13'})]);
+    } finally { db.close(); }
   });
 });
