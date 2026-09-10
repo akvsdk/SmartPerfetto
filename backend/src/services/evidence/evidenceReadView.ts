@@ -43,6 +43,12 @@ export interface EvidenceReadView {
   resolveReferences(requests: readonly EvidenceReadRequest[], signal?: AbortSignal): Promise<readonly EvidenceReadResolution[]>;
 }
 export interface EvidenceReadBudget {maxReferences: number; maxScannedRows: number; maxCells: number; maxElapsedMs: number; maxBytes: number}
+/**
+ * Upper bound on the references one conclusion may resolve. The witness ledger
+ * that answers those references must retain at least this many captures, or a
+ * run can cite evidence the product has already discarded.
+ */
+export const MAX_EVIDENCE_READ_REFERENCES = 256;
 export interface EvidenceReadViewOptions {
   currentRunId?: string;
   allowedTraces: readonly {traceId: string; traceSide: 'current' | 'reference'}[];
@@ -83,7 +89,7 @@ export function createEvidenceReadView(records: () => readonly EvidenceReadRecor
   observations: () => readonly InvestigationToolObservation[] = () => []): EvidenceReadView {
   if (!options.ownerKey.trim()) throw new Error('Evidence read view requires a runtime owner');
   const allowed = new Set(options.allowedTraces.map(trace => `${trace.traceSide}:${trace.traceId}`));
-  const budget: EvidenceReadBudget = {maxReferences: 256, maxScannedRows: 100_000, maxCells: 16_384,
+  const budget: EvidenceReadBudget = {maxReferences: MAX_EVIDENCE_READ_REFERENCES, maxScannedRows: 100_000, maxCells: 16_384,
     maxElapsedMs: 1500, maxBytes: 1_048_576, ...options.budget};
   if (Object.values(budget).some(value => !Number.isSafeInteger(value) || value < 0)) throw new Error('Invalid evidence read budget');
   return Object.freeze({investigationEvidence: () => buildInvestigationEvidenceSnapshot(records(), options, observations()),

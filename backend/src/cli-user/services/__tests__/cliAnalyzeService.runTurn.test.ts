@@ -18,9 +18,12 @@ import {buildStrategyRegistrySnapshotFromDefinitions} from '../../../agentv3/str
 import {analysisDeliveryFingerprint} from '../../../types/analysisDelivery';
 import {createAnalysisHistoryReader, resolveAnalysisHistoryReader, toAnalysisHistoryTurn, type AnalysisHistoryReader} from '../../../agentRuntime/analysisHistory';
 import {AnalysisHistoryStore} from '../../../services/analysisHistoryStore';
+import {privateAnalysisQueryMessage} from '../../../services/security/privateAnalysisProjection';
+import {parseOutputLanguage} from '../../../agentv3/outputLanguage';
 
 const mockAnalyze = jest.fn<IOrchestrator['analyze']>();
 const mockPersistAgentTurn = jest.fn();
+const mockPersistAnalysisRunState = jest.fn();
 const mockGenerateAgentDrivenHTML = jest.fn<(data: unknown) => string>(() => '<html></html>');
 const mockAnnotateLatestCompletedTurn = jest.fn();
 const mockFinalizeAnalysisResult = jest.fn<(input: FinalizeAnalysisResultInput) => Promise<FinalizedAnalysisResult>>();
@@ -75,6 +78,10 @@ jest.mock('../../../services/sessionPersistenceService', () => ({
 
 jest.mock('../../../services/persistAgentSession', () => ({
   persistAgentTurn: (...args: unknown[]) => mockPersistAgentTurn(...args),
+}));
+
+jest.mock('../../../services/analysisRunStore', () => ({
+  persistAnalysisRunState: (...args: unknown[]) => mockPersistAnalysisRunState(...args),
 }));
 
 jest.mock('../../../services/htmlReportGenerator', () => ({
@@ -279,6 +286,32 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
     });
   });
 
+  it('opens the run parent before the finalized turn is archived, then closes it', async () => {
+    await new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli',
+      query: 'Analyze startup', onEvent: jest.fn()});
+    // `persistAgentTurn` writes finalized history, which fails closed unless an
+    // owner-authorized run parent already exists. Ownership and identity must
+    // match exactly, and the open must precede the archive write.
+    const archived = mockPersistAgentTurn.mock.calls[0][0] as {sessionId: string; traceId: string; session: Record<string, string>};
+    const [openScope, openStatus] = mockPersistAnalysisRunState.mock.calls[0] as [Record<string, string>, string];
+    expect(openStatus).toBe('running');
+    expect(openScope).toMatchObject({sessionId: archived.sessionId, traceId: archived.traceId,
+      tenantId: archived.session.tenantId, workspaceId: archived.session.workspaceId, userId: archived.session.userId});
+    expect(mockPersistAnalysisRunState.mock.invocationCallOrder[0])
+      .toBeLessThan(mockPersistAgentTurn.mock.invocationCallOrder[0]);
+    expect(mockPersistAnalysisRunState.mock.calls[1]).toEqual([openScope, 'completed', {error: undefined}]);
+  });
+
+  it('leaves no durable run row when the analysis never reaches the archive', async () => {
+    // An open `running` row blocks trace deletion and holds a quota slot, and
+    // nothing reconciles a CLI-owned row. A turn that fails before archiving
+    // must therefore leave the run graph exactly as it found it.
+    mockAnalyze.mockRejectedValueOnce(new Error('runtime unavailable'));
+    await expect(new CliAnalyzeService().runTurn({...cliTurnBinding, traceId: 'trace-cli',
+      query: 'Analyze startup', onEvent: jest.fn()})).rejects.toThrow('runtime unavailable');
+    expect(mockPersistAnalysisRunState).not.toHaveBeenCalled();
+  });
+
   it('supplies CLI history separately from the question and filters dormant source turns on reads', async () => {
     const stored = jest.spyOn(AnalysisHistoryStore.prototype, 'list').mockReturnValue([]);
     const originalAnalyze = mockAnalyze.getMockImplementation()!;
@@ -382,6 +415,11 @@ describe('CliAnalyzeService runTurn final quality gate', () => {
       }),
     }));
     expect(output.codeAwareMode).toBe('metadata_only');
+    // The run row is durable enterprise state; a private-knowledge question is
+    // recorded as the projected message, never the user's own query.
+    const [runScope] = mockPersistAnalysisRunState.mock.calls[0] as [{query?: string}];
+    expect(runScope.query).toBe(privateAnalysisQueryMessage(
+      parseOutputLanguage(process.env.SMARTPERFETTO_OUTPUT_LANGUAGE)));
     expect(output.result.analysisReceipt?.outputs.cliTurnPath).toBeUndefined();
     expect(events).toContainEqual(expect.objectContaining({
       type: 'finding', content: {message: 'Source location found; implementation has not been read.'},

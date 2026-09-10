@@ -22,7 +22,7 @@ import type {RuntimeToolInvocationEvent} from '../agentRuntime/runtimeToolObserv
 import {captureInvestigationToolObservation, type InvestigationToolObservation} from '../services/evidence/investigationEvidenceLedger';
 import {createDataEnvelope} from '../types/dataContract';
 import {capturedEvidenceTable, freezeEvidenceValue, type EvidenceTableWitness} from '../services/evidence/evidenceCapture';
-import {createEvidenceReadView, type EvidenceReadView, type EvidenceReadViewOptions,
+import {createEvidenceReadView, MAX_EVIDENCE_READ_REFERENCES, type EvidenceReadView, type EvidenceReadViewOptions,
   type EvidenceReadRecord} from '../services/evidence/evidenceReadView';
 import { scopeMetadata, type IdentityResolutionV1, type EvidenceScopeMetadata, type EvidenceScopeProvenanceV1 } from '../types/identityContract';
 import type { DataEnvelopeMeta } from '../types/dataContract';
@@ -248,6 +248,41 @@ export interface CompactArtifactSummary extends EvidenceScopeMetadata {
 // Origin belongs to the issued execution witness, not the latest artifact registration.
 const captureOriginRuns = new WeakMap<EvidenceTableWitness, string | undefined>();
 
+export const EVIDENCE_RETENTION_CELLS_ENV = 'SMARTPERFETTO_EVIDENCE_RETENTION_CELLS';
+
+/**
+ * Retained witnesses are bounded by cells — columns x rows — because a witness
+ * holds every row its query returned, and a 40-column result costs forty times
+ * a single-column one of the same length. Counting captures says nothing about
+ * memory; counting rows says nothing about width.
+ *
+ * The default states an affordable resource cost (roughly tens of MB per
+ * session store), not a figure read off any particular corpus. Deployments that
+ * analyse wider traces raise it through the environment rather than by editing
+ * a number whose only justification was the traces someone had on hand.
+ */
+const DEFAULT_RETAINED_EVIDENCE_CELLS = 1_000_000;
+
+/**
+ * Secondary ceiling: cells do not account for the per-record meta, column and
+ * field-semantics overhead a capture carries, so a flood of one-cell captures
+ * still needs a bound. The floor is what one conclusion may cite; a session
+ * spans several turns and may cite across them, so the ceiling is a multiple of
+ * that floor rather than equal to it.
+ */
+export const RETAINED_EVIDENCE_CAPTURE_CEILING = 8 * MAX_EVIDENCE_READ_REFERENCES;
+
+function resolveRetainedEvidenceCells(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = env[EVIDENCE_RETENTION_CELLS_ENV]?.trim();
+  if (!configured) return DEFAULT_RETAINED_EVIDENCE_CELLS;
+  const parsed = Number(configured);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_RETAINED_EVIDENCE_CELLS;
+}
+
+function capturedCellCount(record: EvidenceReadRecord['record'] | undefined): number {
+  return record ? record.totalRowCount * Math.max(1, record.columns.length) : 0;
+}
+
 export class ArtifactStore {
   private artifacts: Map<string, StoredArtifact> = new Map();
   private readonly executionCaptures = new Map<string, EvidenceReadRecord>();
@@ -257,9 +292,13 @@ export class ArtifactStore {
   private counter = 0;
   /** Maximum number of artifacts before LRU eviction. */
   private readonly maxArtifacts: number;
+  /** Cumulative cells across retained witnesses; the ledger's real cost. */
+  private retainedEvidenceCells = 0;
+  private readonly maxRetainedEvidenceCells: number;
 
   constructor(maxArtifacts = 50) {
     this.maxArtifacts = maxArtifacts;
+    this.maxRetainedEvidenceCells = resolveRetainedEvidenceCells();
   }
 
   /**
@@ -308,10 +347,11 @@ export class ArtifactStore {
           oldestId = aid;
         }
       }
-      if (oldestId) {
-        this.artifacts.delete(oldestId);
-        this.executionCaptures.delete(oldestId);
-      }
+      // Evicting a payload frees what the model reads. The execution witness is
+      // a separate budget: a conclusion cites evidence produced at any point in
+      // the run, and dropping the witness here would make the product report its
+      // own bookkeeping loss as an unsupported claim.
+      if (oldestId) this.artifacts.delete(oldestId);
       else break;
     }
 
@@ -355,14 +395,33 @@ export class ArtifactStore {
     if (!captureOriginRuns.has(witness)) captureOriginRuns.set(witness, originRunId);
     const capturedOriginRunId = captureOriginRuns.get(witness);
     const {queryReview: _reviewOnly, ...capturedMeta} = meta;
-    this.executionCaptures.set(key, {witness, record: freezeEvidenceValue(structuredClone({
+    const record = freezeEvidenceValue(structuredClone({
       captureId: witness.captureId, storeId: this.evidenceStoreId, generation: ++this.captureGeneration,
       ...(capturedOriginRunId ? {originRunId: capturedOriginRunId} : {}),
       columns: [...table.columns], totalRowCount: table.rows.length, fields: table.fields,
       meta: {...capturedMeta, ...scopeMetadata(meta.scopeProvenance)}, display,
       ...(sourceRefs ? {sourceRefs: [...sourceRefs]} : {}),
-    }))});
-    while (this.executionCaptures.size > this.maxArtifacts) this.executionCaptures.delete(this.executionCaptures.keys().next().value!);
+    }));
+    // Both sides of the accounting read the stored record, so they cannot drift.
+    this.retainedEvidenceCells += capturedCellCount(record) -
+      capturedCellCount(this.executionCaptures.get(key)?.record);
+    this.executionCaptures.set(key, {witness, record});
+    this.evictRetainedEvidence();
+  }
+
+  /**
+   * The 200-row truncation upstream applies only to what the model sees, and the
+   * store is reused across a session's turns, so a handful of unbounded scans
+   * can outweigh hundreds of ordinary captures. Oldest goes first, and a single
+   * oversized capture is kept rather than evicting itself.
+   */
+  private evictRetainedEvidence(): void {
+    while (this.executionCaptures.size > RETAINED_EVIDENCE_CAPTURE_CEILING ||
+      (this.retainedEvidenceCells > this.maxRetainedEvidenceCells && this.executionCaptures.size > 1)) {
+      const oldest = this.executionCaptures.keys().next().value!;
+      this.retainedEvidenceCells -= capturedCellCount(this.executionCaptures.get(oldest)?.record);
+      this.executionCaptures.delete(oldest);
+    }
   }
 
   createEvidenceReadView(options: EvidenceReadViewOptions): EvidenceReadView {
@@ -807,6 +866,7 @@ export class ArtifactStore {
   clear(): void {
     this.artifacts.clear();
     this.executionCaptures.clear();
+    this.retainedEvidenceCells = 0;
     this.investigationToolObservations.clear();
     this.counter = 0;
   }

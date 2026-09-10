@@ -529,6 +529,26 @@ do not need to be sent to the model on every turn.
 
 The frontend persists the selected mode in `localStorage['ai-analysis-mode']`.
 
+### Evidence Retention Budget
+
+Every claim in a conclusion has to lead back to the execution it cites, so the
+runtime retains execution witnesses. They are measured in cells (columns x rows):
+a witness holds every row its query returned, so a 40-column result costs forty
+times a single-column one of the same length — counting captures says nothing
+about memory, and counting rows says nothing about width. The default is roughly
+tens of MB per session store:
+
+```bash
+SMARTPERFETTO_EVIDENCE_RETENTION_CELLS=1000000
+```
+
+Raise it when analysing wider or larger traces; a non-positive-integer value
+falls back to the default. Over budget, the oldest witness goes first, and a
+single oversized witness is kept rather than evicting itself. A separate capture
+ceiling absorbs the fixed per-record overhead of many tiny witnesses; it is never
+below the number of references one conclusion may resolve, or a conclusion would
+necessarily cite evidence the product had already discarded.
+
 ## Service Configuration
 
 ```bash

@@ -5,8 +5,80 @@
 import {describe, expect, it} from '@jest/globals';
 import {buildTraceProcessorQueryProvenance} from '../../services/traceProcessorConnectionModel';
 import {sanitizeQueryReview} from '../../types/queryReviewContract';
-import {ArtifactStore} from '../artifactStore';
+import {ArtifactStore, EVIDENCE_RETENTION_CELLS_ENV, RETAINED_EVIDENCE_CAPTURE_CEILING} from '../artifactStore';
+import {captureEvidenceTable} from '../../services/evidence/evidenceCapture';
+import {MAX_EVIDENCE_READ_REFERENCES} from '../../services/evidence/evidenceReadView';
 import type {EvidenceScopeProvenanceV1} from '../../types/identityContract';
+
+describe('ArtifactStore evidence retention', () => {
+  const storeCaptured = (store: ArtifactStore, index: number, rowCount = 1, columnCount = 1) => {
+    const columns = Array.from({length: columnCount}, (_, column) => `col${column}`);
+    const rows = Array.from({length: rowCount}, (_, row) => columns.map((_column, column) => row + column));
+    const id = store.store({skillId: 'execute_sql', title: `query ${index}`,
+      sourceToolCallId: `execute_sql:${index}:hash`,
+      data: {columns, rows},
+      traceProvenance: {traceId: 'trace', traceSide: 'current'} as never});
+    store.registerEvidenceCapture(id, captureEvidenceTable({columns, rows}),
+      {evidenceRefId: `data:sql_table:current:${index}`});
+    return id;
+  };
+  const readView = (store: ArtifactStore) => store.createEvidenceReadView({
+    ownerKey: 'owner', allowedTraces: [{traceId: 'trace', traceSide: 'current'}]});
+
+  it('answers a citation to the first evidence of a long run', async () => {
+    // A real run produced 55 artifacts against a 50-entry payload cache; its
+    // conclusion cited art-2 and art-4, which the cache had already dropped, so
+    // the verifier reported those claims as unsupported. Witness retention is a
+    // separate budget from the payload cache and must survive that eviction.
+    const store = new ArtifactStore();
+    const first = storeCaptured(store, 1);
+    for (let index = 2; index <= 80; index += 1) storeCaptured(store, index);
+
+    expect(store.get(first)).toBeUndefined();
+    const [resolved] = await readView(store).resolveReferences([
+      {key: 'k', reference: {artifactId: first}, requiredColumns: []}]);
+    expect(resolved).toMatchObject({status: 'resolved'});
+  });
+
+  it('retains at least what one conclusion may cite', () => {
+    // The read view lets a single conclusion resolve MAX_EVIDENCE_READ_REFERENCES
+    // references. A ledger below that floor guarantees unanswerable citations
+    // no matter how the ceiling is tuned.
+    expect(RETAINED_EVIDENCE_CAPTURE_CEILING).toBeGreaterThanOrEqual(MAX_EVIDENCE_READ_REFERENCES);
+  });
+
+  it('evicts the oldest witness once the capture ceiling is passed', async () => {
+    const store = new ArtifactStore();
+    const first = storeCaptured(store, 1);
+    for (let index = 2; index <= RETAINED_EVIDENCE_CAPTURE_CEILING + 1; index += 1) storeCaptured(store, index);
+    const [resolved] = await readView(store).resolveReferences([
+      {key: 'k', reference: {artifactId: first}, requiredColumns: []}]);
+    expect(resolved).toMatchObject({status: 'missing'});
+  });
+
+  it('accounts for width, so wide captures evict sooner than narrow ones', async () => {
+    // 300 cells of budget: three 10-cell captures fit, one 200-cell capture of
+    // the same row count does not. A row-based bound would not tell them apart.
+    process.env[EVIDENCE_RETENTION_CELLS_ENV] = '300';
+    try {
+      const narrow = new ArtifactStore();
+      const firstNarrow = storeCaptured(narrow, 1, 10, 1);
+      storeCaptured(narrow, 2, 10, 1);
+      expect((await readView(narrow).resolveReferences([
+        {key: 'k', reference: {artifactId: firstNarrow}, requiredColumns: []}]))[0])
+        .toMatchObject({status: 'resolved'});
+
+      const wide = new ArtifactStore();
+      const firstWide = storeCaptured(wide, 1, 10, 20);
+      storeCaptured(wide, 2, 10, 20);
+      expect((await readView(wide).resolveReferences([
+        {key: 'k', reference: {artifactId: firstWide}, requiredColumns: []}]))[0])
+        .toMatchObject({status: 'missing'});
+    } finally {
+      delete process.env[EVIDENCE_RETENTION_CELLS_ENV];
+    }
+  });
+});
 
 describe('ArtifactStore', () => {
   it.each([

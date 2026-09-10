@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2024-2026 Gracker (Chris)
 
-import {ArtifactStore} from '../../../agentv3/artifactStore';
+import {ArtifactStore, EVIDENCE_RETENTION_CELLS_ENV} from '../../../agentv3/artifactStore';
 import {buildTraceProcessorQueryProvenance} from '../../traceProcessorConnectionModel';
 import {captureEvidenceTable, captureRawSqlEvidence, evidenceTableFor, getCapturedAnchorFacts, type CapturedFieldSemantics} from '../evidenceCapture';
 import * as runtimeIdentity from '../../capabilityManifestRuntimeIdentity';
@@ -163,15 +163,23 @@ describe('runtime execution evidence read view', () => {
   });
 
   it('binds the capture generation set when the view is created and still observes eviction', async () => {
-    const store = new ArtifactStore(2);
-    const first = add(store, undefined, {evidenceRefId: 'first'});
-    const old = store.createEvidenceReadView(readOptions);
-    await Promise.resolve();
-    const second = add(store, undefined, {evidenceRefId: 'second'});
-    expect((await read(old, {artifactId: first.id}))[0].status).toBe('resolved');
-    expect((await read(old, {artifactId: second.id}))[0].status).toBe('missing');
-    add(store, undefined, {evidenceRefId: 'third'});
-    expect((await read(old, {artifactId: first.id}))[0].status).toBe('missing');
+    // The payload cache and the witness ledger are separate budgets now, so the
+    // eviction observed through the old view is the ledger's own. Each fixture
+    // capture is one 2-column row, so a 4-cell budget holds exactly two.
+    process.env[EVIDENCE_RETENTION_CELLS_ENV] = '4';
+    try {
+      const store = new ArtifactStore(2);
+      const first = add(store, undefined, {evidenceRefId: 'first'});
+      const old = store.createEvidenceReadView(readOptions);
+      await Promise.resolve();
+      const second = add(store, undefined, {evidenceRefId: 'second'});
+      expect((await read(old, {artifactId: first.id}))[0].status).toBe('resolved');
+      expect((await read(old, {artifactId: second.id}))[0].status).toBe('missing');
+      add(store, undefined, {evidenceRefId: 'third'});
+      expect((await read(old, {artifactId: first.id}))[0].status).toBe('missing');
+    } finally {
+      delete process.env[EVIDENCE_RETENTION_CELLS_ENV];
+    }
   });
 
   it('revokes every captured record on clear and cannot restore or reuse its read authority', async () => {

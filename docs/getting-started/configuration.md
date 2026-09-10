@@ -486,6 +486,22 @@ provider history；Artifact、DataEnvelope、报告和证据来源不会因此�
 
 前端会把选择持久化到 `localStorage['ai-analysis-mode']`。中途切换模式会清空当前 `agentSessionId`，让后端开启新的 SDK session。
 
+### 证据保留预算
+
+结论里的每条断言都要能回到它引用的那次执行。运行时为此保留执行 witness，按
+单元格（列 x 行）计量：一次查询的 witness 持有它返回的**全部**行，所以 40 列结果
+的成本是同样长度单列结果的四十倍，只数条数或只数行都说明不了内存。默认约为每个
+session store 几十 MB：
+
+```bash
+SMARTPERFETTO_EVIDENCE_RETENTION_CELLS=1000000
+```
+
+分析列更宽或结果更大的 trace 时可以调高；非正整数会 fail 回默认值。超出预算时按
+最旧优先淘汰，单条超大 witness 会被保留而不是淘汰自己。预算之上还有一个条数上限，
+用于兜住大量极小 witness 的每条固定开销；它不低于单条结论可引用的引用数上限，
+否则一次结论必然引用到已被丢弃的证据。
+
 ## 服务配置
 
 ```bash

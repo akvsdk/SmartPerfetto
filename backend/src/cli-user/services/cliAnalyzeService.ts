@@ -40,6 +40,11 @@ import { buildAnalysisReceipt } from '../../services/analysisReceiptBuilder';
 import {recordAdaptiveRoutingPostEvidenceBestEffort} from '../../agentRuntime/adaptiveRoutingProjection';
 import { deriveUiActionProposals } from '../../services/uiActionProposalDeriver';
 import { persistAgentTurn } from '../../services/persistAgentSession';
+import {
+  persistAnalysisRunState,
+  type AnalysisRunPersistenceScope,
+  type PersistedAnalysisRunStatus,
+} from '../../services/analysisRunStore';
 import {finalizeAnalysisResult} from '../../services/finalizeAnalysisResult';
 import {resolveCapturedComparisonIdentity} from '../../services/comparisonAppendixService';
 import type {FinalResultQualityIssue} from '../../services/finalResultQualityGate';
@@ -132,6 +137,42 @@ import {
   createRunManifestLifecycle,
   withRunManifestLifecycle,
 } from '../../services/selfEvolution/runManifestLifecycle';
+
+/**
+ * The finalized-history writer requires an owner-authorized run parent
+ * (`analysis_runs` joined to `analysis_sessions`). The HTTP layer creates that
+ * graph when it admits a run; the CLI owns its own run lifecycle, so it has to
+ * register the same parent or every finalization fails closed with
+ * `analysis_history_parent_not_authorized`. Ownership must be the exact scope
+ * `persistAgentTurn` later appends with, not a re-resolved default.
+ */
+function cliAnalysisRunScope(
+  session: {tenantId?: string; workspaceId?: string; userId?: string},
+  identity: {sessionId: string; runId: string; traceId: string; query: string; mode: string},
+): AnalysisRunPersistenceScope | undefined {
+  const {tenantId, workspaceId, userId} = session;
+  return tenantId && workspaceId && userId
+    ? {tenantId, workspaceId, userId, ...identity}
+    : undefined;
+}
+
+/** Run-lifecycle bookkeeping never turns a delivered analysis into a CLI failure. */
+function recordCliAnalysisRunState(
+  scope: AnalysisRunPersistenceScope | undefined,
+  status: PersistedAnalysisRunStatus,
+  error?: string,
+): void {
+  if (!scope) return;
+  try {
+    persistAnalysisRunState(scope, status, {error});
+  } catch (persistError) {
+    console.warn(
+      '[CliAnalyzeService] Failed to persist analysis run state:',
+      status,
+      (persistError as Error).message,
+    );
+  }
+}
 
 export interface RunTurnInput {
   /** Cancels runtime execution and finalization until the turn is committed. */
@@ -589,6 +630,15 @@ export class CliAnalyzeService {
       throw new Error(`run_manifest_runtime_missing:${sessionId}`);
     }
     const resolvedScope = resolveKnowledgeScope(knowledgeScope);
+    // A private-knowledge run records the projected message in the durable row,
+    // never the user's own query — same rule as the HTTP run scope.
+    const analysisRunScope = cliAnalysisRunScope(session, {
+      sessionId,
+      runId: run.runId,
+      traceId,
+      query: primaryPrivateKnowledge ? privateAnalysisQueryMessage(outputLanguage) : input.query,
+      mode: requestedAnalysisMode,
+    });
     const runtimeRegistrySnapshot = await getEffectiveRuntimeRegistrySnapshot({
       scope: resolvedScope,
     });
@@ -617,6 +667,9 @@ export class CliAnalyzeService {
     const cliTurnPath = primaryPrivateKnowledge ? undefined : input.resolveCliTurnPath(sessionId, input.turn);
 
     let traceProcessorLeases: AnalysisRunTraceProcessorLeases | undefined;
+    // Set once the durable parent exists, so the terminal writes below close
+    // only a run that was actually opened.
+    let openRunScope: AnalysisRunPersistenceScope | undefined;
     try {
       traceProcessorLeases = await prepareAnalysisRunTraceProcessorLeases({
         service: getTraceProcessorService(), scope: resolvedScope, runId: run.runId, sessionId,
@@ -624,7 +677,7 @@ export class CliAnalyzeService {
         signal: run.controller.signal, assertCurrent: assertActive,
         onInvalidated: error => run.controller.abort(error),
       });
-      return await traceProcessorLeases.run(() => withRunManifestLifecycle(runManifestLifecycle, async () => {
+      const turnOutput = await traceProcessorLeases.run(() => withRunManifestLifecycle(runManifestLifecycle, async () => {
         // Surface sessionId to the caller now, before analyze() starts emitting
         // events. Without this, callers must buffer events until runTurn resolves,
         // which accumulates the entire analyze run's output in memory.
@@ -842,6 +895,16 @@ export class CliAnalyzeService {
         // through the same shared helper the HTTP layer uses, so any future schema
         // change applies to both paths automatically.
         assertActive();
+        // Open the durable parent here rather than at run start. `append` fails
+        // closed without it, but a `running` row blocks trace deletion and holds
+        // a quota slot (simpleTraceRoutes DELETE_BLOCKING_RUN_STATUSES,
+        // enterpriseQuotaPolicyService ACTIVE_RUN_STATUSES), and nothing
+        // reconciles a CLI-owned row: failInterruptedAnalysisRunsOnStartup runs
+        // only in the backend process. Ctrl-C is routine here and unwinds
+        // nothing, so the open window stays seconds rather than the whole
+        // analysis, and an aborted turn leaves no durable row at all.
+        recordCliAnalysisRunState(analysisRunScope, 'running');
+        openRunScope = analysisRunScope;
         persistAgentTurn({
           session,
           sessionId,
@@ -915,7 +978,16 @@ export class CliAnalyzeService {
           analysisContextFingerprint,
         };
       }));
+      recordCliAnalysisRunState(openRunScope, 'completed');
+      return turnOutput;
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      recordCliAnalysisRunState(
+        openRunScope,
+        run.controller.signal.aborted || (error instanceof Error && error.name === 'AbortError')
+          ? 'cancelled' : 'failed',
+        primaryPrivateKnowledge ? projectOwnerAnalysisError(sessionId, message, outputLanguage) : message,
+      );
       if (runManifestLifecycle.state === 'collecting') {
         try {
           runManifestLifecycle.sealOnceAndPersist({
