@@ -171,7 +171,10 @@ test('preserves native handoffs, wakeups, priority changes and clipped system ev
   const priorities = queryTrace(outputPath, `
     SELECT DISTINCT priority FROM sched JOIN thread USING (utid)
     WHERE tid = ${targetTid} ORDER BY priority`);
-  assert.equal(priorities.trim(), '"priority"\n' + expected.observed_target_priorities.join('\n'));
+  assert.deepEqual(
+    priorities.trim().split(/\r?\n/),
+    ['"priority"', ...expected.observed_target_priorities.map(String)],
+  );
 
   const negativeEvidence = queryTrace(outputPath, `
     SELECT
