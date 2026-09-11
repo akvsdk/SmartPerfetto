@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Commit prefixes follow [Conventional Commits](https://www.conventionalcommits.org/).
 Detailed commit-level history is available via `git log`.
 
+## [1.10.0] - 2026-09-11
+
+### Added
+- Durable investigation checkpoints and conversation recovery across Web, CLI,
+  reports, and snapshots, with parent-run lineage preserved for later turns.
+- Continuous main-thread scheduling evidence for frame work, observed cadence,
+  task attribution, CPU placement, preemption, and shared system context.
+
+### Changed
+- Authorized source analysis can use registered folders on demand without
+  requiring an index, while keeping source-backed answers readable and their
+  provenance attached through verification and persistence.
+- Provider setup uses refreshed mainstream model catalogs and simpler forms,
+  while preserving saved values and arbitrary manual model identifiers.
+- Analysis runtimes share structured investigation requirements and evidence
+  context across Claude, OpenAI, Pi, OpenCode, and Qoder paths.
+
+### Fixed
+- Register CLI analysis parents before archival so completed turns no longer
+  fail with `analysis_history_parent_not_authorized`; preserve cited evidence in
+  final CLI results.
+- Preserve complete model conclusions, source references, native SQL evidence,
+  and verification diagnostics across owner-facing output surfaces.
+- Start portable frontend readiness timing only after backend health succeeds,
+  and keep release/test gates portable across Windows, macOS, and Linux.
+
 ## [1.9.0] - 2026-09-08
 
 ### Added
@@ -489,7 +515,14 @@ Detailed commit-level history is available via `git log`.
 - HTML report generation and CSV / JSON export.
 - AGPL v3.0 licensing throughout.
 
-[Unreleased]: https://github.com/Gracker/SmartPerfetto/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/Gracker/SmartPerfetto/compare/v1.10.0...HEAD
+[1.10.0]: https://github.com/Gracker/SmartPerfetto/compare/v1.9.0...v1.10.0
+[1.9.0]: https://github.com/Gracker/SmartPerfetto/compare/v1.8.4...v1.9.0
+[1.8.4]: https://github.com/Gracker/SmartPerfetto/compare/v1.8.3...v1.8.4
+[1.8.3]: https://github.com/Gracker/SmartPerfetto/compare/v1.8.2...v1.8.3
+[1.8.2]: https://github.com/Gracker/SmartPerfetto/compare/v1.8.1...v1.8.2
+[1.8.1]: https://github.com/Gracker/SmartPerfetto/compare/v1.8.0...v1.8.1
+[1.8.0]: https://github.com/Gracker/SmartPerfetto/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/Gracker/SmartPerfetto/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/Gracker/SmartPerfetto/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/Gracker/SmartPerfetto/compare/v1.4.0...v1.5.0
